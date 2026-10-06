@@ -187,11 +187,16 @@ new tab's spawn worker is in flight. `--links-test` proves the exact argv and cw
 observer seam and real vim drawing in the new tab; the `terminal-file-reference` scenario proves
 the `conduit-test ctrl-click` route.
 
-TASK-69.1 (Linux tagged release) ran for real on tag `v0.1.0-rc.1`: the release workflow validated
-the tag, passed the reusable Linux gate, built, packaged, verified and published a GitHub
-prerelease with all four assets (run 37539729660). That run exposed one defect, fixed afterwards:
-GitHub renames assets containing `~`, so the Debian package file now keeps the SemVer spelling
-(`conduit_<version>_amd64.deb`) while only its control `Version` uses the Debian `~` form. `zig build
+TASK-69.1 (Linux tagged release) is complete. Prerelease tags `v0.1.0-rc.1` through `rc.4` each
+ran the release workflow for real: tag validation, the reusable Linux gate, a ReleaseSafe build,
+packaging, verification and an idempotent publish (the rc.2 workflow was rerun and replaced its
+four assets in place). rc.1 exposed that GitHub renames assets containing `~`, so the Debian
+package file keeps the SemVer spelling (`conduit_<version>_amd64.deb`) while only its control
+`Version` uses the Debian `~` form; rc.3 was failed by a timing-dependent scrollback unit test,
+fixed before rc.4. The published rc.2 and rc.4 assets were downloaded and re-verified locally
+(checksums, an isolated `ubuntu:22.04` apt install printing the stamped version, AppImage
+extraction). `v0.1.0` was tagged from the rc.4 commit and published as the first full Linux release
+(https://github.com/thowd22/Conduit/releases/tag/v0.1.0), re-verified locally the same way. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
 re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
 the log sink or SDL start, and an unstamped build prints `conduit 0.0.0-dev`.

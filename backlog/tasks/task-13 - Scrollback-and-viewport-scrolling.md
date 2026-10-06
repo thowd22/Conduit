@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@omp'
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-05 12:00'
+updated_date: '2026-10-06 23:21'
 labels:
   - terminal
 milestone: m-1
@@ -46,6 +46,8 @@ Defects found and fixed: (1) --scroll-test's first capture compared the app's re
 Unit caveat, open for a decision before v0.1: SDL reports wheel travel with no unit, so platform calls a delta precise when it is fractional and term divides a precise delta by pixels_per_row (default 40). A device reporting whole numbers gets notch semantics (multiplied by lines_per_notch, 3), which is what a mouse wheel and a macOS trackpad produce; a device reporting fractional pixel counts gets pixel semantics, which is what a Windows precision touchpad produces. The pathological middle - small fractional values - barely moves the view. The check asserts the safe property (no runaway) and prints the real numbers rather than claiming more.
 Also recorded: Ghostty enforces its line limit at whole-page granularity and never below one page, so a small limit is unenforceable; lib_vt exports MouseEncodeOptions but not the renderer Size its field holds, so term rebuilds it by field name and an upstream rename becomes a compile error in exactly one function.
 Not verified here: macOS and Windows, real trackpad hardware, real GPU.
+
+2026-10-06 flaky on a hosted runner (release run 37545204453): 'a real shell's output is scrolled back through with a wheel' waited for >5 history rows and then scrolled 18, so a slow first read of seq's output clamped the offset at 17. Fixed by waiting for >18 rows before turning the wheel.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
