@@ -26,11 +26,16 @@ jobs:
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
       LIBGL_ALWAYS_SOFTWARE: "1"
-      ARTIFACT_ROOT: ${{ runner.temp }}/conduit-linux-gate
 
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+
+      # `runner.temp` is not available to job-level `env`, so the private
+      # artifact root is resolved here from the step-level RUNNER_TEMP.
+      - name: Resolve the private artifact root
+        shell: bash
+        run: echo "ARTIFACT_ROOT=$RUNNER_TEMP/conduit-linux-gate" >> "$GITHUB_ENV"
 
       - name: Install Linux display and input-method dependencies
         shell: bash

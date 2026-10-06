@@ -76,13 +76,21 @@ jobs:
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
       VERSION: ${{ needs.validate-tag.outputs.version }}
-      STAGE: ${{ runner.temp }}/conduit-release/stage
-      DIST: ${{ runner.temp }}/conduit-release/dist
-      TOOLS: ${{ runner.temp }}/conduit-release/tools
-      VERIFY_WORK: ${{ runner.temp }}/conduit-release/verify
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+
+      # `runner.temp` is not available to job-level `env`, so the private
+      # release directories are resolved here from the step-level RUNNER_TEMP.
+      - name: Resolve the private release directories
+        shell: bash
+        run: |
+          {
+            echo "STAGE=$RUNNER_TEMP/conduit-release/stage"
+            echo "DIST=$RUNNER_TEMP/conduit-release/dist"
+            echo "TOOLS=$RUNNER_TEMP/conduit-release/tools"
+            echo "VERIFY_WORK=$RUNNER_TEMP/conduit-release/verify"
+          } >> "$GITHUB_ENV"
 
       - name: Resolve the pinned Zig version
         shell: bash
@@ -179,10 +187,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      DIST: ${{ runner.temp }}/conduit-release/dist
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+
+      - name: Resolve the private release directories
+        shell: bash
+        run: echo "DIST=$RUNNER_TEMP/conduit-release/dist" >> "$GITHUB_ENV"
 
       - name: Download the verified artifacts
         uses: actions/download-artifact@v4
