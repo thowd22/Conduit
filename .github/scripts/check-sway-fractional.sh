@@ -42,11 +42,18 @@ export XDG_RUNTIME_DIR="$runtime_root"
 export WLR_BACKENDS=headless
 export WLR_HEADLESS_OUTPUTS=1
 export WLR_LIBINPUT_NO_DEVICES=1
-# SDL's OpenGL client submits EGL buffers. wlroots' GLES2 software renderer can import those
-# buffers under llvmpipe; the pixman renderer is intentionally avoided because it is limited to
-# CPU buffers on combinations shipped by Ubuntu and can reject an otherwise valid GL client.
-export WLR_RENDERER=gles2
-export WLR_RENDERER_ALLOW_SOFTWARE=1
+# wlroots' GLES2 renderer needs a DRM render node even for software rendering, and hosted
+# runners have none (/dev/dri is absent), so Sway would exit with "no DRM FD available". Without
+# a render node Mesa's Wayland EGL path also falls back to wl_shm buffers, which the pixman
+# renderer imports, so the renderer follows the machine: GLES2 where a render node exists, pixman
+# otherwise. The choice is recorded for the retained evidence.
+if compgen -G '/dev/dri/renderD*' >/dev/null; then
+  export WLR_RENDERER=gles2
+  export WLR_RENDERER_ALLOW_SOFTWARE=1
+else
+  export WLR_RENDERER=pixman
+fi
+echo "wlroots renderer: $WLR_RENDERER" | tee "$artifact_root/renderer.txt"
 export LIBGL_ALWAYS_SOFTWARE=1
 
 sway --unsupported-gpu --debug --config "$artifact_root/sway.conf" \
