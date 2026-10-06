@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Conduit
+GenericName=Terminal Emulator
+Comment=Terminal workspace for humans and coding agents
+TryExec=conduit
+Exec=conduit
+Icon=io.github.thowd22.Conduit
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;terminal;workspace;
+StartupNotify=true
+StartupWMClass=io.github.thowd22.Conduit

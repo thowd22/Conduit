@@ -1,0 +1,23 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Conduit
+Source: https://github.com/thowd22/Conduit
+
+Files: *
+Copyright: 2026 Conduit contributors
+License: MIT
+ The full MIT license text is installed as
+ /usr/share/licenses/conduit/LICENSE.
+
+Comment:
+ Conduit statically links and bundles third-party components whose notices
+ must accompany every binary distribution. Each notice is installed verbatim
+ under /usr/share/licenses/conduit:
+ .
+  Ghostty-LICENSE            libghostty terminal engine (MIT)
+  SDL-LICENSE.txt            SDL3 (zlib)
+  zopengl-LICENSE            zopengl OpenGL bindings (MIT)
+  FreeType-FTL.txt           FreeType (FreeType License)
+  FreeType-LICENSE.TXT       FreeType license selection notice
+  HarfBuzz-COPYING.txt       HarfBuzz (Old MIT)
+  Oniguruma-COPYING.txt      Oniguruma 6.9.9 (BSD-2-Clause)
+  JetBrainsMono-OFL-1.1.txt  JetBrains Mono fallback font (SIL OFL 1.1)

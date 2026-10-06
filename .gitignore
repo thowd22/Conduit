@@ -1,0 +1,13 @@
+# Zig build output
+zig-out/
+.zig-cache/
+zig-pkg/
+
+# Spike artifacts. `spikes/` is throwaway proof, never absorbed into the real
+# build, and it leaves its own build output and readback behind.
+spikes/*/zig-out/
+spikes/*/.zig-cache/
+spikes/*/zig-pkg/
+spikes/*/readback.ppm
+# Per-user Claude Code permissions
+.claude/settings.local.json

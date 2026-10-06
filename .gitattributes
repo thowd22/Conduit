@@ -1,0 +1,10 @@
+# Zig build files and sources are parsed by Zig, which expects LF. A CRLF
+# checkout on a Windows runner would otherwise break `zig build` there while
+# working on Linux.
+build.zig text eol=lf
+build.zig.zon text eol=lf
+*.zig text eol=lf
+
+# Anything we require to keep its bytes.
+*.png binary
+*.ppm binary

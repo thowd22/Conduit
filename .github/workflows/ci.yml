@@ -1,0 +1,114 @@
+# Conduit CI: build and unit-test Conduit on every OS Conduit ships.
+#
+# The Zig version is not written here. `build.zig.zon` is the one source of
+# truth for it, and the "Resolve the pinned Zig version" step below reads
+# `.minimum_zig_version` out of that file and publishes it as `$ZIG_VERSION`
+# for every later step, including the cache key. Nothing in this workflow
+# restates the version, so the pin cannot drift from the toolchain.
+name: CI
+
+on:
+  push:
+    # Branch pushes only: a release tag runs this gate through release.yml
+    # (workflow_call) instead of a second standalone copy.
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# The workflow only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # One OS failing should not hide the other two; every leg reports.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    env:
+      # Zig keeps its global cache (compiled artifacts, and the fetched
+      # dependency tarballs under `p/`) outside the workspace by default, at a
+      # different path on each OS. Pointing it at a directory inside the
+      # workspace makes every cached path repo-relative, so one cache step
+      # covers all three runners without guessing a per-OS home directory.
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # Read the pin rather than repeat it. `sed -E` is portable across GNU,
+      # BSD and Git-for-Windows sed; the capture stops at the closing quote, so
+      # a CRLF checkout cannot smuggle a carriage return into the version.
+      - name: Resolve the pinned Zig version
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)"
+          if [ -z "$version" ]; then
+            echo "::error::build.zig.zon declares no .minimum_zig_version" >&2
+            exit 1
+          fi
+          echo "ZIG_VERSION=$version" >> "$GITHUB_ENV"
+          echo "Zig version pinned by build.zig.zon: $version"
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          # Caching is the next step's job, with keys this workflow owns.
+          cache: false
+
+      # The pin is only worth anything if the toolchain on the runner is the one
+      # the pin names, so state the two side by side and fail when they differ.
+      - name: Check the installed Zig against the pin
+        shell: bash
+        run: |
+          installed="$(zig version)"
+          if [ "$installed" != "$ZIG_VERSION" ]; then
+            echo "::error::installed Zig $installed does not match the pinned $ZIG_VERSION" >&2
+            exit 1
+          fi
+          echo "zig: $installed ($ZIG_VERSION), global cache $ZIG_GLOBAL_CACHE_DIR"
+
+      # `runner.os` is Linux/macOS/Windows, so legs cannot share an entry, and
+      # the version sits in the key, so two Zig versions cannot either. The
+      # source hash rotates the key when the build or the pins change; the
+      # restore-keys fall back to the same OS and version, then the same OS, so
+      # a changed pin or a cold cache is paid for once, not twice.
+      - name: Restore the Zig caches and the fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            zig-out
+            zig-pkg
+            .zig-global-cache
+          key: conduit-${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            conduit-${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-
+            conduit-${{ runner.os }}-zig-
+
+      - name: Check formatting
+        shell: bash
+        run: zig fmt --check .
+
+      - name: Build
+        shell: bash
+        run: zig build
+
+      # `zig build test` runs the unit tests of every Conduit module and exits
+      # non-zero if any of them fail, so a failing test fails the step, fails
+      # the job, and fails this workflow. Nothing here masks that: the step has
+      # no `continue-on-error`, no `if:` that skips it, and no `|| true`.
+      - name: Unit tests
+        shell: bash
+        run: zig build test --summary all

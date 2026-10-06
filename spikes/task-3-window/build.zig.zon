@@ -1,0 +1,19 @@
+.{
+    .name = .task3_window_spike,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x831d583932096556,
+    .dependencies = .{
+        .zopengl = .{
+            .url = "https://github.com/zig-gamedev/zopengl/archive/refs/heads/master.tar.gz",
+            .hash = "zopengl-0.6.0-dev-5-tnz8mnDgCHR72YtUpLBYW_u4JgZ0Ub-UFX-M0zRSG1",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "c",
+        "src",
+        "README.md",
+    },
+}

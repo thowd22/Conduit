@@ -1,0 +1,214 @@
+# Reusable Linux gate for pull requests today and tagged release jobs later.
+# It is intentionally independent of the unresolved macOS/Windows CI evidence.
+name: Linux E2E gate
+
+on:
+  push:
+    # Branch pushes only: a release tag runs this gate through release.yml
+    # (workflow_call) instead of a second standalone copy.
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-e2e:
+    name: Linux build, test and E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      ARTIFACT_ROOT: ${{ runner.temp }}/conduit-linux-gate
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux display and input-method dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            xvfb \
+            xauth \
+            xdotool \
+            dbus-x11 \
+            ibus \
+            ibus-hangul \
+            libglib2.0-bin \
+            sway \
+            jq \
+            xclip \
+            desktop-file-utils \
+            librsvg2-bin
+
+      - name: Resolve the pinned Zig version
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)"
+          if [ -z "$version" ]; then
+            echo "::error::build.zig.zon declares no .minimum_zig_version" >&2
+            exit 1
+          fi
+          echo "ZIG_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache: false
+
+      - name: Check the installed Zig and headless runner
+        shell: bash
+        run: |
+          installed="$(zig version)"
+          if [ "$installed" != "$ZIG_VERSION" ]; then
+            echo "::error::installed Zig $installed does not match the pinned $ZIG_VERSION" >&2
+            exit 1
+          fi
+          command -v xvfb-run
+          command -v xdotool
+          command -v dbus-run-session
+          command -v sway
+          command -v ibus-daemon
+          command -v gsettings
+          command -v jq
+          command -v xclip
+          command -v desktop-file-validate
+          command -v rsvg-convert
+
+      - name: Restore Zig caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+          key: conduit-linux-e2e-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon', 'e2e/**') }}
+          restore-keys: |
+            conduit-linux-e2e-zig-${{ env.ZIG_VERSION }}-
+            conduit-linux-e2e-zig-
+
+      - name: Prepare private artifact root
+        shell: bash
+        run: |
+          mkdir -p "$ARTIFACT_ROOT"
+          chmod 700 "$ARTIFACT_ROOT"
+
+      - name: Check formatting
+        shell: bash
+        run: zig fmt --check .
+
+      - name: Build
+        shell: bash
+        run: zig build
+
+      - name: Validate the installed Linux desktop payload
+        shell: bash
+        run: bash .github/scripts/validate-linux-desktop.sh "$ARTIFACT_ROOT/platform/desktop"
+
+      - name: Unit and integration tests
+        shell: bash
+        run: zig build test --summary all
+
+      # Clipboard fixtures must never touch the Xvfb display clipboard. The
+      # check itself pins SDL's process-local offscreen driver and refuses any
+      # other driver before writing a fixture.
+      - name: Clipboard headless check
+        shell: bash
+        run: |
+          check_root="$ARTIFACT_ROOT/builtin/clipboard-test"
+          mkdir -p "$check_root/logs"
+          ./zig-out/bin/conduit --hidden --clipboard-test \
+            --log-dir="$check_root/logs" \
+            --screenshot="$check_root/final.png"
+
+      - name: Real-window Linux headless checks
+        shell: bash
+        run: |
+          export CONDUIT_CHECK_ROOT="$ARTIFACT_ROOT/builtin"
+          xvfb-run -a --server-args="-screen 0 1280x800x24" bash -euo pipefail <<'CHECKS'
+          export SDL_VIDEODRIVER=x11
+          checks=(
+            --grid-test
+            --self-test
+            --scroll-test
+            --mouse-test
+            --ui-test
+            --ime-test
+            --sidebar-test
+            --tabs-test
+            --panes-test
+            --palette-test
+            --scratchpad-test
+            --workspaces-test
+            --links-test
+            --search-test
+            --menu-test
+            --driver-test
+          )
+          for check in "${checks[@]}"; do
+            name="${check#--}"
+            check_root="$CONDUIT_CHECK_ROOT/$name"
+            mkdir -p "$check_root/logs" "$check_root/driver"
+            ./zig-out/bin/conduit --hidden "$check" \
+              --log-dir="$check_root/logs" \
+              --test-artifact-dir="$check_root/driver" \
+              --screenshot="$check_root/final.png"
+            if ! grep -Fq "window backend x11" "$check_root"/logs/*.log; then
+              echo "::error::$check did not report SDL's x11 backend" >&2
+              exit 1
+            fi
+          done
+          CHECKS
+
+      - name: Native Wayland fractional-scale check
+        shell: bash
+        run: bash .github/scripts/check-sway-fractional.sh "$ARTIFACT_ROOT/platform/sway-fractional"
+
+      - name: Native X11 primary-selection check
+        shell: bash
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            bash .github/scripts/check-x11-primary.sh "$ARTIFACT_ROOT/platform/x11-primary"
+
+      - name: Real IBus Hangul input check
+        shell: bash
+        run: |
+          dbus-run-session -- \
+            xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            bash .github/scripts/check-ibus-hangul.sh "$ARTIFACT_ROOT/platform/ibus-hangul"
+
+      - name: Scripted driver scenarios
+        id: e2e
+        shell: bash
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            zig build e2e -- --artifact-dir="$ARTIFACT_ROOT/e2e"
+
+      - name: Upload Linux platform evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conduit-linux-platform-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/conduit-linux-gate/platform
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
+
+      - name: Upload Linux failure artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conduit-linux-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/conduit-linux-gate
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

@@ -1,0 +1,4 @@
+# Build artifacts produced by `zig build` in this directory.
+.zig-cache/
+zig-out/
+zig-pkg/

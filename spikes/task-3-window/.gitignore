@@ -1,0 +1,10 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# Generated framebuffer readback (regenerate with `zig build run`)
+readback.ppm
+readback.png
+*.ppm
+*.png

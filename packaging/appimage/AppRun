@@ -1,0 +1,10 @@
+#!/bin/sh
+# Entry point of the Conduit AppImage. The AppImage runtime mounts the
+# squashfs image and runs this script with APPDIR set; a manual
+# `--appimage-extract` leaves APPDIR unset, so the script locates itself.
+set -eu
+here="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+# Let desktop integration find the bundled desktop entry, icon and the
+# shell-integration scripts under usr/share without shadowing the host's data.
+export XDG_DATA_DIRS="${here}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+exec "${here}/usr/bin/conduit" "$@"

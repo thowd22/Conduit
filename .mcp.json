@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "conduit-test": {
+      "type": "stdio",
+      "command": "${CLAUDE_PROJECT_DIR:-.}/zig-out/bin/conduit-test",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

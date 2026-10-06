@@ -1,0 +1,203 @@
+# Conduit release: a SemVer tag `v<major>.<minor>.<patch>[-prerelease][+build]`
+# becomes a published Linux x86_64 release once the complete Linux unit and E2E
+# gate has passed on that exact commit.
+#
+# Scope (TASK-69.1): Linux only. macOS and Windows artifacts are explicitly
+# deferred to TASK-69; nothing here builds, signs or notarizes for them.
+#
+# Flow:
+#   validate-tag  strict SemVer check; emits `version` (tag without `v`) and
+#                 `prerelease` (true when the tag has a `-prerelease` part)
+#   linux-gate    the reusable Linux workflow (`linux-e2e.yml`): formatting,
+#                 build, unit/integration tests, every built-in headless check,
+#                 the platform checks and the scripted driver scenarios
+#   build         ReleaseSafe x86_64-linux-gnu build against the glibc
+#                 baseline, stamped with `-Dversion`, packaged as tar.gz, .deb
+#                 and AppImage with SHA256SUMS, then verified
+#   publish       creates or updates the GitHub release for the tag (prerelease
+#                 when the tag says so) and uploads the assets with --clobber,
+#                 so rerunning the same tag replaces rather than duplicates
+#
+# The Zig version is never written here: it is read from `.minimum_zig_version`
+# in build.zig.zon exactly as ci.yml does. The glibc baseline lives once, in
+# `GLIBC_BASELINE` below, and feeds both the `-Dtarget` and the verifier.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Read-only by default; only the publish job may write release assets.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Ubuntu 22.04 LTS ships glibc 2.35. Binaries run on it and anything newer;
+  # docs/release.md records the choice.
+  GLIBC_BASELINE: "2.35"
+
+jobs:
+  validate-tag:
+    name: Validate the release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Check the tag against SemVer 2.0.0
+        id: tag
+        shell: bash
+        run: bash .github/scripts/release-validate-tag.sh "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+  # The complete Linux gate, unchanged, on the tagged commit. The build job
+  # cannot start until this job and the tag validation have both passed.
+  linux-gate:
+    name: Linux gate
+    needs: validate-tag
+    uses: ./.github/workflows/linux-e2e.yml
+    permissions:
+      contents: read
+
+  build:
+    name: Build and package Linux x86_64
+    needs: [validate-tag, linux-gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      VERSION: ${{ needs.validate-tag.outputs.version }}
+      STAGE: ${{ runner.temp }}/conduit-release/stage
+      DIST: ${{ runner.temp }}/conduit-release/dist
+      TOOLS: ${{ runner.temp }}/conduit-release/tools
+      VERIFY_WORK: ${{ runner.temp }}/conduit-release/verify
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Resolve the pinned Zig version
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)"
+          if [ -z "$version" ]; then
+            echo "::error::build.zig.zon declares no .minimum_zig_version" >&2
+            exit 1
+          fi
+          echo "ZIG_VERSION=$version" >> "$GITHUB_ENV"
+          echo "Zig version pinned by build.zig.zon: $version"
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache: false
+
+      - name: Check the installed Zig and the packaging tools
+        shell: bash
+        run: |
+          installed="$(zig version)"
+          if [ "$installed" != "$ZIG_VERSION" ]; then
+            echo "::error::installed Zig $installed does not match the pinned $ZIG_VERSION" >&2
+            exit 1
+          fi
+          # All of these ship on the ubuntu-24.04 runner image; the check names
+          # the missing tool instead of failing somewhere inside a script.
+          for tool in dpkg-deb readelf objdump file tar gzip sha256sum curl docker; do
+            command -v "$tool"
+          done
+
+      - name: Restore Zig caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+          key: conduit-release-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            conduit-release-zig-${{ env.ZIG_VERSION }}-
+            conduit-release-zig-
+
+      - name: Prepare private release directories
+        shell: bash
+        run: |
+          mkdir -p "$STAGE" "$DIST" "$TOOLS" "$VERIFY_WORK"
+          chmod 700 "$(dirname "$STAGE")"
+
+      - name: Fetch the pinned appimagetool and runtime
+        shell: bash
+        run: bash .github/scripts/release-fetch-appimagetool.sh "$TOOLS"
+
+      # ReleaseSafe keeps Zig's safety checks in the shipped binary. The target
+      # names the glibc baseline so Zig links against that exact glibc ABI, and
+      # the verifier below proves no newer symbol version leaked in.
+      - name: Build ReleaseSafe x86_64-linux-gnu.${{ env.GLIBC_BASELINE }}
+        shell: bash
+        run: |
+          zig build \
+            -Doptimize=ReleaseSafe \
+            -Dtarget="x86_64-linux-gnu.$GLIBC_BASELINE" \
+            -Dversion="$VERSION" \
+            --prefix "$STAGE"
+
+      - name: Package tar.gz, Debian package, AppImage and SHA256SUMS
+        shell: bash
+        env:
+          # Commit time, so archive metadata is the same on a rerun.
+          SOURCE_DATE_EPOCH_CMD: git log -1 --format=%ct
+        run: |
+          SOURCE_DATE_EPOCH="$($SOURCE_DATE_EPOCH_CMD)" \
+            bash .github/scripts/release-package.sh "$VERSION" "$STAGE" "$DIST" "$TOOLS"
+
+      - name: Verify the release artifacts
+        shell: bash
+        run: bash .github/scripts/release-verify.sh "$VERSION" "$DIST" "$VERIFY_WORK"
+
+      - name: Upload the release artifacts for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: conduit-linux-x86_64-${{ needs.validate-tag.outputs.version }}
+          path: ${{ runner.temp }}/conduit-release/dist
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish the GitHub release
+    needs: [validate-tag, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DIST: ${{ runner.temp }}/conduit-release/dist
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Download the verified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: conduit-linux-x86_64-${{ needs.validate-tag.outputs.version }}
+          path: ${{ runner.temp }}/conduit-release/dist
+
+      # Idempotent: reuses an existing release for the tag, corrects its
+      # prerelease flag, and --clobber replaces same-named assets. macOS and
+      # Windows assets are deferred to TASK-69 and are not published here.
+      - name: Create or update the release and upload assets
+        shell: bash
+        run: |
+          bash .github/scripts/release-publish.sh \
+            "${{ needs.validate-tag.outputs.tag }}" \
+            "${{ needs.validate-tag.outputs.version }}" \
+            "${{ needs.validate-tag.outputs.prerelease }}" \
+            "$DIST"

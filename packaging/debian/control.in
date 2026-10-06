@@ -1,0 +1,20 @@
+Package: conduit
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Conduit contributors <thowd22@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: @DEPENDS@
+Recommends: @RECOMMENDS@
+Section: utils
+Priority: optional
+Homepage: https://github.com/thowd22/Conduit
+Description: Terminal workspace for humans and coding agents
+ Conduit is a terminal workspace built on libghostty. It combines tabs,
+ split panes, a command palette and a persistent scratchpad with first-class
+ support for coding-agent CLIs and Backlog.md planning. Everything looks and
+ feels like a terminal; mouse and keyboard are equal inputs.
+ .
+ This package installs the conduit binary, its bundled fallback font, the
+ bash/zsh/fish shell integration, the freedesktop desktop entry and icon, and
+ the license notices of Conduit and its vendored dependencies under
+ /usr/share/licenses/conduit.

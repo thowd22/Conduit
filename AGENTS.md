@@ -1,0 +1,526 @@
+# Conduit — Agent Guide
+
+Conduit is a cross-platform (Linux, macOS, Windows) terminal workspace written in Zig on top of
+libghostty. It combines tabs, split panes, a command palette and a persistent scratchpad with
+first-class support for coding-agent CLIs (Claude Code, Codex, Pi) and Backlog.md planning.
+Everything looks and feels like a terminal; mouse and keyboard are equal inputs.
+
+Read this file fully before working. It applies to every agent and every harness.
+
+## Current state
+
+The terminal implementation is present: `zig build run` opens a window with the user's shell over
+a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
+and shell integration (cwd and prompt marks). Its seventeen Linux headless self-checks pass through
+their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
+`--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
+`--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
+`--search-test`, `--menu-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
+
+An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
+and M1 are not currently complete. The Linux repairs have completed TASK-10, TASK-11 and TASK-17:
+the font manager owns four style faces, the grid renderer consumes bold/italic combinations and
+conceals all foreground ink, and `Session` owns the terminal/PTY while exposing cwd and prompt
+marks. TASK-12 is complete: selected and underlined inline preedit renders at the terminal cursor,
+the native candidate area follows the grapheme caret, committed UTF-8 reaches the child exactly
+once, and the deterministic Linux `--ime-test` passes. The remaining criteria need external
+platform evidence: TASK-5's workflow has never run; TASK-15 needs macOS; and TASK-16 needs Windows.
+macOS font discovery is now acceptance in TASK-48 rather than TASK-10. TASK-18 is complete: all
+four UI primitives and the deterministic Linux `--ui-test` pass, and `Input` paste normalizes
+contiguous CR/LF/tab/U+2028/U+2029 separator runs to one ASCII space while atomically rejecting
+other controls and malformed UTF-8. TASK-19 is complete: the fixed-capacity semantic `Tree` is the
+single source for all four primitives' paint payloads, queries, JSON, hit testing, hover, focus,
+activation and stable IDs. Production IME and the deterministic `--ui-test` `Canvas` derive from
+the `Tree`. TASK-20 is complete: named actions dispatch uniformly from keybindings, semantic mouse
+activation and palette callers; macOS and Linux/Windows have distinct default clipboard chords;
+and stateful binding/UI ownership preserves exact terminal fallback across repeats, releases and
+modifier-order changes. Clipboard failures and invalid `Input` paste are non-fatal and atomic. The
+TASK-21 test driver is complete: an explicit `--test-driver` flag starts a bounded local JSON-RPC
+server over private Unix sockets or protected Windows named pipes, and input requests cross the
+real SDL event queue before replying. Read-only terminal text queries target `active` by default
+and may explicitly target the permanent `scratchpad`, including while it is hidden; input methods
+still route only through the real active presentation and cannot take over the scratchpad. Windows
+pipe runtime coverage still requires the Windows CI runner. TASK-22 is complete: hidden runs use
+the same real SDL window, GL context and FBO as visible runs; `--width`, `--height` and `--scale`
+fix screenshot geometry; and the driver's `screenshot` method forces a current frame, reads it
+back on the main thread, then encodes
+and exclusively writes a deterministic RGBA8 PNG off-thread. `--test-artifact-dir` selects the
+run-scoped output directory, or Conduit generates a unique directory for the run. The Linux
+`--driver-test` proves this path under Xvfb; native macOS and Windows rendering remain unverified.
+The root build also installs the external `conduit-test` composition-root executable from TASK-23.
+Its `launch` command creates a private, isolated run, waits until an `inspect` request proves the
+driver is ready, and returns a run id for later commands. Direct commands cover every driver method
+and produce agent-friendly plain output or raw JSON-RPC with `--json`. A Linux end-to-end check
+launches the app without a display, drives every method from separate client processes, captures a
+screenshot and verifies that fake user config/state paths stay untouched. TASK-24 adds a bounded
+stdio MCP server at `conduit-test mcp`; its tools mirror every direct CLI method and return
+screenshots as viewable PNG image content alongside the private artifact path. It supports current
+stateless discovery as well as legacy initialize clients: legacy connections retain the run
+selected by `launch`, while current calls name a run explicitly. The checked-in `.mcp.json` defines
+the installed executable for compatible project MCP clients. Claude Code can load that entry with
+its normal workspace approval; Codex requires
+explicit registration because it does not auto-load `.mcp.json`, and Pi requires an MCP extension
+or can use the CLI directly. The MCP server is local-only and inherits the CLI's
+isolated per-run filesystem boundary; native macOS and Windows runtime behavior has not been
+verified. TASK-25 is now in progress with a checked-in `zig build e2e` composition root. It
+launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
+command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
+suite summary plus per-scenario runner log, semantic tree and application log; failed live
+scenarios request an additional current screenshot before shutdown. Its six declarative scenarios
+include `terminal-links`, which waits for the stable semantic link id and sends a real
+`conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
+`terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
+sidebar row and vi's status line in that tab, and `context-menu`, which right-clicks the pane
+through `conduit-test right-click` and activates the `search` row. The
+checked-in reusable Linux workflow runs
+formatting, build, unit/integration tests, the built-in headless checks and these scripted
+scenarios, then uploads its private artifact root on failure. No remote Actions run has yet
+supplied acceptance evidence, so TASK-25 is not complete. Its Xvfb block pins
+`SDL_VIDEODRIVER=x11`, includes `--links-test` and `--search-test`, and rejects any built-in check
+whose retained application log does not report the X11 backend. The worked agent loop using
+today's CLI and MCP surfaces is documented below. TASK-27 provides the owner beneath the current workspace UI:
+`Workspace` copies and owns its name and working directory, owns a type-erased `ExecutionContext`
+with the Local implementation, and keeps heap-stable session records under monotonic, non-reused
+ids. Each workspace reserves exactly one childless scratchpad session; TASK-32 starts its PTY and
+presents it. Human, scratchpad and agent sessions are distinct kinds. The app lends a non-owning
+context capability to its spawn worker, retains the initiating session id across that asynchronous
+work, then attaches the returned PTY to that session on the owner thread even if selection changed.
+Workspace pumping is bounded, two-way and view-independent: the event loop wakes for any attached
+PTY, drains output, delivers terminal events synchronously, and preserves terminal replies across
+short, zero and failed writes until the child accepts them. Exited PTYs remain serviceable until
+their final queued output is drained, then become quiescent;
+teardown releases every session before the execution context and reports a PTY signalling failure
+only after all owned resources are gone. TASK-28 adds the first workspace shell above that owner:
+`Workspace` keeps heap-stable, monotonic records for already-provisioned tabs and their live
+non-scratchpad sessions, while the app composes the current workspace and those tabs into a
+terminal-styled left sidebar. Product selection is explicit semantic-tree state. The sidebar is a
+true inset: showing or resizing it shifts the terminal origin and resizes the terminal grid to the
+remaining columns, while the UI overlay retains full-canvas coordinates. Named actions provide
+mouse and keyboard tab switching, hide/show, keyboard resizing and divider dragging. The explicit
+sidebar-focus chord enters on the active tab while an unbound Tab remains terminal input; the
+deterministic Linux `--sidebar-test` exercises those paths through real SDL events. TASK-29
+completes the flat tab lifecycle without changing that inset: create snapshots the invoking
+session's validated OSC 7 cwd (falling back to the workspace cwd) before the asynchronous context
+spawn; rename uses the shared `Input`; switch and stable reorder work by mouse and named keyboard
+actions; and closing a live child asks unless a current OSC 133 prompt proves it idle. Background
+output prefixes the copied label with `* `, BEL promotes it to `! `, and activation clears either
+without conflating terminal attention with TASK-56 agent state. Closing the last tab requests
+normal app shutdown so reverse-order teardown releases every session and the scratchpad. The
+shipped defaults are Command+T/W, Command+Shift+`[`/`]`, Command+1…9 and Alt+Shift+Up/Down on
+macOS; Linux and Windows use Ctrl+Shift+T/W, Ctrl+PageUp/PageDown, Alt+1…9 and
+Alt+Shift+Up/Down; F2 renames on all three. TASK-31 supplies the visible command palette over these
+actions, TASK-33 owns multiple workspaces, and TASK-56 owns agent state and notifications. TASK-30
+is complete: every tab owns a binary pane tree whose leaves each name one workspace-owned session,
+with stable pane and divider ids. Right/down
+splits inherit the focused pane's tracked cwd, spawn through the workspace `ExecutionContext` and
+may nest to arbitrary depth while one-cell dividers and 2x2-cell pane minimums keep the layout
+valid. Pane/session creation commits only after validation and allocation, so a refused split
+consumes no session, pane or divider id. Click or directional actions move focus; semantic divider
+drags and directional keyboard actions resize; zoom fills the tab without replacing or stopping
+hidden sessions; and close reuses the conservative running-child confirmation, releases the pane's
+session, promotes its sibling, or delegates the final leaf to tab close. An action that would adopt
+another live session first flushes and otherwise defers while terminal input or response debt
+remains; once the UI claims a pointer press it retains motion and release too. The app retains one
+`Grid` per pane and composites one font-metric-aware full-canvas overlay after the visible panes;
+the sidebar remains a true inset
+whose width reduces and resizes the pane terminals. macOS defaults are Command+D / Command+Shift+D
+for split right/down, Command+Alt+Arrow for focus, Command+Ctrl+Arrow for resize,
+Command+Shift+Enter for zoom and Command+Shift+X for close. Linux and Windows use
+Ctrl+Shift+E/O, Alt+Arrow, Ctrl+Alt+Arrow, Ctrl+Shift+Enter and Ctrl+Shift+X respectively. The
+dedicated `--tabs-test` uses real PTYs and SDL events to cover tracked-cwd inheritance, create,
+inline rename, click/next/goto switching, pointer/keyboard reorder, background activity and BEL,
+modal input isolation, cancel and confirmed
+close. Its final screenshot was visually inspected and shows the true terminal inset with the
+close-confirmation modal. The deterministic Linux `--panes-test` uses real PTYs and SDL events to
+cover nested splits and cwd inheritance, click and directional focus, divider drag and keyboard
+resize, zoom with background pumping, conservative close and sibling rebalancing. Native macOS
+and Windows tab/pane input and rendering remain runtime-unverified. TASK-31 is complete: the
+action registry carries validated palette visibility and optional fixed-choice or free-text
+argument metadata, while an allocation-bounded model fuzzy-matches labels and stable command names,
+ranks an empty query by run-local recency, and formats every bound chord. Command+Shift+P on macOS
+or Ctrl+Shift+P on Linux and Windows opens a centered semantic overlay containing every registered
+user-facing command; semantic-only actions remain hidden. Arrow/Tab navigation, Enter, Escape,
+clickable command and choice rows, and outside-click close all remain modal so no key or pointer
+tail reaches the terminal or UI beneath. Nested argument steps dispatch through the same action
+registry. The deterministic Linux `--palette-test` covers filtering, keyboard and mouse execution,
+fixed-choice and free-text arguments, recent-command ordering, modal isolation and the centered
+rendered frame through real PTYs and SDL events. TASK-32 completes the
+workspace scratchpad: it starts an independent interactive shell with the workspace, retains that
+permanent session while hidden, and presents it as a full-width bottom dock at 50 or 90 percent of
+the window. Command+Backtick/Command+Shift+Backtick on macOS and
+Ctrl+Backtick/Ctrl+Shift+Backtick on Linux and Windows toggle those sizes; Escape or the semantic
+`scratchpad.hide` control hides only the presentation, while
+`scratchpad.restart` atomically replaces the shell without changing the reserved session id. The
+read-only test-driver target can inspect or wait for scratchpad text but adds no input-targeting
+path: `key` and `type` still follow the real active presentation. The deterministic Linux
+`--scratchpad-test` exercises startup, both sizes, hidden process and shell-state survival,
+terminal/input isolation, restart, and the clickable restart/hide controls through real PTYs and
+SDL events. TASK-33 completes multiple workspaces: `workspace.WorkspaceRegistry` owns ordered, heap-stable
+workspace records under monotonic non-reused keys, while `app` owns one presentation bundle per
+record and routes terminal, pane, scratchpad and asynchronous spawn state through the active
+workspace. The sidebar and palette expose named create, rename, switch and confirmed-close
+actions; closing tears down that workspace's tabs, sessions and scratchpad, and closing the last
+workspace requests normal shutdown. Its checked-in deterministic `--workspaces-test` drives two
+real workspaces through SDL events, the action registry, semantic rows and real PTYs, checking
+independent terminals, pane layouts, scratchpads, switching, rename, close cancellation and
+teardown. Its Linux Xvfb execution passes with zero failures; the inspected screenshot shows the
+90 percent scratchpad and close modal, while the semantic checkpoint proves both workspace rows.
+TASK-34 is partially implemented for web links. Visible lexical HTTP(S) URLs and valid OSC 8
+HTTP(S) spans are copied into bounded app-owned storage and registered once as stable
+`terminal_link` semantic elements. OSC 8 metadata is authoritative, including malformed or
+non-HTTP targets that mask lexical promotion. Holding Command on macOS or Ctrl on Linux/Windows
+adds a decoration-only underline; the same modified click opens the exact target through
+`platform.openUrl`, while plain clicks, selection drags and DEC mouse reporting remain terminal
+input. Stable ids use a domain-separated 128-bit SHA-256 fingerprint. The deterministic Linux
+`--links-test` covers the real SDL gesture path and opener seam. TASK-25's `terminal-links`
+scenario independently proves the stable semantic id and `conduit-test ctrl-click` path through a
+fresh isolated app. TASK-34 is complete on Linux: lexical file references (`path`, `path:line`,
+`path:line:col`) register as `terminal_link` elements under a `.file` fingerprint id, and the
+modified click snapshots the source session's OSC 7 cwd (workspace cwd fallback), resolves a
+relative path against it without touching the filesystem, creates a new tab named after the file
+and spawns shell-free argv `vi +<line> -- <path>` (or `vi -- <path>`) through the workspace
+`ExecutionContext` (decision-5; columns are detected but not passed to vi). The job-owned argv is
+freed on every spawn-completion path, and `childGone()` no longer ends a `--command` run while a
+new tab's spawn worker is in flight. `--links-test` proves the exact argv and cwd through an
+observer seam and real vim drawing in the new tab; the `terminal-file-reference` scenario proves
+the `conduit-test ctrl-click` route.
+
+TASK-69.1 (Linux tagged release) is implemented but awaits its first remote run. `zig build
+-Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
+re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
+the log sink or SDL start, and an unstamped build prints `conduit 0.0.0-dev`.
+`.github/workflows/release.yml` validates a `v*` tag, reuses `linux-e2e.yml` as the gate, builds
+ReleaseSafe `x86_64-linux-gnu.2.35`, packages a tar.gz, Debian package, AppImage (pinned
+appimagetool 1.9.1 and type2 runtime, SHA-256 checked) and `SHA256SUMS`, verifies them with
+`release-verify.sh` (stamped version, x86-64 ELF, max `GLIBC_2.35`, payload, isolated
+`ubuntu:22.04` Docker install), and publishes idempotently with `gh release` plus `--clobber`,
+marking prerelease tags. `docs/release.md` documents the procedure. Locally the full dry run
+passed 37/37 verifier checks; `ci.yml` and `linux-e2e.yml` now trigger only on branch pushes so a
+tag runs the gate once through the release workflow. macOS and Windows packaging stay in TASK-69.
+
+TASK-35 is complete. A right click over the focused terminal pane opens a minimal terminal-style
+context menu at the pointer cell: a bordered `Surface` panel (`context-menu`) of `InteractiveText`
+rows `context-menu.copy` (only with a selection), `context-menu.paste`, `context-menu.open-link`
+(only over a `terminal_link`), `context-menu.split-right`, `context-menu.split-down` and
+`context-menu.search`, each dispatching the existing named action (`clipboard.copy`,
+`clipboard.paste`, `terminal.open-link` with the link's id as origin, `pane.split` with
+`direction`, `search.open`). The menu is modal like the palette: Up/Down/Tab/Shift+Tab move, Enter
+activates, Escape closes, a click outside closes, and no key or pointer tail reaches the terminal.
+The palette-visible `terminal.context-menu` action (Shift+F10 on all profiles) opens it at the
+terminal cursor. When the program has captured the mouse a plain right click is still reported to
+it; Shift+right-click opens the menu. The `mouse.right_click` setting (`config.RightClick`)
+defaults to `menu`; the v0.1 session layer `--right-click=paste` makes a right click paste
+instead. The driver gained `right_click` (`conduit-test right-click <id>`, MCP `right_click`).
+The deterministic Linux `--menu-test` covers all of this through real PTYs and SDL events and its
+640x360 frame was visually inspected; TASK-25's sixth scenario `context-menu` drives
+`conduit-test right-click` on `workspace.1.pane.1` and clicks the `search` row.
+
+TASK-36 is complete. Command+F on macOS or Ctrl+Shift+F on Linux/Windows opens an inline semantic
+`Input`; named actions and clickable controls provide next/previous navigation plus case and regex
+toggles. Literal and regex scans are bounded and incremental across retained scrollback, with
+viewport reveal, semantic match decorations, adjacent 128-result pages and generation-based
+resynchronisation after output or resize. Regex uses the exact Oniguruma 6.9.9 source already
+pinned by Ghostty, built statically with bounded pattern size, nesting, retry and match-stack
+limits; its license is installed with Conduit and no distro `libonig` runtime is required. The
+deterministic Linux `--search-test` exercises keyboard, palette and mouse paths, malformed-regex
+recovery, real PTY resynchronisation and more-than-128-match paging through SDL; its final 640x360
+frame was visually inspected.
+
+TASK-50 has verified native Linux X11 and Wayland startup and the packaged desktop payload, but is
+not complete. X11 runs report the X11 backend, and a Weston 14 headless run forced SDL's Wayland
+backend and passed `--self-test` with the same SDL/OpenGL path. An isolated `zig build --prefix`
+staged the binary, fallback font, shell integration, licenses, desktop entry and scalable icon at
+their standard freedesktop paths. A forced 1.25 test scale produced the expected physical surface
+and a visually crisp frame, but it does not prove compositor-reported fractional scaling. The
+synthetic SDL IME check likewise does not prove a real IBus or Fcitx service; neither daemon is
+installed on this machine. Those two external Linux acceptance checks remain open.
+
+- `CONDUIT.md` — the product specification. Source of truth for what the product does.
+- `conversation.md` — the original design conversation. Kept as history; CONDUIT.md supersedes it.
+- `backlog/` — the plan: 9 milestones (M0–M8), 70 tasks with acceptance criteria and dependencies.
+- Sections below marked **(planned)** describe commands and layout that tasks will create. If a
+  planned command does not exist yet, it is not broken; its task has not been done. When you
+  build one of these, update this file in the same change so it stays true.
+
+## Where truth lives
+
+| Question | Source |
+|---|---|
+| What should the product do? | `CONDUIT.md` |
+| What should I work on, and what counts as done? | Backlog tasks and their acceptance criteria |
+| Why was a technical choice made? | Backlog decisions (`backlog decision ...`) |
+| How is the code organised? | `docs/architecture.md` |
+
+Do not invent product behaviour. If a task and the spec disagree, or something is unspecified
+and the choice is not obvious, stop and ask the user rather than guessing.
+
+## Toolchain and environment
+
+- **Zig 0.16.0**, pinned, and confirmed by TASK-2: it is the `.minimum_zig_version` declared in the
+  pinned Ghostty tree. Do not upgrade Zig or the Ghostty dependency casually; a version bump is its
+  own task and decision record.
+- **Ghostty `5dc28bb8eebaf57a6c793a406bfea8c632d4fa94`**, pinned, consumed as the **Zig module
+  `ghostty-vt`** (root `src/lib_vt.zig`). There is no `libghostty-vt/` directory; that name only
+  refers to built artifacts. Wire it up as `b.dependency("ghostty", .{})` plus
+  `addImport("ghostty-vt", ghostty.module("ghostty-vt"))` — see `decision-1` and `doc-1` for the
+  evidence, the API mapping with source lines, and the known `Style` formatting sharp edge under
+  Zig 0.16. The macOS embedding library is explicitly not for external use; never depend on it.
+  Ghostty is MIT: retain the copyright and permission notice in copies.
+- Zig's standard library and build API change between releases. Do not write Zig from memory of
+  older versions: check the installed std source (`zig env` shows `std_dir`) or let the compiler
+  tell you. ZLS 0.16.0 is installed.
+- The dev machine is Ubuntu, headless (no display session). Anything that opens a window must
+  run under `xvfb-run -a ...` or the app's headless mode. GPU is software (llvmpipe), so do not
+  draw performance conclusions from this machine.
+- **SDL3 for window and input, OpenGL 3.3 core for GPU**, decided by TASK-3 and recorded in
+  `decision-2`. SDL3 arrives through the `castholm/SDL` build package plus a thin extern seam
+  Conduit owns; there is no maintained SDL3 Zig binding. `zopengl` is the OpenGL binding and
+  builds on 0.16. GLFW + `zig-gamedev/zglfw` is the documented fallback. Every OS call stays behind
+  `platform` and `render`. Full evidence, including the headless/FBO screenshot contract that
+  TASK-7, TASK-21 and TASK-22 implement, is in `doc-2`.
+- Installed for you: SDL3 and GLFW dev packages, fontconfig, freetype, harfbuzz, Wayland/X11 dev
+  libs, Vulkan/GL, weston, xdotool, xclip, wl-clipboard, imagemagick, ripgrep, docker, and the
+  `claude`, `codex` and `pi` CLIs. Test fonts: JetBrains Mono, Noto Color Emoji, Noto CJK, DejaVu.
+- Zig 0.16 facts that have already cost time here: `std.Build.Step.TranslateC.create(...).createModule()`
+  replaces `b.addTranslateC`; `std.zig.allocator` is gone and `main` takes `std.process.Init`;
+  `glVertexAttribPointer`'s last argument is a byte offset into the bound buffer, not a pointer,
+  and offset 0 must be passed as `null`; `glReadPixels` must precede `glfwSwapBuffers`.
+- Never add a system dependency silently. If a task needs a new package or library, say so,
+  and record it in the build docs.
+
+## Architecture invariants
+
+These came out of the design and are not up for renegotiation inside an unrelated task. Changing
+one needs the user's agreement and a decision record.
+
+1. **Two renderers, one surface.** The terminal engine (libghostty) and the terminal-styled UI
+   renderer are separate and draw to a shared GPU surface. The UI is not ANSI text piped through
+   the terminal.
+2. **Four UI primitives.** All UI is built from `Text`, `InteractiveText`, `Surface` and
+   `Input`. Do not add new widget kinds, buttons, icons or native GUI chrome. If something is
+   actionable it is clickable text.
+3. **One semantic tree.** Every UI element registers once (stable id, role, label, state,
+   bounds, action). Rendering, mouse hit testing, keyboard focus, the test driver and
+   accessibility all read that single tree. Never keep a second representation.
+4. **Keyboard and mouse parity.** Anything doable with the mouse has a keyboard path, and every
+   interactive element is clickable. Every command is a named action in the action registry,
+   reachable from keybindings and the command palette.
+5. **Everything spawns through the workspace's ExecutionContext** (Local, SSH, WSL). No feature
+   may assume the local machine: no direct local process spawn, path or file read where the
+   workspace could be remote.
+6. **Sessions outlive their views.** A session owns its PTY and terminal state and keeps running
+   when hidden. Hiding is never termination.
+7. **The scratchpad belongs to the human.** One per workspace, started with the workspace,
+   persistent. Agents and the control API can never own, target or take over it.
+8. **Never steal terminal input.** Keys not bound by Conduit reach the terminal unmodified.
+   Ctrl+C without a selection is always SIGINT.
+9. **Harness-neutral agents.** Claude Code, Codex and Pi specifics live only inside their
+   adapters, behind the common adapter interface. Nothing outside `agent/` may special-case a
+   harness.
+10. **Platform code stays behind interfaces.** OS-specific code lives in the platform, PTY and
+    font-discovery backends. Shared modules contain no OS conditionals beyond selecting a backend.
+
+## Module layout (planned, TASK-4)
+
+`app`, `platform` (window, clipboard), `pty`, `term` (libghostty wrapper), `render`, `font`,
+`ui` (four primitives, semantic tree), `input`, `workspace`, `session`, `config`, `theme`, `agent`,
+`backlog`, `palette`, `testdriver`.
+Dependencies point downward: `ui` and `workspace` may use `term` and `render`; `term`, `pty`
+and `font` know nothing about workspaces, agents or UI.
+
+## Coding standards
+
+- Run `zig fmt` on everything. CI rejects unformatted code. Follow the Zig style guide:
+  `TitleCase` types, `camelCase` functions, `snake_case` variables, fields and file names.
+- **Memory:** pass allocators explicitly; no hidden global allocator. Every allocation has an
+  obvious owner, and ownership transfer is stated in the doc comment. Pair acquisition with
+  `defer`/`errdefer` on the next line. Use arenas for per-frame and per-request data.
+- **Errors:** return errors, do not swallow them. No `catch unreachable` and no `catch {}`
+  unless a comment proves why it cannot fail or why ignoring is correct. `unreachable` and
+  asserts are for programmer invariants only, never for input from PTYs, files, the network,
+  config or agent harnesses. Malformed external input must never crash the app.
+- **Threads:** the render/UI thread never blocks on IO. PTY, SSH and harness IO run off-thread
+  and hand results over through defined queues. Document which thread owns each piece of state.
+- **Rendering:** render on demand when state is dirty. No busy loops, no per-frame heap
+  allocation on the hot path.
+- **Logging:** use scoped `std.log`. No stray `std.debug.print` in committed code. Never log
+  terminal contents, clipboard data, credentials or prompts above debug level.
+- **Comments:** explain why, not what. Public declarations get a doc comment. No commented-out
+  code, and no TODO without a backlog task id.
+- **Scope:** do what the task says. No drive-by refactors, speculative abstractions or new
+  dependencies. Prefer the smallest change that meets the acceptance criteria, and match the
+  style of the code around you.
+- **User-facing text** is terse and terminal-like. Use box-drawing characters and glyphs, not
+  emoji, in the UI.
+
+## Testing standards
+
+Four levels. Use the lowest level that can actually prove the behaviour, and add higher levels
+where the behaviour is user-visible.
+
+| Level | What it covers | Command |
+|---|---|---|
+| Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
+| Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
+
+Rules:
+
+- Every change ships with tests. Unit tests sit in the same file as the code, in `test` blocks.
+  Use `std.testing.allocator` so leaks fail the test.
+- **Every user-facing feature lands with an E2E scenario** that exercises it the way a user
+  would, by keyboard and by mouse where both apply.
+- A bug fix starts with a test that fails for that bug.
+- E2E tests go through the real input path: `click(id)`, `key`, `type`. Never reach into app
+  state to set up or assert what a user could do or see. Address elements by semantic id, not
+  pixel coordinates.
+- No sleeps. Use `wait_for` with a condition and timeout. Tests must be deterministic: fixed
+  window size and scale, isolated config and state directories, no dependence on the user's
+  shell config, fonts beyond the bundled/test fonts, network, or test order.
+- Tests never touch the real user's config, state, SSH keys or running Conduit instance.
+- Take a screenshot when the claim is visual (fonts, colours, layout, clipping) and actually
+  look at it. A passing semantic assertion does not prove it rendered correctly.
+- Do not weaken, skip or delete a failing test to get green. If a test is wrong, say why and
+  fix it. If a test is flaky, that is a bug to fix, not to retry.
+- Platform-specific code needs coverage on that platform's CI runner. If you cannot run it
+  locally (Windows, macOS), say so explicitly rather than claiming it works.
+
+## Development loop
+
+1. Pick a task whose dependencies are done. Read it and its acceptance criteria.
+2. Implement the smallest change that satisfies them.
+3. Run `zig fmt`, `zig build test`, then `zig build`.
+4. Launch the installed `./zig-out/bin/conduit-test` into an explicit isolated root. Inspect the
+   semantic tree, interact through the real input path, and use `wait-for` to assert terminal or
+   semantic state; never substitute a sleep.
+5. Capture a screenshot and actually inspect the image. A path, hash or successful encode is not
+   visual evidence.
+6. On any failure, capture and read `logs` and the `inspect` semantic tree before changing code.
+7. Add or update the user-facing E2E scenario, exercising keyboard and mouse when both apply.
+   TASK-25's in-progress `zig build e2e` runner is available now; run it under a real headless
+   display such as Xvfb with an explicit private artifact directory. Do not claim TASK-25's Linux
+   CI acceptance until a remote workflow run supplies that evidence.
+8. Check each acceptance criterion against the collected evidence, then finalise the task.
+
+A copy-pastable CLI pass with deterministic child output is:
+
+```sh
+zig build test
+zig build
+
+test_root="$(pwd)/.zig-cache/conduit-agent-example"
+run_id="$(./zig-out/bin/conduit-test --root="$test_root" launch \
+  --width=640 --height=360 --scale=1 \
+  --command='printf "CONDUIT_READY\n"; while IFS= read -r line; do [ "$line" = probe ] && printf "CONDUIT_ASSERTED\n"; done')"
+
+cleanup() {
+  ./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" quit >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" inspect
+./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" type probe
+./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" key ENTER
+if ! ./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" \
+  wait-for terminal-text CONDUIT_ASSERTED 5000; then
+  ./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" logs 1048576
+  ./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" inspect
+  exit 1
+fi
+screenshot_path="$(./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" screenshot)"
+printf 'inspect screenshot: %s\n' "$screenshot_path"
+./zig-out/bin/conduit-test --root="$test_root" --run="$run_id" quit
+trap - EXIT
+```
+
+Open `screenshot_path` with the agent harness's image-viewing capability and inspect the rendered
+frame before accepting it. `./zig-out/bin/conduit-test mcp` exposes the equivalent
+launch/inspect/input/wait/assert/screenshot/`get_logs`/quit surface; an MCP-driven agent follows
+the same sequence and evidence rules.
+
+A task is done when every acceptance criterion is demonstrably met, all applicable implemented
+test levels pass, the code is formatted, and docs affected by the change (including this file) are
+updated. Report what you verified and what you could not. Do not mark a criterion met on the
+strength of code that merely looks right.
+
+## Working style: agent loop, coordinator-led
+
+Standing instruction from the user. It applies to every task in this project unless the user says
+otherwise.
+
+- **The main agent coordinates; subagents execute.** Delegate a task to a subagent with a
+  self-contained brief, then review its output against the acceptance criteria before accepting
+  it. Do not delegate the plan for a milestone, only the slices inside it.
+- **Fan out independent slices in one batch; sequence real dependencies.** M0 is a chain
+  (TASK-2 → TASK-3 → TASK-4 → TASK-5/TASK-6) and must be walked in order; parallel agents are for
+  slices that share no files and no interface.
+- **One owner per file or interface.** When slices meet, name the shared contract in the brief
+  instead of letting two agents invent two versions.
+- **Subagents do not run builds, linters or test suites mid-flight.** They report what they ran;
+  the coordinator runs the build once, after the wave lands.
+- **Check in on every running agent every 30 minutes.** Do not wait for an agent to report before
+  looking at it. On each check-in, read each job's status and its latest assistant text, and decide:
+  progressing, done, stuck, or hung. Treat as **stuck** an agent whose latest text has not changed
+  across two consecutive check-ins while it claims to be working. Treat as **hung** anything whose
+  process is alive but making no progress, and kill it rather than waiting: a hung agent burns the
+  whole box, slows every other slice, and leaves the tree in a half-written state.
+- **Never let two live agents own the same file.** A slice's owner list is fixed when it is
+  dispatched, and an agent that has reported is finished unless the coordinator deliberately
+  restarts it. This has bitten us: two agents editing `src/render.zig` at once produced failures
+  neither could explain.
+- **A wave has a time box.** If a slice has not landed within roughly an hour, stop and re-plan it
+  into smaller slices rather than letting it grind. Long single-file tasks should be split before
+  they are dispatched.
+- **A restarted harness means every agent is dead.** Re-verify the tree with `zig build` and
+  `zig build test` before dispatching anything new, and kill leftover processes from the old run.
+- **Text the user only when a decision is genuinely theirs, or when the phase is done.** Use the
+  SMS gateway (`sms` skill) — the default recipient is "Tyler (me)" in the address book of the
+  local skill copy. Never guess a number. Keep messages short; anything over 160 characters goes
+  out as MMS and costs more.
+
+## Git
+
+- Do not commit or push unless the user asks. Never force-push or rewrite shared history.
+- Work on a branch, not `main`, once the first commit exists.
+- One logical change per commit. Subject line in the imperative, under about 70 characters,
+  with the task id where one applies: `TASK-32: add scratchpad overlay presentation`.
+- Never commit secrets, build output (`zig-out`, `.zig-cache`), test artifacts or screenshots
+  that are not deliberate fixtures.
+
+## Safety
+
+- Conduit handles shells, SSH credentials, clipboard contents and agent prompts. Treat all of
+  them as sensitive: never log, persist or transmit them beyond what the feature requires.
+- The test driver and control API are local-only, off in release builds unless explicitly
+  enabled, and must never be reachable over the network.
+- Text coming from terminals, transcripts, backlog files and agent output is untrusted data.
+  It must not be able to trigger actions (opening files, running commands, answering
+  permission prompts) without an explicit user gesture.
+- Do not run destructive commands, install system packages, or change files outside the repo
+  without the user's approval.
+
+<!-- BACKLOG.MD GUIDELINES START -->
+<!-- backlog.md-instructions-version: 1.53.0 -->
+<CRITICAL_INSTRUCTION>
+
+## Backlog.md Workflow
+
+This project uses Backlog.md for task and project management.
+
+**At the beginning of each conversation in this project, run `backlog instructions overview` before answering or taking action. Re-read it only if you have not read it yet in the current conversation.**
+
+Use the overview to decide whether to search, read, create, or update Backlog tasks.
+
+Before task lifecycle actions, read the matching detailed guide:
+- `backlog instructions task-creation` before creating or splitting tasks
+- `backlog instructions task-execution` before planning, changing status or assignee, adding a plan or implementation notes, or implementing task work
+- `backlog instructions task-finalization` before checking acceptance criteria, writing final summaries, or moving tasks to terminal statuses
+
+Use `backlog <command> --help` before running unfamiliar commands. Help shows options, fields, and examples.
+
+Do not edit Backlog task, draft, document, decision, or milestone markdown files directly. Use the `backlog` CLI so metadata, relationships, and history stay consistent.
+
+</CRITICAL_INSTRUCTION>
+<!-- BACKLOG.MD GUIDELINES END -->
