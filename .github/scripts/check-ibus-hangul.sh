@@ -36,18 +36,37 @@ cleanup() {
   if (( status != 0 )); then
     mkdir -p "$artifact_root/failure-driver-root"
     cp -a -- "$driver_root/." "$artifact_root/failure-driver-root/" 2>/dev/null || true
+    # actions/upload-artifact rejects Unix sockets ("entry not supported"); the driver socket
+    # carries no evidence.
+    find "$artifact_root/failure-driver-root" -type s -delete 2>/dev/null || true
   fi
   rm -rf -- "$driver_root"
   exit "$status"
 }
 trap cleanup EXIT
 
-export GTK_IM_MODULE=ibus
-export QT_IM_MODULE=ibus
-export XMODIFIERS=@im=ibus
-export SDL_IM_MODULE=ibus
 export SDL_VIDEODRIVER=x11
 export LANG=C.UTF-8
+# SDL 3.4's X11 backend reaches input methods only through XIM (its direct D-Bus IBus client is
+# used by the Wayland backend), so the daemon must run its XIM bridge and XMODIFIERS must name it.
+# Verified by strace: without XMODIFIERS the app never connects to the IBus socket.
+export XMODIFIERS=@im=ibus
+export GTK_IM_MODULE=ibus
+export QT_IM_MODULE=ibus
+
+# Engine selection must be settled before any context exists. The daemon reads these at startup,
+# whereas changing them afterwards relies on a change notification racing the first context:
+# one global engine, only Hangul preloaded, and Hangul mode from the first key (the engine's own
+# default is Latin, which passes the keys through as ASCII with no preedit).
+gsettings set org.freedesktop.ibus.general use-global-engine true
+gsettings set org.freedesktop.ibus.general preload-engines "['hangul']"
+gsettings set org.freedesktop.ibus.general engines-order "['hangul']"
+gsettings set org.freedesktop.ibus.engine.hangul initial-input-mode hangul
+{
+  echo "use-global-engine $(gsettings get org.freedesktop.ibus.general use-global-engine)"
+  echo "preload-engines $(gsettings get org.freedesktop.ibus.general preload-engines)"
+  echo "initial-input-mode $(gsettings get org.freedesktop.ibus.engine.hangul initial-input-mode)"
+} >"$artifact_root/ibus-settings.txt"
 
 ibus-daemon --daemonize --replace --xim --panel disable \
   >"$artifact_root/ibus-daemon.stdout" \
@@ -64,18 +83,14 @@ until ibus list-engine >"$artifact_root/engines.txt" 2>"$artifact_root/ibus-quer
   sleep 0.05
 done
 
-# Make the selected engine deterministic across contexts before the SDL input context is created.
-gsettings set org.freedesktop.ibus.general use-global-engine true
-# ibus-hangul starts every new context in Latin mode unless told otherwise, in which case the
-# Dubeolsik keys below pass through as ASCII with no preedit. Start in Hangul mode so the engine
-# composes from the first key, and record what the engine will read.
-gsettings set org.freedesktop.ibus.engine.hangul initial-input-mode hangul
-gsettings get org.freedesktop.ibus.engine.hangul initial-input-mode >"$artifact_root/hangul-initial-input-mode.txt"
+# Select the global engine once the daemon answers; the preload list above makes it the only
+# candidate, so a context created at any later moment also starts on Hangul.
 ibus engine hangul
 
-# `conduit-test launch` gives the app a private HOME and XDG_CONFIG_HOME, so SDL cannot find the
-# daemon's socket file under the real $XDG_CONFIG_HOME/ibus/bus. SDL reads IBUS_ADDRESS first, and
-# the launcher passes the rest of the environment through, so hand it the live bus address.
+# `conduit-test launch` gives the app a private HOME and XDG_CONFIG_HOME, so a client looking for
+# the daemon's socket file under the real $XDG_CONFIG_HOME/ibus/bus would not find it. The XIM
+# bridge needs no file, but IBUS_ADDRESS is exported for any D-Bus client (SDL reads it first) and
+# recorded as evidence of the bus the run used.
 IBUS_ADDRESS="$(ibus address)"
 if [[ -z "$IBUS_ADDRESS" ]]; then
   echo "IBus published no bus address" >&2
@@ -96,11 +111,16 @@ driver wait-for terminal-text IBUS_READY 10000
 window_id="$(timeout 15 xdotool search --sync --onlyvisible --limit 1 --name '^conduit$')"
 timeout 10 xdotool windowfocus --sync "$window_id"
 xdotool mousemove --window "$window_id" 320 180 click 1
-ibus engine hangul
-if [[ "$(ibus engine)" != "hangul" ]]; then
-  echo "IBus did not retain the Hangul engine for the focused Conduit context" >&2
-  exit 1
-fi
+# The click gives Conduit X focus and SDL's IBus context focus-in; wait until the daemon reports
+# Hangul for the focused context rather than assuming the focus round trip is instantaneous.
+deadline=$((SECONDS + 10))
+until [[ "$(ibus engine 2>/dev/null)" == "hangul" ]]; do
+  if (( SECONDS >= deadline )); then
+    echo "IBus did not report the Hangul engine for the focused Conduit context" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
 
 # XTest key events enter SDL's X11 event queue. IBus turns the Dubeolsik sequence into one UTF-8
 # commit; the PTY fixture rejects raw ASCII, duplicate commits and any other line.

@@ -29,6 +29,9 @@ cleanup() {
   if (( status != 0 )); then
     mkdir -p "$artifact_root/failure-driver-root"
     cp -a -- "$driver_root/." "$artifact_root/failure-driver-root/" 2>/dev/null || true
+    # actions/upload-artifact rejects Unix sockets ("entry not supported"); the driver socket
+    # carries no evidence.
+    find "$artifact_root/failure-driver-root" -type s -delete 2>/dev/null || true
   fi
   rm -rf -- "$driver_root"
   exit "$status"

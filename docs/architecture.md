@@ -320,7 +320,9 @@ nothing else is a legal dependency.
   actions explicitly opt out.
 - **Never** swallow a key Conduit did not bind (P10, invariant 8). Ctrl+C with no selection is
   always SIGINT. Never expose a command that is not in the registry, and never special-case a
-  harness.
+  harness. Never deliver one physical keystroke twice: SDL follows a printable key event with a
+  text-input echo, and `KeyTextEcho` (TASK-71) drops the echo that exactly repeats the text the
+  key already wrote, while unrelated text input (IME commits, dead keys) is still committed.
 - **May depend on** `ui` (hit testing, focus), `term` (key and mouse encoding, terminal writes),
   `platform` (raw events, clipboard).
 - **Lands** M1 — TASK-12 (encoding and IME), TASK-14 (mouse and selection); M2 — TASK-20 (routing,

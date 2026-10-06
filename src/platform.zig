@@ -1022,6 +1022,22 @@ fn unshiftedCodepoint(scancode: sdl.SDL_Scancode, mods: sdl.SDL_Keymod) u21 {
     return codepointFromKeycode(sdl.SDL_GetKeyFromScancode(scancode, without, false));
 }
 
+/// The modifiers that choose a key's shift level rather than command it: Shift, Caps Lock, AltGr
+/// (SDL's Mode) and Level 5. Ctrl, Alt and Super stay out because what they do to a character is
+/// the encoder's decision, not the layout's.
+const level_mods: sdl.SDL_Keymod = @as(sdl.SDL_Keymod, sdl.SDL_KMOD_SHIFT) | @as(sdl.SDL_Keymod, sdl.SDL_KMOD_CAPS) |
+    @as(sdl.SDL_Keymod, sdl.SDL_KMOD_MODE) | @as(sdl.SDL_Keymod, sdl.SDL_KMOD_LEVEL5);
+
+/// The character the layout puts on `scancode` with the level-selecting modifiers applied.
+///
+/// SDL 3.4 does not apply modifiers to a key event's own `key` — it is the unmodified keycode, so
+/// Shift+h reports `h` — while the text input SDL sends next carries `H`. Reading `key` made the
+/// key path write `h` and the text echo then commit `H` as well. The layout is asked again here
+/// with the level modifiers, which is the same table lookup `unshiftedCodepoint` makes.
+fn layoutCodepoint(scancode: sdl.SDL_Scancode, mods: sdl.SDL_Keymod) u21 {
+    return codepointFromKeycode(sdl.SDL_GetKeyFromScancode(scancode, mods & level_mods, false));
+}
+
 /// One SDL keyboard event as Conduit's own key event.
 fn keyEvent(raw: sdl.SDL_KeyboardEvent) KeyEvent {
     const action: KeyAction = if (!raw.down) .release else if (raw.repeat) .repeat else .press;
@@ -1029,7 +1045,7 @@ fn keyEvent(raw: sdl.SDL_KeyboardEvent) KeyEvent {
         .action = action,
         .key = keyFromScancode(raw.scancode),
         .mods = modsFrom(raw.mod),
-        .codepoint = codepointFromKeycode(raw.key),
+        .codepoint = layoutCodepoint(raw.scancode, raw.mod),
         .unshifted_codepoint = unshiftedCodepoint(raw.scancode, raw.mod),
     };
 }
@@ -1763,16 +1779,21 @@ pub const Window = struct {
     /// keyboard does. See `post` for why an app is allowed to do this.
     ///
     /// The scancode is the one the active layout puts `codepoint` on, so the translation's
-    /// unshifted lookup answers what a real key would; `mods` is carried on the event itself,
-    /// which is where SDL reports a key's modifiers. `--clipboard-test` needs this to prove the
+    /// lookups answer what a real key would; `mods` is carried on the event itself, which is
+    /// where SDL reports a key's modifiers. A character the layout only reaches with a shift
+    /// level held (`A`, `+`) gets that level added, because the translation derives the
+    /// character from the scancode and the level, as it must for a real key, and a hand cannot
+    /// type `+` on a US layout without Shift either. `--clipboard-test` needs this to prove the
     /// copy and paste chords and Ctrl+C the way a hand presses them.
     pub fn postCharacterKey(self: *const Window, codepoint: u21, mods: Mods, action: KeyAction) !void {
         var raw: sdl.SDL_Event = std.mem.zeroes(sdl.SDL_Event);
         raw.key.type = @intCast(if (action == .release) sdl.SDL_EVENT_KEY_UP else sdl.SDL_EVENT_KEY_DOWN);
         raw.key.windowID = self.id;
-        raw.key.key = codepoint;
-        raw.key.scancode = sdl.SDL_GetScancodeFromKey(codepoint, null);
-        raw.key.mod = modsToSdl(mods);
+        var needed: sdl.SDL_Keymod = 0;
+        raw.key.scancode = sdl.SDL_GetScancodeFromKey(codepoint, &needed);
+        raw.key.mod = modsToSdl(mods) | (needed & level_mods);
+        // SDL 3.4 reports a key event's unmodified keycode, so this does too.
+        raw.key.key = sdl.SDL_GetKeyFromScancode(raw.key.scancode, raw.key.mod, true);
         raw.key.down = action != .release;
         raw.key.repeat = action == .repeat;
         raw.key.timestamp = sdl.SDL_GetTicksNS();
@@ -3609,6 +3630,58 @@ fn textEventFor(id: sdl.SDL_WindowID, kind: anytype, text: [:0]const u8, start: 
     return raw;
 }
 
+test "a key's character applies shift, caps lock and level modifiers but not commands" {
+    // Every event below carries the unmodified keycode in `key`, which is what
+    // SDL 3.4 sends for a real key event. With no keyboard initialised SDL
+    // answers from its built-in US layout, the same table a US X11 keymap
+    // gives, so the expectations are the US characters.
+    const window_id: sdl.SDL_WindowID = 7;
+    const state = State.init(.{ .width = 800, .height = 600 }, Scale.fromPlatform(1.0));
+    const Case = struct {
+        scancode: sdl.SDL_Scancode,
+        key: sdl.SDL_Keycode,
+        mod: sdl.SDL_Keymod,
+        codepoint: u21,
+        unshifted: u21,
+    };
+    const cases = [_]Case{
+        // Shift+h is H: the bug where the key path wrote `h` and the text
+        // echo then committed `H` as well.
+        .{ .scancode = sdl.SDL_SCANCODE_H, .key = 'h', .mod = sdl.SDL_KMOD_LSHIFT, .codepoint = 'H', .unshifted = 'h' },
+        .{ .scancode = sdl.SDL_SCANCODE_W, .key = 'w', .mod = sdl.SDL_KMOD_RSHIFT, .codepoint = 'W', .unshifted = 'w' },
+        // Shift on a symbol key is the layout's shifted symbol.
+        .{ .scancode = sdl.SDL_SCANCODE_1, .key = '1', .mod = sdl.SDL_KMOD_LSHIFT, .codepoint = '!', .unshifted = '1' },
+        // Caps Lock with no Shift is the upper-case letter.
+        .{ .scancode = sdl.SDL_SCANCODE_A, .key = 'a', .mod = sdl.SDL_KMOD_CAPS, .codepoint = 'A', .unshifted = 'a' },
+        // Ctrl, Alt and Super are commands, not shift levels: the encoder
+        // decides what they do to the character.
+        .{ .scancode = sdl.SDL_SCANCODE_A, .key = 'a', .mod = sdl.SDL_KMOD_LCTRL, .codepoint = 'a', .unshifted = 'a' },
+        .{ .scancode = sdl.SDL_SCANCODE_X, .key = 'x', .mod = sdl.SDL_KMOD_LALT, .codepoint = 'x', .unshifted = 'x' },
+        .{ .scancode = sdl.SDL_SCANCODE_V, .key = 'v', .mod = sdl.SDL_KMOD_LGUI, .codepoint = 'v', .unshifted = 'v' },
+        // Ctrl+Shift keeps the shifted character and the plain one apart.
+        .{ .scancode = sdl.SDL_SCANCODE_A, .key = 'a', .mod = sdl.SDL_KMOD_LCTRL | sdl.SDL_KMOD_LSHIFT, .codepoint = 'A', .unshifted = 'a' },
+    };
+    for (cases) |case| {
+        const event = translate(keyEventFor(
+            window_id,
+            sdl.SDL_EVENT_KEY_DOWN,
+            case.scancode,
+            case.key,
+            case.mod,
+        ), window_id, state, state).?;
+        try testing.expectEqual(case.codepoint, event.key.codepoint);
+        try testing.expectEqual(case.unshifted, event.key.unshifted_codepoint);
+    }
+
+    // A shifted press and its release after Shift came up are the same key:
+    // the unshifted character agrees even though the character does not.
+    const press = translate(keyEventFor(window_id, sdl.SDL_EVENT_KEY_DOWN, sdl.SDL_SCANCODE_Y, 'y', sdl.SDL_KMOD_LSHIFT), window_id, state, state).?;
+    const release = translate(keyEventFor(window_id, sdl.SDL_EVENT_KEY_UP, sdl.SDL_SCANCODE_Y, 'y', 0), window_id, state, state).?;
+    try testing.expectEqual(@as(u21, 'Y'), press.key.codepoint);
+    try testing.expectEqual(@as(u21, 'y'), release.key.codepoint);
+    try testing.expectEqual(press.key.unshifted_codepoint, release.key.unshifted_codepoint);
+}
+
 test "a key arrives with its character, its unshifted character and its named key" {
     const window_id: sdl.SDL_WindowID = 7;
     const state = State.init(.{ .width = 800, .height = 600 }, Scale.fromPlatform(1.0));
@@ -3630,12 +3703,13 @@ test "a key arrives with its character, its unshifted character and its named ke
 
     // Shift+a: the character is upper case, the unshifted one is not, and the
     // shift is reported. The pair is what lets a terminal tell ctrl+a from
-    // ctrl+shift+a.
+    // ctrl+shift+a. SDL 3.4 reports the unmodified keycode `a` on the event
+    // itself, so the upper case has to come from the layout, not from `key`.
     const shifted = translate(keyEventFor(
         window_id,
         sdl.SDL_EVENT_KEY_DOWN,
         sdl.SDL_SCANCODE_A,
-        'A',
+        'a',
         sdl.SDL_KMOD_SHIFT,
     ), window_id, state, state).?;
     try testing.expectEqual(@as(u21, 'A'), shifted.key.codepoint);

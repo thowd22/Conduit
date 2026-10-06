@@ -2863,6 +2863,10 @@ const App = struct {
     /// app because platform event payloads expire at the next event, while the
     /// renderer will eventually need the preedit for a later frame.
     composition: inputmod.Composition,
+    /// The character the last terminal key press encoded, held only until
+    /// SDL's matching `text_input` echo arrives so that one keystroke reaches
+    /// the child once. Main-thread state, observed before every event route.
+    key_text_echo: inputmod.KeyTextEcho,
     /// The production UI layer. It is allocated and resized with the terminal
     /// grid, then reused by every frame; composing a preedit allocates nothing.
     ui_canvas: ui.Canvas,
@@ -3507,6 +3511,7 @@ const App = struct {
             .output = output,
             .child_input = .{},
             .composition = .{},
+            .key_text_echo = .{},
             .ui_canvas = ui_canvas,
             .ui_tree = ui_tree,
             .action_definitions = action_definitions,
@@ -6395,6 +6400,7 @@ const App = struct {
                         var encoded: term.EncodedKey = .{};
                         presented.terminal().encodeKey(press, &encoded);
                         self.stageForChild(encoded.slice());
+                        if (encoded.slice().len != 0) self.key_text_echo.recordTerminalPress(key, translated);
                     },
                 }
             },
@@ -8200,7 +8206,17 @@ const App = struct {
         const plan = self.planFocusedUiKey(raw, translated) orelse return false;
         if (!self.ui_key_state.claim(identity, plan.repeat())) return false;
         try self.executeUiKeyPlan(plan);
+        self.recordUiKeyText(raw, plan.repeat());
         return true;
+    }
+
+    /// A key that typed into an `Input` is followed by SDL's text echo of the
+    /// same character, which must not be inserted a second time.
+    fn recordUiKeyText(self: *App, raw: platform.KeyEvent, repeat: UiKeyRepeat) void {
+        switch (repeat) {
+            .text => |text| self.key_text_echo.recordKeyText(raw, text.value.slice()),
+            .none, .edit => {},
+        }
     }
 
     fn routeOwnedUiKey(self: *App, raw: platform.KeyEvent) !bool {
@@ -8208,7 +8224,11 @@ const App = struct {
         if (self.ui_key_state.indexOf(identity)) |owned_index| {
             switch (raw.action) {
                 .press => {},
-                .repeat => try self.executeUiRepeat(self.ui_key_state.storage[owned_index].repeat),
+                .repeat => {
+                    const repeat = self.ui_key_state.storage[owned_index].repeat;
+                    try self.executeUiRepeat(repeat);
+                    self.recordUiKeyText(raw, repeat);
+                },
                 .release => self.ui_key_state.release(owned_index),
             }
             return true;
@@ -10044,6 +10064,13 @@ const App = struct {
                 return true;
             },
             else => {},
+        }
+        // A printable keystroke arrives as a key event and then as its text
+        // echo. The key path already wrote the character, so the echo is
+        // dropped here before any route can commit it a second time.
+        if (self.key_text_echo.filter(event)) {
+            self.pollDriverPending();
+            return true;
         }
         if (try self.handleUiEvent(event)) {
             if (!self.requested_shutdown) self.pollDriverPending();
@@ -11944,11 +11971,13 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         self.ui_key_state.len == 0, "ui-test: Ctrl/Alt/Super+X do not edit Input, and modifier-changed releases remain terminal-owned", .{});
     self.child_input.len = 0;
 
+    // Shift+y types `Y`, as it does on a real keyboard; the release arrives
+    // after Shift came up and still has to find the press it belongs to.
     const terminal_routes_before_owned = self.terminal_key_route_count;
     const owned_press = try postKeyAction(self, io, out, 'y', .{ .shift = true }, .press);
     const owned_release = try postKeyAction(self, io, out, 'y', .{}, .release);
     failures += reportCheck(out, owned_press and owned_release and
-        std.mem.eql(u8, fixture.field.text(), "one twoy") and
+        std.mem.eql(u8, fixture.field.text(), "one twoY") and
         self.terminal_key_route_count == terminal_routes_before_owned and
         self.ui_key_state.len == 0, "ui-test: an Input-owned press keeps its release after Shift is released first", .{});
 
@@ -11956,13 +11985,13 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     const duplicate_press_again = try postKeyAction(self, io, out, 'd', .{}, .press);
     const duplicate_release = try postKeyAction(self, io, out, 'd', .{}, .release);
     failures += reportCheck(out, duplicate_press and duplicate_press_again and duplicate_release and
-        std.mem.eql(u8, fixture.field.text(), "one twoyd"), "ui-test: a duplicate owned press is consumed without a duplicate Input edit", .{});
+        std.mem.eql(u8, fixture.field.text(), "one twoYd"), "ui-test: a duplicate owned press is consumed without a duplicate Input edit", .{});
 
     const repeat_press = try postKeyAction(self, io, out, 'r', .{}, .press);
     const repeat_event = try postKeyAction(self, io, out, 'r', .{}, .repeat);
     const repeat_release = try postKeyAction(self, io, out, 'r', .{}, .release);
     failures += reportCheck(out, repeat_press and repeat_event and repeat_release and
-        std.mem.eql(u8, fixture.field.text(), "one twoydrr"), "ui-test: an owned printable repeat edits Input while its release stays consumed", .{});
+        std.mem.eql(u8, fixture.field.text(), "one twoYdrr"), "ui-test: an owned printable repeat edits Input while its release stays consumed", .{});
 
     const terminal_routes_before_tab = self.terminal_key_route_count;
     const tab_press = try postKeyAction(self, io, out, '\t', .{}, .press);
@@ -17629,6 +17658,22 @@ test "focused UI transition identity survives modifier and focus-order changes" 
     const tab = uiKeyIdentity(.{ .action = .press, .key = .tab }).?;
     const enter = uiKeyIdentity(.{ .action = .press, .key = .enter }).?;
     try std.testing.expect(!uiKeyIdentityEql(tab, enter));
+
+    // A shifted press reports the shifted character, and Shift may come up
+    // before the key does. The identity is the unshifted key, so the release
+    // still finds its press.
+    const shifted_press = uiKeyIdentity(.{
+        .action = .press,
+        .mods = .{ .shift = true },
+        .codepoint = 'Y',
+        .unshifted_codepoint = 'y',
+    }).?;
+    const unshifted_release = uiKeyIdentity(.{
+        .action = .release,
+        .codepoint = 'y',
+        .unshifted_codepoint = 'y',
+    }).?;
+    try std.testing.expect(uiKeyIdentityEql(shifted_press, unshifted_release));
 }
 
 test "focused UI ownership refuses a full inline state atomically" {

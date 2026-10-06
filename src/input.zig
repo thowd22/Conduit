@@ -1036,6 +1036,65 @@ pub fn primaryPaste(raw: platform.PointerButton, owner: term.PointerOwner, prima
 // Input methods
 // ---------------------------------------------------------------------------
 
+/// The text echo SDL sends after a printable key Conduit already encoded.
+///
+/// One physical printable keystroke reaches the app twice: SDL emits the key
+/// event, then a `text_input` event carrying the same character. The key path
+/// stays authoritative because only it carries the modifiers the encoder needs
+/// (Alt+x as ESC x, kitty-style sequences), so the echo must be dropped rather
+/// than committed, or `hello` reaches the child as `hheelllloo`.
+///
+/// The record is deliberately narrow: only the UTF-8 of the one character the
+/// immediately preceding terminal press or repeat encoded, and only until the
+/// next key event of any kind or any preedit. Text that differs (an input
+/// method commit, a dead-key result, synthetic test-driver text with no key
+/// before it) is never touched.
+///
+/// Ownership: the value owns its four-byte buffer; it borrows nothing.
+pub const KeyTextEcho = struct {
+    buffer: [4]u8 = undefined,
+    len: u8 = 0,
+
+    /// Observe one platform event before it is routed. Returns true when the
+    /// event is the expected echo and must be dropped. Every key event and
+    /// every preedit clears the record, so `recordTerminalPress` must be
+    /// called after this for the key event that is being routed.
+    pub fn filter(self: *KeyTextEcho, event: platform.Event) bool {
+        switch (event) {
+            .key, .text_editing => self.len = 0,
+            .text_input => |text| {
+                const pending = self.buffer[0..self.len];
+                self.len = 0;
+                return pending.len != 0 and std.mem.eql(u8, pending, text);
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    /// Remember the character a key press or repeat sent to the terminal.
+    ///
+    /// Ctrl and Super chords produce control bytes or sequences rather than
+    /// text, so they record nothing. Alt records the bare character because
+    /// SDL echoes `x` even though the encoder sent ESC x.
+    pub fn recordTerminalPress(self: *KeyTextEcho, raw: platform.KeyEvent, press: Press) void {
+        self.len = 0;
+        if (press.encoded.composing) return;
+        self.recordKeyText(raw, press.encoded.text);
+    }
+
+    /// Remember the text a key press or repeat inserted into a focused UI
+    /// `Input`. SDL echoes it exactly as it does for the terminal, and an
+    /// `Input` would otherwise insert the character twice.
+    pub fn recordKeyText(self: *KeyTextEcho, raw: platform.KeyEvent, text: []const u8) void {
+        self.len = 0;
+        if (raw.action == .release or raw.mods.ctrl or raw.mods.super) return;
+        if (text.len == 0 or text.len > self.buffer.len) return;
+        @memcpy(self.buffer[0..text.len], text);
+        self.len = @intCast(text.len);
+    }
+};
+
 /// What an input method is composing, and what it last committed.
 ///
 /// An input method (ibus, fcitx, the macOS and Windows ones) does not deliver
@@ -3150,4 +3209,127 @@ test "a middle press pastes the primary selection only where one exists and the 
 
     // The build's answer is Linux's.
     try testing.expectEqual(builtin.os.tag == .linux, platform.primary_selection_supported);
+}
+
+const echo_testing = std.testing;
+
+fn echoAfterPress(echo: *KeyTextEcho, raw: platform.KeyEvent) !void {
+    var scratch: TextScratch = .{};
+    const event: platform.Event = .{ .key = raw };
+    try echo_testing.expect(!echo.filter(event));
+    echo.recordTerminalPress(raw, translate(&scratch, raw, false));
+}
+
+test "a key's identical text echo is dropped exactly once" {
+    var echo: KeyTextEcho = .{};
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'h' });
+    try echo_testing.expect(echo.filter(.{ .text_input = "h" }));
+    // The record is consumed: a second identical text is real text.
+    try echo_testing.expect(!echo.filter(.{ .text_input = "h" }));
+
+    try echoAfterPress(&echo, .{ .action = .repeat, .codepoint = 'h' });
+    try echo_testing.expect(echo.filter(.{ .text_input = "h" }));
+}
+
+test "text that differs from the key's character is committed" {
+    var echo: KeyTextEcho = .{};
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'g' });
+    try echo_testing.expect(!echo.filter(.{ .text_input = "한" }));
+    // The mismatch also consumed the record.
+    try echo_testing.expect(!echo.filter(.{ .text_input = "g" }));
+}
+
+test "text with no preceding key is committed" {
+    var echo: KeyTextEcho = .{};
+    try echo_testing.expect(!echo.filter(.{ .text_input = "hello" }));
+    try echo_testing.expect(!echo.filter(.{ .text_input = "" }));
+}
+
+test "any key event or preedit clears the pending key text" {
+    var echo: KeyTextEcho = .{};
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'a' });
+    try echo_testing.expect(!echo.filter(.{ .key = .{ .action = .release, .codepoint = 'a' } }));
+    try echo_testing.expect(!echo.filter(.{ .text_input = "a" }));
+
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'a' });
+    try echoAfterPress(&echo, .{ .action = .press, .key = .enter });
+    try echo_testing.expect(!echo.filter(.{ .text_input = "a" }));
+
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'k' });
+    try echo_testing.expect(!echo.filter(.{ .text_editing = platform.TextEditing.editing("k", 1, 0) }));
+    try echo_testing.expect(!echo.filter(.{ .text_input = "k" }));
+
+    // Recording a release leaves nothing behind either.
+    try echoAfterPress(&echo, .{ .action = .release, .codepoint = 'a' });
+    try echo_testing.expect(!echo.filter(.{ .text_input = "a" }));
+}
+
+test "alt records the bare character and ctrl or super records nothing" {
+    var echo: KeyTextEcho = .{};
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'x', .mods = .{ .alt = true } });
+    try echo_testing.expect(echo.filter(.{ .text_input = "x" }));
+
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'c', .mods = .{ .ctrl = true } });
+    try echo_testing.expect(!echo.filter(.{ .text_input = "c" }));
+
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'v', .mods = .{ .super = true } });
+    try echo_testing.expect(!echo.filter(.{ .text_input = "v" }));
+
+    // A control codepoint is not text on the key path.
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 0x03 });
+    try echo_testing.expect(!echo.filter(.{ .text_input = "\x03" }));
+}
+
+test "a shifted or four-byte character is matched by its full UTF-8" {
+    var echo: KeyTextEcho = .{};
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 'H', .unshifted_codepoint = 'h', .mods = .{ .shift = true } });
+    try echo_testing.expect(echo.filter(.{ .text_input = "H" }));
+
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 0x1F600 });
+    try echo_testing.expect(!echo.filter(.{ .text_input = "\xF0\x9F\x98" }));
+    try echoAfterPress(&echo, .{ .action = .press, .codepoint = 0x1F600 });
+    try echo_testing.expect(echo.filter(.{ .text_input = "\u{1F600}" }));
+}
+
+test "an Input's typed key text is dropped from its echo once" {
+    var echo: KeyTextEcho = .{};
+    const press: platform.KeyEvent = .{ .action = .press, .codepoint = 'Y', .unshifted_codepoint = 'y', .mods = .{ .shift = true } };
+    try echo_testing.expect(!echo.filter(.{ .key = press }));
+    echo.recordKeyText(press, "Y");
+    try echo_testing.expect(echo.filter(.{ .text_input = "Y" }));
+    try echo_testing.expect(!echo.filter(.{ .text_input = "Y" }));
+
+    // A command chord never inserts text, so it never expects an echo.
+    const chord: platform.KeyEvent = .{ .action = .press, .codepoint = 'a', .unshifted_codepoint = 'a', .mods = .{ .ctrl = true } };
+    echo.recordKeyText(chord, "a");
+    try echo_testing.expect(!echo.filter(.{ .text_input = "a" }));
+}
+
+test "shift and caps lock presses encode their character once with its echo dropped" {
+    var echo: KeyTextEcho = .{};
+    var scratch: TextScratch = .{};
+
+    // What the platform now reports for a real Shift+h and for `a` with Caps
+    // Lock on: the layout's character, not SDL's unmodified keycode.
+    const shifted: platform.KeyEvent = .{ .action = .press, .codepoint = 'H', .unshifted_codepoint = 'h', .mods = .{ .shift = true } };
+    const capitals: platform.KeyEvent = .{ .action = .press, .codepoint = 'A', .unshifted_codepoint = 'a', .mods = .{ .caps_lock = true } };
+    for ([_]struct { raw: platform.KeyEvent, text: []const u8 }{
+        .{ .raw = shifted, .text = "H" },
+        .{ .raw = capitals, .text = "A" },
+    }) |case| {
+        try echo_testing.expect(!echo.filter(.{ .key = case.raw }));
+        const press = translate(&scratch, case.raw, false);
+        try echo_testing.expectEqualStrings(case.text, press.encoded.text);
+        echo.recordTerminalPress(case.raw, press);
+        try echo_testing.expect(echo.filter(.{ .text_input = case.text }));
+    }
+}
+
+test "a press translated while composing records nothing" {
+    var echo: KeyTextEcho = .{};
+    var scratch: TextScratch = .{};
+    const raw: platform.KeyEvent = .{ .action = .press, .codepoint = 'a' };
+    _ = echo.filter(.{ .key = raw });
+    echo.recordTerminalPress(raw, translate(&scratch, raw, true));
+    try echo_testing.expect(!echo.filter(.{ .text_input = "a" }));
 }

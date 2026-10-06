@@ -221,6 +221,21 @@ The deterministic Linux `--menu-test` covers all of this through real PTYs and S
 640x360 frame was visually inspected; TASK-25's sixth scenario `context-menu` drives
 `conduit-test right-click` on `workspace.1.pane.1` and clicks the `search` row.
 
+TASK-71 fixed real keyboard input, which no test had exercised because every check injected
+synthetic SDL events and the dev box is headless. SDL sends a key event and then a matching
+text-input echo for every printable key, and SDL 3.4 key events carry the unmodified keycode
+(`Shift+h` reports `h`). `platform` now builds `KeyEvent.codepoint` by asking the layout with the
+level modifiers applied (Shift, Caps Lock, AltGr/Mode, Level 5; never Ctrl, Alt or Super) while
+`unshifted_codepoint` stays the plain key; UI key ownership matches a release to its press by the
+named key or `unshifted_codepoint`; and `input.KeyTextEcho` drops SDL's identical text-input echo
+after a key that wrote text to the terminal or inserted it into a focused UI `Input`, so one
+physical keystroke is delivered once while IME commits and dead-key results still arrive. Synthetic
+`postCharacterKey` events add the shift level the layout needs. `.github/scripts/check-x11-keyboard.sh`
+types `Hello World`, Alt+x and a shifted search query through real XTest keystrokes under Xvfb and
+asserts single delivery to the child (`KEYS_HEX1:48656c6c6f20576f726c64`, `KEYS_HEX2:1b78`) and to
+the search Input (`1/1`); it runs in the Linux gate. macOS and Windows AltGr/Option behaviour is
+unverified.
+
 TASK-36 is complete. Command+F on macOS or Ctrl+Shift+F on Linux/Windows opens an inline semantic
 `Input`; named actions and clickable controls provide next/previous navigation plus case and regex
 toggles. Literal and regex scans are bounded and incremental across retained scrollback, with
@@ -239,9 +254,12 @@ standard freedesktop paths, and the installed payload passes desktop-file valida
 hosted Linux gate supplies the external evidence: `check-sway-fractional.sh` runs Sway 1.9
 headless (GLES2 where a DRM render node exists, pixman otherwise, because hosted runners have no
 `/dev/dri`) at compositor scale 1.25 and Conduit reports an 800x450 surface for 640x360 logical
-geometry with a crisp frame; `check-ibus-hangul.sh` runs a real `ibus-daemon` with `ibus-hangul`
-started in Hangul mode (its default is Latin) and `IBUS_ADDRESS` exported past the launcher's
-private HOME, and XTest Dubeolsik keys produce a semantic preedit and exactly one committed `한글`;
+geometry with a crisp frame; `check-ibus-hangul.sh` runs a real `ibus-daemon --xim` with `ibus-hangul` as the only preloaded
+global engine started in Hangul mode (its default is Latin), all written to gsettings before the
+daemon starts because changing them afterwards races the first context; SDL 3.4's X11 backend
+reaches input methods only through XIM (its D-Bus IBus client serves Wayland), so `XMODIFIERS`
+must name IBus. XTest Dubeolsik keys then produce a semantic preedit and exactly one committed
+`한글`;
 `check-x11-primary.sh` proves PRIMARY interoperability with `xclip`. Neither IBus nor Sway is
 installed on the dev box, so those checks are reproduced locally in an `ubuntu:24.04` container.
 The bundled fallback face has no Hangul glyphs, so the preedit cell renders as a missing-glyph box

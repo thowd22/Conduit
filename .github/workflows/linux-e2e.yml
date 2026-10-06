@@ -184,6 +184,14 @@ jobs:
           xvfb-run -a --server-args="-screen 0 1280x800x24" \
             bash .github/scripts/check-x11-primary.sh "$ARTIFACT_ROOT/platform/x11-primary"
 
+      # Real X11 keystrokes (XTest) rather than injected SDL events: the only path that produces
+      # SDL's key-down plus text-input pair for one key (TASK-71).
+      - name: Real X11 keyboard check
+        shell: bash
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            bash .github/scripts/check-x11-keyboard.sh "$ARTIFACT_ROOT/platform/x11-keyboard"
+
       - name: Real IBus Hangul input check
         shell: bash
         run: |

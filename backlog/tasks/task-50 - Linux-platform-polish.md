@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-06 22:18'
+updated_date: '2026-10-06 23:05'
 labels:
   - platform
   - linux
@@ -63,6 +63,8 @@ Approved CI evidence is now checked in: the Linux workflow explicitly installs i
 2026-10-06 run 37537621738 passed the Sway fractional-scale check on pixman (renderer.txt retained, final.png captured) and the X11 primary-selection check, then failed the IBus step waiting for ime.preedit. Reproduced in an ubuntu:24.04 container with ibus-hangul: initial-input-mode defaults to 'latin' so the Dubeolsik keys passed through as ASCII, and the launcher's private HOME/XDG_CONFIG_HOME hid the daemon socket file from SDL. Fixed in 2acbd93 (initial-input-mode hangul, IBUS_ADDRESS exported, terminal text retained on failure); the container run then passed every step: 한글 committed once, IBUS_SECOND:exact. The preedit cell renders as a missing-glyph box because the bundled fallback face has no Hangul coverage (TASK-39), while the semantic preedit element and committed bytes prove the IME path.
 
 2026-10-06 hosted evidence from GitHub Actions run 37539118525 (ubuntu-24.04, commit 2acbd93), retained in the conduit-linux-platform artifact: Sway 1.9 headless on wlroots pixman reported one active output at scale 1.25 (mode 1280x720, logical 1024x576) and Conduit logged 'window backend wayland', 'window reports 1.25 physical pixels per logical pixel', 'window geometry 640x360 logical, 800x450 pixels' with a crisp inspected frame; the real ibus-daemon with ibus-hangul composed the Dubeolsik keys sent by XTest into a semantic ime.preedit element, committed 한글 exactly once (IBUS_ASSERT:exact) and the second sentinel matched (IBUS_SECOND:exact); xclip middle-click paste proved PRIMARY_ASSERT:conduit-primary-external against an external X11 client; desktop-file validation passed on the installed payload.
+
+2026-10-06 IBus check hardening after a flaky hosted rerun (3 of 4 runs passed; the failing run's child received ggkkssrrmmff): strace in an ubuntu:24.04 container showed the app never connects to the IBus socket on X11 because SDL 3.4.16's X11 backend reaches input methods only through XIM (SDL_IME_Init is called only by the Wayland backend), so the XIM bridge (ibus-daemon --xim, XMODIFIERS=@im=ibus) is required and keeps being used. The doubled ASCII was TASK-71's key/text duplication on keys the engine forwarded back unhandled. check-ibus-hangul.sh now writes use-global-engine, preload-engines ['hangul'], engines-order and initial-input-mode hangul BEFORE starting the daemon (changing them afterwards raced the first context), waits until 'ibus engine' reports hangul for the focused context, retains terminal text on failure and strips Unix sockets from the uploaded driver root. Container: 5/5 passes, 한글 committed once each run.
 <!-- SECTION:NOTES:END -->
 
 ## Comments

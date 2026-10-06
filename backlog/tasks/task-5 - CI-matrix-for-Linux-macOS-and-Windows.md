@@ -2,9 +2,10 @@
 id: TASK-5
 title: 'CI matrix for Linux, macOS and Windows'
 status: To Do
-assignee: []
+assignee:
+  - '@claude'
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-05 20:34'
+updated_date: '2026-10-06 22:34'
 labels:
   - infra
   - ci
@@ -42,4 +43,6 @@ Added .gitattributes (coordinator) pinning build.zig, build.zig.zon and *.zig to
 Not verifiable here: the workflow has never run on GitHub, and nothing about the macOS or Windows legs executed on this headless Ubuntu box. Only a real CI run settles action availability, whether the SDL3 source build completes on those images, and what setup-zig resolves for Apple Silicon macos-latest.
 
 2026-10-05 reconciliation: reopened and AC #1 unchecked. The workflow is configured for ubuntu, macOS and Windows, but this repository has no commits and the workflow has never run; static YAML inspection is not runtime evidence for the three runners.
+
+2026-10-06 first hosted runs after the initial push: ubuntu-latest passes zig fmt/build/test; windows-latest fails in 'zig build' compiling Ghostty's C++ SIMD sources (zig-pkg/ghostty/src/simd/codepoint_width.cpp via Highway) against Zig 0.16's bundled clang headers: 'argument unused during compilation: -nostdinc++ / -fno-rtlib-defaultlib' followed by 109 errors in mmintrin.h/immintrin.h ('function-style cast to a builtin type can only take one argument'). The pinned-Zig resolution and version check worked on Windows (runs 37539118625 and 37535520847). The macOS leg had not finished before the runs were superseded; see later runs on main for its result. Windows build repair belongs with TASK-49/TASK-16; AC1 stays unchecked.
 <!-- SECTION:NOTES:END -->
