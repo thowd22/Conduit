@@ -266,7 +266,9 @@ These are out of scope on purpose. Naming them prevents scope drift:
   beyond what v1 provides.
 - **No persistence.** Workspaces do not survive a restart of the app.
 - **No `conduit` CLI** (the `conduit-test` automation CLI *is* in scope), no single-instance IPC,
-  no accessibility bridge, no packaging or release pipeline.
+  no accessibility bridge, no macOS or Windows packaging. The Linux tagged release (tar.gz, Debian
+  package, AppImage and checksums from a SemVer tag) was pulled into v0.1 as TASK-69.1 so the
+  Linux MVP can ship on its own; the three-platform pipeline remains TASK-69.
 
 ---
 

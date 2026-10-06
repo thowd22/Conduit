@@ -656,7 +656,9 @@ selected text from the palette `Input` before pasting and executing it in the te
 `conduit-test ctrl-click <id>` through the JSON-RPC driver and real SDL event queue before taking
 its screenshot. A fifth `terminal-file-reference` scenario does the same for a `path:line`
 reference and then waits for the new tab's sidebar row and for vi's quoted path in the active
-terminal, proving the editor tab through the same external route.
+terminal, proving the editor tab through the same external route. A sixth `context-menu` scenario
+right-clicks the pane through `conduit-test right-click`, waits for the `context-menu.search` row,
+clicks it and waits for the search `Input` to exist and the menu to be gone.
 
 The runner reports PASS/FAIL for every scenario without stopping at the first failure and writes a
 run-unique suite directory beneath the explicit `--artifact-dir`. Each scenario retains
@@ -1233,8 +1235,9 @@ Rules that apply to all levels:
   clicks both semantic controls. Its final frame captures the bordered 90-percent bottom dock with
   `scratchpad.restart` and `scratchpad.hide`. Native macOS and Windows scratchpad input and
   rendering remain runtime-unverified.
-- TASK-25's five checked-in `zig build e2e` scenarios create isolated `conduit-test` runs for
-  prompt, command/output, Input-copy/terminal-paste, terminal-link and file-reference paths, report each result,
+- TASK-25's six checked-in `zig build e2e` scenarios create isolated `conduit-test` runs for
+  prompt, command/output, Input-copy/terminal-paste, terminal-link, file-reference and context-menu
+  paths, report each result,
   and retain per-scenario diagnostics plus a suite summary. `terminal-links` addresses the stable
   semantic id and drives it through the public `ctrl-click` command. The Linux workflow is present
   and uploads its artifact root on failure; its Xvfb block includes `--links-test` and
