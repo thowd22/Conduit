@@ -37,7 +37,7 @@ git push origin v0.2.0-rc.1
    `build.zig` rejects a `-Dversion` that is not SemVer, and the generated
    `build_options` module carries the value into `src/version.zig` and the
    application. `release-package.sh` then turns the staged prefix into
-   `conduit-<version>-x86_64-linux.tar.gz`, `conduit_<debian-version>_amd64.deb`,
+   `conduit-<version>-x86_64-linux.tar.gz`, `conduit_<version>_amd64.deb`,
    `Conduit-<version>-x86_64.AppImage` and `SHA256SUMS`, and
    `release-verify.sh` checks them (next section). The artifacts are uploaded
    as a workflow artifact.
@@ -72,10 +72,12 @@ FreeType, HarfBuzz, Oniguruma, JetBrains Mono OFL). The development-only
   X11/Wayland/xkbcommon/libdecor/dbus libraries as `Recommends`.
   `release-package.sh` derives the `libc6` dependency from the binary's
   `NEEDED` entries and refuses to package if an unmapped library appears.
-- **Debian version:** SemVer `-<prerelease>` becomes `~<prerelease>`
+- **Asset file names keep the SemVer spelling** (`conduit_0.2.0-rc.1_amd64.deb`): GitHub
+  release assets cannot contain `~` and are silently renamed on upload, which would break
+  `SHA256SUMS` and the `--clobber` match on a rerun. Only the control file's `Version` uses `~`.
+- **Debian version:** inside the package, SemVer `-<prerelease>` becomes `~<prerelease>`
   (`0.2.0-rc.1` → `0.2.0~rc.1`) so a prerelease sorts below its release the
-  way Debian expects; `+build` metadata is kept as is. The `.deb` file name
-  uses the Debian form.
+  way Debian expects; `+build` metadata is kept as is.
 - **AppImage:** built with `appimagetool` 1.9.1 and the type2 runtime
   `20251108`, both downloaded by `release-fetch-appimagetool.sh` and verified
   against SHA-256 pins recorded in that script (checked against the digests

@@ -1,11 +1,11 @@
 ---
 id: TASK-50
 title: Linux platform polish
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-06 21:59'
+updated_date: '2026-10-06 22:18'
 labels:
   - platform
   - linux
@@ -32,8 +32,8 @@ Verify and polish Wayland and X11: fractional scaling, primary selection, IME (i
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [x] #1 Conduit runs natively on Wayland and on X11
-- [ ] #2 Fractional scaling renders crisply
-- [ ] #3 IME input works under at least one of ibus or fcitx
+- [x] #2 Fractional scaling renders crisply
+- [x] #3 IME input works under at least one of ibus or fcitx
 - [x] #4 Desktop entry and icon are installed by the package
 <!-- AC:END -->
 
@@ -59,6 +59,10 @@ Approved CI evidence is now checked in: the Linux workflow explicitly installs i
 2026-10-06 handover from Codex: the audit's blocking race in check-x11-primary.sh (Enter posted before the pasted PRIMARY text arrived) is fixed with a driver wait-for between the XTest middle click and Enter. Remaining AC2/AC3 evidence is CI-only.
 
 2026-10-06 first hosted run (37535520822) passed formatting, build, unit tests, desktop validation and all seventeen headless checks, then failed the Sway check: wlroots GLES2 needs a DRM render node and ubuntu-24.04 runners have no /dev/dri. check-sway-fractional.sh now selects pixman when no render node exists (46104ee). Reproduced in an ubuntu:24.04 container without DRM: Sway get_outputs reported scale 1.25 / mode 1280 / rect 1024 and the ReleaseSafe conduit --self-test ran as a Wayland client logging 'window backend wayland', 'scale 1.25, surface 1200x800'; exit 0.
+
+2026-10-06 run 37537621738 passed the Sway fractional-scale check on pixman (renderer.txt retained, final.png captured) and the X11 primary-selection check, then failed the IBus step waiting for ime.preedit. Reproduced in an ubuntu:24.04 container with ibus-hangul: initial-input-mode defaults to 'latin' so the Dubeolsik keys passed through as ASCII, and the launcher's private HOME/XDG_CONFIG_HOME hid the daemon socket file from SDL. Fixed in 2acbd93 (initial-input-mode hangul, IBUS_ADDRESS exported, terminal text retained on failure); the container run then passed every step: 한글 committed once, IBUS_SECOND:exact. The preedit cell renders as a missing-glyph box because the bundled fallback face has no Hangul coverage (TASK-39), while the semantic preedit element and committed bytes prove the IME path.
+
+2026-10-06 hosted evidence from GitHub Actions run 37539118525 (ubuntu-24.04, commit 2acbd93), retained in the conduit-linux-platform artifact: Sway 1.9 headless on wlroots pixman reported one active output at scale 1.25 (mode 1280x720, logical 1024x576) and Conduit logged 'window backend wayland', 'window reports 1.25 physical pixels per logical pixel', 'window geometry 640x360 logical, 800x450 pixels' with a crisp inspected frame; the real ibus-daemon with ibus-hangul composed the Dubeolsik keys sent by XTest into a semantic ime.preedit element, committed 한글 exactly once (IBUS_ASSERT:exact) and the second sentinel matched (IBUS_SECOND:exact); xclip middle-click paste proved PRIMARY_ASSERT:conduit-primary-external against an external X11 client; desktop-file validation passed on the installed payload.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -69,3 +73,9 @@ created: 2026-10-06 19:53
 User approved CI-only Linux packages needed for real IBus and compositor fractional-scaling evidence, following modern Linux distro defaults; desktop-managed decorations remain the v0.1 choice.
 ---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Linux platform polish verified on native X11 and Wayland with hosted CI evidence: the SDL application metadata and high-pixel-density window run under X11 and a Weston/Sway Wayland session; a Sway headless compositor at fractional scale 1.25 produced a crisp 800x450 surface from 640x360 logical geometry; a real IBus daemon with the Hangul engine composed and committed through SDL's IME path; the X11 PRIMARY selection interoperates with an external client; and the install prefix stages the validated desktop entry and icon. Evidence: GitHub Actions run 37539118525 artifacts plus local Xvfb, Weston and Docker reproductions.
+<!-- SECTION:FINAL_SUMMARY:END -->

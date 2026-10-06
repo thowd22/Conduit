@@ -28,7 +28,7 @@ expected_version_line="conduit $version"
 deb_version="${version/-/\~}"
 
 tar_path="$dist/conduit-$version-x86_64-linux.tar.gz"
-deb_path="$dist/conduit_${deb_version}_amd64.deb"
+deb_path="$dist/conduit_${version}_amd64.deb"
 appimage_path="$dist/Conduit-$version-x86_64.AppImage"
 
 failures=0

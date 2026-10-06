@@ -63,7 +63,7 @@ its normal workspace approval; Codex requires
 explicit registration because it does not auto-load `.mcp.json`, and Pi requires an MCP extension
 or can use the CLI directly. The MCP server is local-only and inherits the CLI's
 isolated per-run filesystem boundary; native macOS and Windows runtime behavior has not been
-verified. TASK-25 is now in progress with a checked-in `zig build e2e` composition root. It
+verified. TASK-25 is complete with a checked-in `zig build e2e` composition root. It
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
@@ -75,8 +75,9 @@ sidebar row and vi's status line in that tab, and `context-menu`, which right-cl
 through `conduit-test right-click` and activates the `search` row. The
 checked-in reusable Linux workflow runs
 formatting, build, unit/integration tests, the built-in headless checks and these scripted
-scenarios, then uploads its private artifact root on failure. No remote Actions run has yet
-supplied acceptance evidence, so TASK-25 is not complete. Its Xvfb block pins
+scenarios, then uploads its private artifact root on failure. GitHub Actions run 37539118525 on
+ubuntu-24.04 passed that whole gate, and the two failing runs before it uploaded the failure
+artifacts that diagnosed the Sway renderer and IBus fixes. Its Xvfb block pins
 `SDL_VIDEODRIVER=x11`, includes `--links-test` and `--search-test`, and rejects any built-in check
 whose retained application log does not report the X11 backend. The worked agent loop using
 today's CLI and MCP surfaces is documented below. TASK-27 provides the owner beneath the current workspace UI:
@@ -186,7 +187,11 @@ new tab's spawn worker is in flight. `--links-test` proves the exact argv and cw
 observer seam and real vim drawing in the new tab; the `terminal-file-reference` scenario proves
 the `conduit-test ctrl-click` route.
 
-TASK-69.1 (Linux tagged release) is implemented but awaits its first remote run. `zig build
+TASK-69.1 (Linux tagged release) ran for real on tag `v0.1.0-rc.1`: the release workflow validated
+the tag, passed the reusable Linux gate, built, packaged, verified and published a GitHub
+prerelease with all four assets (run 37539729660). That run exposed one defect, fixed afterwards:
+GitHub renames assets containing `~`, so the Debian package file now keeps the SemVer spelling
+(`conduit_<version>_amd64.deb`) while only its control `Version` uses the Debian `~` form. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
 re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
 the log sink or SDL start, and an unstamped build prints `conduit 0.0.0-dev`.
@@ -227,14 +232,20 @@ deterministic Linux `--search-test` exercises keyboard, palette and mouse paths,
 recovery, real PTY resynchronisation and more-than-128-match paging through SDL; its final 640x360
 frame was visually inspected.
 
-TASK-50 has verified native Linux X11 and Wayland startup and the packaged desktop payload, but is
-not complete. X11 runs report the X11 backend, and a Weston 14 headless run forced SDL's Wayland
-backend and passed `--self-test` with the same SDL/OpenGL path. An isolated `zig build --prefix`
-staged the binary, fallback font, shell integration, licenses, desktop entry and scalable icon at
-their standard freedesktop paths. A forced 1.25 test scale produced the expected physical surface
-and a visually crisp frame, but it does not prove compositor-reported fractional scaling. The
-synthetic SDL IME check likewise does not prove a real IBus or Fcitx service; neither daemon is
-installed on this machine. Those two external Linux acceptance checks remain open.
+TASK-50 is complete. X11 runs report the X11 backend, and Weston and Sway headless sessions run
+SDL's Wayland backend over the same SDL/OpenGL path. An isolated `zig build --prefix` stages the
+binary, fallback font, shell integration, licenses, desktop entry and scalable icon at their
+standard freedesktop paths, and the installed payload passes desktop-file validation in CI. The
+hosted Linux gate supplies the external evidence: `check-sway-fractional.sh` runs Sway 1.9
+headless (GLES2 where a DRM render node exists, pixman otherwise, because hosted runners have no
+`/dev/dri`) at compositor scale 1.25 and Conduit reports an 800x450 surface for 640x360 logical
+geometry with a crisp frame; `check-ibus-hangul.sh` runs a real `ibus-daemon` with `ibus-hangul`
+started in Hangul mode (its default is Latin) and `IBUS_ADDRESS` exported past the launcher's
+private HOME, and XTest Dubeolsik keys produce a semantic preedit and exactly one committed `한글`;
+`check-x11-primary.sh` proves PRIMARY interoperability with `xclip`. Neither IBus nor Sway is
+installed on the dev box, so those checks are reproduced locally in an `ubuntu:24.04` container.
+The bundled fallback face has no Hangul glyphs, so the preedit cell renders as a missing-glyph box
+until TASK-39.
 
 - `CONDUIT.md` — the product specification. Source of truth for what the product does.
 - `conversation.md` — the original design conversation. Kept as history; CONDUIT.md supersedes it.
@@ -399,9 +410,8 @@ Rules:
    visual evidence.
 6. On any failure, capture and read `logs` and the `inspect` semantic tree before changing code.
 7. Add or update the user-facing E2E scenario, exercising keyboard and mouse when both apply.
-   TASK-25's in-progress `zig build e2e` runner is available now; run it under a real headless
-   display such as Xvfb with an explicit private artifact directory. Do not claim TASK-25's Linux
-   CI acceptance until a remote workflow run supplies that evidence.
+   Run the `zig build e2e` runner under a real headless display such as Xvfb with an explicit
+   private artifact directory; the Linux CI gate runs the same scenarios on every push.
 8. Check each acceptance criterion against the collected evidence, then finalise the task.
 
 A copy-pastable CLI pass with deterministic child output is:

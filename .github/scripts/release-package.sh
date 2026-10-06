@@ -14,7 +14,7 @@
 #
 # Produces, under dist-dir:
 #   conduit-<version>-x86_64-linux.tar.gz
-#   conduit_<debian-version>_amd64.deb
+#   conduit_<version>_amd64.deb   (the control file carries the Debian form, e.g. 0.1.0~rc.1)
 #   Conduit-<version>-x86_64.AppImage
 #   SHA256SUMS
 #
@@ -147,7 +147,10 @@ chmod 0755 "$deb_root/DEBIAN" && chmod 0644 "$deb_root/DEBIAN/control" "$deb_roo
 find "$deb_root/usr" -type d -exec chmod 0755 {} +
 find "$deb_root/usr" -type f -exec chmod 0644 {} +
 chmod 0755 "$deb_root/usr/bin/conduit"
-deb_path="$dist/conduit_${deb_version}_amd64.deb"
+# The file name keeps the SemVer spelling: GitHub release assets cannot contain `~` and would be
+# renamed on upload, which breaks SHA256SUMS and --clobber matching. Only the control file's
+# Version field uses the Debian `~` form.
+deb_path="$dist/conduit_${version}_amd64.deb"
 rm -f -- "$deb_path"
 dpkg-deb --build --root-owner-group "$deb_root" "$deb_path" > /dev/null
 pass "wrote $(basename "$deb_path")"
