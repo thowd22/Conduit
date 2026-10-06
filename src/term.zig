@@ -8672,9 +8672,13 @@ test "a real shell's output is scrolled back through with a wheel, and the rows 
     try terminal.init(testIo(), gpa, .{ .cols = 20, .rows = 5 });
     defer terminal.deinit(gpa);
 
-    try waitForHistory(gpa, child, &terminal, 5);
+    // Six notches scroll eighteen rows, so the history must hold at least that
+    // many before the wheel is turned. A slow runner can deliver `seq`'s first
+    // read with only a handful of lines, and waiting for "some history" let the
+    // offset clamp at whatever had arrived (seen on a hosted runner: 17).
+    try waitForHistory(gpa, child, &terminal, 18);
     const history = terminal.viewport().history_rows;
-    try testing.expect(history > 5);
+    try testing.expect(history > 18);
 
     // The wheel event goes through exactly the call `App.onWheel` makes, with
     // the delta a real notched device would report.
