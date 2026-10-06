@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-06 21:19'
+updated_date: '2026-10-06 21:59'
 labels:
   - platform
   - linux
@@ -57,6 +57,8 @@ A supporting forced 1.25 renderer run produced an 800x450 surface from 640x360 l
 Approved CI evidence is now checked in: the Linux workflow explicitly installs its X11, Sway, IBus Hangul, desktop-validation and X11 primary-selection tools; Conduit declares composition/candidate UI with SDL override priority before video initialization; native Sway runs without --scale and asserts compositor IPC scale 1.25 plus SDL 1.25 geometry and PNG dimensions; real IBus uses XTest, asserts live ime.preedit, exact one-time Hangul delivery and a second sentinel; a separate xclip middle-click round trip proves the X11 PRIMARY selection against an external client. Failure paths retain driver artifacts and Sway shutdown is bounded. Local bash syntax and platform formatting checks pass, and independent audit found the checked-in contracts clean after race/priority repairs. AC2/AC3 remain unchecked until the ubuntu-24.04 GitHub Actions run supplies actual Sway/IBus evidence.
 
 2026-10-06 handover from Codex: the audit's blocking race in check-x11-primary.sh (Enter posted before the pasted PRIMARY text arrived) is fixed with a driver wait-for between the XTest middle click and Enter. Remaining AC2/AC3 evidence is CI-only.
+
+2026-10-06 first hosted run (37535520822) passed formatting, build, unit tests, desktop validation and all seventeen headless checks, then failed the Sway check: wlroots GLES2 needs a DRM render node and ubuntu-24.04 runners have no /dev/dri. check-sway-fractional.sh now selects pixman when no render node exists (46104ee). Reproduced in an ubuntu:24.04 container without DRM: Sway get_outputs reported scale 1.25 / mode 1280 / rect 1024 and the ReleaseSafe conduit --self-test ran as a Wayland client logging 'window backend wayland', 'scale 1.25, surface 1200x800'; exit 0.
 <!-- SECTION:NOTES:END -->
 
 ## Comments

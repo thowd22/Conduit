@@ -18,6 +18,7 @@ cleanup() {
   if [[ -n "$run_id" ]]; then
     if (( status != 0 )); then
       driver inspect >"$artifact_root/failure-semantic-tree.json" 2>/dev/null || true
+      driver terminal-text >"$artifact_root/failure-terminal.txt" 2>/dev/null || true
       driver logs 1048576 >"$artifact_root/failure-application.log" 2>/dev/null || true
       failure_screenshot="$(driver screenshot 2>/dev/null)" || failure_screenshot=""
       if [[ -n "$failure_screenshot" && -f "$failure_screenshot" ]]; then
@@ -65,7 +66,23 @@ done
 
 # Make the selected engine deterministic across contexts before the SDL input context is created.
 gsettings set org.freedesktop.ibus.general use-global-engine true
+# ibus-hangul starts every new context in Latin mode unless told otherwise, in which case the
+# Dubeolsik keys below pass through as ASCII with no preedit. Start in Hangul mode so the engine
+# composes from the first key, and record what the engine will read.
+gsettings set org.freedesktop.ibus.engine.hangul initial-input-mode hangul
+gsettings get org.freedesktop.ibus.engine.hangul initial-input-mode >"$artifact_root/hangul-initial-input-mode.txt"
 ibus engine hangul
+
+# `conduit-test launch` gives the app a private HOME and XDG_CONFIG_HOME, so SDL cannot find the
+# daemon's socket file under the real $XDG_CONFIG_HOME/ibus/bus. SDL reads IBUS_ADDRESS first, and
+# the launcher passes the rest of the environment through, so hand it the live bus address.
+IBUS_ADDRESS="$(ibus address)"
+if [[ -z "$IBUS_ADDRESS" ]]; then
+  echo "IBus published no bus address" >&2
+  exit 1
+fi
+export IBUS_ADDRESS
+printf '%s\n' "$IBUS_ADDRESS" >"$artifact_root/ibus-address.txt"
 
 run_id="$(./zig-out/bin/conduit-test --root="$driver_root" launch \
   --visible \
