@@ -220,6 +220,47 @@ pub const PumpResult = struct {
     }
 };
 
+/// How much child output one event-loop wake may drain before it must return
+/// to the window queue, the test driver and the frame decision.
+///
+/// A single pump moves at most one buffer per session, which is a few KiB from
+/// a real PTY. Draining is therefore a loop of pumps, and this is what bounds
+/// that loop: it stops when a pass found nothing, when the byte budget is
+/// spent, or when the time slice is used up. Both limits exist because neither
+/// alone is enough: bytes bound the work a fast parser does between frames, and
+/// time bounds how long a slow (Debug) parser can keep input and the driver
+/// waiting. The check is pure so its every edge can be tested without a clock.
+pub const DrainBudget = struct {
+    /// Most bytes one wake may feed into terminals across all sessions.
+    max_bytes: usize,
+    /// Longest one wake may spend draining, in nanoseconds.
+    max_ns: u64,
+
+    /// The event loop's budget: 4 MiB or 8 ms, whichever comes first. Eight
+    /// milliseconds is half a 60 Hz frame, so a wake that drains and then
+    /// draws still fits about one display interval, and 4 MiB is more than a
+    /// release-build parser feeds in that slice, so on a fast machine time is
+    /// the binding limit and the byte cap only guards a pathological clock.
+    pub const per_wake: DrainBudget = .{
+        .max_bytes = 4 * 1024 * 1024,
+        .max_ns = 8 * std.time.ns_per_ms,
+    };
+
+    /// Whether to run another pump pass after one that drained
+    /// `last_pass_bytes`, with `total_bytes` drained and `elapsed_ns` spent
+    /// so far in this wake.
+    pub fn allowsAnotherPass(
+        self: DrainBudget,
+        last_pass_bytes: usize,
+        total_bytes: usize,
+        elapsed_ns: u64,
+    ) bool {
+        if (last_pass_bytes == 0) return false;
+        if (total_bytes >= self.max_bytes) return false;
+        return elapsed_ns < self.max_ns;
+    }
+};
+
 const SessionRecord = struct {
     id: session.SessionId,
     kind: session.Session.Kind,
@@ -4054,4 +4095,136 @@ test "failed pane split leaves the tree focus and monotonic ids untouched" {
     var dividers: [1]DividerLayout = undefined;
     _ = try workspace.layoutDividers(tab_id, bounds, &dividers);
     try testing.expectEqual(DividerId.first, dividers[0].divider_id);
+}
+
+test "the drain budget stops on an empty pass, the byte cap and the time slice" {
+    const testing = std.testing;
+    const budget: DrainBudget = .{ .max_bytes = 100, .max_ns = 50 };
+    try testing.expect(budget.allowsAnotherPass(1, 0, 0));
+    try testing.expect(budget.allowsAnotherPass(10, 99, 49));
+    try testing.expect(!budget.allowsAnotherPass(0, 0, 0));
+    try testing.expect(!budget.allowsAnotherPass(10, 100, 0));
+    try testing.expect(!budget.allowsAnotherPass(10, 200, 0));
+    try testing.expect(!budget.allowsAnotherPass(10, 0, 50));
+    try testing.expect(!budget.allowsAnotherPass(10, 0, std.math.maxInt(u64)));
+    try testing.expect(DrainBudget.per_wake.max_bytes >= 1024 * 1024);
+    try testing.expect(DrainBudget.per_wake.max_ns <= 16 * std.time.ns_per_ms);
+}
+
+/// Drain one wake's worth of output the way the event loop does, with a fixed
+/// elapsed time so the byte cap and the empty pass are what end it.
+fn drainOneWake(
+    workspace: *Workspace,
+    budget: DrainBudget,
+    io_buffer: []u8,
+    response_buffer: []u8,
+    sink: EventSink,
+    passes: *usize,
+) !usize {
+    var total: usize = 0;
+    while (true) {
+        const result = workspace.pump(io_buffer, response_buffer, sink);
+        if (result.first_error) |err| return err;
+        passes.* += 1;
+        total += result.bytes_drained;
+        if (!budget.allowsAnotherPass(result.bytes_drained, total, 0)) return total;
+    }
+}
+
+test "a multi-megabyte flood reaches the terminal in a bounded number of wakes" {
+    const testing = std.testing;
+    const size = try term.GridSize.init(40, 4);
+    // Records that overwrite one row with a carriage return rather than
+    // scroll: the test is about how the drain is bounded, not how fast the
+    // engine scrolls, and a Debug engine verifies its whole page list on
+    // every scroll. Every byte is still parsed by the real terminal.
+    const record = "0123456789abcdef0123456789abcdef\r";
+    const record_count = 160 * 1024;
+    const marker = "FLOOD-END";
+    const flood = try testing.allocator.alloc(u8, record.len * record_count + marker.len);
+    defer testing.allocator.free(flood);
+    for (0..record_count) |index| @memcpy(flood[index * record.len ..][0..record.len], record);
+    @memcpy(flood[record.len * record_count ..], marker);
+    try testing.expect(flood.len > 5 * 1024 * 1024);
+
+    var audit: FakeAudit = .{};
+    audit.outputs[0] = flood;
+    const context = try FakeContext.create(testing.allocator, &audit, .local);
+    var workspace = try Workspace.init(testing.io, testing.allocator, "flood", "/tmp", context, size);
+    defer workspace.deinit() catch |err| std.debug.panic("workspace cleanup failed: {s}", .{@errorName(err)});
+    const id = try workspace.createSession(.human_terminal, size);
+    try spawnAndAttach(&workspace, id);
+
+    var ignored: IgnoredEvents = .{};
+    var io_buffer: [64 * 1024]u8 = undefined;
+    var response_buffer: [term.response_capacity]u8 = undefined;
+    const budget = DrainBudget.per_wake;
+    var wakes: usize = 0;
+    var passes: usize = 0;
+    var total: usize = 0;
+    while (workspace.needsPump()) {
+        const drained = try drainOneWake(&workspace, budget, &io_buffer, &response_buffer, ignored.sink(), &passes);
+        wakes += 1;
+        total += drained;
+        // No wake overshoots the byte cap by more than one pass.
+        try testing.expect(drained <= budget.max_bytes + io_buffer.len);
+        try testing.expect(wakes <= flood.len);
+    }
+
+    // Every byte reached the terminal, and the wake count is set by the byte
+    // budget rather than by how many reads the flood took.
+    try testing.expectEqual(flood.len, total);
+    const expected_wakes = (flood.len + budget.max_bytes - 1) / budget.max_bytes;
+    try testing.expectEqual(@as(usize, 2), expected_wakes);
+    try testing.expect(wakes <= expected_wakes);
+    try testing.expect(passes >= flood.len / io_buffer.len);
+    const live = workspace.sessionById(id) orelse return error.SessionNotFound;
+    try live.terminal().refresh(testing.allocator);
+    try testing.expect(live.terminalConst().visibleTextContains(marker));
+}
+
+test "a real 4 MiB PTY flood is fully consumed within the per-wake budget in bounded time" {
+    // Carriage returns rather than newlines, for the same reason as the fake
+    // flood above: this proves the drain keeps up with a real reader thread.
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const testing = std.testing;
+    const size = try term.GridSize.init(80, 24);
+    var workspace = try Workspace.initLocal(testing.io, testing.allocator, "real-flood", "/tmp", size);
+    defer workspace.deinit() catch |err| std.debug.panic("workspace cleanup failed: {s}", .{@errorName(err)});
+    const id = try workspace.createSession(.human_terminal, size);
+    const request = try workspace.spawnRequest(id, .{
+        .argv = &.{ "/bin/sh", "-c", "yes 0123456789abcdef | tr '\\n' '\\r' | head -c 4194304" },
+        .env = &.{ "PATH=/usr/bin:/bin", "TERM=xterm-256color" },
+    });
+    try workspace.attachChild(id, try workspace.contextRef().spawn(request));
+
+    var ignored: IgnoredEvents = .{};
+    var io_buffer: [64 * 1024]u8 = undefined;
+    var response_buffer: [term.response_capacity]u8 = undefined;
+    const budget = DrainBudget.per_wake;
+    const started = std.Io.Clock.awake.now(testing.io).nanoseconds;
+    const deadline = started + 10 * std.time.ns_per_s;
+    var total: usize = 0;
+    while (std.Io.Clock.awake.now(testing.io).nanoseconds < deadline) {
+        const live = workspace.sessionById(id) orelse return error.SessionNotFound;
+        const attached = live.child().?;
+        if (attached.state() == .exited and !workspace.needsPump()) break;
+        if (!workspace.needsPump()) {
+            _ = attached.waitReadable(25);
+            continue;
+        }
+        const wake_started = std.Io.Clock.awake.now(testing.io).nanoseconds;
+        var wake_total: usize = 0;
+        while (true) {
+            const result = workspace.pump(&io_buffer, &response_buffer, ignored.sink());
+            if (result.first_error) |err| return err;
+            wake_total += result.bytes_drained;
+            const elapsed: u64 = @intCast(std.Io.Clock.awake.now(testing.io).nanoseconds - wake_started);
+            if (!budget.allowsAnotherPass(result.bytes_drained, wake_total, elapsed)) break;
+        }
+        try testing.expect(wake_total <= budget.max_bytes + io_buffer.len);
+        total += wake_total;
+    }
+    try testing.expectEqual(@as(usize, 4194304), total);
+    try testing.expect(!workspace.needsPump());
 }

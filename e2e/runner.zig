@@ -332,6 +332,22 @@ fn suitePath(io: Io, allocator: Allocator, artifact_dir: []const u8) ![]u8 {
     return joined(allocator, &.{ artifact_dir, name });
 }
 
+/// The default bound on one `conduit-test` client process, in seconds.
+const client_timeout_s: i64 = 15;
+
+/// Time a client needs beyond its own wait: process start, connect and reply.
+const client_margin_s: i64 = 5;
+
+/// How long one client process may run. A `wait-for` whose own timeout is
+/// close to the default is given that timeout plus a fixed margin,
+/// so the driver's bounded wait, not the process kill, decides the outcome.
+fn clientTimeoutSeconds(tail: []const []const u8) i64 {
+    if (tail.len < 2 or !std.mem.eql(u8, tail[0], "wait-for")) return client_timeout_s;
+    const wait_ms = std.fmt.parseInt(u32, tail[tail.len - 1], 10) catch return client_timeout_s;
+    const wait_s: i64 = @divTrunc(@as(i64, wait_ms) + 999, 1000);
+    return @max(client_timeout_s, wait_s + client_margin_s);
+}
+
 fn runCli(
     init: std.process.Init,
     executable: []const u8,
@@ -355,7 +371,7 @@ fn runCli(
         .stdout_limit = .limited(max_command_output),
         .stderr_limit = .limited(max_command_output),
         .timeout = .{ .duration = .{
-            .raw = .fromSeconds(15),
+            .raw = .fromSeconds(clientTimeoutSeconds(tail)),
             .clock = .awake,
         } },
     });
@@ -974,11 +990,11 @@ test "run ids accepted from conduit-test cannot escape a scenario root" {
 }
 
 test "summary reporting is deterministic and names every scenario" {
-    const results = [_]bool{ true, false, true, true, true, true };
+    const results = [_]bool{ true, false, true, true, true, true, true };
     const summary = try renderSummary(std.testing.allocator, &results);
     defer std.testing.allocator.free(summary);
     try std.testing.expectEqualStrings(
-        "{\"passed\":5,\"failed\":1,\"scenarios\":[{\"name\":\"launch-prompt\",\"passed\":true},{\"name\":\"type-command\",\"passed\":false},{\"name\":\"select-copy\",\"passed\":true},{\"name\":\"terminal-links\",\"passed\":true},{\"name\":\"terminal-file-reference\",\"passed\":true},{\"name\":\"context-menu\",\"passed\":true}]}\n",
+        "{\"passed\":6,\"failed\":1,\"scenarios\":[{\"name\":\"launch-prompt\",\"passed\":true},{\"name\":\"type-command\",\"passed\":false},{\"name\":\"select-copy\",\"passed\":true},{\"name\":\"terminal-links\",\"passed\":true},{\"name\":\"terminal-file-reference\",\"passed\":true},{\"name\":\"output-flood\",\"passed\":true},{\"name\":\"context-menu\",\"passed\":true}]}\n",
         summary,
     );
 }
@@ -1108,4 +1124,12 @@ test "cross-device fallback retains runtime data before source cleanup" {
     defer std.testing.allocator.free(retained);
     try std.testing.expectEqualStrings("retained evidence", retained);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "runtime", .{}));
+}
+
+test "a long wait-for gets a client timeout longer than its own bound" {
+    try std.testing.expectEqual(client_timeout_s, clientTimeoutSeconds(&.{"inspect"}));
+    try std.testing.expectEqual(client_timeout_s, clientTimeoutSeconds(&.{ "key", "ENTER" }));
+    try std.testing.expectEqual(client_timeout_s, clientTimeoutSeconds(&.{ "wait-for", "terminal-text", "x", "5000" }));
+    try std.testing.expectEqual(@as(i64, 25), clientTimeoutSeconds(&.{ "wait-for", "terminal-text", "x", "20000" }));
+    try std.testing.expectEqual(client_timeout_s, clientTimeoutSeconds(&.{ "wait-for", "terminal-text", "x", "soon" }));
 }

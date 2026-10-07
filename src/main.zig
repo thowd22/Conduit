@@ -1123,6 +1123,69 @@ pub const Scheduler = struct {
     }
 };
 
+/// When an owed frame is drawn while child output keeps arriving.
+///
+/// Draining and drawing are separate steps of the loop. Without pacing, a
+/// flood would still draw once per wake, and on a software renderer a frame
+/// costs far more than the bytes it shows. While output is active (this wake
+/// drained bytes, or a session is still readable) an owed frame waits until
+/// the previous one is at least `interval` old; the moment output pauses, an
+/// owed frame is drawn at once. The interval is the longer of one 60 Hz
+/// display period and the last frame's own cost, so a slow renderer spends at
+/// most about half of a flood drawing rather than all of it. Pure state plus
+/// timestamps, so the policy is tested without a window or a clock.
+pub const FramePacer = struct {
+    /// One display period at 60 Hz, in nanoseconds.
+    pub const min_interval_ns: u64 = 16 * std.time.ns_per_ms;
+    /// How long a deferred frame waits for more output when none is readable
+    /// right now, in milliseconds. A reader thread that is mid-read looks
+    /// idle for an instant; this grace keeps that instant from counting as
+    /// a pause, and is short enough that a real pause still draws promptly.
+    pub const pause_grace_ms: i32 = 1;
+
+    /// When the last frame finished, on the awake clock; null before the first.
+    last_frame_end_ns: ?i96 = null,
+    /// How long the last frame took to draw.
+    last_frame_cost_ns: u64 = 0,
+
+    /// The shortest gap between frames while output is active.
+    pub fn interval(self: *const FramePacer) u64 {
+        return @max(min_interval_ns, self.last_frame_cost_ns);
+    }
+
+    /// Whether an owed frame is drawn now. `output_active` says the wake
+    /// drained bytes or a session still has output waiting.
+    pub fn shouldDraw(self: *const FramePacer, owed: bool, output_active: bool, now_ns: i96) bool {
+        if (!owed) return false;
+        if (!output_active) return true;
+        return self.untilDueNs(now_ns) == 0;
+    }
+
+    /// Nanoseconds until a frame is due under the active-output interval.
+    pub fn untilDueNs(self: *const FramePacer, now_ns: i96) u64 {
+        const last = self.last_frame_end_ns orelse return 0;
+        const age = now_ns - last;
+        const gap: i96 = @intCast(self.interval());
+        if (age >= gap) return 0;
+        if (age <= 0) return self.interval();
+        return @intCast(gap - age);
+    }
+
+    /// The longest the loop may wait for an event while a frame is deferred:
+    /// nothing while output is still readable, otherwise the pause grace,
+    /// which is far shorter than any interval, so a deferred frame is never
+    /// held much past the moment it falls due.
+    pub fn deferredWaitMs(readable: bool) i32 {
+        return if (readable) 0 else pause_grace_ms;
+    }
+
+    /// Record a frame drawn between `started_ns` and `ended_ns`.
+    pub fn noteFrame(self: *FramePacer, started_ns: i96, ended_ns: i96) void {
+        self.last_frame_end_ns = ended_ns;
+        self.last_frame_cost_ns = if (ended_ns > started_ns) @intCast(ended_ns - started_ns) else 0;
+    }
+};
+
 /// The surface size a window state implies.
 fn surfaceSize(state: platform.State) render.Size {
     return .{ .width = state.surface.width_px, .height = state.surface.height_px };
@@ -1504,10 +1567,20 @@ const font_points: f32 = 14.0;
 const atlas_width_px: u32 = 1024;
 const atlas_height_px: u32 = 1024;
 
-/// How many bytes are copied out of the child per frame. A program's output
+/// The fixed buffer child output is copied into. A program's output
 /// arrives in whatever sizes the pipe hands over, and this buffer is never
 /// resized, so a frame never allocates.
 const pty_read_capacity = 64 * 1024;
+
+/// How many bytes one pump pass feeds a session's terminal, at most.
+///
+/// The drain loop checks its time slice between passes, so this is the
+/// granularity of that slice. Parsing cost is dominated by the content rather
+/// than the byte count: a pass of newline-heavy output costs far more than a
+/// pass of plain text, so a smaller pass keeps input and the test driver
+/// answered during such floods without lowering throughput, which per-pass
+/// overhead does not limit.
+const pty_pass_capacity = 16 * 1024;
 
 /// How long the cursor is on, and how long it is off, in nanoseconds.
 const blink_period_ns: i128 = 600 * std.time.ns_per_ms;
@@ -2809,6 +2882,8 @@ const App = struct {
     /// a resize, a scale change and an expose all leave the two out of step.
     needs_present: bool,
     scheduler: Scheduler,
+    /// Frame coalescing while child output is flowing; owned by the loop.
+    pacer: FramePacer = .{},
     /// The face the grid is rasterised from. Owned.
     fonts: font.Manager,
     /// Registry-owned workspace models and their parallel, heap-stable
@@ -6003,14 +6078,19 @@ const App = struct {
     /// Neither direction waits: the read side is another thread's queue and the
     /// write side is the terminal's own answers, both copied into buffers the
     /// app already owns. That is what lets the loop's single blocking wait
-    /// inside SDL stay the only wait a frame has.
-    fn pumpChild(self: *App) !void {
+    /// inside SDL stay the only wait a frame has. Returns how many output
+    /// bytes this one pass fed into terminals across every workspace, which
+    /// is what `drainChildren` loops on.
+    fn pumpChild(self: *App) !usize {
+        var drained: usize = 0;
+        const pass = self.input[0..@min(self.input.len, pty_pass_capacity)];
         const presented = self.presentedLive();
         if (presented.child() != null) {
-            const got = presented.drainChildOutput(self.input);
+            const got = presented.drainChildOutput(pass);
+            drained += got;
             if (got != 0) {
                 self.noteSearchTerminalChange(self.presentedSessionId());
-                if (self.trace) |trace| try trace.received.appendSlice(self.allocator, self.input[0..got]);
+                if (self.trace) |trace| try trace.received.appendSlice(self.allocator, pass[0..got]);
             }
             for (presented.terminal().takeEvents()) |event| self.noteTerminalEvent(presented, event);
             try self.flushToChild();
@@ -6028,21 +6108,53 @@ const App = struct {
             const hidden = if (presentation.key == active_key)
                 model.pumpExcept(
                     self.presentedSessionId(),
-                    self.input,
+                    pass,
                     self.output,
                     .{ .ptr = &event_context, .on_events = noteWorkspaceEvents },
                 )
             else
                 model.pump(
-                    self.input,
+                    pass,
                     self.output,
                     .{ .ptr = &event_context, .on_events = noteWorkspaceEvents },
                 );
+            drained +|= hidden.bytes_drained;
             if (hidden.first_error) |err| log.warn(
                 "a hidden session could not write a terminal response: {s}",
                 .{@errorName(err)},
             );
         }
+        return drained;
+    }
+
+    /// Drain child output in a bounded loop of pumps, independently of drawing.
+    ///
+    /// One pump moves one buffer per session, a few KiB from a real PTY; a
+    /// flood drained once per frame costs a whole frame per chunk. This keeps
+    /// pumping while passes still find bytes, until `DrainBudget.per_wake`
+    /// says the wake has spent its bytes or its time slice, so input, the
+    /// test driver and the frame decision still run between slices. Nothing
+    /// here blocks or allocates: each pass is the nonblocking `pumpChild`.
+    fn drainChildren(self: *App, io: Io) !usize {
+        const budget = workspace.DrainBudget.per_wake;
+        const started = Io.Clock.awake.now(io).nanoseconds;
+        var total: usize = 0;
+        while (true) {
+            const got = try self.pumpChild();
+            total +|= got;
+            const elapsed = Io.Clock.awake.now(io).nanoseconds - started;
+            const elapsed_ns: u64 = if (elapsed <= 0) 0 else @intCast(@min(elapsed, std.math.maxInt(u64)));
+            if (!budget.allowsAnotherPass(got, total, elapsed_ns)) return total;
+        }
+    }
+
+    /// Whether any session in any workspace has output or replies waiting.
+    fn outputReadable(self: *App) bool {
+        for (self.workspace_presentations.items) |presentation| {
+            const model = self.workspace_registry.byKey(presentation.key) orelse continue;
+            if (model.needsPump()) return true;
+        }
+        return false;
     }
 
     /// Deliver events produced while the workspace services a hidden session.
@@ -9971,7 +10083,7 @@ const App = struct {
     /// P6 as call order — the grid renderer and the UI renderer draw into this
     /// one surface in sequence.
     fn drawFrame(self: *App) !void {
-        try self.pumpChild();
+        _ = try self.pumpChild();
         try self.syncGrid();
         for (self.pane_layouts[0..self.pane_layout_count]) |layout| {
             const live = self.activeWorkspace().sessionById(layout.session_id) orelse continue;
@@ -10175,8 +10287,13 @@ const App = struct {
 
     /// The event loop.
     ///
-    /// One iteration is one wait for an event, one look at everything outside
-    /// the event queue, and then at most one frame. The wait is a blocking wait
+    /// One iteration is one wait for an event, one bounded drain of child
+    /// output (`drainChildren`), one look at everything outside the event
+    /// queue, and then at most one frame. While output keeps arriving the
+    /// frame is coalesced by `FramePacer` and the wait shrinks to zero or a
+    /// one-millisecond grace, so a flood is drained at parser speed rather
+    /// than one PTY read per frame, and the test driver is still served every
+    /// iteration because each drain is time-sliced. The wait is a blocking wait
     /// inside SDL, so a window nobody is touching costs no CPU: no polling
     /// timer, no sleep-and-retry, and no frame that nothing asked for.
     /// `deadline_ns`, when given, is the only reason to wake up on a timer.
@@ -10192,27 +10309,63 @@ const App = struct {
     /// `--force-redraw` measure the same idle cost as render-on-demand and
     /// prove nothing.
     fn run(self: *App, io: Io, deadline_ns: ?i128) !void {
+        // A cap on the next wait while child output is flowing: zero while
+        // bytes are still waiting, a short grace after a wake that drained
+        // some, and nothing at all otherwise, which leaves an idle window to
+        // `waitBudget` and a blocking wait inside SDL.
+        var flow_wait_ms: ?i32 = null;
         while (true) {
-            const event = self.window.pump(self.waitBudget(io, deadline_ns));
+            var wait = self.waitBudget(io, deadline_ns);
+            if (flow_wait_ms) |cap| wait = if (wait < 0) cap else @min(wait, cap);
+            const event = self.window.pump(wait);
             if (event) |one| {
                 if (!try self.handle(one)) break;
             }
+            // Only a session that asks for service is pumped here, so an idle
+            // wake does no more work than it did before draining moved out of
+            // `drawFrame`.
+            const drained = if (self.outputReadable()) try self.drainChildren(io) else 0;
+            if (drained != 0) self.scheduler.invalidate();
             if (self.poll()) self.scheduler.invalidate();
             if (self.requested_shutdown) break;
-            if (self.scheduler.shouldDraw()) try self.drawFrame();
-            self.pollDriverPending();
-            if (self.driver_quit_deadline_ns) |quit_deadline| {
-                if (Io.Clock.real.now(io).nanoseconds >= quit_deadline) break;
+            if (self.scheduler.shouldDraw()) {
+                const output_active = drained != 0 or self.outputReadable();
+                const now = Io.Clock.awake.now(io).nanoseconds;
+                if (self.scheduler.force or self.pacer.shouldDraw(true, output_active, now)) {
+                    try self.drawPacedFrame(io);
+                }
             }
-            if (self.childGone()) break;
+            flow_wait_ms = if (drained == 0)
+                null
+            else
+                FramePacer.deferredWaitMs(self.outputReadable());
+            self.pollDriverPending();
+            var ending = false;
+            if (self.driver_quit_deadline_ns) |quit_deadline| {
+                if (Io.Clock.real.now(io).nanoseconds >= quit_deadline) ending = true;
+            }
+            if (self.childGone()) ending = true;
             // The wait expired with nothing to report, which is the normal state
             // of an idle window, and the only thing that ends a bounded run.
             if (event == null) {
                 if (deadline_ns) |deadline| {
-                    if (Io.Clock.real.now(io).nanoseconds >= deadline) break;
+                    if (Io.Clock.real.now(io).nanoseconds >= deadline) ending = true;
                 }
             }
+            if (ending) {
+                // A frame deferred while output was flowing is still owed; the
+                // run never leaves the surface behind what the terminal holds.
+                if (self.scheduler.shouldDraw()) try self.drawPacedFrame(io);
+                break;
+            }
         }
+    }
+
+    /// Draw one frame from the event loop and tell the pacer what it cost.
+    fn drawPacedFrame(self: *App, io: Io) !void {
+        const started = Io.Clock.awake.now(io).nanoseconds;
+        try self.drawFrame();
+        self.pacer.noteFrame(started, Io.Clock.awake.now(io).nanoseconds);
     }
 };
 
@@ -11090,7 +11243,7 @@ fn waitForChildText(self: *App, io: Io, needle: []const u8) !bool {
     const trace = self.trace.?;
     const deadline = Io.Clock.real.now(io).nanoseconds + clipboard_test_budget_ms * std.time.ns_per_ms;
     while (true) {
-        try self.pumpChild();
+        _ = try self.pumpChild();
         if (std.mem.indexOf(u8, trace.received.items, needle) != null) return true;
         const child = self.activeLive().child() orelse return false;
         if (child.state() == .exited) return false;
@@ -11121,7 +11274,7 @@ fn childEcho(self: *const App, marker: []const u8, buffer: []u8) []const u8 {
 fn waitForEcho(self: *App, io: Io, marker: []const u8, want: usize, buffer: []u8) ![]const u8 {
     const deadline = Io.Clock.real.now(io).nanoseconds + clipboard_test_budget_ms * std.time.ns_per_ms;
     while (true) {
-        try self.pumpChild();
+        _ = try self.pumpChild();
         const echoed = childEcho(self, marker, buffer);
         if (echoed.len >= want) return echoed;
         const child = self.activeLive().child() orelse return echoed;
@@ -11137,7 +11290,7 @@ fn waitForChildExit(self: *App, io: Io) !?pty.ChildState {
     const child = self.activeLive().child() orelse return null;
     const deadline = Io.Clock.real.now(io).nanoseconds + clipboard_test_budget_ms * std.time.ns_per_ms;
     while (true) {
-        try self.pumpChild();
+        _ = try self.pumpChild();
         const state = child.state();
         if (state == .exited) return state;
         const left = deadline - Io.Clock.real.now(io).nanoseconds;
@@ -17777,4 +17930,128 @@ test "search bar keeps a usable Input on every nonzero canvas" {
     try std.testing.expectEqual(ui.Rect{ .x = 7, .y = 9, .width = 1, .height = 1 }, one_cell.query);
     try std.testing.expect(calculateSearchBarLayout(.{ .x = 0, .y = 0, .width = 0, .height = 4 }) == null);
     try std.testing.expect(calculateSearchBarLayout(.{ .x = 0, .y = 0, .width = 4, .height = 0 }) == null);
+}
+
+test "the frame pacer draws at once when output pauses and coalesces while it flows" {
+    const testing = std.testing;
+    const ms: i96 = std.time.ns_per_ms;
+    var pacer: FramePacer = .{};
+    // Nothing owed is never drawn, whatever the output does.
+    try testing.expect(!pacer.shouldDraw(false, false, 0));
+    try testing.expect(!pacer.shouldDraw(false, true, 0));
+    // The first frame is never held back.
+    try testing.expect(pacer.shouldDraw(true, true, 0));
+    try testing.expect(pacer.shouldDraw(true, false, 0));
+
+    pacer.noteFrame(100 * ms, 102 * ms);
+    try testing.expectEqual(FramePacer.min_interval_ns, pacer.interval());
+    // Flowing output waits for the interval; a pause draws immediately.
+    try testing.expect(!pacer.shouldDraw(true, true, 102 * ms));
+    try testing.expect(!pacer.shouldDraw(true, true, 117 * ms));
+    try testing.expect(pacer.shouldDraw(true, false, 103 * ms));
+    try testing.expect(pacer.shouldDraw(true, true, 118 * ms));
+    try testing.expectEqual(@as(u64, 16 * std.time.ns_per_ms), pacer.untilDueNs(102 * ms));
+    try testing.expectEqual(@as(u64, 0), pacer.untilDueNs(200 * ms));
+    // A clock that reads earlier than the last frame still waits, never panics.
+    try testing.expect(!pacer.shouldDraw(true, true, 50 * ms));
+
+    // A frame slower than a display period stretches the interval to its cost,
+    // so drawing takes at most about half of a flood.
+    pacer.noteFrame(200 * ms, 240 * ms);
+    try testing.expectEqual(@as(u64, 40 * std.time.ns_per_ms), pacer.interval());
+    try testing.expect(!pacer.shouldDraw(true, true, 279 * ms));
+    try testing.expect(pacer.shouldDraw(true, true, 280 * ms));
+    // A clock that went backwards across a frame records no cost.
+    pacer.noteFrame(300 * ms, 299 * ms);
+    try testing.expectEqual(FramePacer.min_interval_ns, pacer.interval());
+
+    try testing.expectEqual(@as(i32, 0), FramePacer.deferredWaitMs(true));
+    try testing.expectEqual(FramePacer.pause_grace_ms, FramePacer.deferredWaitMs(false));
+    try testing.expect(FramePacer.pause_grace_ms * std.time.ns_per_ms < FramePacer.min_interval_ns);
+}
+
+/// The outcome of `simulateFlood`.
+const SimulatedFlood = struct {
+    consumed: usize,
+    frames: u64,
+    elapsed_ns: i96,
+    drawing_ns: i96,
+    owed: bool,
+};
+
+/// Run the event loop's drain and draw decisions against a simulated clock.
+///
+/// A source delivers `total` bytes in `chunk`-sized reads, the parser costs
+/// `ns_per_byte`, and a frame costs `frame_ns`. Only `DrainBudget`, `Scheduler`
+/// and `FramePacer` decide; the arithmetic stands in for the PTY and renderer.
+fn simulateFlood(total: usize, chunk: usize, ns_per_byte: i96, frame_ns: i96) !SimulatedFlood {
+    const budget = workspace.DrainBudget.per_wake;
+    var scheduler = Scheduler.init(false);
+    var pacer: FramePacer = .{};
+    var clock: i96 = 0;
+    var remaining = total;
+    var consumed: usize = 0;
+    var drawing: i96 = 0;
+    var wakes: usize = 0;
+    while (remaining != 0 or scheduler.shouldDraw()) {
+        wakes += 1;
+        if (wakes > 10_000_000) return error.TestUnexpectedResult;
+        const started = clock;
+        var drained: usize = 0;
+        while (true) {
+            const got = @min(chunk, remaining);
+            remaining -= got;
+            drained += got;
+            clock += @as(i96, @intCast(got)) * ns_per_byte;
+            if (!budget.allowsAnotherPass(got, drained, @intCast(clock - started))) break;
+        }
+        consumed += drained;
+        if (drained != 0) scheduler.invalidate();
+        const readable = remaining != 0;
+        if (scheduler.shouldDraw() and pacer.shouldDraw(true, drained != 0 or readable, clock)) {
+            const frame_started = clock;
+            clock += frame_ns;
+            drawing += frame_ns;
+            scheduler.drawn();
+            pacer.noteFrame(frame_started, clock);
+        }
+        if (drained != 0) clock += @as(i96, FramePacer.deferredWaitMs(readable)) * std.time.ns_per_ms;
+    }
+    return .{
+        .consumed = consumed,
+        .frames = scheduler.frames,
+        .elapsed_ns = clock,
+        .drawing_ns = drawing,
+        .owed = scheduler.shouldDraw(),
+    };
+}
+
+test "a multi-megabyte flood is consumed in frames bounded by time, not by reads" {
+    const testing = std.testing;
+    const total = 8 * 1024 * 1024;
+    const chunk = 4096;
+    const reads = total / chunk;
+    const ms: i96 = std.time.ns_per_ms;
+
+    // A release-speed parser on a software renderer: 100 MB/s and 30 ms frames.
+    const fast = try simulateFlood(total, chunk, 10, 30 * ms);
+    try testing.expectEqual(@as(usize, total), fast.consumed);
+    try testing.expect(!fast.owed);
+    try testing.expect(fast.frames <= @as(u64, @intCast(@divTrunc(fast.elapsed_ns, 30 * ms))) + 2);
+    try testing.expect(fast.frames * 64 < reads);
+    try testing.expect(fast.elapsed_ns < 2000 * ms);
+
+    // A debug-speed parser: 5 MB/s. Frames still track the interval, and the
+    // flood spends no more than about half its time drawing.
+    const slow = try simulateFlood(total, chunk, 200, 30 * ms);
+    try testing.expectEqual(@as(usize, total), slow.consumed);
+    try testing.expect(!slow.owed);
+    try testing.expect(slow.frames <= @as(u64, @intCast(@divTrunc(slow.elapsed_ns, 30 * ms))) + 2);
+    try testing.expect(slow.frames * 4 < reads);
+    try testing.expect(slow.drawing_ns * 2 <= slow.elapsed_ns + 30 * ms);
+
+    // A tiny burst still draws exactly once, as soon as it is drained.
+    const burst = try simulateFlood(100, chunk, 10, 30 * ms);
+    try testing.expectEqual(@as(usize, 100), burst.consumed);
+    try testing.expectEqual(@as(u64, 1), burst.frames);
 }

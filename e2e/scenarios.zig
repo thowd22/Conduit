@@ -190,6 +190,28 @@ const context_menu_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-72: a multi-megabyte burst of output must drain at parser speed
+// rather than one PTY read per frame. The 4 MB of records overwrite one row
+// with carriage returns, so the run measures the drain and frame pacing rather
+// than how fast a Debug engine scrolls (it verifies its page list on every
+// scroll). Before the fix this took about 13 s in a ReleaseSafe build at
+// 1000x640 for 40 MB; after it, about 1.4 s. The marker is built by the shell
+// at run time, so the echoed command line (which contains `FLOOD_$((1+1))_DONE`)
+// cannot satisfy the wait: only the shell finishing the flood and then running
+// `echo` can.
+const output_flood_marker = "FLOOD_2_DONE";
+const output_flood_command =
+    "yes 0123456789abcdef | tr '\\n' '\\r' | head -c 4000000; echo; echo FLOOD_$((1+1))_DONE";
+
+const output_flood_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .type_text = output_flood_command },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = output_flood_marker, .timeout_ms = 20_000 } },
+    .inspect,
+    .screenshot,
+};
+
 /// All scenarios in deterministic execution and report order.
 pub const all = [_]Scenario{
     .{
@@ -216,6 +238,11 @@ pub const all = [_]Scenario{
         .name = "terminal-file-reference",
         .command = terminal_file_reference_command,
         .steps = &terminal_file_reference_steps,
+    },
+    .{
+        .name = "output-flood",
+        .command = deterministic_shell,
+        .steps = &output_flood_steps,
     },
     .{
         .name = "context-menu",
@@ -329,6 +356,23 @@ test "context menu scenario right-clicks the terminal pane and activates the sea
         .wait_element => |wait| {
             try std.testing.expectEqualStrings("context-menu", wait.id);
             try std.testing.expect(!wait.equals);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "output flood scenario waits for a marker the typed command cannot echo" {
+    const scenario = all[5];
+    try std.testing.expectEqualStrings("output-flood", scenario.name);
+    try std.testing.expect(std.mem.indexOf(u8, output_flood_command, output_flood_marker) == null);
+    switch (scenario.steps[1]) {
+        .type_text => |text| try std.testing.expectEqualStrings(output_flood_command, text),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (scenario.steps[3]) {
+        .wait_terminal_text => |wait| {
+            try std.testing.expectEqualStrings(output_flood_marker, wait.contains);
+            try std.testing.expect(wait.timeout_ms <= 20_000);
         },
         else => return error.TestUnexpectedResult,
     }

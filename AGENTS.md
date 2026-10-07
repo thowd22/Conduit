@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its six declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its seven declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -257,6 +257,18 @@ non-fatal); `.github/scripts/check-x11-window-icon.sh` proves under Xvfb that th
 `_NET_WM_ICON` is 64x64 and matches the fixture pixel for pixel, and it runs in the Linux gate.
 Wayland has no window-icon property, so the desktop entry supplies the icon there; native macOS
 and Windows window icons are unverified.
+
+TASK-72 (in progress) separates draining from drawing. When a session asks for service,
+`App.run` drains child output in a bounded loop of 16 KiB pump passes under
+`workspace.DrainBudget.per_wake` (4 MiB or 8 ms, whichever comes first), then decides whether to
+draw with `FramePacer`: while output keeps arriving, frames are coalesced to at most one per
+max(16 ms, last frame's cost), and the moment output stops an owed frame is drawn at once. The
+test driver is polled on every iteration, an owed frame is drawn before the loop exits, and an
+idle window still blocks in SDL and draws nothing. A 40 MB carriage-return flood dropped from
+12.7 s to 1.4 s in ReleaseSafe, and the scripted `output-flood` E2E scenario covers the path.
+Newline-heavy floods (`seq 1 200000`) remain engine-bound: each LF costs about 75 µs inside
+`Terminal.feed` in ReleaseSafe, and Debug adds Ghostty's per-scroll page-list integrity checks.
+TASK-72 stays open on that cost.
 
 TASK-36 is complete. Command+F on macOS or Ctrl+Shift+F on Linux/Windows opens an inline semantic
 `Input`; named actions and clickable controls provide next/previous navigation plus case and regex
