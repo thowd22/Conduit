@@ -387,6 +387,35 @@ const font_picker_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-41: the settings view opened from the palette by keyboard (Down moves
+// the highlight over the Fonts heading, Escape closes) and by mouse (the
+// sidebar hint, the typed command, a clicked bool row that toggles and saves
+// while the dialog stays open). The launch's private config directory holds
+// the file the click writes.
+const settings_bool_row = "settings.row.font.ligatures";
+
+const settings_view_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "settings" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "settings.dialog", .state = "exists", .equals = true } },
+    .{ .key = "DOWN" },
+    .screenshot,
+    .{ .key = "ESCAPE" },
+    .{ .wait_element = .{ .id = "settings.dialog", .state = "exists", .equals = false } },
+    .{ .click = "sidebar.palette" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "settings" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = settings_bool_row, .state = "exists", .equals = true } },
+    .{ .click = settings_bool_row },
+    .{ .wait_element = .{ .id = "settings.dialog", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "settings.error", .state = "exists", .equals = false } },
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -448,6 +477,11 @@ pub const all = [_]Scenario{
         .name = "font-picker",
         .command = deterministic_shell,
         .steps = &font_picker_steps,
+    },
+    .{
+        .name = "settings-view",
+        .command = deterministic_shell,
+        .steps = &settings_view_steps,
     },
 };
 
@@ -645,4 +679,43 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
         },
         else => {},
     };
+}
+
+test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
+    const scenario = all[12];
+    try std.testing.expectEqualStrings("settings-view", scenario.name);
+    try std.testing.expectEqual(@as(usize, 13), all.len);
+    var saw_dialog = false;
+    var saw_down = false;
+    var saw_escape = false;
+    var saw_hint = false;
+    var clicked_row = false;
+    var screenshots: usize = 0;
+    for (scenario.steps, 0..) |step, index| switch (step) {
+        .wait_element => |wait| if (std.mem.eql(u8, wait.id, "settings.dialog") and wait.equals) {
+            saw_dialog = true;
+        },
+        .key => |key| {
+            if (std.mem.eql(u8, key, "DOWN")) saw_down = true;
+            if (std.mem.eql(u8, key, "ESCAPE")) saw_escape = true;
+        },
+        .click => |id| {
+            if (std.mem.eql(u8, id, "sidebar.palette")) saw_hint = true;
+            if (std.mem.eql(u8, id, settings_bool_row)) {
+                clicked_row = true;
+                // The dialog is still there after the click toggled the row.
+                switch (scenario.steps[index + 1]) {
+                    .wait_element => |wait| {
+                        try std.testing.expectEqualStrings("settings.dialog", wait.id);
+                        try std.testing.expect(wait.equals);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            }
+        },
+        .screenshot => screenshots += 1,
+        else => {},
+    };
+    try std.testing.expect(saw_dialog and saw_down and saw_escape and saw_hint and clicked_row);
+    try std.testing.expectEqual(@as(usize, 2), screenshots);
 }
