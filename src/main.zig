@@ -2630,6 +2630,44 @@ fn preeditCellWidth(text: []const u8) ?u32 {
     return width;
 }
 
+/// Terminal cells `text` occupies. Invalid UTF-8 counts one cell per byte so
+/// a malformed label can never under-size its row.
+fn labelCellWidth(text: []const u8) u32 {
+    const view = std.unicode.Utf8View.init(text) catch return @intCast(@min(text.len, std.math.maxInt(u32)));
+    var codepoints: [64]u21 = undefined;
+    var count: usize = 0;
+    var width: u32 = 0;
+    var iterator = view.iterator();
+    while (true) {
+        const next = iterator.nextCodepoint();
+        if (next) |codepoint| {
+            if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint < 0xa0)) continue;
+            codepoints[count] = codepoint;
+            count += 1;
+            if (count < codepoints.len) continue;
+        }
+        // Measure whole buffers; a grapheme split across two buffers is
+        // measured as two, which only ever over-sizes a row.
+        var index: usize = 0;
+        while (index < count) {
+            const measured = term.graphemeWidth(codepoints[index..count]);
+            width +|= measured.width;
+            index += @max(measured.len, 1);
+        }
+        count = 0;
+        if (next == null) break;
+    }
+    return width;
+}
+
+/// One sidebar footer row with `label` centred in the content columns. A
+/// label wider than the content starts at the first column and clips.
+fn centeredFooterRow(label: []const u8, content_width: u32, y: u32) ui.Rect {
+    const cells = labelCellWidth(label);
+    if (cells >= content_width) return .{ .x = 1, .y = y, .width = content_width, .height = 1 };
+    return .{ .x = 1 + (content_width - cells) / 2, .y = y, .width = cells, .height = 1 };
+}
+
 fn utf8Boundary(text: []const u8, offset: usize) bool {
     if (offset > text.len) return false;
     return std.unicode.utf8ValidateSlice(text[0..offset]);
@@ -3005,6 +3043,8 @@ const App = struct {
     workspace_semantic_storage: [sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
     tab_semantic_storage: [sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
     tab_rename_semantic_storage: [workspace_semantic_capacity]u8 = undefined,
+    /// Backs the sidebar `Palette  <chord>` hint label until the frame is drawn.
+    sidebar_palette_label_storage: [128]u8 = undefined,
     pane_semantic_storage: [sidebar_element_capacity][pane_semantic_capacity]u8 = undefined,
     divider_semantic_storage: [sidebar_element_capacity][pane_semantic_capacity]u8 = undefined,
     divider_visual_storage: [sidebar_element_capacity][pane_semantic_capacity + 7]u8 = undefined,
@@ -3061,6 +3101,9 @@ const App = struct {
     palette_query: ui.Input,
     palette_argument: ui.Input,
     palette_step: PaletteStep = .closed,
+    /// Cells of the widest palette row, prompt or title; measured when the
+    /// palette opens so the dialog never clips a row the window can show.
+    palette_content_width: u32 = 0,
     palette_pointer_owned: bool = false,
     /// The `mouse.right_click` setting resolved through `config.Layer` at
     /// startup: the built-in `menu` unless `--right-click=` supplied a
@@ -4698,7 +4741,8 @@ const App = struct {
         if (!self.paletteVisible()) return null;
         const canvas = self.ui_canvas.bounds();
         if (canvas.width < 20 or canvas.height < 5) return null;
-        const width = @min(@as(u32, 64), canvas.width - 4);
+        // Two border and two padding columns around the widest row.
+        const width = @min(canvas.width - 4, @max(@as(u32, 40), self.palette_content_width +| 4));
         const wanted_height: u32 = switch (self.palette_step) {
             .closed => return null,
             .commands => @intCast(@min(self.palette_model.results().len, palette_visible_rows) + 4),
@@ -5595,10 +5639,11 @@ const App = struct {
 
             const content_width: u32 = if (origin > 2) origin - 2 else 0;
             if (content_width != 0 and canvas_bounds.height > 2) {
-                const footer_rows: u32 = 13;
+                // Palette hint and version, plus the transient status line
+                // above them while one is shown.
+                const footer_rows: u32 = if (self.workspace_status != null) 4 else 3;
                 const list_limit = canvas_bounds.height -| (footer_rows + 1);
                 const active_key = self.workspace_registry.activeKey();
-                var active_workspace_semantic: ?[]const u8 = null;
                 var workspace_storage_index: usize = 0;
                 var tab_storage_index: usize = 0;
                 var row: u32 = 1;
@@ -5612,7 +5657,6 @@ const App = struct {
                     workspace_storage_index += 1;
                     const workspace_id: ui.Id = .{ .value = semantic };
                     const selected = active_key != null and active_key.? == key;
-                    if (selected) active_workspace_semantic = semantic;
                     try self.ui_tree.addInteractiveText(.{
                         .id = workspace_id,
                         .parent = .{ .value = "sidebar" },
@@ -5687,69 +5731,6 @@ const App = struct {
                 }
 
                 if (canvas_bounds.height > footer_rows + 1) {
-                    const workspace_controls = [_]struct {
-                        id: []const u8,
-                        label: []const u8,
-                        action: []const u8,
-                        row: u32,
-                    }{
-                        .{ .id = "workspaces.new", .label = "+ workspace", .action = workspace_create_action, .row = canvas_bounds.height - 14 },
-                        .{ .id = "workspaces.rename", .label = "rename workspace", .action = workspace_rename_action, .row = canvas_bounds.height - 13 },
-                        .{ .id = "workspaces.switch", .label = "switch workspace", .action = workspace_switch_action, .row = canvas_bounds.height - 12 },
-                        .{ .id = "workspaces.close", .label = "close workspace", .action = workspace_close_action, .row = canvas_bounds.height - 11 },
-                    };
-                    for (workspace_controls) |control| {
-                        const control_id: ui.Id = .{ .value = control.id };
-                        try self.ui_tree.addInteractiveText(.{
-                            .id = control_id,
-                            .parent = .{ .value = "sidebar" },
-                            .role = "workspace_action",
-                            .label = control.label,
-                            .action = control.action,
-                            .bounds = .{ .x = 1, .y = control.row, .width = content_width, .height = 1 },
-                        }, .{
-                            .id = control_id,
-                            .label = control.label,
-                            .action = control.action,
-                            .normal = .{ .foreground = .bright_black },
-                            .hovered = .{ .foreground = .bright_white, .underline = .accent },
-                            .focused = .{ .foreground = .black, .background = .accent },
-                        });
-                    }
-
-                    const parent_id: ui.Id = .{ .value = active_workspace_semantic orelse "sidebar" };
-                    const tab_controls = [_]struct {
-                        id: []const u8,
-                        label: []const u8,
-                        action: []const u8,
-                        bounds: ui.Rect,
-                    }{
-                        .{ .id = "tabs.new", .label = "+ new tab", .action = tab_new_action, .bounds = .{ .x = 1, .y = canvas_bounds.height - 10, .width = content_width, .height = 1 } },
-                        .{ .id = "tabs.rename", .label = "rename", .action = tab_rename_action, .bounds = .{ .x = 1, .y = canvas_bounds.height - 9, .width = content_width, .height = 1 } },
-                        .{ .id = "tabs.close", .label = "close", .action = tab_close_action, .bounds = .{ .x = 1, .y = canvas_bounds.height - 8, .width = content_width, .height = 1 } },
-                        .{ .id = "tabs.move-up", .label = "up", .action = tab_move_action, .bounds = .{ .x = 1, .y = canvas_bounds.height - 7, .width = @min(content_width, 4), .height = 1 } },
-                        .{ .id = "tabs.move-down", .label = "down", .action = tab_move_action, .bounds = .{ .x = @min(content_width, 6), .y = canvas_bounds.height - 7, .width = content_width -| @min(content_width, 6), .height = 1 } },
-                    };
-                    for (tab_controls) |control| {
-                        if (control.bounds.width == 0) continue;
-                        const control_id: ui.Id = .{ .value = control.id };
-                        try self.ui_tree.addInteractiveText(.{
-                            .id = control_id,
-                            .parent = parent_id,
-                            .role = "tab_action",
-                            .label = control.label,
-                            .action = control.action,
-                            .bounds = control.bounds,
-                        }, .{
-                            .id = control_id,
-                            .label = control.label,
-                            .action = control.action,
-                            .normal = .{ .foreground = .bright_black },
-                            .hovered = .{ .foreground = .bright_white, .underline = .accent },
-                            .focused = .{ .foreground = .black, .background = .accent },
-                        });
-                    }
-
                     if (self.workspace_status) |status| {
                         const runs = [_]ui.Run{.{
                             .text = status,
@@ -5760,39 +5741,53 @@ const App = struct {
                             .parent = .{ .value = "sidebar" },
                             .role = "status",
                             .label = status,
-                            .bounds = .{ .x = 1, .y = canvas_bounds.height - 6, .width = content_width, .height = 1 },
+                            .bounds = .{ .x = 1, .y = canvas_bounds.height - 4, .width = content_width, .height = 1 },
                         }, .{ .runs = &runs });
                     }
 
-                    const pane_controls = [_]struct {
-                        id: []const u8,
-                        label: []const u8,
-                        action: []const u8,
-                        bounds: ui.Rect,
-                    }{
-                        .{ .id = "panes.split-right", .label = "split right", .action = pane_split_action, .bounds = .{ .x = 1, .y = canvas_bounds.height - 5, .width = content_width, .height = 1 } },
-                        .{ .id = "panes.split-down", .label = "split down", .action = pane_split_action, .bounds = .{ .x = 1, .y = canvas_bounds.height - 4, .width = content_width, .height = 1 } },
-                        .{ .id = "panes.zoom", .label = "zoom", .action = pane_zoom_action, .bounds = .{ .x = 1, .y = canvas_bounds.height - 3, .width = content_width, .height = 1 } },
-                        .{ .id = "panes.close", .label = "close pane", .action = pane_close_action, .bounds = .{ .x = 1, .y = canvas_bounds.height - 2, .width = content_width, .height = 1 } },
-                    };
-                    for (pane_controls) |control| {
-                        const control_id: ui.Id = .{ .value = control.id };
-                        try self.ui_tree.addInteractiveText(.{
-                            .id = control_id,
-                            .parent = parent_id,
-                            .role = "pane_action",
-                            .label = control.label,
-                            .action = control.action,
-                            .bounds = control.bounds,
-                        }, .{
-                            .id = control_id,
-                            .label = control.label,
-                            .action = control.action,
-                            .normal = .{ .foreground = .bright_black },
-                            .hovered = .{ .foreground = .bright_white, .underline = .accent },
-                            .focused = .{ .foreground = .black, .background = .accent },
-                        });
-                    }
+                    // The footer is the mouse path to every sidebar command:
+                    // the palette lists each one with its chord, so one hint
+                    // replaces a stack of per-action controls.
+                    var chord_storage: [96]u8 = undefined;
+                    const chords = palette_mod.formatActionBindings(
+                        &chord_storage,
+                        palette_open_action,
+                        self.bindings,
+                        self.binding_profile,
+                    );
+                    const hint_label = if (chords.text.len == 0)
+                        "Palette"
+                    else
+                        try std.fmt.bufPrint(&self.sidebar_palette_label_storage, "Palette  {s}", .{chords.text});
+                    const hint_id: ui.Id = .{ .value = "sidebar.palette" };
+                    try self.ui_tree.addInteractiveText(.{
+                        .id = hint_id,
+                        .parent = .{ .value = "sidebar" },
+                        .role = "palette_hint",
+                        .label = hint_label,
+                        .action = palette_open_action,
+                        .bounds = centeredFooterRow(hint_label, content_width, canvas_bounds.height - 3),
+                    }, .{
+                        .id = hint_id,
+                        .label = hint_label,
+                        .action = palette_open_action,
+                        .normal = .{ .foreground = .bright_black },
+                        .hovered = .{ .foreground = .bright_white, .underline = .accent },
+                        .focused = .{ .foreground = .black, .background = .accent },
+                    });
+
+                    const version_label = "v" ++ version;
+                    const version_runs = [_]ui.Run{.{
+                        .text = version_label,
+                        .style = .{ .foreground = .bright_black },
+                    }};
+                    try self.ui_tree.addText(.{
+                        .id = .{ .value = "sidebar.version" },
+                        .parent = .{ .value = "sidebar" },
+                        .role = "version",
+                        .label = version_label,
+                        .bounds = centeredFooterRow(version_label, content_width, canvas_bounds.height - 2),
+                    }, .{ .runs = &version_runs });
                 }
             }
 
@@ -7262,15 +7257,11 @@ const App = struct {
 
     fn targetTab(self: *const App, invocation: inputmod.Invocation) ?workspace.TabId {
         if (invocation.source == .mouse) {
+            // A pointer acts on the tab row it was pressed on, never on
+            // whichever tab happens to be active.
             const origin = invocation.origin orelse return null;
-            if (std.mem.startsWith(u8, origin.value, "workspace.")) {
-                return self.tabIdForSemantic(origin.value);
-            }
-            const active_control = std.mem.eql(u8, origin.value, "tabs.close") or
-                std.mem.eql(u8, origin.value, "tabs.rename") or
-                std.mem.eql(u8, origin.value, "tabs.move-up") or
-                std.mem.eql(u8, origin.value, "tabs.move-down");
-            if (!active_control) return null;
+            if (!std.mem.startsWith(u8, origin.value, "workspace.")) return null;
+            return self.tabIdForSemantic(origin.value);
         }
         return self.activeWorkspaceConst().activeTabId();
     }
@@ -7537,10 +7528,7 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(context));
         const id = self.targetTab(invocation) orelse return;
         const index = self.activeWorkspace().tabIndex(id) orelse return;
-        const direction = argument(invocation, "direction") orelse if (invocation.origin) |origin|
-            if (std.mem.eql(u8, origin.value, "tabs.move-up")) "up" else if (std.mem.eql(u8, origin.value, "tabs.move-down")) "down" else return
-        else
-            return;
+        const direction = argument(invocation, "direction") orelse return;
         const final_index = if (std.mem.eql(u8, direction, "up"))
             index -| 1
         else if (std.mem.eql(u8, direction, "down"))
@@ -7637,10 +7625,7 @@ const App = struct {
             return;
         }
         const focused_pane = self.activeWorkspace().focusedPaneId(tab_id) orelse return;
-        const split_text = argument(invocation, "direction") orelse if (invocation.origin) |origin|
-            if (std.mem.eql(u8, origin.value, "panes.split-right")) "right" else if (std.mem.eql(u8, origin.value, "panes.split-down")) "down" else return
-        else
-            return;
+        const split_text = argument(invocation, "direction") orelse return;
         const split: workspace.PaneSplit = if (std.mem.eql(u8, split_text, "right"))
             .right
         else if (std.mem.eql(u8, split_text, "down"))
@@ -8187,12 +8172,44 @@ const App = struct {
         clearPaletteInput(&self.palette_argument);
         self.palette_model.refresh("");
         self.palette_model.selectFirst();
+        self.palette_content_width = self.paletteContentWidth();
         self.palette_step = .commands;
         self.ui_tree.clearFocus();
         try self.composeUi();
         if (self.ui_tree.focus(.{ .value = "palette.query" })) try self.composeUi();
         try self.syncTextInput();
         self.invalidateUi();
+    }
+
+    /// The widest text any palette step can show: every command row as
+    /// `composePalette` formats it, every choice, every prompt and the title.
+    fn paletteContentWidth(self: *const App) u32 {
+        var widest = labelCellWidth(" Command palette ");
+        for (self.actions.definitions()) |definition| {
+            const command = definition.palette orelse continue;
+            var chord_storage: [96]u8 = undefined;
+            const chords = palette_mod.formatActionBindings(
+                &chord_storage,
+                definition.name,
+                self.bindings,
+                self.binding_profile,
+            );
+            var row = labelCellWidth(definition.label);
+            if (chords.text.len != 0) {
+                row +|= 2 + labelCellWidth(chords.text);
+                if (chords.truncated) row +|= labelCellWidth(" …");
+            }
+            widest = @max(widest, row);
+            switch (command.argument) {
+                .none => {},
+                .input => |argument_meta| widest = @max(widest, labelCellWidth(argument_meta.prompt)),
+                .choices => |argument_meta| {
+                    widest = @max(widest, labelCellWidth(argument_meta.prompt));
+                    for (argument_meta.values) |choice| widest = @max(widest, labelCellWidth(choice.label));
+                },
+            }
+        }
+        return widest;
     }
 
     fn closePalette(self: *App, clear_inputs: bool) !void {
@@ -12653,6 +12670,29 @@ fn clickTabsElement(self: *App, io: Io, out: *Writer, id: []const u8) !bool {
     });
 }
 
+/// Reach a command by mouse the way a person does now that the sidebar has
+/// no per-action controls: click the footer Palette hint, type the command's
+/// label so its row is visible, click that row and, for a fixed-choice
+/// command, click the choice row.
+fn clickPaletteCommand(self: *App, io: Io, out: *Writer, action_name: []const u8, choice_index: ?usize) !bool {
+    if (!try clickTabsElement(self, io, out, "sidebar.palette")) return false;
+    if (!self.paletteVisible() or self.ui_tree.byId(.{ .value = "palette.dialog" }) == null) return false;
+    const index = definitionIndex(self, action_name) orelse return false;
+    const label = self.actions.definitions()[index].label;
+    var query_storage: [palette_label_capacity:0]u8 = undefined;
+    if (label.len > palette_label_capacity) return false;
+    @memcpy(query_storage[0..label.len], label);
+    query_storage[label.len] = 0;
+    if (!try postPaletteText(self, io, out, query_storage[0..label.len :0])) return false;
+    var row_storage: [palette_semantic_capacity]u8 = undefined;
+    const row_id = try std.fmt.bufPrint(&row_storage, "palette.action.{d}", .{index});
+    if (!try clickTabsElement(self, io, out, row_id)) return false;
+    const choice = choice_index orelse return true;
+    var choice_storage: [palette_semantic_capacity]u8 = undefined;
+    const choice_id = try std.fmt.bufPrint(&choice_storage, "palette.choice.{d}.{d}", .{ index, choice });
+    return clickTabsElement(self, io, out, choice_id);
+}
+
 fn dragTabs(self: *App, io: Io, out: *Writer, from_id: []const u8, to_id: []const u8) !bool {
     const from = self.ui_tree.byId(.{ .value = from_id }) orelse return false;
     const to = self.ui_tree.byId(.{ .value = to_id }) orelse return false;
@@ -12687,7 +12727,7 @@ fn tabsTest(self: *App, io: Io, out: *Writer) !u8 {
         try waitForTabs(self, io, out, .{ .element = second_semantic }), "new tab {s} is selected and present in the semantic tree", .{second_semantic});
     tabsCheck(out, &failures, try waitForTabs(self, io, out, .{ .terminal_text = "TAB-PWD:/tmp" }), "the new child really spawned in the originating tab's tracked cwd", .{});
 
-    tabsCheck(out, &failures, try clickTabsElement(self, io, out, "tabs.rename"), "the mouse opened inline rename", .{});
+    tabsCheck(out, &failures, try clickPaletteCommand(self, io, out, tab_rename_action, null), "the mouse opened inline rename", .{});
     tabsCheck(out, &failures, try waitForTabs(self, io, out, .{ .element = rename_semantic }) and
         self.ui_tree.focusedElement() != null and
         std.mem.eql(u8, self.ui_tree.focusedElement().?.id.value, rename_semantic), "rename is a focused semantic Input", .{});
@@ -12751,7 +12791,7 @@ fn tabsTest(self: *App, io: Io, out: *Writer) !u8 {
     tabsCheck(out, &failures, try waitForTabs(self, io, out, .{ .attention = .{ .id = second_id, .value = .bell } }), "a hidden BEL upgraded attention to bell", .{});
     _ = try self.activateTab(second_id);
 
-    tabsCheck(out, &failures, try clickTabsElement(self, io, out, "tabs.close") and
+    tabsCheck(out, &failures, try clickPaletteCommand(self, io, out, tab_close_action, null) and
         try waitForTabs(self, io, out, .{ .element = "tab-close.dialog" }), "closing a running foreground process opened the semantic confirmation", .{});
     const routes_before_modal = self.terminal_key_route_count;
     const queued_before_modal = self.pending_child_bytes.items.len;
@@ -12761,9 +12801,9 @@ fn tabsTest(self: *App, io: Io, out: *Writer) !u8 {
     tabsCheck(out, &failures, self.terminal_key_route_count == routes_before_modal and
         self.pending_child_bytes.items.len == queued_before_modal and self.pending_committed_text.len == 0, "the modal consumed committed and key input instead of leaking it to the terminal", .{});
     const count_before_modal_click = self.activeWorkspace().tabCount();
-    _ = try clickTabsElement(self, io, out, "tabs.new");
+    _ = try clickTabsElement(self, io, out, "sidebar.palette");
     tabsCheck(out, &failures, self.activeWorkspace().tabCount() == count_before_modal_click and
-        self.pending_close_tab_id == second_id, "the modal consumed a pointer click on controls behind it", .{});
+        !self.paletteVisible() and self.pending_close_tab_id == second_id, "the modal consumed a pointer click on controls behind it", .{});
     _ = try postNamedKey(self, io, out, .tab, .{ .shift = true });
     tabsCheck(out, &failures, if (self.ui_tree.focusedElement()) |focused|
         std.mem.eql(u8, focused.id.value, "tab-close.confirm")
@@ -12777,7 +12817,7 @@ fn tabsTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try postNamedKey(self, io, out, .escape, .{});
     tabsCheck(out, &failures, self.pending_close_tab_id == null and self.activeWorkspace().tab(second_id) != null, "Escape cancelled close", .{});
 
-    _ = try clickTabsElement(self, io, out, "tabs.close");
+    _ = try clickPaletteCommand(self, io, out, tab_close_action, null);
     _ = try postNamedKey(self, io, out, .tab, .{});
     _ = try postNamedKey(self, io, out, .enter, .{});
     tabsCheck(out, &failures, self.activeWorkspace().tab(second_id) == null and
@@ -12792,7 +12832,7 @@ fn tabsTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try pumpUntil(self, io, out, .text_input, self_test_event_budget_ms);
     _ = try postNamedKey(self, io, out, .enter, .{});
     tabsCheck(out, &failures, try waitForTabs(self, io, out, .{ .terminal_text = "TAB-ACTIVITY" }), "the visual-fixture child entered a foreground phase", .{});
-    tabsCheck(out, &failures, try clickTabsElement(self, io, out, "tabs.close") and
+    tabsCheck(out, &failures, try clickPaletteCommand(self, io, out, tab_close_action, null) and
         try waitForTabs(self, io, out, .{ .element = "tab-close.dialog" }), "closing the foreground tab presents the confirmation for visual capture", .{});
 
     try self.drawFrame();
@@ -12993,16 +13033,16 @@ fn panesTest(self: *App, io: Io, out: *Writer) !u8 {
     panesCheck(out, &failures, try postNamedKey(self, io, out, .enter, zoom_mods) and
         self.activeWorkspace().tab(tab_id).?.zoomedPaneId() == null and
         self.activeWorkspace().paneSessionId(tab_id, lower_pane) == lower_session, "unzoom restored the same nested sessions", .{});
-    panesCheck(out, &failures, try clickTabsElement(self, io, out, "panes.zoom") and
+    panesCheck(out, &failures, try clickPaletteCommand(self, io, out, pane_zoom_action, null) and
         self.activeWorkspace().tab(tab_id).?.zoomedPaneId() == root_pane and
         self.activeWorkspace().tab(tab_id).?.paneCount() == 3, "the clickable sidebar zoomed the focused pane through the named action", .{});
-    panesCheck(out, &failures, try clickTabsElement(self, io, out, "panes.zoom") and
+    panesCheck(out, &failures, try clickPaletteCommand(self, io, out, pane_zoom_action, null) and
         self.activeWorkspace().tab(tab_id).?.zoomedPaneId() == null and
         self.activeWorkspace().paneSessionId(tab_id, lower_pane) == lower_session, "the clickable sidebar unzoomed without replacing sessions", .{});
 
     var lower_id_buffer: [pane_semantic_capacity]u8 = undefined;
     const lower_id = try paneSemanticId(&lower_id_buffer, self.activePresentation().key, lower_pane);
-    const zoom_element = self.ui_tree.byId(.{ .value = "panes.zoom" }) orelse return error.ElementNotFound;
+    const zoom_element = self.ui_tree.byId(.{ .value = "sidebar.palette" }) orelse return error.ElementNotFound;
     const lower_element = self.ui_tree.byId(.{ .value = lower_id }) orelse return error.ElementNotFound;
     const zoom_point = elementCenter(zoom_element, self.window.state.scale);
     const lower_point = elementCenter(lower_element, self.window.state.scale);
@@ -13012,7 +13052,7 @@ fn panesTest(self: *App, io: Io, out: *Writer) !u8 {
     const released_over_inactive_pane = try postButton(self, io, out, .{ .button = .left, .action = .release, .x = lower_point.x, .y = lower_point.y });
     panesCheck(out, &failures, pressed_zoom and dragged_over_inactive_pane and released_over_inactive_pane and
         trace.sent.items.len == sent_before_ui_drag and
-        self.activeWorkspace().focusedPaneId(tab_id) == root_pane and
+        self.activeWorkspace().focusedPaneId(tab_id) == root_pane and !self.paletteVisible() and
         self.activeWorkspace().tab(tab_id).?.zoomedPaneId() == null, "a sidebar-owned press kept drag motion and release out of the inactive terminal", .{});
 
     _ = try clickTabsElement(self, io, out, lower_id);
@@ -13030,7 +13070,7 @@ fn panesTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try postNamedKey(self, io, out, .escape, .{});
     panesCheck(out, &failures, self.pending_close_pane == null and
         self.activeWorkspace().paneSessionId(tab_id, lower_pane) == lower_session, "Escape cancelled the keyboard-requested close without changing the tree", .{});
-    panesCheck(out, &failures, try clickTabsElement(self, io, out, "panes.close") and
+    panesCheck(out, &failures, try clickPaletteCommand(self, io, out, pane_close_action, null) and
         try waitForPanes(self, io, out, .{ .element = "tab-close.dialog" }) and
         self.pending_close_pane != null, "closing a running pane opened the shared confirmation modal", .{});
     const routes_before_modal = self.terminal_key_route_count;
@@ -13039,21 +13079,22 @@ fn panesTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try postKey(self, io, out, 'x', .{});
     panesCheck(out, &failures, self.terminal_key_route_count == routes_before_modal and self.pending_committed_text.len == 0, "the pane-close modal isolated committed and key input", .{});
     const panes_before_modal_click = self.activeWorkspace().tab(tab_id).?.paneCount();
-    _ = try clickTabsElement(self, io, out, "panes.split-right");
-    panesCheck(out, &failures, self.activeWorkspace().tab(tab_id).?.paneCount() == panes_before_modal_click and self.pending_close_pane != null, "the pane-close modal isolated pointer input", .{});
+    _ = try clickTabsElement(self, io, out, "sidebar.palette");
+    panesCheck(out, &failures, self.activeWorkspace().tab(tab_id).?.paneCount() == panes_before_modal_click and
+        !self.paletteVisible() and self.pending_close_pane != null, "the pane-close modal isolated pointer input", .{});
     const viewport_before_modal_wheel = self.activeLive().terminal().viewport().offset;
     _ = try postWheelEvent(self, io, out, 3);
     panesCheck(out, &failures, self.activeLive().terminal().viewport().offset == viewport_before_modal_wheel, "the pane-close modal isolated wheel input", .{});
     _ = try postNamedKey(self, io, out, .escape, .{});
     panesCheck(out, &failures, self.pending_close_pane == null and self.activeWorkspace().paneSessionId(tab_id, lower_pane) == lower_session, "Escape cancelled pane close without changing the tree", .{});
 
-    _ = try clickTabsElement(self, io, out, "panes.close");
+    _ = try clickPaletteCommand(self, io, out, pane_close_action, null);
     _ = try postNamedKey(self, io, out, .tab, .{});
     _ = try postNamedKey(self, io, out, .enter, .{});
     panesCheck(out, &failures, self.activeWorkspace().paneSessionId(tab_id, lower_pane) == null and
         self.activeWorkspace().tab(tab_id).?.paneCount() == 2 and self.activePresentation().pane_renderers.items.len == 2, "confirmation closed the pane, renderer and session and rebalanced its sibling", .{});
 
-    panesCheck(out, &failures, try clickTabsElement(self, io, out, "panes.close") and
+    panesCheck(out, &failures, try clickPaletteCommand(self, io, out, pane_close_action, null) and
         self.activeWorkspace().tab(tab_id).?.paneCount() == 1 and
         self.activeWorkspace().focusedPaneSessionId(tab_id) == root_session and
         self.activePresentation().active_session_id == root_session and self.ui_tree.focusedElement() == null and
@@ -13062,12 +13103,12 @@ fn panesTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try pumpUntil(self, io, out, .text_input, self_test_event_budget_ms);
     _ = try postNamedKey(self, io, out, .enter, .{});
     panesCheck(out, &failures, try waitForPanes(self, io, out, .{ .session_text = .{ .id = root_session, .text = "final-busy" } }), "the final pane entered a foreground phase before close", .{});
-    _ = try clickTabsElement(self, io, out, "panes.close");
+    _ = try clickPaletteCommand(self, io, out, pane_close_action, null);
     panesCheck(out, &failures, self.pending_close_tab_id == tab_id and self.pending_close_pane == null, "closing the final pane delegated to the tab close policy", .{});
     _ = try postNamedKey(self, io, out, .escape, .{});
     panesCheck(out, &failures, self.activeWorkspace().tab(tab_id).?.paneCount() == 1 and !self.requested_shutdown, "cancelling final-pane close left the tab usable", .{});
 
-    const mouse_split = try clickTabsElement(self, io, out, "panes.split-right");
+    const mouse_split = try clickPaletteCommand(self, io, out, pane_split_action, 0);
     const final_right_session = self.activeWorkspace().focusedPaneSessionId(tab_id) orelse return error.SessionNotFound;
     panesCheck(out, &failures, mouse_split and
         final_right_session != root_session and
@@ -13639,7 +13680,7 @@ fn workspacesTest(self: *App, io: Io, out: *Writer) !u8 {
         .text = "WORKSPACE-SECOND-READY",
     } }), "the created workspace terminal accepted input through its independent shell", .{});
 
-    workspacesCheck(out, &failures, try clickTabsElement(self, io, out, "panes.split-right"), "the sidebar created a persistent pane layout in the second workspace", .{});
+    workspacesCheck(out, &failures, try clickPaletteCommand(self, io, out, pane_split_action, 0), "the sidebar created a persistent pane layout in the second workspace", .{});
     const second_tab_id = self.activeWorkspace().activeTabId() orelse return 1;
     const split_pane = self.activeWorkspace().focusedPaneId(second_tab_id) orelse return 1;
     const split_session = self.activePresentation().active_session_id;
@@ -13692,7 +13733,7 @@ fn workspacesTest(self: *App, io: Io, out: *Writer) !u8 {
         } }), "palette switching restored the first terminal and its same 50 percent scratchpad", .{});
 
     _ = try scratchpadChord(self, io, out, false);
-    const duplicate_opened = try clickTabsElement(self, io, out, "workspaces.new");
+    const duplicate_opened = try clickPaletteCommand(self, io, out, workspace_create_action, null);
     workspacesCheck(out, &failures, duplicate_opened and self.palette_step == .input, "the clickable sidebar Create workspace control opened its input", .{});
     if (!duplicate_opened) return 1;
     _ = try postPaletteText(self, io, out, "/tmp/");
@@ -13705,7 +13746,7 @@ fn workspacesTest(self: *App, io: Io, out: *Writer) !u8 {
         (self.activeLive().child() orelse return 1).ptr == split_child.ptr, "creating an already-open cwd activated it without duplication and restored its pane layout", .{});
     _ = try scratchpadChord(self, io, out, true);
 
-    const rename_opened = try clickTabsElement(self, io, out, "workspaces.rename");
+    const rename_opened = try clickPaletteCommand(self, io, out, workspace_rename_action, null);
     workspacesCheck(out, &failures, rename_opened and self.palette_step == .input, "the clickable sidebar Rename workspace control opened its input", .{});
     if (!rename_opened) return 1;
     _ = try postPaletteText(self, io, out, "secondary");
@@ -13719,7 +13760,7 @@ fn workspacesTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try postNamedKey(self, io, out, .enter, .{});
     workspacesCheck(out, &failures, self.workspace_registry.keyForName("renamed") == second_key, "palette rename updated the same stable workspace key", .{});
 
-    const sidebar_switch_opened = try clickTabsElement(self, io, out, "workspaces.switch");
+    const sidebar_switch_opened = try clickPaletteCommand(self, io, out, workspace_switch_action, null);
     workspacesCheck(out, &failures, sidebar_switch_opened and self.palette_step == .input, "the clickable sidebar Switch workspace control opened its input", .{});
     if (!sidebar_switch_opened) return 1;
     _ = try postPaletteText(self, io, out, "default");
@@ -13789,11 +13830,11 @@ fn workspacesTest(self: *App, io: Io, out: *Writer) !u8 {
     } }) and try waitForWorkspaces(self, io, out, .{ .settled = second_key }), "all terminal and scratchpad output was quiescent before teardown", .{});
     workspacesCheck(out, &failures, second_model.registeredSessionCount() == 3 and second_model.hasAttachedChild(), "the close target still owned two terminals and one scratchpad PTY", .{});
 
-    _ = try clickTabsElement(self, io, out, "workspaces.close");
+    _ = try clickPaletteCommand(self, io, out, workspace_close_action, null);
     workspacesCheck(out, &failures, self.pending_close_workspace == second_key, "the clickable sidebar Close workspace control opened confirmation", .{});
     _ = try clickTabsElement(self, io, out, "workspace-close.cancel");
     workspacesCheck(out, &failures, self.pending_close_workspace == null and self.workspace_registry.byKey(second_key) != null, "pointer cancel retained every workspace process", .{});
-    _ = try clickTabsElement(self, io, out, "workspaces.close");
+    _ = try clickPaletteCommand(self, io, out, workspace_close_action, null);
     _ = try clickTabsElement(self, io, out, "workspace-close.confirm");
     workspacesCheck(out, &failures, try waitForWorkspaces(self, io, out, .{ .removed = second_key }) and
         self.workspace_registry.count() == 1 and self.workspace_registry.activeKey().? == first_key and

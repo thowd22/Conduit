@@ -221,6 +221,31 @@ const output_flood_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-74: the sidebar footer's only control is the centred `Palette <chord>`
+// hint. Clicking it through the real pointer path must open the command
+// palette with its query focused, which is the mouse route to every sidebar
+// command the footer used to list.
+const sidebar_palette_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .wait_element = .{
+        .id = "sidebar.version",
+        .state = "exists",
+        .equals = true,
+    } },
+    .{ .click = "sidebar.palette" },
+    .{ .wait_element = .{
+        .id = "palette.dialog",
+        .state = "exists",
+        .equals = true,
+    } },
+    .{ .wait_element = .{
+        .id = "palette.query",
+        .state = "focused",
+        .equals = true,
+    } },
+    .screenshot,
+};
+
 // TASK-73: a Local child inherits the environment Conduit was launched with.
 // The runner sets a profile-style export, a stand-in agent socket and both
 // conduit-test addressing variables for the launch only; the app inherits
@@ -304,6 +329,11 @@ pub const all = [_]Scenario{
         .launch_env = &child_environment_launch_env,
         .command = child_environment_command,
         .steps = &child_environment_steps,
+    },
+    .{
+        .name = "sidebar-palette",
+        .command = deterministic_shell,
+        .steps = &sidebar_palette_steps,
     },
 };
 
@@ -444,4 +474,25 @@ test "child environment scenario waits only on values the child expanded" {
         .wait_terminal_text => |wait| try std.testing.expect(std.mem.indexOf(u8, scenario.command, wait.contains) == null),
         else => {},
     };
+}
+
+test "sidebar palette scenario clicks the footer hint and waits for the focused query" {
+    const scenario = all[8];
+    try std.testing.expectEqualStrings("sidebar-palette", scenario.name);
+    switch (scenario.steps[2]) {
+        .click => |id| try std.testing.expectEqualStrings("sidebar.palette", id),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (scenario.steps[3]) {
+        .wait_element => |wait| try std.testing.expectEqualStrings("palette.dialog", wait.id),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (scenario.steps[4]) {
+        .wait_element => |wait| {
+            try std.testing.expectEqualStrings("palette.query", wait.id);
+            try std.testing.expectEqualStrings("focused", wait.state);
+            try std.testing.expect(wait.equals);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

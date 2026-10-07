@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its eight declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its nine declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -160,8 +160,8 @@ terminal/input isolation, restart, and the clickable restart/hide controls throu
 SDL events. TASK-33 completes multiple workspaces: `workspace.WorkspaceRegistry` owns ordered, heap-stable
 workspace records under monotonic non-reused keys, while `app` owns one presentation bundle per
 record and routes terminal, pane, scratchpad and asynchronous spawn state through the active
-workspace. The sidebar and palette expose named create, rename, switch and confirmed-close
-actions; closing tears down that workspace's tabs, sessions and scratchpad, and closing the last
+workspace. The palette exposes named create, rename, switch and confirmed-close
+actions (the sidebar's footer control rows were removed by TASK-74); closing tears down that workspace's tabs, sessions and scratchpad, and closing the last
 workspace requests normal shutdown. Its checked-in deterministic `--workspaces-test` drives two
 real workspaces through SDL events, the action registry, semantic rows and real PTYs, checking
 independent terminals, pane layouts, scratchpads, switching, rename, close cancellation and
@@ -297,6 +297,22 @@ inherits; remote contexts supply their own". The eighth `zig build e2e` scenario
 `child-environment`, sets a probe variable, a stand-in SSH_AUTH_SOCK and both `conduit-test`
 addressing variables for `launch` only, and the child must show the probe, the agent socket, a
 display, the isolated HOME layout, unset driver addressing and Conduit's identity.
+
+TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
+`tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
+`Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
+Linux/Windows, Cmd+Shift+P on macOS) that dispatches `palette.open`, with the stamped version
+(`sidebar.version`, `v<semver>` or `v0.0.0-dev`) centred on the row beneath it. A label wider than
+the sidebar clips from the first column and never wraps. The transient `workspace.status` line, when
+present, sits above the hint. The palette is the mouse path to every command the controls listed,
+so the `--tabs-test`, `--panes-test` and `--workspaces-test` mouse paths click the hint and then a
+`palette.action.<n>` (and `palette.choice.<n>.<c>`) row, and their modal-isolation checks click the
+hint behind the modal and assert the palette stayed closed. The palette dialog no longer has a
+fixed 64-column width: `openPalette` measures the widest row it can show (title, every
+palette-visible label plus its chords, every prompt and choice label, in display cells) and the
+dialog is that width plus four, at least 40 columns, clamped to the window; rows clip only when the
+window itself is too narrow. The ninth scripted scenario `sidebar-palette` clicks the hint through
+`conduit-test click` and waits for `palette.dialog` and the focused `palette.query`.
 
 TASK-36 is complete. Command+F on macOS or Ctrl+Shift+F on Linux/Windows opens an inline semantic
 `Input`; named actions and clickable controls provide next/previous navigation plus case and regex

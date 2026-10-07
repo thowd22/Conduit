@@ -155,7 +155,12 @@ nothing else is a legal dependency.
   including a pane activation deferred by that debt, so no later event leaks to the old terminal.
 - **Palette actions.** `palette.open` presents a centered semantic `Surface` with a query `Input`
   and clickable `InteractiveText` rows for every registry definition whose palette metadata is
-  present. Command+Shift+P binds it on macOS; Ctrl+Shift+P binds it on Linux and Windows. Arrow
+  present. Command+Shift+P binds it on macOS; Ctrl+Shift+P binds it on Linux and Windows, and the
+  sidebar footer's centred `sidebar.palette` hint (`Palette  <chord>`, TASK-74) dispatches it by
+  mouse. The dialog sizes itself to its content: `openPalette` measures the widest title, command
+  row (label plus formatted chords), prompt or choice label in display cells, and `paletteBounds`
+  uses that width plus four columns, at least 40, clamped to the canvas, so rows are never wrapped
+  and clip only when the window is narrower than the text. Arrow
   keys or Tab move selection, Enter or a row click dispatches through the same action registry,
   and Escape or an outside click closes it. Fixed-choice and free-text argument metadata open a
   nested modal step before dispatch. `palette.dialog`, `palette.query`, indexed command/choice
@@ -171,7 +176,8 @@ nothing else is a legal dependency.
   none leak to the panes behind it.
 - **Workspace actions.** `workspace.create`, `workspace.rename`, `workspace.switch` and
   `workspace.close` are palette-visible commands, while sidebar rows dispatch
-  `workspace.activate` and the confirmation surface dispatches `workspace.close.confirm` or
+  `workspace.activate` (the per-action footer controls were removed by TASK-74; the footer is the
+  `Palette <chord>` hint over a centred `sidebar.version` line) and the confirmation surface dispatches `workspace.close.confirm` or
   `workspace.close.cancel`. Create accepts a directory, activates an existing workspace for the
   same normalized directory, or starts an independent terminal and reserved scratchpad through
   the new workspace's `ExecutionContext`. Every pane, divider, tab and scratchpad semantic id is

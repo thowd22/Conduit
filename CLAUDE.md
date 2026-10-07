@@ -16,7 +16,7 @@ tree identify the failure.
 The implemented deterministic app checks are `xvfb-run -a zig build run -- --ui-test`, the same
 command with `--ime-test`, `--menu-test` and the other `--*-test` flags listed in `AGENTS.md`, and
 the same command with `--driver-test`. The aggregated `zig build e2e` scenario runner exists and
-runs six scripted scenarios under a display such as Xvfb with an explicit private
+runs nine scripted scenarios under a display such as Xvfb with an explicit private
 `--artifact-dir`; its Linux CI acceptance (TASK-25) still needs a remote Actions run.
 
 The project `.mcp.json` exposes the same surface through `conduit-test mcp` after Claude Code's
