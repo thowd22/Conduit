@@ -36,7 +36,8 @@ guessed at.
 Conduit/
 ├── .github/workflows/
 │   └── linux-e2e.yml    checked-in TASK-25 Linux gate; remote acceptance evidence pending
-├── build.zig            root build: modules, deps, install/run/test/font-check steps
+├── build.zig            root build: modules, deps, install/run/test/font-check/bench steps
+├── bench/               TASK-67 benchmark programs, runner and budgets (docs/performance.md)
 ├── build.zig.zon        pinned deps: ghostty @5dc28bb8, SDL, zopengl
 ├── e2e/
 │   ├── runner.zig       isolated scripted-scenario runner and artifact collector
@@ -514,6 +515,10 @@ nothing else is a legal dependency.
   source used only by the search boundary.
 - **(convention)** `term` is the *only* module that imports `ghostty-vt`. `input` takes key and
   mouse encoding from `term`, so the third-party module never appears in two import tables.
+- **Performance** (TASK-67, `docs/performance.md`): `feed` adds nothing measurable on top of the
+  engine (plain lines about 94 MiB/s, SGR-heavy 54 MiB/s, carriage-return floods over 1 GiB/s at
+  ReleaseSafe on the reference machine); `zig build bench` measures it through `term` alone and
+  with frames, and `bench-check` holds it to budgets.
 - **Lands** M0 — TASK-2 (the boundary); M1 — TASK-9 (state wired to the PTY); partial M3 —
   TASK-34 (OSC 8 metadata), TASK-36 (literal and regex search).
 
@@ -556,6 +561,11 @@ nothing else is a legal dependency.
   on the same row (`SmallRun`), then drawn in a fourth instanced pass over the small texture.
   Without a small face the cell draws at the normal size. TASK-77: `OverlayCell.offset_y_px`
   moves a cell down by whole device pixels, the same shift `ui` applied to its element's bounds.
+- **Performance** (TASK-67, `docs/performance.md`): a full redraw of 1 to 9 panes at 1920x1080
+  costs 4.4 to 7.5 ms on the calling thread on llvmpipe, of which Conduit's own staging is about
+  a third and the rest the driver; a frame with one changed row costs about 0.1 ms. The glyph
+  atlas is sized by the app, not here, and at display scale 2 a screen of distinct CJK glyphs can
+  outgrow the app's 1024x1024 atlas (see that document's known limit).
 - **Never** own product or layout state; it draws terminal cells or UI primitives supplied by
   callers. Never call SDL event or window functions (those are `platform`'s). Never block on IO.
 - **May depend on** `font` (glyphs), `platform` (window and context), `term` (terminal cells and
@@ -593,6 +603,9 @@ nothing else is a legal dependency.
   non-colour file FreeType reports fixed-width that maps `M` and `0` — sorted, de-duplicated
   case-insensitively and bounded, borrowing the catalog's strings. `Manager.configuredFallbackCount`,
   `builtinSymbols` and `styleFamilyName` let the app and its checks observe the request's effect.
+  TASK-67: `Atlas.find` and slot reuse read a key-to-slot hash index rather than scanning every
+  slot, and the free-rectangle allocator cuts along the shorter leftover so columns keep their
+  width under varying glyph sizes (`docs/performance.md`).
 - **Never** know about sessions, workspaces, agents or UI (`AGENTS.md`). Never draw anything
   itself. Never let a missing glyph turn a terminal into boxes (CONDUIT.md §8).
 - **May depend on** no other Conduit module, plus the external FreeType and HarfBuzz seam.
