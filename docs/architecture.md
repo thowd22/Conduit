@@ -369,6 +369,11 @@ nothing else is a legal dependency.
   every product view is composed above it (P4).
 - **May depend on** `term` and `render` (`AGENTS.md`, module layout), plus `font` for glyphs and
   `theme` for colours.
+- **Colours are roles.** A primitive's style names `theme.Role`s, never colour values; the canvas
+  resolves them against the palette the caller passes to `Canvas.view` at projection time, so a
+  theme change or a picker preview recolours every element without recomposing it. Chrome uses
+  the derived roles (`strong`, `muted`, `border`, `attention`, `danger`, `on_accent`, `field`,
+  `accent`, `selection`) rather than raw ANSI slots, which keeps it readable on light schemes.
 - **Lands** M2 — TASK-18 (primitives), TASK-19 (tree, hit testing, hover, focus); M3 — TASK-28
   (semantic selected state used by the first composed workspace view).
 
@@ -584,7 +589,7 @@ nothing else is a legal dependency.
   value), and the rest of the file applies. A key whose every line was rejected keeps the
   previous `Config`'s value (`kept_previous`). Supported keys: `font.family`, `font.bold`,
   `font.italic`, `font.bold_italic`, `font.size` (1–72 points), `font.ligatures`,
-  `font.nerd_symbols`, `theme` (stored for TASK-38), `scratchpad.size` and
+  `font.nerd_symbols`, `theme` (resolved by `app` through `theme`, TASK-38), `scratchpad.size` and
   `scratchpad.large_size` (10–100 percent, default 50/90), `mouse.right_click` and `keybind`.
   A `Config` owns everything through one arena and is replaced wholesale on reload.
   `defaults_document` is the commented self-documenting file `config.open` writes; a unit test
@@ -594,7 +599,15 @@ nothing else is a legal dependency.
   systems. The thread only sets an atomic flag and calls the owner's wake callback; `app` reads,
   validates and applies the file on the main thread. `app` resolves `font.family` and
   `mouse.right_click` through `Layer` with `--font` / `--right-click` as the session layer, and
-  built-in checks other than `--config-test` never read the user's file.
+  built-in checks other than `--config-test` and `--theme-test` never read the user's file.
+- **TASK-38 additions.** `themesDirectory` names the user theme directory (`themes` beside the
+  settings file). `setDocumentValue` returns the document with one key set: the winning line is
+  replaced in place (indentation and line ending kept), every other line and comment is kept byte
+  for byte, and an absent key is appended; `writeDocumentValue` applies it to the file, creating
+  it from `defaults_document` when missing, through a sibling write and rename. The theme picker
+  uses it; TASK-40 and TASK-41 can reuse it. Theme files are not watched by themselves: the
+  watcher watches the settings file's directory, and `app` re-reads the theme directory on every
+  settings reload.
 
 ### `theme`
 
@@ -602,8 +615,31 @@ nothing else is a legal dependency.
   consume, plus the built-in colour schemes.
 - **Never** introduce a colour path outside `theme` — two renderers, one palette (P6). Never
   draw anything.
-- **May depend on** `config`; `ui` and `render` read it downward.
-- **Lands** M4 — TASK-38. Explicitly a v0.1 non-goal.
+- **May depend on** `config` (the build offers it; the module uses only `std`); `ui` and
+  `render` read it downward.
+- **Lands** M4 — TASK-38.
+- **TASK-38 engine.** A `Scheme` is what a scheme author writes: 16 ANSI colours, foreground,
+  background, cursor, selection background and the optional cursor-text and selection-foreground
+  colours (stored; the grid keeps a cell's own colours under the cursor and a selection), with a
+  dark/light `kind` from the background's WCAG luminance. `derive` maps a scheme onto every
+  `Role`: the terminal roles are the scheme's own, and the chrome roles (`strong`, `muted`,
+  `accent`, `border`, `attention`, `danger`, `on_accent`, `field`, and a `selection` toned toward
+  the background when it would hide text) each prefer the conventional ANSI slot and fall back
+  rule by rule to keep WCAG contrast (4.5:1 for text, 3:1 for coloured chrome, 1.8:1 for muted).
+  `conduit-dark` derives exactly the palette Conduit drew with before themes. The 14 bundled
+  schemes are compile-time data in `theme_schemes.zig`, copied from the Ghostty theme files of
+  the iTerm2-Color-Schemes collection with a source URL per scheme; `assets/themes/README.md`
+  records the licences. `parseGhostty` reads Ghostty's theme format, bounded (64 KiB files,
+  1024-byte lines, eight stored diagnostics) and never fatal; colours a file omits come from
+  `conduit-dark`. `parseSelection` reads the `theme` value (empty, a name, or
+  `auto:<dark>,<light>`), and `sameName` compares names ignoring case, spaces, hyphens and
+  underscores. `app` owns the rest: a heap-stable `ThemeCatalog` of bundled plus user themes
+  (user files shadow bundled names, at most 32, sorted, the active one first) that the
+  `theme.pick` palette command borrows as its choices; resolution at startup, on every settings
+  reload and on SDL's system-theme event through `platform.systemTheme`; the active `Palette`
+  feeding `render.Colors` for every pane grid, scratchpad grid and the overlay plus the cleared
+  surface; and the picker's live preview, which follows the most recently moved keyboard
+  highlight or hovered choice and returns to the committed palette when the picker closes.
 
 ### `agent`
 
@@ -1380,7 +1416,6 @@ decision record and this file is updated in the same change.
 | What do harness adapters do when a harness offers no structured surface? | TASK-51 |
 | Which queue primitive and thread decomposition each boundary uses | this document sets the rule only; each boundary documents its own choice |
 | Config file format and the hot-reload mechanism | TASK-37 |
-| Theme file format and the built-in scheme list | TASK-38 |
 | How workspace state is persisted and restored | TASK-65 |
 | Windows CI rendering with OpenGL | TASK-49 — a known gap, not a v0.1 promise |
 | Whether OpenGL 3.3 core stays the GPU choice | revisit at M5 if Apple removes OpenGL, a need exceeds GL 3.3 core, or `zgpu`/`wgpu-native` stabilise |

@@ -54,7 +54,7 @@ keybind = ctrl+alt+p=palette.open
 | `font.size` | points, `1` to `72`, decimals allowed | `14` | Applies; the face is rebuilt and the grid re-measured |
 | `font.ligatures` | `true` or `false` | `true` | Validated and stored for the font manager |
 | `font.nerd_symbols` | `true` or `false` | `true` | Validated and stored for the font manager |
-| `theme` | string | `""` | Reserved for the theme engine (TASK-38); no effect yet |
+| `theme` | theme name or `auto:<dark>,<light>` | `""` (`conduit-dark`) | Applies to the terminal and every UI colour; see [Themes](#themes) |
 | `scratchpad.size` | whole percent, `10` to `100`, optional `%` | `50` | Height of the scratchpad opened by `scratchpad.toggle-50` |
 | `scratchpad.large_size` | whole percent, `10` to `100`, optional `%` | `90` | Height of the scratchpad opened by `scratchpad.toggle-90` |
 | `mouse.right_click` | `menu` or `paste` | `menu` | What a right click over a terminal does when the program has not captured the mouse |
@@ -62,6 +62,55 @@ keybind = ctrl+alt+p=palette.open
 
 Command-line flags are a session layer above the file: `--font=<family>` wins over `font.family`
 and `--right-click=<menu|paste>` wins over `mouse.right_click`, for that run only.
+
+## Themes
+
+`theme` names one colour scheme. It colours the terminal (the 16 ANSI colours, foreground,
+background, cursor and selection) and every piece of Conduit's own UI, whose colours are derived
+from the same scheme so they stay readable on dark and light schemes alike.
+
+- **Bundled schemes.** `conduit-dark` (the default), `gruvbox-dark`, `gruvbox-light`,
+  `catppuccin-mocha`, `catppuccin-latte`, `dracula`, `nord`, `tokyo-night`, `solarized-dark`,
+  `solarized-light`, `one-dark`, `kanagawa-wave`, `everforest-dark` and `rose-pine`. Names are
+  matched ignoring case, spaces, hyphens and underscores, so `Tokyo Night`, `tokyo-night` and
+  `TokyoNight` are the same theme; the display names (`Rosé Pine`) also match.
+- **Your own themes.** Drop a theme file in Ghostty's format into the `themes` directory beside
+  the settings file (`~/.config/conduit/themes/` on Linux, `~/Library/Application
+  Support/conduit/themes/` on macOS, `%APPDATA%\conduit\themes\` on Windows) and name it in
+  `theme`, by its file name. A user file wins over a bundled scheme of the same name. Files from
+  Ghostty's own theme collection work as they are:
+
+  ```
+  palette = 0=#21222c
+  palette = 4=#bd93f9
+  background = #282a36
+  foreground = #f8f8f2
+  cursor-color = #f8f8f2
+  cursor-text = #282a36
+  selection-background = #44475a
+  selection-foreground = #ffffff
+  ```
+
+  `palette = N=` sets ANSI colour N (0 to 15); colours are `#rrggbb` or `rrggbb`. A file may set
+  only some colours; the rest come from `conduit-dark`. A line Conduit cannot use (another key,
+  a named colour, a palette index above 15) is reported in the sidebar and skipped. Files are at
+  most 64 KiB; names must be one line of printable text without `"` or `,`, not starting with
+  `.`, at most 64 bytes, and at most 32 files are listed.
+- **Light and dark.** `theme = auto:<dark>,<light>` (for example
+  `auto:gruvbox-dark,gruvbox-light`) follows the desktop's light/dark preference when the
+  platform reports one and the dark theme when it does not. A preference change while Conduit
+  runs is applied at once where SDL reports it.
+- **Choosing from the palette.** `Theme: choose` (`theme.pick`) lists every bundled and user
+  theme, the active one first. Moving the highlight with the arrow keys or the pointer shows the
+  highlighted theme across the whole window at once; Enter or a click keeps it and writes
+  `theme = <name>` into the settings file (creating the file from the defaults when it does not
+  exist, and leaving every other line and comment as it was); Escape or a click outside goes back
+  to the theme you had.
+- **Problems.** A name that is neither bundled nor a file in the themes directory shows
+  `config:<line>: theme: no bundled or user theme named ...` and the previous theme stays.
+- **Reloading.** The theme directory is read at startup and on every settings reload. Editing a
+  theme file is not watched by itself: save the settings file or run `Reload config` to pick up
+  a changed or newly added theme file.
 
 ## Keybindings
 
