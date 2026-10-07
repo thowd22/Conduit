@@ -206,6 +206,9 @@ const Vt = struct {
     const Stream = ghostty_vt.TerminalStream;
     const Handler = ghostty_vt.TerminalStream.Handler;
     const SemanticPrompt = ghostty_vt.TerminalStream.Handler.SemanticPrompt;
+    /// The payload of upstream's `desktop_notification` effect, named through
+    /// the effect's own signature so the seam has one spelling.
+    const DesktopNotification = @typeInfo(@typeInfo(@typeInfo(@FieldType(Handler.Effects, "desktop_notification")).optional.child).pointer.child).@"fn".params[1].type.?;
     const RenderState = ghostty_vt.RenderState;
     const Style = ghostty_vt.Style;
     const Color = ghostty_vt.Style.Color;
@@ -1224,7 +1227,65 @@ pub const Event = union(enum) {
     /// directory, the title and every prompt mark are gone, and a command
     /// that was running will never report its end.
     reset,
+    /// The program asked for a desktop notification with OSC 9
+    /// (`ESC ] 9 ; body ST`) or OSC 777 (`ESC ] 777 ; notify ; title ; body
+    /// ST`). Both texts are untrusted display data: bounded, cleaned of
+    /// control characters, made valid UTF-8 and truncated here, and never
+    /// used to open or run anything (TASK-56). They borrow the terminal until
+    /// the next `feed`, like a title.
+    notification: Notification,
 };
+
+/// A desktop notification a program asked for. See `Event.notification`.
+pub const Notification = struct {
+    /// Empty for OSC 9, which carries a body only.
+    title: []const u8,
+    body: []const u8,
+    /// Set when either text was cut to its bound.
+    truncated: bool = false,
+};
+
+/// The most bytes of a notification title kept; longer titles are cut at a
+/// UTF-8 boundary and the event says so.
+pub const max_notification_title_bytes = 256;
+/// The most bytes of a notification body kept.
+pub const max_notification_body_bytes = 1024;
+
+/// Copy `text` into `out` as display text: invalid UTF-8 becomes U+FFFD, C0
+/// and C1 controls and DEL become spaces, and the copy stops at the last
+/// whole character that fits. Returns the written slice and whether anything
+/// was left out. Never fails: notification text is display data, and a
+/// malformed one must still produce something harmless.
+pub fn sanitizeNotificationText(out: []u8, text: []const u8) struct { text: []const u8, truncated: bool } {
+    var written: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        var encoded: [4]u8 = undefined;
+        var piece: []const u8 = undefined;
+        const length = std.unicode.utf8ByteSequenceLength(text[index]) catch 0;
+        const decoded: ?u21 = if (length != 0 and index + length <= text.len)
+            std.unicode.utf8Decode(text[index .. index + length]) catch null
+        else
+            null;
+        if (decoded) |codepoint| {
+            if (codepoint < 0x20 or codepoint == 0x7f or (codepoint >= 0x80 and codepoint < 0xa0)) {
+                encoded[0] = ' ';
+                piece = encoded[0..1];
+            } else {
+                piece = text[index .. index + length];
+            }
+            index += length;
+        } else {
+            const n = std.unicode.utf8Encode(std.unicode.replacement_character, &encoded) catch unreachable;
+            piece = encoded[0..n];
+            index += 1;
+        }
+        if (written + piece.len > out.len) return .{ .text = out[0..written], .truncated = true };
+        @memcpy(out[written..][0..piece.len], piece);
+        written += piece.len;
+    }
+    return .{ .text = out[0..written], .truncated = false };
+}
 
 /// The longest OSC 7 report this terminal will believe, in bytes.
 ///
@@ -3515,6 +3576,9 @@ pub const Terminal = struct {
         handler.effects.pwd_changed = &onPwdChanged;
         handler.effects.semantic_prompt = &onSemanticPrompt;
         handler.effects.reset = &onReset;
+        // OSC 9 and OSC 777 desktop notifications (TASK-56). Upstream parses
+        // both into one action; the text is cleaned and bounded here.
+        handler.effects.desktop_notification = &onDesktopNotification;
         // The response seam: every answer the engine owes the child is queued
         // here rather than written anywhere, because the parse that produces
         // it may not be on the thread that owns the PTY.
@@ -5180,6 +5244,30 @@ fn onReset(handler: *Vt.Handler) void {
     terminal.record(.reset);
 }
 
+/// Ghostty calls this for a complete OSC 9 or OSC 777 notification. The
+/// texts are copied, cleaned and bounded into the per-feed payload; when that
+/// arena is out of memory the event is dropped and counted like a title.
+fn onDesktopNotification(_: *Vt.Handler, notification: Vt.DesktopNotification) void {
+    const terminal = feeding orelse return;
+    var title_buffer: [max_notification_title_bytes]u8 = undefined;
+    var body_buffer: [max_notification_body_bytes]u8 = undefined;
+    const title = sanitizeNotificationText(&title_buffer, notification.title);
+    const body = sanitizeNotificationText(&body_buffer, notification.body);
+    const allocator = terminal.payload.allocator();
+    const owned_title = allocator.dupe(u8, title.text) catch return dropNotification(terminal);
+    const owned_body = allocator.dupe(u8, body.text) catch return dropNotification(terminal);
+    terminal.record(.{ .notification = .{
+        .title = owned_title,
+        .body = owned_body,
+        .truncated = title.truncated or body.truncated,
+    } });
+}
+
+fn dropNotification(terminal: *Terminal) void {
+    terminal.events_dropped += 1;
+    log.debug("terminal event dropped: a notification did not fit in memory", .{});
+}
+
 fn clipboardLocation(location: Vt.ClipboardLocation) ClipboardLocation {
     return switch (location) {
         .standard => .standard,
@@ -6361,6 +6449,55 @@ test "no key press ever writes past the fixed encoding buffer" {
     }
     try testing.expect(longest <= max_encoded_key_bytes);
     try testing.expect(encoded.len <= max_encoded_key_bytes);
+}
+
+test "OSC 9 and OSC 777 notifications arrive as bounded, cleaned events" {
+    const testing = std.testing;
+
+    var terminal: Terminal = undefined;
+    try terminal.init(testIo(), testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer terminal.deinit(testing.allocator);
+
+    // OSC 9 carries a body only, ST-terminated, and leaves the grid alone.
+    terminal.feed("\x1b]9;Build finished\x1b\\after");
+    var events = terminal.takeEvents();
+    try testing.expectEqual(@as(usize, 1), events.len);
+    try testing.expectEqualStrings("", events[0].notification.title);
+    try testing.expectEqualStrings("Build finished", events[0].notification.body);
+    try testing.expect(!events[0].notification.truncated);
+
+    // OSC 777 notify carries a title and a body, here BEL-terminated, beside
+    // a bell in the same write and in order.
+    terminal.feed("\x07\x1b]777;notify;Claude;Needs approval\x07");
+    events = terminal.takeEvents();
+    try testing.expectEqual(@as(usize, 2), events.len);
+    try testing.expectEqual(Event.bell, events[0]);
+    try testing.expectEqualStrings("Claude", events[1].notification.title);
+    try testing.expectEqualStrings("Needs approval", events[1].notification.body);
+
+    // An over-long body is cut to its bound at a character boundary.
+    const long = "\xc3\xa9" ** (max_notification_body_bytes / 2 + 8);
+    terminal.feed("\x1b]9;" ++ long ++ "\x1b\\");
+    events = terminal.takeEvents();
+    try testing.expectEqual(@as(usize, 1), events.len);
+    const body = events[0].notification.body;
+    try testing.expect(events[0].notification.truncated);
+    try testing.expect(body.len <= max_notification_body_bytes);
+    try testing.expect(std.unicode.utf8ValidateSlice(body));
+}
+
+test "notification text is cleaned of controls and invalid UTF-8" {
+    const testing = std.testing;
+    var out: [16]u8 = undefined;
+    const cleaned = sanitizeNotificationText(&out, "a\x1bb\xffc\xc2\x85d");
+    try testing.expectEqualStrings("a b\xef\xbf\xbdc d", cleaned.text);
+    try testing.expect(!cleaned.truncated);
+    // A character that does not fit whole is left out entirely.
+    var small: [4]u8 = undefined;
+    const cut = sanitizeNotificationText(&small, "abc\xe2\x82\xac");
+    try testing.expectEqualStrings("abc", cut.text);
+    try testing.expect(cut.truncated);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut.text));
 }
 
 test "a title change and a bell arrive as events, in order" {

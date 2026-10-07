@@ -25,7 +25,7 @@ with a commented copy of every default, so it documents itself. **Reload config*
 
 **Settings** (`settings.open`; Ctrl+Shift+, on Linux and Windows, Cmd+Shift+, on macOS, or type
 `settings` in the command palette) opens a dialog over the window that lists every setting below,
-grouped under dim headings: Appearance, Fonts, Keys, Scratchpad and Mouse. Each row reads
+grouped under dim headings: Appearance, Fonts, Keys, Scratchpad, Mouse and Agents. Each row reads
 `<setting>  <value>`, the value being the one in effect. A `·` after the value means the settings
 file sets it; no mark means the built-in default (or a command-line flag) decides it. The last
 row, **Open config file**, closes the dialog and opens the file itself, as `config.open` does.
@@ -35,7 +35,8 @@ row, **Open config file**, closes the dialog and opens the file itself, as `conf
   the highlighted row on screen. Escape, or a click outside the dialog, closes it. While it is
   open no key, typed text or click reaches the terminal or anything else beneath it.
 - **Editing.** Enter or a click edits a row the way its value needs:
-  - `true`/`false` settings (`font.ligatures`, `font.nerd_symbols`) flip;
+  - `true`/`false` settings (`font.ligatures`, `font.nerd_symbols` and every `notifications.*`
+    switch in the Agents group) flip;
   - `mouse.right_click` switches between `menu` and `paste`;
   - `theme` and `font.family` close the dialog and open the palette's theme or family chooser,
     with its live preview;
@@ -104,6 +105,17 @@ keybind = ctrl+alt+p=palette.open
 | `scratchpad.size` | whole percent, `10` to `100`, optional `%` | `50` | Height of the scratchpad opened by `scratchpad.toggle-50` |
 | `scratchpad.large_size` | whole percent, `10` to `100`, optional `%` | `90` | Height of the scratchpad opened by `scratchpad.toggle-90` |
 | `mouse.right_click` | `menu` or `paste` | `menu` | What a right click over a terminal does when the program has not captured the mouse |
+| `notifications.enabled` | `true` or `false` | `true` | Applies to the next notification; `false` lists and raises none (see [Notifications](#notifications)) |
+| `notifications.os` | `true` or `false` | `true` | Applies; `false` keeps notifications in the in-app list only, never the desktop |
+| `notifications.permission` | `true` or `false` | `true` | An agent waiting for permission |
+| `notifications.input` | `true` or `false` | `true` | An agent waiting for input, or a harness's own notification |
+| `notifications.done` | `true` or `false` | `true` | An agent's turn finished |
+| `notifications.error` | `true` or `false` | `true` | An agent's turn (or launch) failed |
+| `notifications.terminal` | `true` or `false` | `true` | OSC 9 / OSC 777 from a terminal without an agent, and a bell from a tab you are not looking at |
+| `notifications.claude_code` | `true` or `false` | `true` | Every notification from Claude Code agents |
+| `notifications.codex` | `true` or `false` | `true` | Every notification from Codex agents |
+| `notifications.pi` | `true` or `false` | `true` | Every notification from Pi agents |
+| `notifications.opencode` | `true` or `false` | `true` | Every notification from OpenCode agents |
 | `keybind` | see below | the shipped bindings | Applies |
 
 Command-line flags are a session layer above the file: `--font=<family>` wins over `font.family`
@@ -265,10 +277,32 @@ ones most often rebound are:
 | `pane.split:right` / `:down` | `ctrl+shift+e` / `ctrl+shift+o` | `super+d` / `super+shift+d` |
 | `font.size.increase` | `ctrl+equal`, `ctrl+shift+equal` | `super+equal`, `super+shift+equal` |
 | `font.size.decrease` / `font.size.reset` | `ctrl+minus` / `ctrl+0` | `super+minus` / `super+0` |
+| `notifications.open` | `ctrl+shift+n` | `super+shift+n` |
 
 Not configurable yet: the search chord (Ctrl+Shift+F, Cmd+F on macOS) and the keys inside modal
 UI (palette, settings view, search field, context menu, rename and confirmation prompts) are
 handled by those surfaces directly. `search.open` itself can still be given an additional chord with `keybind`.
+
+## Notifications
+
+An agent's state changes and terminal notification sequences become entries in the in-app list
+(**Notifications**, `notifications.open`: Ctrl+Shift+N on Linux and Windows, Cmd+Shift+N on
+macOS, or the palette). Each entry is raised only when `notifications.enabled`, its kind's switch
+and, for an agent, its harness's switch are all `true`; a switch turned off applies to the next
+notification and leaves entries already listed. When the window does not have keyboard focus an
+entry is also sent to the desktop, unless `notifications.os` is `false`. On Linux that is
+`notify-send` (absent: nothing is shown, logged once at debug); macOS and Windows have no desktop
+notifications yet. A hidden (`--hidden`, headless) run never notifies the desktop.
+
+| Kind | Raised when |
+|---|---|
+| `permission` | an agent starts waiting for permission |
+| `input` | an agent starts waiting for input, or its harness raises a notification of its own |
+| `done` | an agent's turn finishes |
+| `error` | an agent's turn, or its launch, fails |
+| `terminal` | a session without an agent sends OSC 9 or OSC 777, or rings the bell while its tab is not the one shown |
+
+The list keeps the newest 32 entries. **Notifications: clear** empties it.
 
 ## Errors
 
@@ -317,6 +351,9 @@ into the row's field and opens a dock of that height, steps `font.size` with Rig
 the cells, has `99` points refused with its message and the file unchanged, cycles
 `mouse.right_click`, captures a new palette chord and uses it, has a taken chord reported,
 kept on Escape and taken on Enter, opens the raw file from its row, and proves keys, text and
-clicks behind the dialog do nothing, reading the file back after every change. `conduit-test launch` isolates `XDG_CONFIG_HOME`, so an
+clicks behind the dialog do nothing, reading the file back after every change.
+`xvfb-run -a zig build run -- --agent-test` writes its own private settings file too: it turns
+`notifications.permission` off by a rewrite and proves the next permission wait is neither listed
+nor sent to the desktop, then turns it back on through the settings view's Agents row. `conduit-test launch` isolates `XDG_CONFIG_HOME`, so an
 agent can write `<root>/<run>/config/conduit/config` and observe the reload through `inspect` and
 `wait-for element config.error`.

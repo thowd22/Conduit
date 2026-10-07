@@ -285,6 +285,46 @@ nothing else is a legal dependency.
   spacing. `sidebarRowLimit` lowers the list limit by the group's device-pixel shift rounded up
   to whole rows, so no shifted row reaches the blank row above the footer, the Palette hint or the
   version line.
+- **Agent runtime and notifications (TASK-56).** `src/app_agents.zig` (a file of `app`) owns
+  the one `agent.Registry`, every launched agent's `Runner` (its adapter, owner-side transport,
+  `EventQueue` and IO worker), the per-agent `Heuristics`, the bounded `NotificationList` (newest
+  32) and the OS notification seam (`Notifier`, default `platform.notify` on a short-lived worker,
+  replaced by an observer in checks and by a discard in hidden runs). Launch:
+  `agent.launch` (fixed choices: the scripted fake when a check enabled it, then the harnesses
+  whose `detect` answered in the active workspace's context, probed once per workspace on a
+  worker) then an optional free-text prompt step (`agent.launch-prompt`, which also launches the
+  last-used harness by itself). It creates an `agent_terminal` session and tab
+  (`Workspace.createSession` + `registerTab`), registers the agent owned, and hands the runner to
+  the spawn `Load`, whose worker runs `Runner.prepare` (the adapter's `launch`, every
+  `LaunchSpec.files` entry written 0600/0700 inside the run's private sink, the env overlay merged
+  over the integration-free agent environment) before spawning through the workspace
+  ExecutionContext; the poll worker starts once the child is attached. Sinks live under
+  `$XDG_STATE_HOME/conduit/agents/<run>/<token>` (or `~/.local/state/...`), created 0700 and
+  deleted with the agent and the run. Per harness the runner builds: Claude Code with its sink
+  and config dir; Pi with an owner `PiSink` transport and its `conduit.js` extension file; Codex
+  with a lazily connected daemon WebSocket (seeded from `io.random`) and retried `attach`;
+  OpenCode with a loopback port found by bind-0-then-release. Sink-based harnesses and the fake
+  launch in Local workspaces only (TASK-61). Every session's terminal events feed the agent's
+  heuristics when the session has one (output, title, BEL, OSC 9/777, OSC 133 command and prompt
+  marks, the human's key presses, child exit); otherwise OSC 9/777, and a bell from a tab that is
+  not shown, become `terminal` notifications. `App.pollAgents` drains every queue into the
+  registry each loop iteration, raises notifications for new `waiting_permission`,
+  `waiting_input`, `done` and `errored` states and harness notifications (filtered by
+  `config.Notifications`), sends them to the OS seam while the window is unfocused, records exits
+  and forgets agents whose session closed. The sidebar leads an agent's tab row with its state
+  glyph (`·` idle, `▸` working, `?` input, `!` permission, `✓` done, `×` errored) instead of
+  TASK-29's marks, and the workspace row with its most urgent agent's glyph; each glyph is also a
+  semantic-only `Text` (`<row id>.agent.<state>`) the driver can wait for. **Notifications**
+  (`notifications.open`, Ctrl+Shift+N / Cmd+Shift+N, an app-level default inserted before the
+  file's keybinds) is a modal `Surface` like the context menu with `notification.<n>` rows
+  (newest first: age, workspace › tab, title: text); Enter or a click focuses that workspace,
+  tab and pane and selects the agent; Escape or an outside click closes it;
+  `notifications.clear` empties it. `agent.stop` hangs up an owned agent's PTY (an observed one
+  is only forgotten) and `agent.focus` shows its session; both list live agents only, so never the
+  scratchpad. API for TASK-57/58/60/64: `Runtime.registry` (states, summaries, pending
+  permissions), `runnerForSession(...).adapter()` (respond, send input — from that runner's
+  worker), `createRunner` + `register` + the `Load.agent_runner` spawn path, `observe`,
+  `notifications`, `selected_agent`, `displayName`, `workspaceState`.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
@@ -302,7 +342,8 @@ nothing else is a legal dependency.
   presentation, action routing and lifecycle), TASK-34 (URL/OSC 8 opening and file-reference
   editor tabs), TASK-36 (bounded literal and regex search UI); M4 — TASK-40 (font settings,
   commands and family picker), TASK-41 (settings view and keybinding editor); TASK-76 (git branch
-  rows and the secondary small face), TASK-77 (sidebar workspace gap).
+  rows and the secondary small face), TASK-77 (sidebar workspace gap); M6 — TASK-56 (agent runtime,
+  sidebar glyphs and notifications).
 
 ### `platform`
 
@@ -310,7 +351,11 @@ nothing else is a legal dependency.
   context, HiDPI and scale, window visibility, IME composition and input area, event translation,
   the hidden-but-real headless window, optional fixed display scale, application identity metadata
   and runtime backend/density reporting. `platform.clipboard`: native copy/paste, primary
-  selection, and the OSC 52 policy. `platform.openUrl` is the sole desktop URL-opening seam. PTY
+  selection, and the OSC 52 policy. `platform.openUrl` is the sole desktop URL-opening seam.
+  `platform.notify(title, body)` (TASK-56) is the desktop notification seam: on Linux and the
+  BSDs it runs `notify-send --app-name=Conduit -- <title> <body>` as argv, bounded by a 5 s
+  deadline on a worker thread (absent helper: `error.Unavailable`); macOS and Windows return
+  `error.Unsupported` until TASK-48/49. `Window.hasInputFocus` reports keyboard focus. PTY
   and font-discovery backends own
   their narrow OS calls, as architecture invariant 10 permits. SDL3 arrives through the
   `castholm/SDL` build package plus a thin `@cImport`/extern seam Conduit owns (decision-2).
@@ -352,7 +397,9 @@ nothing else is a legal dependency.
   bytes through `Stream`, resize, damage tracking, cell and selection access, search, and
   Conduit's own style describer. It exposes OSC 8 target metadata without interpreting product
   actions and implements bounded literal and retry-limited regex full-scrollback search, ordered
-  results, viewport reveal and generation invalidation after terminal output or resize. See
+  results, viewport reveal and generation invalidation after terminal output or resize. OSC 9
+  and OSC 777 `notify` (parsed upstream) surface as a `notification{title, body}` event beside
+  BEL, cleaned of controls, made valid UTF-8 and cut to 256/1024 bytes (TASK-56). See
   [§4.1](#41-the-ghostty-vt-boundary).
 - **Never** render, load fonts, own a PTY, or take a UI concern. Never reach for the macOS
   embedding library (decision-1). Never rely on `ghostty_vt.Style`'s `{f}`: it does not compile
@@ -959,7 +1006,8 @@ nothing else is a legal dependency.
   - `adapter.zig`: the type-erased `Adapter` (`detect`, `launch`, `attach`, `poll`, `sendInput`,
     `respondPermission`, `readPrompt`, `updatePrompt`, `stop`, `destroy`). Every method is gated
     by the instance's `Capabilities` and returns `error.Unsupported` when off. `launch` returns a
-    `LaunchSpec` (argv plus extra env) that the workspace spawns through its ExecutionContext into
+    `LaunchSpec` (argv plus extra env, and since TASK-56 the `files` the owner writes into the
+    agent's private sink before the spawn) that the workspace spawns through its ExecutionContext into
     an `agent_terminal` session; `CorrelationToken` is the `CONDUIT_AGENT_TOKEN` value hooks and
     extensions report back. Methods other than `harness`/`capabilities` run on IO workers only.
   - `registry.zig`: `Registry` of `Agent` records under monotonic, never-reused `AgentId`s, each
@@ -1675,7 +1723,8 @@ inside the same event loop, so the main thread is that render/UI thread.
 | Clipboard read/write | `platform.clipboard` | IO; must not block the main thread **(d)** |
 | Settings file watch | `config.Watcher`, own thread | the thread only sets an atomic `changed` flag and posts an SDL wake; `app` reads, validates and applies the file on the main thread in `poll` |
 | Font discovery and file loading | `font`, off-thread | discovered faces handed to the main thread **(d)** |
-| Agent harness IO | `agent` adapters, off-thread | events handed over through a defined queue **(d)** |
+| Agent harness IO | `agent` adapters, one IO worker per launched agent (`app_agents.Runner`) | the worker alone calls its adapter's `attach`/`poll` and pushes into that agent's `EventQueue`; the spawn worker runs `Runner.prepare` before the poll worker exists; `App.pollAgents` drains on the main thread and wakes the loop through the driver wake |
+| Harness detection, OS notifications | `app_agents`, short-lived workers | detection borrows the workspace context (joined before the workspace goes) and publishes versions behind an atomic `done`; an OS notification worker owns copies of its text and only runs `platform.notify` |
 | SSH transport | `workspace`'s ExecutionContext, off-thread | decision-8: the system OpenSSH client in Conduit-owned PTYs and pipes, one ControlMaster per SSH workspace on Linux/macOS; TASK-43 implements it |
 | Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)**; a context `WatchHandle` has no thread and is polled by the `Project` owner |
 | Backlog CLI writes | `backlog.Cli`, worker thread | `ExecutionContext.run` waits for the bounded child; the CLI's file edits return through `Project.poll` |

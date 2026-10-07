@@ -464,6 +464,56 @@ const sidebar_branch_steps = [_]Step{
     .{ .wait_element = .{ .id = "workspace.2.tab.1", .state = "exists", .equals = true } },
 };
 
+// TASK-56: the scripted fake agent, offered only to a driver run whose
+// launch sets CONDUIT_TEST_FAKE_AGENT=1, is launched from the palette by
+// keyboard (it is always the first harness choice), stepped by typed lines
+// through idle, working, waiting for permission and done, and its done
+// notification is opened from the list by a real click while another tab is
+// active. The agent's own tab is the workspace's second.
+const agent_tab_id = "workspace.1.tab.2";
+
+const agent_notifications_env = [_]EnvVar{
+    .{ .name = "CONDUIT_TEST_FAKE_AGENT", .value = "1" },
+};
+
+const agent_notifications_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "Agent: launch" },
+    // Command, then the first harness choice (the fake), then the optional
+    // prompt left empty.
+    .{ .key = "ENTER" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "palette.argument", .state = "exists", .equals = true } },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.idle", .state = "exists", .equals = true } },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-AGENT-READY" } },
+    .{ .type_text = "one" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.working", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "workspace.1.agent.working", .state = "exists", .equals = true } },
+    .{ .type_text = "two" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.waiting_permission", .state = "exists", .equals = true } },
+    .{ .type_text = "three" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.done", .state = "exists", .equals = true } },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-STEP 3" } },
+    // Back to the first tab, then the list by its chord; a click on the
+    // newest entry (done) shows the agent's tab again.
+    .{ .click = "workspace.1.tab.1" },
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+n" },
+    .{ .wait_element = .{ .id = "notifications", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "notification.1", .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .click = "notification.0" },
+    .{ .wait_element = .{ .id = "notifications", .state = "exists", .equals = false } },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-STEP 3" } },
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -536,7 +586,32 @@ pub const all = [_]Scenario{
         .command = sidebar_branch_command,
         .steps = &sidebar_branch_steps,
     },
+    .{
+        .name = "agent-notifications",
+        .launch_env = &agent_notifications_env,
+        .command = deterministic_shell,
+        .steps = &agent_notifications_steps,
+    },
 };
+
+test "the agent scenario enables the fake only for launch and walks every glyph to done" {
+    const scenario = all[14];
+    try std.testing.expectEqualStrings("agent-notifications", scenario.name);
+    try std.testing.expectEqual(@as(usize, 1), scenario.launch_env.len);
+    try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
+    var states: usize = 0;
+    var clicked_row = false;
+    for (scenario.steps) |step| switch (step) {
+        .wait_element => |wait| if (std.mem.indexOf(u8, wait.id, ".agent.") != null) {
+            states += 1;
+        },
+        .click => |id| if (std.mem.eql(u8, id, "notification.0")) {
+            clicked_row = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(states >= 5 and clicked_row);
+}
 
 test "sidebar branch scenario waits on the branch row appearing, leaving and returning" {
     const scenario = all[13];
@@ -758,7 +833,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 14), all.len);
+    try std.testing.expectEqual(@as(usize, 15), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;

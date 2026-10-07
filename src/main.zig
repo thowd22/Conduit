@@ -90,9 +90,13 @@ const testdriver = @import("testdriver");
 /// Repository and branch resolution for the sidebar; a file of this module
 /// rather than a module of its own because only the app consumes it.
 const git = @import("git.zig");
+/// The agent runtime, notification list and OS notification seam (TASK-56).
+const app_agents = @import("app_agents.zig");
+const agent = @import("agent");
 
 test {
     _ = git;
+    _ = app_agents;
 }
 /// The input module, imported under a name that does not collide with the app's
 /// `input` buffer field. A module shadowed by a local reads as "the buffer"
@@ -324,6 +328,14 @@ pub const Run = struct {
     /// Exercise TASK-76's branch rows against real repositories in a private
     /// temporary directory through real PTYs and SDL events, then exit.
     git_test: bool = false,
+    /// Exercise TASK-56: a scripted fake agent launched from the palette, its
+    /// live sidebar glyphs, the notification list by chord, palette and
+    /// mouse, a hot-reloaded notification switch, a background tab's OSC 777
+    /// and the OS notification seam, through real PTYs and SDL events.
+    agent_test: bool = false,
+    /// The private directory `--agent-test` keeps its agent sinks and its
+    /// background-tab trigger in. Not a command-line flag: `runApp` sets it.
+    agent_test_dir: ?[]const u8 = null,
     /// The settings file to load and watch instead of the platform location.
     /// Not a command-line flag: `runApp` sets it for `--config-test`,
     /// `--theme-test`, `--font-test` and `--settings-test`, which
@@ -424,7 +436,7 @@ fn optionsForRun(options: Options) Options {
         !options.run.workspaces_test and !options.run.links_test and
         !options.run.search_test and !options.run.menu_test and !options.run.config_test and
         !options.run.theme_test and !options.run.font_test and !options.run.settings_test and
-        !options.run.git_test) return options;
+        !options.run.git_test and !options.run.agent_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -570,6 +582,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.settings_test = true;
         } else if (std.mem.eql(u8, arg, "--git-test")) {
             run.git_test = true;
+        } else if (std.mem.eql(u8, arg, "--agent-test")) {
+            run.agent_test = true;
         } else if (std.mem.eql(u8, arg, "--font-test")) {
             run.font_test = true;
         } else if (namesValue(arg, "--right-click")) {
@@ -1278,6 +1292,10 @@ const Load = struct {
     /// This job spawned a transactional scratchpad replacement rather than a
     /// child for a starting session.
     scratchpad_replacement: bool = false,
+    /// The launched agent whose adapter describes this spawn (TASK-56). Its
+    /// `prepare` runs here, before the spawn, and fills argv and env; the
+    /// runtime keeps the runner alive until this job is reported finished.
+    agent_runner: ?*app_agents.Runner = null,
     /// Borrowed from the workspace that owns this job's target session. The
     /// owner outlives and joins the worker before releasing its context.
     execution_context: ?workspace.ExecutionContext.Ref = null,
@@ -1326,12 +1344,22 @@ const Load = struct {
                 self.font_failure = @errorName(err);
             }
         }
-        if (self.spawn) |request| {
+        if (self.spawn) |spawn_request| {
             const context = self.execution_context orelse {
                 self.spawn_failure = "MissingExecutionContext";
                 self.state.store(1, .release);
                 return;
             };
+            var request = spawn_request;
+            if (self.agent_runner) |runner| {
+                const prepared = runner.prepare(request.env) catch |err| {
+                    self.spawn_failure = @errorName(err);
+                    self.state.store(1, .release);
+                    return;
+                };
+                request.argv = prepared.argv;
+                request.env = prepared.env;
+            }
             const child = context.spawn(request);
             if (child) |spawned| {
                 self.child = spawned;
@@ -1443,6 +1471,11 @@ const ChildSpec = struct {
         // An enclosing Conduit's agent correlation token (TASK-52) must not reach a
         // nested child, or a harness started inside it would report to the wrong agent.
         "CONDUIT_AGENT_TOKEN",
+        // An enclosing agent's sink, and the switch that offers the scripted fake
+        // harness (TASK-56): neither may leak into a child.
+        "CONDUIT_AGENT_SINK",
+        "CONDUIT_AGENT_GATE",
+        fake_agent_env,
     };
 
     /// A child's environment while it is being built: the key-replacing map
@@ -1528,8 +1561,16 @@ const ChildSpec = struct {
             settings_test_script
         else if (options.run.git_test)
             git_test_script
+        else if (options.run.agent_test)
+            agent_test_script
         else
             options.run.command;
+        // `--agent-test`'s first tab arms a background notification that a
+        // file in the check's private directory releases.
+        if (options.run.agent_test_dir) |dir| {
+            var trigger_buffer: [path_capacity]u8 = undefined;
+            try variables.put(agent_test_trigger_env, try std.fmt.bufPrint(&trigger_buffer, "{s}/trigger", .{dir}));
+        }
         const shell: ?[]const u8 = if (command) |line| blk: {
             // `/bin/sh` rather than `$SHELL`: a line to run is a script, and a
             // script should not depend on which login shell the person running
@@ -1792,7 +1833,7 @@ fn wantsChild(options: Options) bool {
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
         options.run.links_test or options.run.search_test or options.run.menu_test or
         options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
-        options.run.git_test) return true;
+        options.run.git_test or options.run.agent_test) return true;
     return !options.run.no_child and !options.run.self_test and !options.run.grid_test and
         !options.run.scroll_test and !options.run.mouse_test and !options.run.ui_test and
         !options.run.sidebar_test;
@@ -1808,7 +1849,8 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.clipboard_test or run.ui_test or run.ime_test or run.sidebar_test or
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
-        run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test or run.git_test;
+        run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test or run.git_test or
+        run.agent_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -1864,6 +1906,28 @@ const search_case_action = "search.toggle-case";
 const search_regex_action = "search.toggle-regex";
 const search_activate_match_action = "search.activate-match";
 const terminal_context_menu_action = "terminal.context-menu";
+const agent_launch_action = "agent.launch";
+const agent_launch_prompt_action = "agent.launch-prompt";
+const agent_stop_action = "agent.stop";
+const agent_focus_action = "agent.focus";
+const notifications_open_action = "notifications.open";
+const notifications_clear_action = "notifications.clear";
+const notifications_activate_action = "notifications.activate";
+/// Offers the scripted fake harness (TASK-56) to a run that also has the test
+/// driver, which is how the `agent-notifications` E2E scenario reaches it.
+const fake_agent_env = "CONDUIT_TEST_FAKE_AGENT";
+/// The file `--agent-test`'s background tab waits for.
+const agent_test_trigger_env = "CONDUIT_AGENT_TEST_TRIGGER";
+const agent_choice_capacity: usize = 32;
+const agent_choice_value_capacity: usize = 24;
+const notification_visible_rows: usize = 10;
+const notification_row_label_capacity: usize = 384;
+/// The placeholder rows of an empty harness or agent list.
+const no_harness_choices = [_]inputmod.PaletteChoice{.{ .label = "No coding agent found here", .value = "none" }};
+const no_agent_choices = [_]inputmod.PaletteChoice{.{ .label = "No agents", .value = "none" }};
+/// The process `agent.launch` names before the adapter's `prepare` replaces it
+/// on the spawn worker.
+const agent_placeholder_argv = [_][]const u8{"/bin/sh"};
 
 const tab_move_choices = [_]inputmod.PaletteChoice{
     .{ .label = "Up", .value = "up" },
@@ -1895,7 +1959,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 60;
+const action_capacity_base: usize = 67;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 const settings_open_action = "settings.open";
@@ -1945,6 +2009,19 @@ const settings_scratchpad_fields = [_]SettingsField{
     settingsField(.scratchpad_large_size, .number),
 };
 const settings_mouse_fields = [_]SettingsField{settingsField(.mouse_right_click, .cycle)};
+const settings_agents_fields = [_]SettingsField{
+    settingsField(.notifications_enabled, .toggle),
+    settingsField(.notifications_os, .toggle),
+    settingsField(.notifications_permission, .toggle),
+    settingsField(.notifications_input, .toggle),
+    settingsField(.notifications_done, .toggle),
+    settingsField(.notifications_error, .toggle),
+    settingsField(.notifications_terminal, .toggle),
+    settingsField(.notifications_claude_code, .toggle),
+    settingsField(.notifications_codex, .toggle),
+    settingsField(.notifications_pi, .toggle),
+    settingsField(.notifications_opencode, .toggle),
+};
 
 /// One line of the settings list: a group heading (`Text`), a setting, a
 /// command's keybinding, or the raw-file row (each an `InteractiveText`).
@@ -1970,8 +2047,8 @@ const SettingsMode = enum {
 };
 
 /// Every settings row: headings, the fields, every bindable command and the raw row.
-const settings_row_capacity: usize = 5 + settings_appearance_fields.len + settings_font_fields.len +
-    settings_scratchpad_fields.len + settings_mouse_fields.len + action_capacity_base + 1;
+const settings_row_capacity: usize = 6 + settings_appearance_fields.len + settings_font_fields.len +
+    settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len + action_capacity_base + 1;
 /// The most list rows one frame registers; the list scrolls past this.
 const settings_visible_capacity: usize = 48;
 const settings_semantic_capacity: usize = 96;
@@ -2782,6 +2859,9 @@ const UiKeyPlan = union(enum) {
     context_menu_close,
     context_menu_move: bool,
     context_menu_activate,
+    notifications_close,
+    notifications_move: bool,
+    notifications_activate,
     select_all: ui.Id,
     copy: ui.Id,
     paste: ui.Id,
@@ -3371,6 +3451,10 @@ fn buildConfiguredBindings(
     defer arguments.deinit(allocator);
     try arguments.ensureTotalCapacity(allocator, loaded.keybinds.items.len);
 
+    // TASK-56's list chord is the app's own default until `input` ships it
+    // with the others; it goes first so a file line can still rebind or unbind
+    // it.
+    try overrides.append(allocator, .{ .chord = notificationsChord(profile), .action = notifications_open_action });
     for (loaded.keybinds.items) |keybind| {
         const chord = inputmod.parseChord(keybind.chord) catch |err| {
             loaded.addDiagnostic(keybind.line, "{s}", .{chordErrorMessage(err)});
@@ -3407,6 +3491,31 @@ fn buildConfiguredBindings(
         try overrides.append(allocator, .{ .chord = chord, .action = action, .arguments = argument_slice });
     }
     return inputmod.buildBindings(allocator, defaults, overrides.items);
+}
+
+/// Where this run keeps its agents' private sinks (TASK-56): beside the
+/// check's own files for `--agent-test`, otherwise a per-run directory under
+/// `$XDG_STATE_HOME/conduit/agents` (or `~/.local/state/...`), created 0700 on
+/// first use and removed when the run ends. Null when there is no home.
+fn agentSinkRoot(io: Io, env: EnvSource, options: Options, buffer: []u8) ?[]const u8 {
+    if (options.run.agent_test_dir) |dir| return std.fmt.bufPrint(buffer, "{s}/agents", .{dir}) catch null;
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = generateRunId(io, &id_buffer) catch return null;
+    if (env.get("XDG_STATE_HOME")) |state| {
+        if (state.len != 0 and state[0] == '/') return std.fmt.bufPrint(buffer, "{s}/conduit/agents/{s}", .{ state, id }) catch null;
+    }
+    const home = env.get("HOME") orelse return null;
+    if (home.len == 0 or home[0] != '/') return null;
+    return std.fmt.bufPrint(buffer, "{s}/.local/state/conduit/agents/{s}", .{ home, id }) catch null;
+}
+
+/// Ctrl+Shift+N on Linux and Windows, Cmd+Shift+N on macOS: the notification
+/// list (TASK-56). Free in both shipped default tables.
+fn notificationsChord(profile: inputmod.PlatformProfile) inputmod.Chord {
+    return switch (profile) {
+        .macos => .{ .key = .{ .character = 'n' }, .modifiers = .{ .shift = true, .super = true } },
+        .linux_windows => .{ .key = .{ .character = 'n' }, .modifiers = .{ .ctrl = true, .shift = true } },
+    };
 }
 
 /// Report every diagnostic of a load at warn level as `<path>:<line>: <message>`.
@@ -4005,6 +4114,48 @@ const App = struct {
     /// pasting right press, a menu row press, or a closing outside press) owns
     /// its motion and release so no tail reaches the terminal beneath.
     context_menu_pointer_owned: bool = false,
+    /// The agent runtime (TASK-56): registry, adapters, heuristics and the
+    /// notification list. Main thread; its workers only fill queues.
+    agents: app_agents.Runtime,
+    /// The environment an agent's process starts from: the workspace child
+    /// environment without shell integration, which a harness never wants.
+    agent_spec: ChildSpec,
+    /// `$CLAUDE_CONFIG_DIR` and `$CODEX_HOME` as this process sees them,
+    /// borrowed from the process environment, for the Local side channels.
+    claude_config_dir: ?[]const u8 = null,
+    codex_home: ?[]const u8 = null,
+    agent_launch_index: usize = 0,
+    agent_prompt_index: usize = 0,
+    agent_stop_index: usize = 0,
+    agent_focus_index: usize = 0,
+    /// The harness `agent.launch` chose, waiting for its optional prompt.
+    agent_launch_pending: ?app_agents.Choice = null,
+    /// The harness last launched, which `agent.launch-prompt` reuses.
+    agent_last_choice: ?app_agents.Choice = null,
+    /// `agent.stop` and `agent.focus` choices: one per agent, by id. The
+    /// registry definitions borrow them; rebuilt only while the palette is
+    /// closed.
+    agent_choices: [agent_choice_capacity]inputmod.PaletteChoice = undefined,
+    agent_choice_labels: [agent_choice_capacity][palette_label_capacity]u8 = undefined,
+    agent_choice_values: [agent_choice_capacity][agent_choice_value_capacity]u8 = undefined,
+    agent_choice_count: usize = 0,
+    /// The notification list modal (TASK-56): open state and the pointer
+    /// gesture it owns through release, like the context menu.
+    notifications_visible: bool = false,
+    notifications_pointer_owned: bool = false,
+    notification_row_ids: [notification_visible_rows][palette_semantic_capacity]u8 = undefined,
+    notification_row_labels: [notification_visible_rows][notification_row_label_capacity]u8 = undefined,
+    /// Whether the window has keyboard focus, from SDL's focus events.
+    window_focused: bool = true,
+    /// A check's stand-in for the window's focus, or null for the real one.
+    focus_override: ?bool = null,
+    /// Sidebar labels with an agent glyph, per row slot, and the state ids of
+    /// the glyph elements. The ids alternate storage per frame, like terminal
+    /// link ids, so the tree never sees an id's bytes change under it.
+    agent_tab_labels: [sidebar_element_capacity][tab_name_capacity + 8]u8 = undefined,
+    agent_workspace_labels: [sidebar_element_capacity][tab_name_capacity + 8]u8 = undefined,
+    agent_state_ids: [2][sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
+    agent_state_id_generation: usize = 0,
     palette_row_ids: [palette_action_capacity][palette_semantic_capacity]u8 = undefined,
     palette_row_labels: [palette_action_capacity][palette_label_capacity]u8 = undefined,
     palette_choice_ids: [palette_visible_rows][palette_semantic_capacity]u8 = undefined,
@@ -4679,6 +4830,56 @@ const App = struct {
             .handler = settingsActivateAction,
             .palette = null,
         });
+        // TASK-56. The three choice lists start empty and are filled from the
+        // agent runtime (detected harnesses, live agents) while the palette
+        // is closed, like the font and theme pickers.
+        const agent_launch_index = actions.definitions().len;
+        try actions.register(.{
+            .name = agent_launch_action,
+            .label = "Agent: launch",
+            .handler = agentLaunchAction,
+            .palette = agentChoiceCommand("harness", "Launch agent", &no_harness_choices),
+        });
+        const agent_prompt_index = actions.definitions().len;
+        try actions.register(.{
+            .name = agent_launch_prompt_action,
+            .label = "Agent: launch with prompt",
+            .handler = agentLaunchPromptAction,
+            .palette = .{ .argument = .{ .input = .{
+                .name = "prompt",
+                .prompt = "Initial prompt (Enter for none)",
+            } } },
+        });
+        const agent_stop_index = actions.definitions().len;
+        try actions.register(.{
+            .name = agent_stop_action,
+            .label = "Agent: stop",
+            .handler = agentStopAction,
+            .palette = agentChoiceCommand("agent", "Stop agent", &no_agent_choices),
+        });
+        const agent_focus_index = actions.definitions().len;
+        try actions.register(.{
+            .name = agent_focus_action,
+            .label = "Agent: focus",
+            .handler = agentFocusAction,
+            .palette = agentChoiceCommand("agent", "Focus agent", &no_agent_choices),
+        });
+        try actions.register(.{
+            .name = notifications_open_action,
+            .label = "Notifications",
+            .handler = notificationsOpenAction,
+        });
+        try actions.register(.{
+            .name = notifications_clear_action,
+            .label = "Notifications: clear",
+            .handler = notificationsClearAction,
+        });
+        try actions.register(.{
+            .name = notifications_activate_action,
+            .label = "Open notification",
+            .handler = notificationsActivateAction,
+            .palette = null,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -4741,9 +4942,29 @@ const App = struct {
         };
         workspace_presentations.appendAssumeCapacity(initial_presentation);
 
+        var agent_spec = try ChildSpec.buildInteractive(allocator, io, env, .local, true, "/bin/sh");
+        errdefer agent_spec.deinit();
+        var sink_root_buffer: [path_capacity]u8 = undefined;
+        var agents = try app_agents.Runtime.init(allocator, io, .{
+            .sink_root = agentSinkRoot(io, env, options, &sink_root_buffer),
+            .fake_enabled = options.run.agent_test or (options.run.test_driver_endpoint != null and
+                std.mem.eql(u8, env.get(fake_agent_env) orelse "", "1")),
+        });
+        errdefer agents.deinit();
+        agents.settings = loaded_config.settings.notifications;
+
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
         app.* = .{
+            .agents = agents,
+            .agent_spec = agent_spec,
+            .claude_config_dir = env.get("CLAUDE_CONFIG_DIR"),
+            .codex_home = env.get("CODEX_HOME"),
+            .agent_launch_index = agent_launch_index,
+            .agent_prompt_index = agent_prompt_index,
+            .agent_stop_index = agent_stop_index,
+            .agent_focus_index = agent_focus_index,
+            .window_focused = window.hasInputFocus(),
             .allocator = allocator,
             .io = io,
             .window = window,
@@ -4813,10 +5034,18 @@ const App = struct {
             .screenshot = options.run.screenshot,
             .driver_artifact_dir = options.run.test_artifact_dir,
         };
+        app.agents.wake = .{ .context = app, .wake_fn = agentWake };
+        // A hidden window is headless automation: its agents notify the list,
+        // never the desktop, unless a check installs its own seam.
+        if (options.run.hidden) app.agents.notifier = .{ .notify_fn = discardOsNotification };
         app.resolveTheme();
         app.theme_catalog.order(app.activeThemeName());
         app.setThemeChoices();
         app.setFontChoices();
+        // Built-in checks other than the agent check never probe harnesses:
+        // what is installed on a machine must not change what they measure.
+        if (!usesDeterministicScratchpad(options)) app.ensureAgentDetection();
+        app.setAgentLaunchChoices();
         app.refreshConfigError();
         try app.syncGrid();
         if (testdriver.isEnabled(options.run.test_driver_endpoint != null)) {
@@ -4921,6 +5150,11 @@ const App = struct {
             if (presentation.load) |job| self.destroyLoad(job);
             if (presentation.scratchpad_load) |job| self.destroyLoad(job);
         }
+        // Every spawn worker that could still be preparing an agent has been
+        // joined above; the runtime's own workers stop here, before the
+        // workspaces whose contexts its detections borrow.
+        self.agents.deinit();
+        self.agent_spec.deinit();
         self.stopSearchEngine();
         if (self.rename_input) |*field| field.deinit();
         self.search_query.deinit();
@@ -5388,6 +5622,14 @@ const App = struct {
         if (job.spawn_failure) |name| {
             log.warn("no child process: {s}; the terminal stays empty", .{name});
         }
+        if (job.agent_runner) |runner| {
+            const started = if (job.spawn_session_id) |id|
+                (if (model.sessionById(id)) |target| target.child() != null else false)
+            else
+                false;
+            self.agents.spawnFinished(runner, started);
+            self.invalidateUi();
+        }
         job.freeSpawnInputs();
         self.allocator.destroy(job);
         presentation.load = null;
@@ -5686,7 +5928,7 @@ const App = struct {
     /// semantic frame and is copied before that frame is rebuilt. Nothing
     /// opens over another modal surface or while a gesture is in flight.
     fn openContextMenu(self: *App, col: u32, row: u32, link_id: ?[]const u8) !void {
-        if (self.contextMenuVisible() or self.paletteVisible() or self.settingsVisible() or self.closeModalActive() or
+        if (self.contextMenuVisible() or self.notificationsVisible() or self.paletteVisible() or self.settingsVisible() or self.closeModalActive() or
             self.rename_tab_id != null or self.search_visible or self.scratchpadVisible() or
             self.ui_pointer_owned or self.sidebar_dragging or self.dragged_divider_id != null or
             self.dragged_tab_id != null) return;
@@ -5873,6 +6115,633 @@ const App = struct {
             .text_editing, .candidates => return true,
             else => return false,
         }
+    }
+
+    // Agents and notifications (TASK-56) ------------------------------------
+
+    /// Wake the loop from an agent worker: events are waiting in a queue.
+    fn agentWake(context: ?*anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(context.?));
+        self.window.postDriverWake() catch |err| {
+            log.debug("could not wake the event loop for agent events: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// The OS notification seam of a hidden (headless) run: nothing reaches
+    /// the desktop.
+    fn discardOsNotification(_: ?*anyopaque, _: []const u8, _: []const u8) void {}
+
+    /// `--agent-test`'s private directory: the parent of the sink root.
+    fn agentTestDir(self: *const App) ?[]const u8 {
+        const root = self.agents.sink_root orelse return null;
+        return std.fs.path.dirnamePosix(root);
+    }
+
+    fn windowFocused(self: *const App) bool {
+        return self.focus_override orelse self.window_focused;
+    }
+
+    /// Start finding the active workspace's harnesses, once per workspace.
+    fn ensureAgentDetection(self: *App) void {
+        const key = self.workspace_registry.activeKey() orelse return;
+        const model = self.workspace_registry.byKey(key) orelse return;
+        self.agents.ensureDetection(key, model.contextRef(), self.agent_spec.env);
+    }
+
+    /// A fixed-choice command; an empty list shows its one placeholder row,
+    /// whose value no handler accepts, so the step says why nothing can run.
+    fn agentChoiceCommand(name: []const u8, prompt: []const u8, values: []const inputmod.PaletteChoice) inputmod.PaletteCommand {
+        const shown = if (values.len != 0) values else if (std.mem.eql(u8, name, "harness")) &no_harness_choices else &no_agent_choices;
+        return .{ .argument = .{ .choices = .{ .name = name, .prompt = prompt, .values = shown } } };
+    }
+
+    /// Point `agent.launch` at the active workspace's detected harnesses.
+    /// Only while the palette is closed: an open picker's rows are indices.
+    fn setAgentLaunchChoices(self: *App) void {
+        if (self.paletteVisible()) return;
+        const key = self.workspace_registry.activeKey() orelse return;
+        self.action_definitions[self.agent_launch_index].palette = agentChoiceCommand("harness", "Launch agent", self.agents.launchChoices(key));
+    }
+
+    /// The tab name a session is shown under, if it is in a tab.
+    fn sessionTabName(self: *App, key: workspace.WorkspaceKey, id: session.SessionId) ?[]const u8 {
+        const model = self.workspace_registry.byKey(key) orelse return null;
+        const location = model.paneForSession(id) orelse return null;
+        const tab = model.tab(location.tab_id) orelse return null;
+        return tab.name();
+    }
+
+    /// Relist the agents `agent.stop` and `agent.focus` offer. Never the
+    /// scratchpad: the registry refuses to bind an agent there.
+    fn rebuildAgentChoices(self: *App) void {
+        if (self.paletteVisible()) return;
+        var count: usize = 0;
+        for (self.agents.registry.all()) |*record| {
+            if (count == agent_choice_capacity) break;
+            const value = std.fmt.bufPrint(&self.agent_choice_values[count], "{d}", .{@intFromEnum(record.id)}) catch continue;
+            const workspace_name = if (self.workspace_registry.byKey(record.workspace)) |model| model.name() else "?";
+            const label = std.fmt.bufPrint(&self.agent_choice_labels[count], "{s} {s} #{d}  {s} › {s}", .{
+                app_agents.stateGlyph(record.state),
+                self.agents.displayName(record),
+                @intFromEnum(record.id),
+                workspace_name,
+                self.sessionTabName(record.workspace, record.session) orelse "(closed)",
+            }) catch value;
+            self.agent_choices[count] = .{ .label = label, .value = value };
+            count += 1;
+        }
+        self.agent_choice_count = count;
+        const choices = self.agent_choices[0..count];
+        self.action_definitions[self.agent_stop_index].palette = agentChoiceCommand("agent", "Stop agent", choices);
+        self.action_definitions[self.agent_focus_index].palette = agentChoiceCommand("agent", "Focus agent", choices);
+    }
+
+    fn agentByArgument(self: *App, invocation: inputmod.Invocation) ?*const agent.Agent {
+        const text = argument(invocation, "agent") orelse return null;
+        const raw = std.fmt.parseInt(u64, text, 10) catch return null;
+        if (raw == 0) return null;
+        return self.agents.registry.get(@enumFromInt(raw));
+    }
+
+    /// The first harness this workspace can launch, for a prompt typed
+    /// before any harness was chosen.
+    fn firstAgentChoice(self: *App) ?app_agents.Choice {
+        const key = self.workspace_registry.activeKey() orelse return null;
+        const choices = self.agents.launchChoices(key);
+        self.setAgentLaunchChoices();
+        if (choices.len == 0) return null;
+        return app_agents.Choice.parse(choices[0].value);
+    }
+
+    fn agentLaunchAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const value = argument(invocation, "harness") orelse return;
+        const choice = app_agents.Choice.parse(value) orelse {
+            self.setWorkspaceStatus("no coding agent found here");
+            return;
+        };
+        if (choice == .fake and !self.agents.fake_enabled) return;
+        if (invocation.source == .palette) {
+            // The palette asks for the optional prompt next, in the same
+            // modal; Enter on an empty field launches without one.
+            self.agent_launch_pending = choice;
+            try self.showPalette();
+            try self.beginPaletteArgument(self.agent_prompt_index);
+            return;
+        }
+        try self.launchAgent(choice, argument(invocation, "prompt"));
+    }
+
+    fn agentLaunchPromptAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const pending = self.agent_launch_pending;
+        self.agent_launch_pending = null;
+        const choice = pending orelse self.agent_last_choice orelse self.firstAgentChoice() orelse {
+            self.setWorkspaceStatus("no coding agent found here");
+            return;
+        };
+        try self.launchAgent(choice, argument(invocation, "prompt"));
+    }
+
+    /// Launch `choice` in a new tab of the active workspace: an
+    /// `agent_terminal` session, its agent registered, and the adapter's
+    /// process spawned through the workspace's ExecutionContext in the
+    /// invoking session's cwd. Refusals are status lines, never errors.
+    fn launchAgent(self: *App, choice: app_agents.Choice, prompt: ?[]const u8) !void {
+        const presentation = self.activePresentation();
+        if (presentation.load != null) {
+            self.setWorkspaceStatus("agent launch deferred: a start is in progress");
+            return;
+        }
+        if (!try self.prepareToLeaveActiveSession()) return;
+        const key = presentation.key;
+        const model = self.activeWorkspace();
+        const inherited = self.activeLive().workingDirectory() orelse model.workingDirectory();
+        const cwd = try self.allocator.dupe(u8, inherited);
+        var cwd_owned = true;
+        defer if (cwd_owned) self.allocator.free(cwd);
+
+        try presentation.pane_renderers.ensureUnusedCapacity(self.allocator, 1);
+        const expected_session = session.SessionId.fromOrdinal(@intCast(model.registeredSessionCount()));
+        var pane_renderer = try self.newPaneRenderer(expected_session);
+        var renderer_owned = true;
+        errdefer if (renderer_owned) pane_renderer.deinit();
+        const session_id = try model.createSession(.agent_terminal, self.activeLive().terminal().gridSize());
+        var session_owned = true;
+        errdefer if (session_owned) model.closeSession(session_id) catch |err| log.warn("an agent session could not be released: {s}", .{@errorName(err)});
+
+        const runner = self.agents.createRunner(.{
+            .choice = choice,
+            .workspace = key,
+            .session = session_id,
+            .context_kind = model.contextKind(),
+            .cwd = cwd,
+            .prompt = prompt,
+            .probe_env = self.agent_spec.env,
+            .home = self.home_dir,
+            .claude_config_dir = self.claude_config_dir,
+            .codex_home = self.codex_home,
+        }) catch |err| {
+            self.setWorkspaceStatus(switch (err) {
+                error.RemoteUnsupported => "this agent needs a local workspace for now",
+                error.NoSinkRoot => "no private state directory for the agent",
+                error.OutOfMemory => "out of memory",
+            });
+            pane_renderer.deinit();
+            renderer_owned = false;
+            session_owned = false;
+            model.closeSession(session_id) catch |close_err| log.warn("an agent session could not be released: {s}", .{@errorName(close_err)});
+            return;
+        };
+        var runner_owned = true;
+        errdefer if (runner_owned) self.agents.discard(runner);
+        const label = switch (choice) {
+            .harness => |harness| harness.displayName(),
+            .fake => "Fake agent",
+        };
+        const tab_id = try model.registerTab(label, session_id);
+        _ = try self.agents.register(runner, .{
+            .workspace = key,
+            .session = session_id,
+            .session_kind = .agent_terminal,
+            .scratchpad = model.scratchpadId(),
+        });
+        try model.activateTab(tab_id);
+        pane_renderer.session_id = session_id;
+        presentation.pane_renderers.appendAssumeCapacity(pane_renderer);
+        renderer_owned = false;
+        session_owned = false;
+        runner_owned = false;
+        self.agent_last_choice = choice;
+        try self.adoptActiveTab();
+        cwd_owned = false;
+        self.startAgentChild(session_id, cwd, runner);
+        self.rebuildAgentChoices();
+        self.invalidateUi();
+    }
+
+    /// `startTabChildWith` for an agent: the job carries the runner whose
+    /// `prepare` describes the process on the worker. Takes `cwd`.
+    fn startAgentChild(self: *App, session_id: session.SessionId, cwd: []u8, runner: *app_agents.Runner) void {
+        const presentation = self.activePresentation();
+        const model = self.workspace_registry.byKey(presentation.key) orelse unreachable;
+        var request = model.spawnRequest(session_id, .{
+            .argv = &agent_placeholder_argv,
+            .env = self.agent_spec.env,
+        }) catch |err| {
+            log.warn("could not prepare the agent's child: {s}", .{@errorName(err)});
+            self.allocator.free(cwd);
+            self.agents.spawnFinished(runner, false);
+            return;
+        };
+        request.cwd = cwd;
+        const job = self.allocator.create(Load) catch |err| {
+            log.warn("no memory to start the agent's child: {s}", .{@errorName(err)});
+            self.allocator.free(cwd);
+            self.agents.spawnFinished(runner, false);
+            return;
+        };
+        job.* = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .spawn = request,
+            .spawn_cwd = cwd,
+            .spawn_session_id = session_id,
+            .workspace_key = presentation.key,
+            .execution_context = model.contextRef(),
+            .agent_runner = runner,
+        };
+        runner.spawning = true;
+        job.start() catch |err| {
+            log.warn("could not start the worker for the agent: {s}", .{@errorName(err)});
+            job.freeSpawnInputs();
+            self.allocator.destroy(job);
+            self.agents.spawnFinished(runner, false);
+            return;
+        };
+        presentation.load = job;
+    }
+
+    fn agentStopAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const record = self.agentByArgument(invocation) orelse return;
+        const key = record.workspace;
+        const id = record.session;
+        switch (record.ownership) {
+            // Conduit ends an agent it launched by hanging up its PTY child;
+            // the exit then arrives like any other and settles the glyph.
+            .owned => {
+                const model = self.workspace_registry.byKey(key) orelse return;
+                const live = model.sessionById(id) orelse return;
+                const child = live.child() orelse return;
+                child.kill(.hangup) catch |err| switch (err) {
+                    error.Closed => {},
+                    else => log.warn("could not stop the agent: {s}", .{@errorName(err)}),
+                };
+            },
+            // A human's own process is never ended: stop only observing it.
+            .observed => self.agents.sessionClosed(key, id),
+        }
+        self.rebuildAgentChoices();
+        self.invalidateUi();
+    }
+
+    fn agentFocusAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const record = self.agentByArgument(invocation) orelse return;
+        const id = record.id;
+        try self.focusSession(record.workspace, record.session);
+        self.agents.selected_agent = id;
+    }
+
+    /// Show one session: its workspace, then the tab and pane that hold it.
+    fn focusSession(self: *App, key: workspace.WorkspaceKey, id: session.SessionId) !void {
+        if (!try self.activateWorkspaceKey(key, false)) return;
+        const model = self.activeWorkspace();
+        const location = model.paneForSession(id) orelse return;
+        if (model.activeTabId() == location.tab_id and model.focusedPaneId(location.tab_id) == location.pane_id) {
+            try self.refreshActiveUi();
+            return;
+        }
+        if (!try self.prepareToLeaveActiveSession()) return;
+        try model.focusPane(location.tab_id, location.pane_id);
+        try model.activateTab(location.tab_id);
+        try self.adoptActiveTab();
+    }
+
+    /// Owner-thread agent service, once per loop iteration: drain the
+    /// workers' queues, record exits and forget agents whose session closed.
+    fn pollAgents(self: *App) bool {
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        self.agents.focused = self.windowFocused();
+        var changed = self.agents.poll(now);
+        sweep: while (true) {
+            for (self.agents.registry.all()) |record| {
+                const model = self.workspace_registry.byKey(record.workspace);
+                const live = if (model) |owner| owner.sessionById(record.session) else null;
+                const present = live orelse {
+                    self.agents.sessionClosed(record.workspace, record.session);
+                    changed = true;
+                    continue :sweep;
+                };
+                if (record.hasExited()) continue;
+                const child = present.child() orelse continue;
+                switch (child.state()) {
+                    .running => {},
+                    .exited => |status| {
+                        self.agents.childExited(record.workspace, record.session, agentExitStatus(status), now);
+                        changed = true;
+                        continue :sweep;
+                    },
+                }
+            }
+            break;
+        }
+        if (self.agents.poll(now)) changed = true;
+        if (changed) {
+            self.setAgentLaunchChoices();
+            self.rebuildAgentChoices();
+        }
+        return changed;
+    }
+
+    fn agentExitStatus(status: pty.ExitStatus) agent.ExitStatus {
+        return switch (status) {
+            .code => |code| .{ .code = @intCast(@min(code, 255)) },
+            .signal => |signal| .{ .signal = switch (signal) {
+                .hangup => 1,
+                .interrupt => 2,
+                .terminate => 15,
+                .kill => 9,
+            } },
+            .unknown => .{ .signal = 0 },
+        };
+    }
+
+    /// Output from a session is activity for its agent's heuristics.
+    fn noteAgentOutput(self: *App, key: workspace.WorkspaceKey, id: session.SessionId) void {
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        self.agents.observe(key, id, .{ .output = .{ .now_ns = monotonicNs(now) } }, now);
+    }
+
+    /// Route one terminal event to its agent's heuristics, or, for a session
+    /// without an agent, raise a terminal notification: OSC 9/777 from any
+    /// session, a bell only from one the human is not looking at.
+    fn noteAgentTerminalEvent(self: *App, key: workspace.WorkspaceKey, id: session.SessionId, event: term.Event) void {
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        const has_agent = self.agents.hasAgent(key, id);
+        switch (event) {
+            .title => if (has_agent) self.agents.observe(key, id, .{ .title = .{ .now_ns = monotonicNs(now) } }, now),
+            .bell => if (has_agent) {
+                self.agents.observe(key, id, .bell, now);
+            } else if (!self.sessionVisible(key, id)) {
+                var body_buffer: [tab_name_capacity + 32]u8 = undefined;
+                const body = std.fmt.bufPrint(&body_buffer, "{s} rang the bell", .{self.sessionTabName(key, id) orelse "a terminal"}) catch "a terminal rang the bell";
+                self.agents.raiseTerminal(key, id, "Bell", body);
+            },
+            .notification => |n| if (has_agent) {
+                self.agents.observe(key, id, .{ .notification = .{ .title = n.title, .body = n.body, .truncated = n.truncated } }, now);
+            } else {
+                self.agents.raiseTerminal(key, id, n.title, n.body);
+            },
+            .prompt => |mark| if (has_agent) switch (mark.kind) {
+                .output_start => self.agents.observe(key, id, .{ .command_started = .{ .now_ns = monotonicNs(now) } }, now),
+                .prompt_start => self.agents.observe(key, id, .shell_prompt, now),
+                .input_start, .command_end => {},
+            },
+            .permission_request, .working_directory, .reset => {},
+        }
+    }
+
+    /// Whether a session is in the tab the human is looking at.
+    fn sessionVisible(self: *App, key: workspace.WorkspaceKey, id: session.SessionId) bool {
+        const active_key = self.workspace_registry.activeKey() orelse return false;
+        if (active_key != key) return false;
+        // The presented session includes a shown scratchpad, which has no tab.
+        if (id == self.presentedSessionId()) return true;
+        const model = self.workspace_registry.byKey(key) orelse return false;
+        const location = model.paneForSession(id) orelse return false;
+        return model.activeTabId() == location.tab_id;
+    }
+
+    fn monotonicNs(now: i96) u64 {
+        if (now <= 0) return 0;
+        return @intCast(@min(now, std.math.maxInt(u64)));
+    }
+
+    // The notification list --------------------------------------------------
+
+    fn notificationsVisible(self: *const App) bool {
+        return self.notifications_visible;
+    }
+
+    fn notificationRowCount(self: *const App) usize {
+        return @min(self.agents.notifications.count(), notification_visible_rows);
+    }
+
+    fn notificationsBounds(self: *const App) ?ui.Rect {
+        if (!self.notifications_visible) return null;
+        const canvas = self.ui_canvas.bounds();
+        const rows: u32 = @intCast(@max(self.notificationRowCount(), 1));
+        const width = @min(canvas.width, @as(u32, 76));
+        const height = @min(canvas.height, rows + 4);
+        if (width < 24 or height < 5) return null;
+        return .{
+            .x = (canvas.width - width) / 2,
+            .y = (canvas.height - height) / 2,
+            .width = width,
+            .height = height,
+        };
+    }
+
+    /// A short age: `now`, `42s`, `7m`, `3h`, `2d`.
+    fn formatAge(buffer: []u8, raised_ns: i96, now_ns: i96) []const u8 {
+        const seconds: i96 = @divTrunc(@max(now_ns - raised_ns, 0), std.time.ns_per_s);
+        return (if (seconds < 5)
+            std.fmt.bufPrint(buffer, "now", .{})
+        else if (seconds < 60)
+            std.fmt.bufPrint(buffer, "{d}s", .{seconds})
+        else if (seconds < 3600)
+            std.fmt.bufPrint(buffer, "{d}m", .{@divTrunc(seconds, 60)})
+        else if (seconds < 86400)
+            std.fmt.bufPrint(buffer, "{d}h", .{@divTrunc(seconds, 3600)})
+        else
+            std.fmt.bufPrint(buffer, "{d}d", .{@divTrunc(seconds, 86400)})) catch "";
+    }
+
+    /// The list is a `Surface` panel of `InteractiveText` rows, newest first,
+    /// each `<age>  <workspace> › <tab>  <title>: <text>`. Text is the
+    /// program's or harness's display data, clipped at the panel edge.
+    fn composeNotifications(self: *App) !void {
+        const bounds = self.notificationsBounds() orelse return;
+        const dialog_id: ui.Id = .{ .value = "notifications" };
+        try self.ui_tree.addSurface(.{
+            .id = dialog_id,
+            .role = "dialog",
+            .label = "Notifications",
+            .bounds = bounds,
+        }, .{
+            .rect = bounds,
+            .erase_underlay = true,
+            .fill = .background,
+            .border = .double,
+            .border_style = .{ .foreground = .border, .background = .background },
+            .title = " Notifications ",
+            .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
+        });
+        const inner_x = bounds.x + 2;
+        const inner_width = bounds.width - 4;
+        const count = self.notificationRowCount();
+        if (count == 0) {
+            const runs = [_]ui.Run{.{ .text = "No notifications", .style = .{ .foreground = .muted } }};
+            try self.ui_tree.addText(.{
+                .id = .{ .value = "notifications.empty" },
+                .parent = dialog_id,
+                .role = "status",
+                .label = "No notifications",
+                .bounds = .{ .x = inner_x, .y = bounds.y + 2, .width = inner_width, .height = 1 },
+            }, .{ .runs = &runs });
+        }
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        for (0..count) |index| {
+            if (bounds.y + 2 + index >= bounds.y + bounds.height - 1) break;
+            const entry = self.agents.notifications.newest(index) orelse break;
+            const id_text = try std.fmt.bufPrint(&self.notification_row_ids[index], "notification.{d}", .{index});
+            var age_buffer: [16]u8 = undefined;
+            const workspace_name = if (self.workspace_registry.byKey(entry.workspace)) |model| model.name() else "?";
+            const label = std.fmt.bufPrint(&self.notification_row_labels[index], "{s: >4}  {s} › {s}  {s}: {s}", .{
+                formatAge(&age_buffer, entry.raised_ns, now),
+                workspace_name,
+                self.sessionTabName(entry.workspace, entry.session) orelse "(closed)",
+                entry.title(),
+                entry.body(),
+            }) catch entry.title();
+            const id: ui.Id = .{ .value = id_text };
+            try self.ui_tree.addInteractiveText(.{
+                .id = id,
+                .parent = dialog_id,
+                .role = "notification",
+                .label = label,
+                .action = notifications_activate_action,
+                .bounds = .{ .x = inner_x, .y = bounds.y + 2 + @as(u32, @intCast(index)), .width = inner_width, .height = 1 },
+            }, .{
+                .id = id,
+                .label = label,
+                .action = notifications_activate_action,
+                .normal = .{ .foreground = if (entry.kind == .permission or entry.kind == .@"error") .attention else .foreground, .background = .background },
+                .hovered = .{ .foreground = .strong, .underline = .accent, .background = .background },
+                .focused = .{ .foreground = .on_accent, .background = .accent },
+            });
+        }
+    }
+
+    fn openNotifications(self: *App) !void {
+        if (self.notificationsVisible() or self.contextMenuVisible() or self.paletteVisible() or self.settingsVisible() or
+            self.closeModalActive() or self.rename_tab_id != null or self.ui_pointer_owned or self.sidebar_dragging or
+            self.dragged_divider_id != null or self.dragged_tab_id != null) return;
+        if (self.search_visible) try self.closeSearch();
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        try self.window.stopTextInput();
+        self.notifications_visible = true;
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        if (self.notificationRowCount() != 0 and self.ui_tree.focus(.{ .value = "notification.0" })) try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    fn closeNotifications(self: *App) !void {
+        if (!self.notificationsVisible()) return;
+        self.notifications_visible = false;
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    fn moveNotificationFocus(self: *App, next: bool) !void {
+        const count = self.notificationRowCount();
+        if (count == 0) return;
+        var current: ?usize = null;
+        if (self.ui_tree.focusedElement()) |focused| current = notificationRowIndex(focused.id.value);
+        const target = if (current) |index|
+            if (next) (index + 1) % count else (index + count - 1) % count
+        else if (next) 0 else count - 1;
+        var storage: [palette_semantic_capacity]u8 = undefined;
+        const id = try std.fmt.bufPrint(&storage, "notification.{d}", .{target});
+        if (self.ui_tree.focus(.{ .value = id })) try self.refreshActiveUi();
+    }
+
+    fn notificationRowIndex(id: []const u8) ?usize {
+        const prefix = "notification.";
+        if (!std.mem.startsWith(u8, id, prefix)) return null;
+        return std.fmt.parseInt(usize, id[prefix.len..], 10) catch null;
+    }
+
+    /// Activating a row closes the list and shows the entry's session:
+    /// its workspace, tab and pane, and selects its agent.
+    fn activateNotificationRow(self: *App, row_id: []const u8) !void {
+        const index = notificationRowIndex(row_id) orelse return;
+        const found = self.agents.notifications.newest(index) orelse return;
+        const entry = found.*;
+        try self.closeNotifications();
+        try self.focusSession(entry.workspace, entry.session);
+        self.agents.selected_agent = entry.agent;
+    }
+
+    fn handleNotificationsUiEvent(self: *App, event: platform.Event) !bool {
+        const tree = self.activeUiTree();
+        switch (event) {
+            .mouse_motion => |motion| {
+                const point = devicePointerPoint(motion.x, motion.y, self.window.state.scale);
+                const before = uiInteractionState(tree);
+                tree.pointerMoved(point);
+                if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                return true;
+            },
+            .mouse_button => |button| {
+                const point = devicePointerPoint(button.x, button.y, self.window.state.scale);
+                const bounds = self.notificationsBounds();
+                const inside = bounds != null and self.pointInCellRect(point, bounds.?);
+                switch (button.action) {
+                    .press => {
+                        self.notifications_pointer_owned = true;
+                        if (!inside) {
+                            try self.closeNotifications();
+                            return true;
+                        }
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        tree.pointerPressed(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        return true;
+                    },
+                    .repeat => return true,
+                    .release => {
+                        if (!self.notifications_pointer_owned) return true;
+                        self.notifications_pointer_owned = false;
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        const activation = tree.pointerReleased(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        if (activation) |requested| {
+                            var id_storage: [palette_semantic_capacity]u8 = undefined;
+                            if (requested.id.value.len > id_storage.len) return true;
+                            @memcpy(id_storage[0..requested.id.value.len], requested.id.value);
+                            try self.activateNotificationRow(id_storage[0..requested.id.value.len]);
+                        }
+                        return true;
+                    },
+                }
+            },
+            .wheel => return true,
+            .text_input, .key => return false,
+            .text_editing, .candidates => return true,
+            else => return false,
+        }
+    }
+
+    fn notificationsOpenAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        try self.openNotifications();
+    }
+
+    fn notificationsClearAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        self.agents.notifications.clear();
+        if (self.notificationsVisible()) try self.refreshActiveUi() else self.invalidateUi();
+    }
+
+    fn notificationsActivateAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const origin = invocation.origin orelse return;
+        var id_storage: [palette_semantic_capacity]u8 = undefined;
+        if (origin.value.len > id_storage.len) return;
+        @memcpy(id_storage[0..origin.value.len], origin.value);
+        try self.activateNotificationRow(id_storage[0..origin.value.len]);
     }
 
     fn paletteBounds(self: *const App) ?ui.Rect {
@@ -6818,6 +7687,8 @@ const App = struct {
                 const geometry = self.uiGeometry();
                 var workspace_storage_index: usize = 0;
                 var tab_storage_index: usize = 0;
+                var agent_state_slot: usize = 0;
+                self.agent_state_id_generation = (self.agent_state_id_generation + 1) % self.agent_state_ids.len;
                 var row: u32 = 1;
                 var workspace_index: usize = 0;
                 // Every workspace after the first listed one sits a few
@@ -6837,21 +7708,42 @@ const App = struct {
                     if (row >= row_limit) break;
                     group_index += 1;
                     const semantic = try workspaceSemanticId(&self.workspace_semantic_storage[workspace_storage_index], key);
+                    const workspace_slot = workspace_storage_index;
                     workspace_storage_index += 1;
                     const workspace_id: ui.Id = .{ .value = semantic };
                     const selected = active_key != null and active_key.? == key;
+                    // The most urgent agent state in the workspace leads its
+                    // row (TASK-56); the glyph element's id carries the state.
+                    var workspace_label = model.name();
+                    if (self.agents.workspaceState(key)) |state| {
+                        workspace_label = std.fmt.bufPrint(&self.agent_workspace_labels[workspace_slot], "{s} {s}", .{ app_agents.stateGlyph(state), model.name() }) catch model.name();
+                        if (agent_state_slot < sidebar_element_capacity) {
+                            const state_id = try std.fmt.bufPrint(&self.agent_state_ids[self.agent_state_id_generation][agent_state_slot], "{s}.agent.{s}", .{ semantic, @tagName(state) });
+                            agent_state_slot += 1;
+                            // Semantic only: the row painted over it shows
+                            // the glyph, so it takes none of the frame's runs.
+                            try self.ui_tree.addText(.{
+                                .id = .{ .value = state_id },
+                                .parent = .{ .value = "sidebar" },
+                                .role = "agent_state",
+                                .label = @tagName(state),
+                                .bounds = .{ .x = 1, .y = row, .width = 1, .height = 1 },
+                                .offset_px = group_offset_px,
+                            }, .{ .runs = &.{} });
+                        }
+                    }
                     try self.ui_tree.addInteractiveText(.{
                         .id = workspace_id,
                         .parent = .{ .value = "sidebar" },
                         .role = "workspace",
-                        .label = model.name(),
+                        .label = workspace_label,
                         .selected = selected,
                         .action = workspace_activate_action,
                         .bounds = .{ .x = 1, .y = row, .width = content_width, .height = 1 },
                         .offset_px = group_offset_px,
                     }, .{
                         .id = workspace_id,
-                        .label = model.name(),
+                        .label = workspace_label,
                         .action = workspace_activate_action,
                         .normal = if (selected)
                             .{ .foreground = .accent, .background = .selection }
@@ -6901,18 +7793,38 @@ const App = struct {
                         }
                         if (!renaming) {
                             const tab_selected = model.activeTabId() == tab.id();
+                            // An agent's tab leads with its state glyph in
+                            // place of TASK-29's `* `/`! ` marks (TASK-56).
+                            var tab_label = tab.displayLabel();
+                            const agent_session = model.focusedPaneSessionId(tab.id()) orelse tab.sessionId();
+                            const tab_agent = self.agents.agentForSession(key, agent_session) orelse self.agents.agentForSession(key, tab.sessionId());
+                            if (tab_agent) |record| {
+                                tab_label = std.fmt.bufPrint(&self.agent_tab_labels[storage_index], "{s} {s}", .{ app_agents.stateGlyph(record.state), tab.name() }) catch tab.displayLabel();
+                                if (agent_state_slot < sidebar_element_capacity) {
+                                    const state_id = try std.fmt.bufPrint(&self.agent_state_ids[self.agent_state_id_generation][agent_state_slot], "{s}.agent.{s}", .{ tab_semantic, @tagName(record.state) });
+                                    agent_state_slot += 1;
+                                    try self.ui_tree.addText(.{
+                                        .id = .{ .value = state_id },
+                                        .parent = workspace_id,
+                                        .role = "agent_state",
+                                        .label = @tagName(record.state),
+                                        .bounds = .{ .x = 2, .y = row, .width = 1, .height = 1 },
+                                        .offset_px = group_offset_px,
+                                    }, .{ .runs = &.{} });
+                                }
+                            }
                             try self.ui_tree.addInteractiveText(.{
                                 .id = id,
                                 .parent = workspace_id,
                                 .role = "tab",
-                                .label = tab.displayLabel(),
+                                .label = tab_label,
                                 .selected = tab_selected,
                                 .action = tab_activate_action,
                                 .bounds = .{ .x = 2, .y = row, .width = content_width - 1, .height = 1 },
                                 .offset_px = group_offset_px,
                             }, .{
                                 .id = id,
-                                .label = tab.displayLabel(),
+                                .label = tab_label,
                                 .action = tab_activate_action,
                                 .normal = if (tab_selected)
                                     .{ .foreground = .strong, .background = .selection }
@@ -7315,6 +8227,7 @@ const App = struct {
         if (self.paletteVisible()) try self.composePalette();
         if (self.settingsVisible()) try self.composeSettings();
         if (self.contextMenuVisible()) try self.composeContextMenu();
+        if (self.notificationsVisible()) try self.composeNotifications();
         if (self.closeModalActive()) {
             const modal_width = @min(canvas_bounds.width, @as(u32, 42));
             const modal_height = @min(canvas_bounds.height, @as(u32, 7));
@@ -7425,14 +8338,16 @@ const App = struct {
         if (presented.child() != null) {
             const got = presented.drainChildOutput(pass);
             drained += got;
+            const presented_key = self.activePresentation().key;
+            const presented_id = self.presentedSessionId();
             if (got != 0) {
                 self.noteSearchTerminalChange(self.presentedSessionId());
                 if (self.trace) |trace| try trace.received.appendSlice(self.allocator, pass[0..got]);
+                self.noteAgentOutput(presented_key, presented_id);
             }
-            const presented_key = self.activePresentation().key;
-            const presented_id = self.presentedSessionId();
             for (presented.terminal().takeEvents()) |event| {
                 self.noteGitEvent(presented_key, presented_id, event);
+                self.noteAgentTerminalEvent(presented_key, presented_id, event);
                 self.noteTerminalEvent(presented, event);
             }
             try self.flushToChild();
@@ -7510,12 +8425,14 @@ const App = struct {
         const model = self.workspace_registry.byKey(event_context.key) orelse return;
         const live = model.sessionById(id) orelse return;
         var attention_changed = model.noteBackgroundActivity(id, false);
+        self.noteAgentOutput(event_context.key, id);
         for (events) |event| {
             switch (event) {
                 .bell => attention_changed = model.noteBackgroundActivity(id, true) or attention_changed,
                 else => {},
             }
             self.noteGitEvent(event_context.key, id, event);
+            self.noteAgentTerminalEvent(event_context.key, id, event);
             self.noteTerminalEvent(live, event);
         }
         if (attention_changed) self.invalidateUi();
@@ -7669,6 +8586,8 @@ const App = struct {
             else
                 log.debug("shell prompt mark {s}", .{@tagName(mark.kind)}),
             .reset => log.debug("the program reset the terminal; working directory and prompt marks forgotten", .{}),
+            // Display text from the program; TASK-56 shows it, never logs it.
+            .notification => |n| log.debug("program asked for a notification ({d}+{d} byte(s))", .{ n.title.len, n.body.len }),
         }
     }
 
@@ -7926,7 +8845,7 @@ const App = struct {
         const modal = self.closeModalActive();
         switch (inputmod.resolve(&self.binding_state, key, translated, self.bindings)) {
             .action => |request| {
-                if (modal or self.contextMenuVisible()) return;
+                if (modal or self.contextMenuVisible() or self.notificationsVisible()) return;
                 if (self.search_visible) {
                     const input_clipboard = self.activeUiTree().focusedInput() != null and
                         (std.mem.eql(u8, request.action, clipboard_copy_action) or
@@ -7954,7 +8873,7 @@ const App = struct {
             .consumed => {},
             .terminal => |press| {
                 if (try self.routeFocusedUiKey(key, translated)) return;
-                if (self.paletteVisible() or self.search_visible or self.contextMenuVisible()) return;
+                if (self.paletteVisible() or self.search_visible or self.contextMenuVisible() or self.notificationsVisible()) return;
                 const presented = self.presentedLive();
                 switch (inputmod.clipboardKey(key, .{
                     .has_selection = presented.terminal().hasSelection(),
@@ -7970,7 +8889,10 @@ const App = struct {
                     .terminal => {
                         self.trackTerminalKeyTransition(key);
                         self.terminal_key_route_count += 1;
-                        if (key.action != .release) presented.terminal().userInput();
+                        if (key.action != .release) {
+                            presented.terminal().userInput();
+                            self.agents.observe(self.activePresentation().key, self.presentedSessionId(), .user_input, Io.Clock.awake.now(self.io).nanoseconds);
+                        }
                         var encoded: term.EncodedKey = .{};
                         presented.terminal().encodeKey(press, &encoded);
                         self.stageForChild(encoded.slice());
@@ -7982,7 +8904,7 @@ const App = struct {
     }
 
     fn routeSearchKey(self: *App, raw: platform.KeyEvent) !bool {
-        if (self.paletteVisible() or self.contextMenuVisible()) return false;
+        if (self.paletteVisible() or self.contextMenuVisible() or self.notificationsVisible()) return false;
         const action = searchKeyAction(self.binding_profile, self.search_visible, raw) orelse return false;
         const identity = uiKeyIdentity(raw) orelse return true;
         if (raw.action != .press) return true;
@@ -8199,6 +9121,9 @@ const App = struct {
             self.refreshFontDiagnostic();
         }
         self.reloadThemes(true);
+        // Notification switches apply to the next notification; entries
+        // already in the list stay.
+        self.agents.settings = settings.notifications;
     }
 
     /// Make `values` the committed font settings: toggle ligatures in place
@@ -9138,8 +10063,10 @@ const App = struct {
                 index += 1;
                 continue;
             }
-            // Branch lookups borrow this workspace's context.
+            // Branch lookups and harness detection borrow this workspace's
+            // context; its agents and notifications go with it.
             self.dropGitTracks(presentation.key);
+            self.agents.removeWorkspace(presentation.key);
             const result = self.workspace_registry.remove(presentation.key) catch {
                 log.err("a closing workspace disappeared before teardown", .{});
                 index += 1;
@@ -10169,7 +11096,7 @@ const App = struct {
         }
         rows[count] = .{ .heading = .{ .id = "settings.heading.keys", .label = "Keys" } };
         count += 1;
-        const reserved = 4 + settings_scratchpad_fields.len + settings_mouse_fields.len;
+        const reserved = 5 + settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len;
         for (self.actions.definitions(), 0..) |*definition, definition_index| {
             if (!settingsBindable(definition)) continue;
             if (count + reserved >= rows.len) break;
@@ -10186,6 +11113,12 @@ const App = struct {
         rows[count] = .{ .heading = .{ .id = "settings.heading.mouse", .label = "Mouse" } };
         count += 1;
         for (settings_mouse_fields) |field| {
+            rows[count] = .{ .field = field };
+            count += 1;
+        }
+        rows[count] = .{ .heading = .{ .id = "settings.heading.agents", .label = "Agents" } };
+        count += 1;
+        for (settings_agents_fields) |field| {
             rows[count] = .{ .field = field };
             count += 1;
         }
@@ -10243,6 +11176,18 @@ const App = struct {
             .scratchpad_size => std.fmt.bufPrint(buffer, "{d}%", .{self.scratchpad_percent_small}) catch "",
             .scratchpad_large_size => std.fmt.bufPrint(buffer, "{d}%", .{self.scratchpad_percent_large}) catch "",
             .mouse_right_click => self.right_click.text(),
+            .notifications_enabled,
+            .notifications_os,
+            .notifications_permission,
+            .notifications_input,
+            .notifications_done,
+            .notifications_error,
+            .notifications_terminal,
+            .notifications_claude_code,
+            .notifications_codex,
+            .notifications_pi,
+            .notifications_opencode,
+            => if (self.config_current.settings.notifications.get(key) orelse true) "true" else "false",
             .keybind => "",
         };
     }
@@ -10686,6 +11631,18 @@ const App = struct {
                 .menu => config.RightClick.paste.text(),
                 .paste => config.RightClick.menu.text(),
             },
+            .notifications_enabled,
+            .notifications_os,
+            .notifications_permission,
+            .notifications_input,
+            .notifications_done,
+            .notifications_error,
+            .notifications_terminal,
+            .notifications_claude_code,
+            .notifications_codex,
+            .notifications_pi,
+            .notifications_opencode,
+            => if (self.config_current.settings.notifications.get(field.key) orelse true) "false" else "true",
             .font_size => size: {
                 const points = self.font_settings.values.points;
                 const next = config.stepFontPoints(points, if (forward) .increase else .decrease);
@@ -10933,7 +11890,7 @@ const App = struct {
     }
 
     fn openPalette(self: *App) !void {
-        if (self.paletteVisible() or self.settingsVisible() or self.closeModalActive() or self.rename_tab_id != null or
+        if (self.paletteVisible() or self.settingsVisible() or self.notificationsVisible() or self.closeModalActive() or self.rename_tab_id != null or
             self.ui_key_state.len != 0 or self.terminal_key_state.len != 0 or
             self.ui_pointer_owned or self.scratchpad_ui_pointer_owned or
             self.scratchpad_terminal_pointer_owned or self.terminal_pointer_presses != 0 or
@@ -10956,6 +11913,11 @@ const App = struct {
         // Installed families can change between openings (a font installed
         // or a reload's rescan); the list is fixed while the palette is open.
         self.rebuildFontChoices();
+        // The same for detected harnesses and live agents (TASK-56). Checks
+        // that never probed keep their fixed list.
+        if (!self.agents.fake_enabled) self.ensureAgentDetection();
+        self.setAgentLaunchChoices();
+        self.rebuildAgentChoices();
         self.palette_content_width = self.paletteContentWidth();
         self.palette_step = .commands;
         self.ui_tree.clearFocus();
@@ -11054,9 +12016,13 @@ const App = struct {
             .none => if (value != null) return,
             .input => |input_argument| {
                 const supplied = std.mem.trim(u8, value orelse return, std.ascii.whitespace[0..]);
-                if (supplied.len == 0) return;
-                arguments[0] = .{ .name = input_argument.name, .value = supplied };
-                invocation_arguments = arguments[0..1];
+                // An agent's initial prompt is optional: Enter on an empty
+                // field launches without one (TASK-56).
+                if (supplied.len == 0 and definition_index != self.agent_prompt_index) return;
+                if (supplied.len != 0) {
+                    arguments[0] = .{ .name = input_argument.name, .value = supplied };
+                    invocation_arguments = arguments[0..1];
+                }
             },
             .choices => |choice_argument| {
                 const supplied = value orelse return;
@@ -11275,7 +12241,7 @@ const App = struct {
     ) ?UiKeyPlan {
         const tree = self.activeUiTree();
         const intent = translated.intent orelse return if (self.closeModalActive() or self.paletteVisible() or
-            self.contextMenuVisible()) .consume else null;
+            self.contextMenuVisible() or self.notificationsVisible()) .consume else null;
         const no_command = !raw.mods.ctrl and !raw.mods.alt and !raw.mods.super;
 
         // The context menu is modal: its four navigation keys move, activate
@@ -11289,6 +12255,22 @@ const App = struct {
                     .up => return .{ .context_menu_move = false },
                     .down => return .{ .context_menu_move = true },
                     .enter => return .context_menu_activate,
+                    else => {},
+                },
+                .character => {},
+            };
+            return .consume;
+        }
+
+        // The notification list is modal in the same way.
+        if (self.notificationsVisible()) {
+            if (no_command) switch (intent.key) {
+                .named => |named| switch (named) {
+                    .escape => return .notifications_close,
+                    .tab => return .{ .notifications_move = !raw.mods.shift },
+                    .up => return .{ .notifications_move = false },
+                    .down => return .{ .notifications_move = true },
+                    .enter => return .notifications_activate,
                     else => {},
                 },
                 .character => {},
@@ -11451,6 +12433,12 @@ const App = struct {
             .context_menu_activate => {
                 const activation = self.activeUiTree().activateFocused() orelse return;
                 try self.activateContextMenuItem(activation, .keybinding);
+            },
+            .notifications_close => try self.closeNotifications(),
+            .notifications_move => |next| try self.moveNotificationFocus(next),
+            .notifications_activate => {
+                const activation = self.activeUiTree().activateFocused() orelse return;
+                try self.activateNotificationRow(activation.id.value);
             },
             .palette_activate => try self.dispatchAction(palette_activate_action, .{
                 .source = .keybinding,
@@ -11663,6 +12651,10 @@ const App = struct {
         changed = self.pollScratchpadLoad() or changed;
         changed = self.finalizeClosingPresentations() or changed;
         if (self.pollGit()) {
+            self.invalidateUi();
+            changed = true;
+        }
+        if (self.pollAgents()) {
             self.invalidateUi();
             changed = true;
         }
@@ -12716,7 +13708,16 @@ const App = struct {
             },
             else => {},
         };
+        if (!self.notificationsVisible() and self.notifications_pointer_owned) switch (event) {
+            .mouse_motion => return true,
+            .mouse_button => |button| {
+                if (button.action == .release) self.notifications_pointer_owned = false;
+                return true;
+            },
+            else => {},
+        };
         if (self.contextMenuVisible()) return self.handleContextMenuUiEvent(event);
+        if (self.notificationsVisible()) return self.handleNotificationsUiEvent(event);
         if (self.paletteVisible()) return self.handlePaletteUiEvent(event);
         if (self.settingsVisible()) return self.handleSettingsUiEvent(event);
         if (self.search_visible) return self.handleSearchUiEvent(event);
@@ -13158,8 +14159,14 @@ const App = struct {
                     });
                     try self.syncSurface(change.state);
                 },
-                .focused => log.debug("event focus gained", .{}),
-                .unfocused => log.debug("event focus lost", .{}),
+                .focused => {
+                    log.debug("event focus gained", .{});
+                    self.window_focused = true;
+                },
+                .unfocused => {
+                    log.debug("event focus lost", .{});
+                    self.window_focused = false;
+                },
                 .exposed => {
                     log.debug("event exposed: the surface on screen may be stale", .{});
                     self.scheduler.invalidate();
@@ -14782,7 +15789,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 61 and
+    failures += reportCheck(out, registered_actions.len == 68 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -14843,7 +15850,14 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[57].name, font_fallbacks_action) and
         std.mem.eql(u8, registered_actions[58].name, settings_open_action) and
         std.mem.eql(u8, registered_actions[59].name, settings_activate_action) and
-        std.mem.eql(u8, registered_actions[60].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[60].name, agent_launch_action) and
+        std.mem.eql(u8, registered_actions[61].name, agent_launch_prompt_action) and
+        std.mem.eql(u8, registered_actions[62].name, agent_stop_action) and
+        std.mem.eql(u8, registered_actions[63].name, agent_focus_action) and
+        std.mem.eql(u8, registered_actions[64].name, notifications_open_action) and
+        std.mem.eql(u8, registered_actions[65].name, notifications_clear_action) and
+        std.mem.eql(u8, registered_actions[66].name, notifications_activate_action) and
+        std.mem.eql(u8, registered_actions[67].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -17940,6 +18954,309 @@ const config_test_fixed =
 
 /// A private absolute path for `--config-test`'s settings file, under the
 /// platform temporary directory, so the user's real file is never read.
+
+// --agent-test (TASK-56) -------------------------------------------------------
+
+/// The first tab of `--agent-test`: a readiness marker, an echo, and on the
+/// line `later` a background job that waits for the check's trigger file and
+/// then rings a bell and asks for an OSC 777 notification, so both arrive
+/// while the tab is in the background.
+const agent_test_script =
+    "printf 'AGENT-TEST-READY\\r\\n'; " ++
+    "while IFS= read -r line; do " ++
+    "if [ \"$line\" = later ]; then " ++
+    "( while [ ! -e \"$" ++ agent_test_trigger_env ++ "\" ]; do sleep 0.05; done; " ++
+    "printf '\\033]777;notify;Build;background finished\\033\\\\'; printf '\\007' ) & " ++
+    "printf 'ARMED\\r\\n'; " ++
+    "else printf 'ECHO:%s\\r\\n' \"$line\"; fi; done";
+
+const agent_test_initial_config = "# --agent-test\n";
+const agent_test_budget_ms: i64 = 8000;
+
+fn agentTestDir(io: Io, env: EnvSource, buffer: []u8) ![]const u8 {
+    const base = firstEnv(env, temp_dir_vars[0..]) orelse "/tmp";
+    const root = if (base.len != 0 and base[0] == '/') base else "/tmp";
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = try generateRunId(io, &id_buffer);
+    return std.fmt.bufPrint(buffer, "{s}/conduit-agent-test-{s}", .{ root, id });
+}
+
+fn removeAgentTestDir(io: Io, dir: []const u8) void {
+    if (std.mem.indexOf(u8, dir, "conduit-agent-test-") == null) return;
+    Dir.cwd().deleteTree(io, dir) catch |err| {
+        log.warn("could not remove the agent-test directory: {s}", .{@errorName(err)});
+    };
+}
+
+const AgentWait = union(enum) {
+    terminal_text: []const u8,
+    element: []const u8,
+    element_absent: []const u8,
+    entries: usize,
+    entry_body: []const u8,
+    os_calls: usize,
+    reloads: usize,
+    active_tab: workspace.TabId,
+    active_workspace: workspace.WorkspaceKey,
+};
+
+const AgentOsTrace = struct {
+    calls: usize = 0,
+
+    fn record(context: ?*anyopaque, title: []const u8, body: []const u8) void {
+        _ = title;
+        _ = body;
+        const self: *AgentOsTrace = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+    }
+};
+
+fn agentWaitMet(self: *App, trace: *const AgentOsTrace, condition: AgentWait) bool {
+    return switch (condition) {
+        .terminal_text => |text| self.activeLive().terminal().visibleTextContains(text),
+        .element => |id| self.ui_tree.byId(.{ .value = id }) != null,
+        .element_absent => |id| self.ui_tree.byId(.{ .value = id }) == null,
+        .entries => |count| self.agents.notifications.count() >= count,
+        .entry_body => |text| agentEntryIndex(self, text) != null,
+        .os_calls => |count| trace.calls >= count,
+        .reloads => |count| self.config_reload_count >= count,
+        .active_tab => |id| self.activeWorkspace().activeTabId() == id,
+        .active_workspace => |key| self.workspace_registry.activeKey() == key,
+    };
+}
+
+/// The newest-first row index of the entry whose body contains `text`.
+fn agentEntryIndex(self: *const App, text: []const u8) ?usize {
+    for (0..self.agents.notifications.count()) |index| {
+        const entry = self.agents.notifications.newest(index) orelse break;
+        if (std.mem.indexOf(u8, entry.body(), text) != null) return index;
+    }
+    return null;
+}
+
+fn waitForAgent(self: *App, io: Io, out: *Writer, trace: *const AgentOsTrace, condition: AgentWait) !bool {
+    const deadline = Io.Clock.real.now(io).nanoseconds + agent_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        if (agentWaitMet(self, trace, condition)) return true;
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return false;
+        }
+        if (self.poll()) self.scheduler.invalidate();
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) {
+            if (self.scheduler.shouldDraw()) try self.drawFrame();
+            return agentWaitMet(self, trace, condition);
+        }
+    }
+}
+
+fn agentCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("agent-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+fn agentTypeLine(self: *App, io: Io, out: *Writer, text: [:0]const u8) !bool {
+    if (text.len != 0) {
+        try self.window.postTextInput(text);
+        if (!try pumpUntil(self, io, out, .text_input, self_test_event_budget_ms)) return false;
+    }
+    return postNamedKey(self, io, out, .enter, .{});
+}
+
+fn notificationsChordKey(self: *App, io: Io, out: *Writer) !bool {
+    const mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .shift = true, .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    return postKey(self, io, out, 'n', mods);
+}
+
+/// The palette's choice row that offers `value` for `action_name`.
+fn agentChoiceIndex(self: *const App, action_name: []const u8, value: []const u8) ?usize {
+    const index = definitionIndex(self, action_name) orelse return null;
+    const command = self.actions.definitions()[index].palette orelse return null;
+    const values = switch (command.argument) {
+        .choices => |choices| choices.values,
+        else => return null,
+    };
+    for (values, 0..) |choice, choice_index| {
+        if (std.mem.eql(u8, choice.value, value)) return choice_index;
+    }
+    return null;
+}
+
+/// Launch the fake agent through the palette by mouse: the hint, the
+/// command row, the fake's choice row, then Enter on the empty prompt.
+fn launchFakeAgentByMouse(self: *App, io: Io, out: *Writer) !bool {
+    self.setAgentLaunchChoices();
+    const choice = agentChoiceIndex(self, agent_launch_action, app_agents.fake_choice_value) orelse return false;
+    if (!try clickPaletteCommand(self, io, out, agent_launch_action, choice)) return false;
+    if (!(self.palette_step == .input and self.palette_step.input == self.agent_prompt_index)) return false;
+    return postNamedKey(self, io, out, .enter, .{});
+}
+
+/// Exercise TASK-56 through real PTYs and SDL events: the fake agent's live
+/// glyphs, the notification list by chord, palette, Enter and click, a
+/// hot-reloaded switch, a background tab's OSC 777 and bell, and the OS seam.
+fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    var os_trace: AgentOsTrace = .{};
+    self.agents.notifier = .{ .context = &os_trace, .notify_fn = AgentOsTrace.record };
+    defer self.agents.notifier = .{ .notify_fn = App.discardOsNotification };
+    self.focus_override = true;
+    defer self.focus_override = null;
+    const trigger_dir = self.agentTestDir() orelse return 1;
+
+    try self.drawFrame();
+    const first_key = self.workspace_registry.activeKey() orelse return 1;
+    const first_model = self.activeWorkspace();
+    const first_tab = first_model.activeTabId() orelse return 1;
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "AGENT-TEST-READY" }), "the first tab's real PTY peer became ready", .{});
+    _ = try agentTypeLine(self, io, out, "later");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "ARMED" }), "the first tab armed its background notification", .{});
+
+    // The palette offers the fake (and only detected harnesses), never the
+    // scratchpad; a launch makes an agent tab with an idle glyph.
+    self.setAgentLaunchChoices();
+    const launch_command = self.actions.definitions()[self.agent_launch_index].palette.?.argument.choices;
+    var scratch_offered = false;
+    for (launch_command.values) |choice| {
+        if (std.mem.indexOf(u8, choice.value, "scratch") != null or std.mem.indexOf(u8, choice.label, "Scratch") != null) scratch_offered = true;
+    }
+    agentCheck(out, &failures, agentChoiceIndex(self, agent_launch_action, app_agents.fake_choice_value) != null and !scratch_offered, "Agent: launch offers the fake harness and nothing that names the scratchpad", .{});
+    agentCheck(out, &failures, try launchFakeAgentByMouse(self, io, out), "Agent: launch ran by mouse through the palette hint, the command row, the fake's choice and an empty prompt", .{});
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.idle" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-AGENT-READY" }), "the agent tab shows the idle glyph and its real process is running", .{});
+    const agent_tab = first_model.activeTabId() orelse return 1;
+    const agent_session = first_model.focusedPaneSessionId(agent_tab) orelse return 1;
+    agentCheck(out, &failures, first_model.sessionKind(agent_session) == .agent_terminal and agent_tab != first_tab, "the agent runs in a new agent_terminal session and tab", .{});
+
+    // Each typed line releases one step of the scripted adapter.
+    _ = try agentTypeLine(self, io, out, "one");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.working" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.agent.working" }), "working: the tab and workspace glyphs changed live", .{});
+    _ = try agentTypeLine(self, io, out, "two");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.waiting_permission" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.agent.waiting_permission" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .entry_body = "Run: make test" }), "waiting for permission: glyphs changed and a permission notification was listed", .{});
+    agentCheck(out, &failures, os_trace.calls == 0, "a focused window raised no OS notification", .{});
+
+    self.focus_override = false;
+    _ = try agentTypeLine(self, io, out, "three");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.done" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .os_calls = 1 }), "done: the glyph changed and an unfocused window raised one OS notification", .{});
+
+    // The background tab's OSC 777 and bell become terminal notifications.
+    var trigger_buffer: [path_capacity]u8 = undefined;
+    const trigger = try std.fmt.bufPrint(&trigger_buffer, "{s}/trigger", .{trigger_dir});
+    try Dir.cwd().writeFile(io, .{ .sub_path = trigger, .data = "go" });
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .entry_body = "background finished" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .entry_body = "rang the bell" }), "a background tab's OSC 777 and bell were listed as terminal notifications", .{});
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .os_calls = 3 }), "both reached the OS seam while unfocused", .{});
+
+    _ = try agentTypeLine(self, io, out, "four");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.errored" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.agent.errored" }), "errored: the glyphs changed", .{});
+
+    // A second agent (idle) does not lower the workspace's most urgent glyph.
+    agentCheck(out, &failures, try launchFakeAgentByMouse(self, io, out) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.3.agent.idle" }) and
+        self.ui_tree.byId(.{ .value = "workspace.1.agent.errored" }) != null, "with an idle second agent the workspace keeps the errored glyph", .{});
+
+    // Agent choices list live agents and never the scratchpad.
+    self.rebuildAgentChoices();
+    var scratchpad_choice = false;
+    for (self.agent_choices[0..self.agent_choice_count]) |choice| {
+        const raw = std.fmt.parseInt(u64, choice.value, 10) catch continue;
+        const record = self.agents.registry.get(@enumFromInt(raw)) orelse continue;
+        if (record.session == first_model.scratchpadId()) scratchpad_choice = true;
+    }
+    agentCheck(out, &failures, self.agent_choice_count == 2 and !scratchpad_choice, "Agent: stop and Agent: focus list the two agents and never the scratchpad", .{});
+
+    // A hot-reloaded switch suppresses that kind of entry.
+    const path = self.config_path orelse return 1;
+    const reloads = self.config_reload_count;
+    try writeConfigTestFile(io, path, "notifications.permission = false\n");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .reloads = reloads + 1 }) and
+        !self.agents.settings.permission, "the settings file's notifications.permission = false applied by hot reload", .{});
+    const entries_before = self.agents.notifications.count();
+    const os_before = os_trace.calls;
+    // Back to the first agent's tab by its sidebar row, then its next step.
+    var tab_id_buffer: [workspace_semantic_capacity]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, try tabSemanticId(&tab_id_buffer, first_key, agent_tab));
+    // The click focused the sidebar row; a click in the pane gives the
+    // keyboard back to the terminal, as a person would.
+    var pane_id_buffer: [pane_semantic_capacity]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, try paneSemanticId(&pane_id_buffer, first_key, first_model.focusedPaneId(agent_tab) orelse return 1));
+    _ = try agentTypeLine(self, io, out, "five");
+    const fifth_glyph = try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.waiting_permission" });
+    agentCheck(out, &failures, fifth_glyph and self.agents.notifications.count() == entries_before and os_trace.calls == os_before, "a new permission wait changed the glyph but listed and raised nothing (glyph {}, entries {d}->{d}, os {d}->{d})", .{ fifth_glyph, entries_before, self.agents.notifications.count(), os_before, os_trace.calls });
+
+    // The settings view's Agents group edits the same switch by keyboard.
+    _ = try settingsChord(self, io, out);
+    const settings_reloads = self.config_reload_count;
+    const settings_open = try waitForAgent(self, io, out, &os_trace, .{ .element = "settings.dialog" });
+    const row_selected = try selectSettingsRow(self, io, out, "settings.row.notifications.permission");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    agentCheck(out, &failures, settings_open and row_selected and
+        try waitForAgent(self, io, out, &os_trace, .{ .reloads = settings_reloads + 1 }) and self.agents.settings.permission and
+        std.mem.indexOf(u8, settingsLabel(self, "settings.row.notifications.permission"), "true") != null, "the settings view's Agents row turned notifications.permission back on", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element_absent = "settings.dialog" }), "Escape closed the settings view", .{});
+
+    // The list by chord; Enter focuses the newest entry's tab.
+    _ = try clickTabsElement(self, io, out, try tabSemanticId(&tab_id_buffer, first_key, first_tab));
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .active_tab = first_tab }), "the first tab is active again", .{});
+    _ = try notificationsChordKey(self, io, out);
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "notifications" }) and
+        self.ui_tree.byId(.{ .value = "notification.4" }) != null and
+        std.mem.eql(u8, focusedMenuRow(self), "notification.0"), "the chord opened the list with every entry and the newest focused", .{});
+    try self.drawFrame();
+    const screenshot_pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(screenshot_pixels);
+    // A key the list does not use stays in the modal.
+    const sent_before = first_model.sessionById(self.presentedSessionId()).?.pendingResponseBytes();
+    _ = try postKey(self, io, out, 'x', .{});
+    agentCheck(out, &failures, self.notificationsVisible() and first_model.sessionById(self.presentedSessionId()).?.pendingResponseBytes() == sent_before, "an unrelated key stayed inside the modal list", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .active_tab = agent_tab }) and !self.notificationsVisible() and
+        self.agents.selected_agent != null, "Enter on the newest (error) entry focused the agent's tab and selected the agent", .{});
+
+    // A second workspace; a click on the OSC entry returns to workspace 1's
+    // first tab.
+    _ = try runPaletteCommandByKeyboard(self, io, out, "Create workspace");
+    _ = try agentTypeLine(self, io, out, "/tmp");
+    const second_ok = try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.2" });
+    const second_key = self.workspace_registry.activeKey() orelse return 1;
+    agentCheck(out, &failures, second_ok and second_key != first_key, "a second workspace is active", .{});
+    agentCheck(out, &failures, try clickPaletteCommand(self, io, out, notifications_open_action, null) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "notifications" }), "the palette opened the list by mouse", .{});
+    const osc_row = agentEntryIndex(self, "background finished") orelse return 1;
+    var row_buffer: [palette_semantic_capacity]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, try std.fmt.bufPrint(&row_buffer, "notification.{d}", .{osc_row}));
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .active_workspace = first_key }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .active_tab = first_tab }) and !self.notificationsVisible(), "a click on the OSC 777 entry focused workspace 1 and the tab that sent it", .{});
+
+    // Escape closes; clear empties the list.
+    _ = try notificationsChordKey(self, io, out);
+    _ = try waitForAgent(self, io, out, &os_trace, .{ .element = "notifications" });
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element_absent = "notifications" }), "Escape closed the list", .{});
+    _ = try runPaletteCommandByKeyboard(self, io, out, "Notifications: clear");
+    agentCheck(out, &failures, self.agents.notifications.count() == 0, "Notifications: clear emptied the list", .{});
+
+    var screenshot_path_buffer: [path_capacity]u8 = undefined;
+    var id_buffer: [path_capacity]u8 = undefined;
+    const screenshot_path = try std.fmt.bufPrint(&screenshot_path_buffer, "{s}{c}agent-test-{s}.png", .{ fallback_log_dir, std.fs.path.sep, try generateRunId(io, &id_buffer) });
+    try writePngOffThread(self.allocator, io, screenshot_path, screenshot_pixels, self.size);
+    out.print("agent-test: screenshot {s}\n", .{screenshot_path}) catch {};
+    out.print("agent-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
 fn configTestPath(io: Io, env: EnvSource, buffer: []u8) ![]const u8 {
     const base = firstEnv(env, temp_dir_vars[0..]) orelse "/tmp";
     const root = if (base.len != 0 and base[0] == '/') base else "/tmp";
@@ -20210,6 +21527,9 @@ const usage =
     \\  --git-test                         drive the sidebar branch rows against real
     \\                                    repositories: checkout, watch, cwd changes,
     \\                                    detached HEAD and two-row tab behaviour, then exit
+    \\  --agent-test                       drive a scripted fake agent: live sidebar glyphs,
+    \\                                    the notification list by chord, palette and
+    \\                                    mouse, settings switches and OSC 777, then exit
     \\  --right-click=<menu|paste>        what a right click over a terminal does when
     \\                                    the program has not captured the mouse
     \\                                    (default: menu)
@@ -20369,6 +21689,14 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         try writeConfigTestFile(init.io, options.run.config_path.?, settings_test_initial);
     }
     defer if (options.run.settings_test) removeSettingsTestDir(init.io, options.run.config_path.?);
+    var agent_test_dir_buffer: [path_capacity]u8 = undefined;
+    if (options.run.agent_test) {
+        const dir = try agentTestDir(init.io, env, &agent_test_dir_buffer);
+        options.run.agent_test_dir = dir;
+        options.run.config_path = try std.fmt.bufPrint(&config_path_buffer, "{s}/conduit/config", .{dir});
+        try writeConfigTestFile(init.io, options.run.config_path.?, agent_test_initial_config);
+    }
+    defer if (options.run.agent_test) removeAgentTestDir(init.io, options.run.agent_test_dir.?);
     try platform.setAppMetadata(.{
         .name = app_name,
         .version = version,
@@ -20399,7 +21727,7 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
                 options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
-                options.run.git_test or options.run.driver_test) return err;
+                options.run.git_test or options.run.agent_test or options.run.driver_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
                 "no usable display ({s}): there is no window to draw in. Set DISPLAY, or run under xvfb-run",
@@ -20515,6 +21843,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try settingsTest(app, init.io, out);
     } else if (options.run.git_test) {
         check_status = try gitTest(app, init.io, out);
+    } else if (options.run.agent_test) {
+        check_status = try agentTest(app, init.io, out);
     } else {
         try app.run(init.io, runDeadline(init.io, options.run.run_ms));
     }
@@ -20974,6 +22304,47 @@ test "--git-test owns a fixed real-child viewport and its own deterministic chil
     var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings(git_test_script, spec.argv[2]);
+}
+
+test "--agent-test owns a fixed real-child viewport and its own deterministic child" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--agent-test" }, env.source());
+    try std.testing.expect(parsed.run.agent_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--agent-test") != null);
+    var options = optionsForRun(parsed);
+    try std.testing.expectEqual(ui_test_width, options.run.width);
+    try std.testing.expect(options.run.hidden and !options.run.no_child);
+    try std.testing.expect(wantsChild(options));
+    try std.testing.expect(usesDeterministicScratchpad(options));
+    options.run.agent_test_dir = "/tmp/conduit-agent-test-x";
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, options);
+    defer spec.deinit();
+    try std.testing.expectEqualStrings(agent_test_script, spec.argv[2]);
+    try std.testing.expect(hasEntry(spec.env, agent_test_trigger_env ++ "=/tmp/conduit-agent-test-x/trigger"));
+    // The sink root sits in the check's private directory.
+    var buffer: [path_capacity]u8 = undefined;
+    try std.testing.expectEqualStrings("/tmp/conduit-agent-test-x/agents", agentSinkRoot(std.testing.io, env.source(), options, &buffer).?);
+}
+
+test "agent sinks are per-run private state under XDG_STATE_HOME or HOME" {
+    var buffer: [path_capacity]u8 = undefined;
+    const state_env = test_env{ .vars = &.{ .{ "HOME", "/home/u" }, .{ "XDG_STATE_HOME", "/state" } } };
+    const from_state = agentSinkRoot(std.testing.io, state_env.source(), .{}, &buffer).?;
+    try std.testing.expect(std.mem.startsWith(u8, from_state, "/state/conduit/agents/run-"));
+    const home_env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const from_home = agentSinkRoot(std.testing.io, home_env.source(), .{}, &buffer).?;
+    try std.testing.expect(std.mem.startsWith(u8, from_home, "/home/u/.local/state/conduit/agents/run-"));
+    const no_home = test_env{ .vars = &.{} };
+    try std.testing.expect(agentSinkRoot(std.testing.io, no_home.source(), .{}, &buffer) == null);
+}
+
+test "the notification list chord is free in both shipped profiles" {
+    for ([_]inputmod.PlatformProfile{ .linux_windows, .macos }) |profile| {
+        const chord = notificationsChord(profile);
+        for (inputmod.defaultBindings(profile)) |binding| {
+            try std.testing.expect(!inputmod.chordEql(binding.chord, chord));
+        }
+    }
 }
 
 test "--settings-test owns a fixed real-child viewport and its own deterministic child" {
@@ -22570,6 +23941,9 @@ const inheriting_env = test_env{ .vars = &.{
     .{ "CONDUIT_BASH_INJECT", "1" },
     .{ "CONDUIT_ZSH_ZDOTDIR", "/outer/zdotdir" },
     .{ "CONDUIT_SHELL_INTEGRATION_XDG_DIR", "/outer/fish" },
+    .{ "CONDUIT_AGENT_SINK", "/outer/sink" },
+    .{ "CONDUIT_AGENT_GATE", "1" },
+    .{ "CONDUIT_TEST_FAKE_AGENT", "1" },
     .{ "HOME", "" },
     .{ "SHELL", "/bin/sh" },
 } };

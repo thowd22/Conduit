@@ -207,6 +207,17 @@ pub const Key = enum {
     scratchpad_size,
     scratchpad_large_size,
     mouse_right_click,
+    notifications_enabled,
+    notifications_os,
+    notifications_permission,
+    notifications_input,
+    notifications_done,
+    notifications_error,
+    notifications_terminal,
+    notifications_claude_code,
+    notifications_codex,
+    notifications_pi,
+    notifications_opencode,
     keybind,
 
     /// The key's spelling in the file, which is also its `Name`.
@@ -224,6 +235,17 @@ pub const Key = enum {
             .scratchpad_size => "scratchpad.size",
             .scratchpad_large_size => "scratchpad.large_size",
             .mouse_right_click => RightClick.name.text(),
+            .notifications_enabled => "notifications.enabled",
+            .notifications_os => "notifications.os",
+            .notifications_permission => "notifications.permission",
+            .notifications_input => "notifications.input",
+            .notifications_done => "notifications.done",
+            .notifications_error => "notifications.error",
+            .notifications_terminal => "notifications.terminal",
+            .notifications_claude_code => "notifications.claude_code",
+            .notifications_codex => "notifications.codex",
+            .notifications_pi => "notifications.pi",
+            .notifications_opencode => "notifications.opencode",
             .keybind => "keybind",
         };
     }
@@ -266,6 +288,56 @@ pub const Settings = struct {
     scratchpad_large_size: u8 = 90,
     /// The file layer of `mouse.right_click`; null when the file is silent.
     right_click: ?RightClick = null,
+    /// Which agent and terminal notifications are raised (TASK-56).
+    notifications: Notifications = .{},
+};
+
+/// The `notifications.*` switches (TASK-56). Every one defaults to on. `enabled` gates the whole
+/// in-app list and every OS notification; `os` gates only the OS notification when the window is
+/// unfocused; the per-type switches name what an entry is about, and the per-harness switches
+/// silence one coding agent. `app` interprets them; this module only parses them.
+pub const Notifications = struct {
+    enabled: bool = true,
+    os: bool = true,
+    permission: bool = true,
+    input: bool = true,
+    done: bool = true,
+    @"error": bool = true,
+    terminal: bool = true,
+    claude_code: bool = true,
+    codex: bool = true,
+    pi: bool = true,
+    opencode: bool = true,
+
+    /// The field a `notifications.*` key sets, or null for any other key.
+    pub fn field(key: Key) ?*const fn (*Notifications) *bool {
+        return switch (key) {
+            inline .notifications_enabled,
+            .notifications_os,
+            .notifications_permission,
+            .notifications_input,
+            .notifications_done,
+            .notifications_error,
+            .notifications_terminal,
+            .notifications_claude_code,
+            .notifications_codex,
+            .notifications_pi,
+            .notifications_opencode,
+            => |tag| &struct {
+                fn get(n: *Notifications) *bool {
+                    return &@field(n, tag.name()["notifications.".len..]);
+                }
+            }.get,
+            else => null,
+        };
+    }
+
+    /// The value a `notifications.*` key has here.
+    pub fn get(self: Notifications, key: Key) ?bool {
+        var copy = self;
+        const accessor = field(key) orelse return null;
+        return accessor(&copy).*;
+    }
 };
 
 /// One `keybind = <chord>=<action>[:<argument>]` line, split but not yet resolved.
@@ -369,6 +441,18 @@ pub const Config = struct {
             .scratchpad_size => to.scratchpad_size = from.scratchpad_size,
             .scratchpad_large_size => to.scratchpad_large_size = from.scratchpad_large_size,
             .mouse_right_click => to.right_click = from.right_click,
+            .notifications_enabled,
+            .notifications_os,
+            .notifications_permission,
+            .notifications_input,
+            .notifications_done,
+            .notifications_error,
+            .notifications_terminal,
+            .notifications_claude_code,
+            .notifications_codex,
+            .notifications_pi,
+            .notifications_opencode,
+            => Notifications.field(key).?(&to.notifications).* = previous.settings.notifications.get(key).?,
             // Keybind lines are resolved against the previous binding table by `app`, which is
             // the only place that knows what a rejected chord used to do.
             .keybind => {},
@@ -538,6 +622,18 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
         .scratchpad_size => settings.scratchpad_size = try parsePercent(value),
         .scratchpad_large_size => settings.scratchpad_large_size = try parsePercent(value),
         .mouse_right_click => settings.right_click = RightClick.parse(value) catch return error.NotRightClick,
+        .notifications_enabled,
+        .notifications_os,
+        .notifications_permission,
+        .notifications_input,
+        .notifications_done,
+        .notifications_error,
+        .notifications_terminal,
+        .notifications_claude_code,
+        .notifications_codex,
+        .notifications_pi,
+        .notifications_opencode,
+        => Notifications.field(key).?(&settings.notifications).* = try parseBool(value),
         .keybind => {
             const split = try splitKeybind(value);
             try result.keybinds.append(allocator, .{
@@ -795,6 +891,21 @@ pub const defaults_document =
     "# Right click over a terminal: menu or paste.\n" ++
     "# mouse.right_click = menu\n" ++
     "\n" ++
+    "# Agent and terminal notifications: the in-app list, and an OS notification while the\n" ++
+    "# window is unfocused. Per kind: permission, input, done, error and terminal (OSC 9/777\n" ++
+    "# and a background bell); per harness: claude_code, codex, pi and opencode.\n" ++
+    "# notifications.enabled = true\n" ++
+    "# notifications.os = true\n" ++
+    "# notifications.permission = true\n" ++
+    "# notifications.input = true\n" ++
+    "# notifications.done = true\n" ++
+    "# notifications.error = true\n" ++
+    "# notifications.terminal = true\n" ++
+    "# notifications.claude_code = true\n" ++
+    "# notifications.codex = true\n" ++
+    "# notifications.pi = true\n" ++
+    "# notifications.opencode = true\n" ++
+    "\n" ++
     "# Keybindings: keybind = <chord>=<action>[:<argument>], or <chord>=unbind.\n" ++
     "# Modifiers are ctrl, shift, alt and super (cmd). These lines repeat some defaults.\n" ++
     keybind_examples;
@@ -874,7 +985,20 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
                 _ = parsePoints(value) catch |err| break :check err;
                 return null;
             },
-            .font_ligatures, .font_nerd_symbols => {
+            .font_ligatures,
+            .font_nerd_symbols,
+            .notifications_enabled,
+            .notifications_os,
+            .notifications_permission,
+            .notifications_input,
+            .notifications_done,
+            .notifications_error,
+            .notifications_terminal,
+            .notifications_claude_code,
+            .notifications_codex,
+            .notifications_pi,
+            .notifications_opencode,
+            => {
                 _ = parseBool(value) catch |err| break :check err;
                 return null;
             },
@@ -1431,6 +1555,35 @@ test "every key accepts its documented spellings" {
     try testing.expectEqualStrings("1", config.keybinds.items[1].argument.?);
     try testing.expectEqualStrings("ctrl+shift+w", config.keybinds.items[2].chord);
     try testing.expectEqual(@as(?[]const u8, null), config.keybinds.items[2].action);
+}
+
+test "the notifications switches parse, default on and report a non-boolean" {
+    const text =
+        \\notifications.enabled = true
+        \\notifications.os = false
+        \\notifications.permission = false
+        \\notifications.error = false
+        \\notifications.pi = false
+        \\notifications.done = maybe
+    ;
+    var config = try parse(testing.allocator, text, null);
+    defer config.deinit();
+    const n = config.settings.notifications;
+    try testing.expect(n.enabled);
+    try testing.expect(!n.os);
+    try testing.expect(!n.permission);
+    try testing.expect(!n.@"error");
+    try testing.expect(!n.pi);
+    // Silent keys keep the built-in value, and a rejected line leaves it too.
+    try testing.expect(n.input and n.terminal and n.claude_code and n.codex and n.opencode);
+    try testing.expect(n.done);
+    try expectDiagnostic(&config, 6, "notifications.done: expected `true` or `false`");
+    try testing.expectEqual(@as(?bool, false), n.get(.notifications_os));
+    try testing.expectEqual(@as(?bool, null), n.get(.font_size));
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.notifications_codex, "false"));
+    try testing.expectEqualStrings("expected `true` or `false`", checkValue(.notifications_input, "on").?);
+    try testing.expectEqual(Key.notifications_claude_code, Key.fromName("notifications.claude_code").?);
+    for (std.enums.values(Key)) |key| _ = try Name.parse(key.name());
 }
 
 test "each malformed value is reported with its line and key and leaves the default" {
