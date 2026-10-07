@@ -578,6 +578,29 @@ nothing else is a legal dependency.
   the permanent session id and `.running` lifecycle; every pre-commit failure leaves the old shell
   untouched. The TASK-28 tab registry rejects the scratchpad, so the sidebar does not turn it into
   an ordinary tab.
+- **File and command capabilities (TASK-62).** Beside `spawn` and `kind`, the vtable carries
+  `read_file`, `list_dir`, `stat_path`, `watch` and `run`, reached through both the owner and the
+  borrowed `ExecutionContext.Ref`: `readFile(io, path, buffer) FsError![]u8` (the buffer length
+  is the bound; a longer file is `error.TooLarge`), `listDir(io, path, DirVisitor) FsError!void`
+  (a visitor returning `false` stops the listing), `statPath(io, path) FsError!PathStat`
+  (`kind`, `size`, `mtime_ns`), `watch(allocator, io, path) WatchError!WatchHandle` and
+  `run(allocator, io, RunRequest) RunError!RunResult`. Paths are `/`-separated in the
+  context's own syntax and every error set is closed so remote contexts map onto it. An entry a
+  context does not implement defaults to `error.Unsupported`, which is how SSH and WSL contexts
+  (TASK-43, TASK-47) and test fakes compile before they supply their own. Local inherits; remote
+  contexts supply their own: the Local `run` uses `std.process` with Conduit's inherited
+  environment, no shell, stdin capped at 16 KiB, each output stream capped (`OutputTooLarge`)
+  and a whole-run timeout that kills the child (`Timeout`); a missing program is
+  `CommandNotFound`, and a non-zero exit is a `RunResult`, not an error.
+- **Watch threads.** A `WatchHandle` starts no thread and never calls back. The Local handle
+  drains a non-blocking inotify descriptor on Linux at `pollChanges`; elsewhere, and while the
+  watched directory does not exist yet, it compares a bounded fingerprint of the entries' names,
+  kinds, sizes and mtimes at most once a second (the `config.Watcher` design without its
+  thread). It only reports that something may have changed; the owner re-reads through the
+  context, so no file content crosses threads. `spawn`, `readFile`, `listDir`, `statPath` and
+  `run` keep no mutable context state and may run on any thread holding a `Ref`; they block on
+  IO, so for a remote context they stay off the render thread, and `run` waits for its child
+  and belongs on a worker everywhere. A handle belongs to the thread that created it.
 - **Spawn boundary.** `ExecutionContext` owns and destroys its erased implementation. A worker may
   borrow an `ExecutionContext.Ref` and return the PTY for owner-thread `attachChild`. For a new
   tab, `app` snapshots and owns a copy of the invoking session's current validated OSC 7 cwd before
@@ -616,7 +639,8 @@ nothing else is a legal dependency.
   and its app-facing lifecycle. TASK-34 links (including file-reference editor tabs, which are
   ordinary tabs spawned through the workspace `ExecutionContext` with a job-owned argv) and
   TASK-36 search are composed above this owner; TASK-35 remains an unfinished workspace
-  interaction.
+  interaction. TASK-62 (M7) adds the context's file, watch and command capabilities for
+  `backlog`.
 
 ### `session`
 
@@ -784,7 +808,41 @@ nothing else is a legal dependency.
   file.
 - **May depend on** `config`, `input`, `theme`, `ui`, and `workspace`. Reads arrive through the
   workspace's ExecutionContext, and backlog views are composed from the four `ui` primitives.
-- **Lands** M7 — TASK-62 – TASK-64. Explicitly a v0.1 non-goal.
+  The TASK-62 data layer imports only `workspace`, for `ExecutionContext.Ref`.
+- **Model (TASK-62).** `Project.load(allocator, io, ref, root_dir, Limits)` reads a `backlog/`
+  directory: `config.yml` (statuses, default status, labels, date format, task prefix) and the
+  `tasks/`, `completed/`, `drafts/`, `milestones/`, `docs/` and `decisions/` directories into
+  `Task` (id, title, status text, assignees, labels, milestone, dependencies, priority, ordinal,
+  dates, parent, description, numbered acceptance criteria, plan, notes, final summary, path and
+  active/completed/draft state), `Milestone`, `Doc` and `Decision`. Front matter is read by
+  `backlog/yaml.zig`, which accepts only the YAML subset Backlog.md writes (plain, quoted and
+  folded/literal block scalars, flow and block lists) and turns everything else into a
+  line-numbered issue; `backlog/markdown.zig` reads the tool's `SECTION:*` and `AC` markers, with
+  a `## Heading` fallback. Parsing is bounded by `Limits` (1 MiB per file, 4096 files per
+  directory, 4096-byte front-matter lines, 256 list items and criteria, 32 diagnostics per file),
+  tolerant and never fatal: a malformed file is a `Diagnostic` and, without a usable id, no item.
+  Only a missing root (`NotABacklog`) or a context without files fails a load. Each file owns an
+  arena, so re-reading one file frees exactly that file.
+- **Live update.** `Project.watch` takes one context `WatchHandle` for the root and each
+  directory; `Project.poll(change_allocator)` lists only directories whose watch fired, re-reads
+  only files whose size or mtime changed, drops removed ones and returns `Change{kind, location,
+  path, id}` records. A burst of writes between polls is one change per file. A `config.yml`
+  rewrite re-parses every file only when the statuses or default status changed, because the CLI
+  normalises that file on every write. Without watches (`error.Unsupported`) `poll` compares every
+  file.
+- **Writes.** `Cli` runs `backlog <args>` through `ExecutionContext.run` with the directory that
+  contains `backlog/` as cwd. `detect` reports `error.CliUnavailable` when the context has no
+  `backlog` (the caller then presents the backlog read-only); otherwise every call returns
+  `.ok` with stdout or `.failed` with the exit status and stderr. `setStatus`, `checkAcceptance`,
+  `editTitle`, `addNote`, `setAssignee` and `setPriority` validate the id (`isTaskId`, which a
+  flag can never satisfy) and the value (no control characters except a note's newlines and
+  tabs) and pass each as one `--option=value` argv entry. Conduit never edits backlog markdown;
+  the CLI's file changes return through `poll`.
+- **Threads.** A `Project` belongs to the thread that loaded it and blocks on the context's IO;
+  `Cli` calls wait for the child. Both therefore run on a worker for a remote context, and `Cli`
+  on a worker always; TASK-63 decides the hand-over to `ui`.
+- **Lands** M7 — TASK-62 provides the data layer; TASK-63 and TASK-64 the views and agent
+  linking. Explicitly a v0.1 non-goal.
 
 ### `testdriver`
 
@@ -1307,7 +1365,8 @@ inside the same event loop, so the main thread is that render/UI thread.
 | Font discovery and file loading | `font`, off-thread | discovered faces handed to the main thread **(d)** |
 | Agent harness IO | `agent` adapters, off-thread | events handed over through a defined queue **(d)** |
 | SSH transport | `workspace`'s ExecutionContext, off-thread | decision-8: the system OpenSSH client in Conduit-owned PTYs and pipes, one ControlMaster per SSH workspace on Linux/macOS; TASK-43 implements it |
-| Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)** |
+| Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)**; a context `WatchHandle` has no thread and is polled by the `Project` owner |
+| Backlog CLI writes | `backlog.Cli`, worker thread | `ExecutionContext.run` waits for the bounded child; the CLI's file edits return through `Project.poll` |
 
 **(d)** = derived by applying the AGENTS.md rule "the render/UI thread never blocks on IO" to a
 source of IO. The rule is the constraint; *which* IO runs off-thread and how it hands over is
