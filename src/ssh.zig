@@ -911,6 +911,29 @@ pub const SshContext = struct {
         master.kill(.hangup) catch |err| log.debug("ssh master hangup: {s}", .{@errorName(err)});
     }
 
+    /// Hang the connection up on purpose without waiting: SIGHUP the master,
+    /// which ends it (`ControlPersist=no`) and with it every session over it.
+    /// The non-blocking form of `disconnect` for the render thread, which
+    /// must not wait on `ssh -O exit`. Owner thread.
+    pub fn hangUp(self: *SshContext) void {
+        const master = self.master orelse return;
+        if (master.state() != .running) return;
+        self.machine.hangUp();
+        self.publish();
+        master.kill(.hangup) catch |err| log.debug("ssh master hangup: {s}", .{@errorName(err)});
+    }
+
+    /// The copied destination this context connects to (an alias or
+    /// `[user@]host`). Display data; never logged above debug.
+    pub fn destinationText(self: *const SshContext) []const u8 {
+        return self.destination;
+    }
+
+    /// The explicit port, when the target named one.
+    pub fn portNumber(self: *const SshContext) ?u16 {
+        return self.port;
+    }
+
     /// Start a new master (after `lost`, `failed` or `disconnected`) at the
     /// last master terminal size. The owner respawns sessions once `poll`
     /// reports `connected` again. Owner thread.

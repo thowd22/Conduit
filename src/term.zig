@@ -3338,6 +3338,13 @@ pub const Terminal = struct {
     cwd: [max_working_directory_bytes]u8,
     /// How many bytes of `cwd` are live.
     cwd_len: usize,
+    /// The host a remote shell names in its OSC 7 reports, set by the owner
+    /// of a terminal whose program runs on another machine (an SSH session,
+    /// decision-8). When `cwd_host_len` is non-zero this name replaces this
+    /// machine's own in `decodeWorkingDirectory`'s host check, so the remote
+    /// shell's own reports are believed and this machine's name is foreign.
+    cwd_host: [std.Io.net.HostName.max_len]u8,
+    cwd_host_len: usize,
     /// Whether the shell has marked a step of a command with OSC 133 since
     /// `init` or the last full reset. See `hasSeenPromptMarks`.
     seen_prompt_marks: bool,
@@ -3507,6 +3514,8 @@ pub const Terminal = struct {
             .last_clipboard = null,
             .cwd = undefined,
             .cwd_len = 0,
+            .cwd_host = undefined,
+            .cwd_host_len = 0,
             .seen_prompt_marks = false,
             .owner = std.Thread.getCurrentId(),
             .ownership_violations = 0,
@@ -5032,6 +5041,18 @@ pub const Terminal = struct {
         return self.cwd[0..self.cwd_len];
     }
 
+    /// Accept OSC 7 reports that name `host` instead of this machine, for a
+    /// terminal whose shell runs on that host (an SSH session). `localhost`
+    /// stays accepted: on the remote side it names the remote machine. A
+    /// name that is empty or longer than a host name can be is refused and
+    /// changes nothing. The path is still only display data and is never
+    /// resolved locally.
+    pub fn setWorkingDirectoryHost(self: *Terminal, host: []const u8) error{InvalidHost}!void {
+        if (host.len == 0 or host.len > self.cwd_host.len) return error.InvalidHost;
+        @memcpy(self.cwd_host[0..host.len], host);
+        self.cwd_host_len = host.len;
+    }
+
     /// Whether the cursor sits in a prompt or in the user's input rather than
     /// in a command's output, by the shell's own OSC 133 marks. Always false
     /// on the alternate screen and for a shell that sends no marks, so a
@@ -5191,7 +5212,11 @@ fn onPwdChanged(handler: *Vt.Handler) void {
     const url: []const u8 = handler.terminal.getPwd() orelse "";
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     var decoded: [max_working_directory_bytes]u8 = undefined;
-    const path = decodeWorkingDirectory(url, localHostName(&host_buffer), &decoded) catch |err| {
+    const expected_host = if (terminal.cwd_host_len != 0)
+        terminal.cwd_host[0..terminal.cwd_host_len]
+    else
+        localHostName(&host_buffer);
+    const path = decodeWorkingDirectory(url, expected_host, &decoded) catch |err| {
         // The reason, and never the URL: the URL is the program's text.
         log.debug("OSC 7 working directory ignored: {s}", .{@errorName(err)});
         return;
@@ -10634,6 +10659,29 @@ fn expectCwdIgnored(terminal: *Terminal, url: []const u8, before: ?[]const u8) !
     } else {
         try testing.expectEqual(@as(?[]const u8, null), terminal.workingDirectory());
     }
+}
+
+test "a remote terminal believes OSC 7 from its remote host and refuses this machine's name" {
+    const testing = std.testing;
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try testHostName(&host_buffer);
+    var terminal: Terminal = undefined;
+    try terminal.init(testIo(), testing.allocator, .{ .cols = 40, .rows = 4 });
+    defer terminal.deinit(testing.allocator);
+    var url: [256]u8 = undefined;
+
+    try testing.expectError(error.InvalidHost, terminal.setWorkingDirectoryHost(""));
+    try terminal.setWorkingDirectoryHost("remote-box");
+    try testing.expectEqual(@as(usize, 1), (try feedCwd(&terminal, "file://remote-box/srv/app")).len);
+    try testing.expectEqualStrings("/srv/app", terminal.workingDirectory().?);
+    // The remote side's own `localhost` is still that machine.
+    try testing.expectEqual(@as(usize, 1), (try feedCwd(&terminal, "file://localhost/srv")).len);
+    try testing.expectEqualStrings("/srv", terminal.workingDirectory().?);
+    // This machine's name, or a third host (a nested ssh), is foreign here.
+    if (!std.mem.eql(u8, host, "remote-box")) {
+        try expectCwdIgnored(&terminal, try std.fmt.bufPrint(&url, "file://{s}/tmp", .{host}), "/srv");
+    }
+    try expectCwdIgnored(&terminal, "file://other-box/tmp", "/srv");
 }
 
 test "OSC 7 from this host becomes the working directory, decoded by its scheme's rule" {

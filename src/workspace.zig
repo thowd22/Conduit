@@ -1776,7 +1776,9 @@ pub const Workspace = struct {
         session_id: session.SessionId,
     ) RegisterTabError!TabId {
         const session_record = self.recordByIdConst(session_id) orelse return error.UnknownSession;
-        if (session_record.kind == .scratchpad) return error.ScratchpadSession;
+        // The scratchpad and an SSH connection terminal are reserved sessions:
+        // neither is ever a tab (`ScratchpadSession` names both).
+        if (isReservedKind(session_record.kind)) return error.ScratchpadSession;
         if (session_record.live == null or session_record.lifecycle == .exited) return error.SessionExited;
         for (self.tabs.items) |tab_record| {
             if (findSessionPane(tab_record.root, session_id) != null) return error.SessionAlreadyRegistered;
@@ -2008,7 +2010,7 @@ pub const Workspace = struct {
         const split_target = try self.paneSplitTarget(tab_id, pane_id, split, bounds);
 
         const session_record = self.recordByIdConst(new_session_id) orelse return error.UnknownSession;
-        if (session_record.kind == .scratchpad) return error.ScratchpadSession;
+        if (isReservedKind(session_record.kind)) return error.ScratchpadSession;
         if (session_record.live == null or session_record.lifecycle == .exited) return error.SessionExited;
         if (self.paneForSession(new_session_id) != null) return error.SessionAlreadyRegistered;
         if (self.next_pane_ordinal == std.math.maxInt(u32)) return error.PaneLimit;
@@ -2037,7 +2039,7 @@ pub const Workspace = struct {
         bounds: CellRect,
     ) CreatePaneSessionError!CreatedPane {
         const split_target = try self.paneSplitTarget(tab_id, pane_id, split, bounds);
-        if (kind == .scratchpad) return error.ScratchpadSession;
+        if (isReservedKind(kind)) return error.ScratchpadSession;
         if (self.sessions.items.len >= std.math.maxInt(u32)) return error.SessionLimit;
         if (self.next_pane_ordinal == std.math.maxInt(u32)) return error.PaneLimit;
         if (self.next_divider_ordinal == std.math.maxInt(u32)) return error.DividerLimit;
@@ -2550,6 +2552,71 @@ pub const Workspace = struct {
         return result;
     }
 
+    pub const RespawnRequestError = error{ SessionNotFound, SessionNotRestartable };
+    pub const ReplaceChildError = term.Terminal.Error || error{
+        SessionNotFound,
+        SessionNotRestartable,
+        ChildAlreadyAttached,
+    };
+
+    /// Build a worker request for a fresh child of a running tab, pane or
+    /// agent session whose child has ended, such as an SSH session whose
+    /// connection was lost (decision-8 reconnect). `cwd` is the context path
+    /// the new child starts in, borrowed like `process` until spawning
+    /// finishes. The session keeps its id; `replaceSessionChild` commits.
+    pub fn respawnRequest(
+        self: *const Workspace,
+        id: session.SessionId,
+        process: ProcessSpec,
+        cwd: []const u8,
+    ) RespawnRequestError!pty.SpawnRequest {
+        const record = self.recordByIdConst(id) orelse return error.SessionNotFound;
+        const live = if (record.live) |*value| value else return error.SessionNotFound;
+        if (isReservedKind(record.kind)) return error.SessionNotRestartable;
+        if (!childEnded(record, live)) return error.SessionNotRestartable;
+        const size = live.terminalConst().gridSize();
+        return .{
+            .argv = process.argv,
+            .env = process.env,
+            .cwd = cwd,
+            .size = pty.WindowSize.init(size.rows, size.cols),
+        };
+    }
+
+    /// Atomically give a session whose child has ended a fresh terminal and
+    /// `child`, under the same id, as `replaceScratchpad` does for the
+    /// scratchpad. On every error before commit the old session is untouched
+    /// and `child` stays with the caller.
+    pub fn replaceSessionChild(
+        self: *Workspace,
+        id: session.SessionId,
+        child: pty.Pty,
+    ) ReplaceChildError!ScratchpadReplacement {
+        const record = self.recordById(id) orelse return error.SessionNotFound;
+        const current = if (record.live) |*value| value else return error.SessionNotFound;
+        if (isReservedKind(record.kind)) return error.SessionNotRestartable;
+        if (!childEnded(record, current)) return error.SessionNotRestartable;
+
+        const size = current.terminalConst().gridSize();
+        var replacement = try session.Session.init(self.io, self.allocator, record.kind, size);
+        child.resize(pty.WindowSize.init(size.rows, size.cols)) catch |err| {
+            deinitChildlessReplacement(&replacement);
+            return err;
+        };
+        replacement.attachChild(child) catch |err| {
+            deinitChildlessReplacement(&replacement);
+            return err;
+        };
+        var previous = record.live.?;
+        record.live = replacement;
+        record.lifecycle = .running;
+        var result: ScratchpadReplacement = .{};
+        previous.deinit() catch |err| {
+            result.old_child_deinit_error = err;
+        };
+        return result;
+    }
+
     /// Close one non-scratchpad session. The stable id remains as an exited
     /// record, while all terminal and PTY ownership is released before an
     /// optional hangup failure is returned.
@@ -2656,6 +2723,19 @@ pub const Workspace = struct {
         }
     }
 };
+
+/// Sessions a workspace reserves for itself: the scratchpad and an SSH
+/// connection terminal. Neither is ever a tab, a pane or restartable here.
+fn isReservedKind(kind: session.Session.Kind) bool {
+    return kind == .scratchpad or kind == .connection;
+}
+
+/// Whether a running record's child has ended, so it may be replaced.
+fn childEnded(record: *const SessionRecord, live: *const session.Session) bool {
+    if (record.lifecycle != .running) return false;
+    const child = live.child() orelse return false;
+    return child.state() == .exited;
+}
 
 fn deinitChildlessReplacement(replacement: *session.Session) void {
     // This helper is called only before `attachChild` succeeds, so the session
@@ -2931,6 +3011,8 @@ const FakeAudit = struct {
     fail_hangup: [fake_capacity]bool = .{false} ** fake_capacity,
     resize_rows: [fake_capacity]u16 = .{0} ** fake_capacity,
     resize_cols: [fake_capacity]u16 = .{0} ** fake_capacity,
+    /// Children whose process has ended, by spawn index.
+    exited: [fake_capacity]bool = .{false} ** fake_capacity,
 
     fn accepted(self: *const FakeAudit) []const u8 {
         return self.written[0..self.written_len];
@@ -3058,7 +3140,9 @@ const FakePty = struct {
         return count;
     }
 
-    fn state(_: *anyopaque) pty.ChildState {
+    fn state(ptr: *anyopaque) pty.ChildState {
+        const self: *FakePty = @ptrCast(@alignCast(ptr));
+        if (self.audit.exited[self.index]) return .{ .exited = .{ .code = 255 } };
         return .running;
     }
 
@@ -3779,6 +3863,62 @@ test "scratchpad restart preserves identity and installs a fresh terminal at cur
     try fresh.terminal().refresh(testing.allocator);
     try testing.expect(fresh.terminalConst().visibleTextContains("FRESH-SCRATCHPAD"));
     try testing.expect(!fresh.terminalConst().visibleTextContains("OLD-SCRATCHPAD"));
+}
+
+test "a session whose child ended is respawned under its id in a given cwd, and reserved sessions never are" {
+    const testing = std.testing;
+    const size = try term.GridSize.init(24, 6);
+    var audit: FakeAudit = .{};
+    audit.outputs[1] = "OLD-TAB";
+    audit.outputs[2] = "FRESH-TAB";
+    const context = try FakeContext.create(testing.allocator, &audit, .ssh);
+    var workspace = try Workspace.init(testing.io, testing.allocator, "remote", "", context, size);
+    defer workspace.deinit() catch |err| std.debug.panic("workspace cleanup failed: {s}", .{@errorName(err)});
+
+    // A connection terminal is a reserved session: never a tab or a pane.
+    const connection_id = try workspace.createSession(.connection, size);
+    try testing.expectError(error.ScratchpadSession, workspace.registerTab("conn", connection_id));
+    try spawnAndAttach(&workspace, connection_id);
+
+    const created = try workspace.createTab("Terminal 1", size);
+    try testing.expectError(error.ScratchpadSession, workspace.splitPane(
+        created.tab_id,
+        workspace.focusedPaneId(created.tab_id).?,
+        connection_id,
+        .right,
+        try CellRect.init(0, 0, 40, 10),
+    ));
+    try spawnAndAttach(&workspace, created.session_id);
+
+    // A running child cannot be replaced.
+    try testing.expectError(error.SessionNotRestartable, workspace.respawnRequest(created.session_id, testProcess(), "/srv"));
+    audit.exited[1] = true;
+    audit.exited[0] = true;
+    try testing.expectError(error.SessionNotRestartable, workspace.respawnRequest(connection_id, testProcess(), "/srv"));
+    try testing.expectError(error.SessionNotRestartable, workspace.respawnRequest(workspace.scratchpadId(), testProcess(), "/srv"));
+
+    const request = try workspace.respawnRequest(created.session_id, testProcess(), "/srv/app");
+    try testing.expectEqualStrings("/srv/app", request.cwd);
+    const fresh_child = try workspace.contextRef().spawn(request);
+    var caller_owns = true;
+    defer if (caller_owns) destroyCallerOwnedTestChild(fresh_child);
+    try testing.expectEqualStrings("/srv/app", audit.last_cwd[0..audit.last_cwd_len]);
+    try testing.expectError(error.SessionNotRestartable, workspace.replaceSessionChild(connection_id, fresh_child));
+    const replaced = try workspace.replaceSessionChild(created.session_id, fresh_child);
+    caller_owns = false;
+    try testing.expect(replaced.old_child_deinit_error == null);
+    try testing.expectEqual(session.Session.Kind.human_terminal, workspace.sessionKind(created.session_id).?);
+    try testing.expectEqual(session.Lifecycle.running, workspace.sessionLifecycle(created.session_id).?);
+    try testing.expectEqual(created.session_id, workspace.focusedPaneSessionId(created.tab_id).?);
+
+    var ignored: IgnoredEvents = .{};
+    var io_buffer: [64]u8 = undefined;
+    var response_buffer: [64]u8 = undefined;
+    _ = workspace.pump(&io_buffer, &response_buffer, ignored.sink());
+    const fresh = workspace.sessionById(created.session_id).?;
+    try fresh.terminal().refresh(testing.allocator);
+    try testing.expect(fresh.terminalConst().visibleTextContains("FRESH-TAB"));
+    try testing.expect(!fresh.terminalConst().visibleTextContains("OLD-TAB"));
 }
 
 test "scratchpad replacement allocation failure keeps old state and caller ownership" {

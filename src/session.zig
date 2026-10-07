@@ -64,10 +64,15 @@ pub const Session = struct {
     /// workspace owns exactly one and agents may never target it. Agent
     /// terminals are separate from both human-owned kinds so later adapter
     /// code cannot accidentally treat one as an ordinary tab or pane.
+    /// A connection terminal presents an SSH workspace's ControlMaster
+    /// (decision-8): OpenSSH's own prompts appear in it and the person
+    /// answers them there. It is never a tab, a pane, an agent or a control
+    /// target, and it is not the scratchpad.
     pub const Kind = enum {
         human_terminal,
         scratchpad,
         agent_terminal,
+        connection,
     };
 
     /// Failures from resizing terminal state or the attached PTY. Ghostty may
@@ -146,6 +151,15 @@ pub const Session = struct {
     pub fn attachChild(self: *Session, child_pty: pty.Pty) error{ChildAlreadyAttached}!void {
         if (self.child_handle != null) return error.ChildAlreadyAttached;
         self.child_handle = child_pty;
+        self.child_output_quiescent = false;
+    }
+
+    /// Wake an attached child whose output had gone quiet because it exited,
+    /// after its backend started a new process behind the same handle. A
+    /// connection terminal's PTY is a view of the SSH master, and
+    /// `ssh.SshContext.reconnect` replaces the master behind that view, so
+    /// the session must be serviced again for the new master's prompts.
+    pub fn rearmChildOutput(self: *Session) void {
         self.child_output_quiescent = false;
     }
 
@@ -702,6 +716,27 @@ test "a child spawned at the current size is not resized again on attach" {
     try live.syncChildSize(pty.WindowSize.init(3, 20));
 
     try testing.expect(fake.resized == null);
+}
+
+test "a quiesced child is serviced again once a new process starts behind its handle" {
+    const testing = std.testing;
+    var fake: ResponsePty = .{ .child_state = .{ .exited = .{ .code = 255 } } };
+    var live = try Session.init(testing.io, testing.allocator, .connection, .{ .cols = 20, .rows = 3 });
+    defer live.deinit() catch |err| std.debug.panic("session cleanup failed: {s}", .{@errorName(err)});
+    try live.attachChild(fake.asPty());
+    var buffer: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), live.drainChildOutput(&buffer));
+    try testing.expect(!live.needsPump());
+
+    // The view now fronts a new master with a prompt waiting.
+    fake.child_state = .running;
+    fake.output = "Enter passphrase";
+    fake.readable_override = true;
+    try testing.expect(!live.needsPump());
+    live.rearmChildOutput();
+    try testing.expect(live.needsPump());
+    try testing.expectEqual(@as(usize, 16), live.drainChildOutput(&buffer));
+    try testing.expectEqualStrings("Enter passphrase", &buffer);
 }
 
 test "a session retains its explicit owner kind" {
