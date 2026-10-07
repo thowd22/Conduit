@@ -306,9 +306,13 @@ pub const Run = struct {
     /// keyboard and hover, Escape reverting it and a mouse choice saved to the
     /// settings file, through real SDL events, then exit.
     theme_test: bool = false,
+    /// Exercise the font commands: size by chord, palette and mouse with cell
+    /// metrics, ligatures, built-in symbols, fallbacks and the family picker's
+    /// preview, revert and saved choice through real SDL events, then exit.
+    font_test: bool = false,
     /// The settings file to load and watch instead of the platform location.
-    /// Not a command-line flag: `runApp` sets it for `--config-test` and
-    /// `--theme-test`, which
+    /// Not a command-line flag: `runApp` sets it for `--config-test`,
+    /// `--theme-test` and `--font-test`, which
     /// writes into a private directory. Null means the platform location for
     /// an ordinary run and no file at all for every other built-in check, so
     /// a user's settings never change what a check measures.
@@ -405,7 +409,7 @@ fn optionsForRun(options: Options) Options {
         !options.run.scratchpad_test and !options.run.palette_test and
         !options.run.workspaces_test and !options.run.links_test and
         !options.run.search_test and !options.run.menu_test and !options.run.config_test and
-        !options.run.theme_test) return options;
+        !options.run.theme_test and !options.run.font_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -547,6 +551,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.config_test = true;
         } else if (std.mem.eql(u8, arg, "--theme-test")) {
             run.theme_test = true;
+        } else if (std.mem.eql(u8, arg, "--font-test")) {
+            run.font_test = true;
         } else if (namesValue(arg, "--right-click")) {
             run.right_click = config.RightClick.parse(try takeValue(arg, "--right-click", args, &i)) catch
                 return error.InvalidRightClick;
@@ -1224,9 +1230,12 @@ const Load = struct {
     io: Io,
     /// The face to build, or null when this job is only spawning a child.
     font_request: ?font.Request = null,
-    /// The owned copy `font_request.family` borrows. A reload may replace the
-    /// app's family while this worker still reads it, so the job keeps its own.
-    font_family_owned: ?[]u8 = null,
+    /// The owned settings every string of `font_request` borrows. A reload may
+    /// replace the app's settings while this worker still reads them, so the
+    /// job keeps its own copy.
+    font_settings_owned: ?FontSettings = null,
+    /// `FontValues.faceKey` of the face `font_request` builds.
+    font_key: u64 = 0,
     /// The child to start, or null when this job is only loading a face.
     spawn: ?pty.SpawnRequest = null,
     /// A copied cwd used by `spawn`, or null when the request borrows the
@@ -1270,8 +1279,8 @@ const Load = struct {
     /// Release the copied cwd and owned argv a spawn job carried. Safe on
     /// every completion and failure path once the worker is no longer running.
     fn freeSpawnInputs(self: *Load) void {
-        if (self.font_family_owned) |family| self.allocator.free(family);
-        self.font_family_owned = null;
+        if (self.font_settings_owned) |*settings| settings.deinit();
+        self.font_settings_owned = null;
         if (self.spawn_cwd) |cwd| self.allocator.free(cwd);
         self.spawn_cwd = null;
         if (self.spawn_argv) |argv| freeEntries(self.allocator, argv);
@@ -1444,6 +1453,8 @@ const ChildSpec = struct {
             config_test_script
         else if (options.run.theme_test)
             theme_test_script
+        else if (options.run.font_test)
+            font_test_script
         else
             options.run.command;
         const shell: ?[]const u8 = if (command) |line| blk: {
@@ -1707,7 +1718,7 @@ fn wantsChild(options: Options) bool {
     if (options.run.clipboard_test or options.run.ime_test or options.run.tabs_test or
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
         options.run.links_test or options.run.search_test or options.run.menu_test or
-        options.run.config_test or options.run.theme_test) return true;
+        options.run.config_test or options.run.theme_test or options.run.font_test) return true;
     return !options.run.no_child and !options.run.self_test and !options.run.grid_test and
         !options.run.scroll_test and !options.run.mouse_test and !options.run.ui_test and
         !options.run.sidebar_test;
@@ -1723,7 +1734,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.clipboard_test or run.ui_test or run.ime_test or run.sidebar_test or
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
-        run.config_test or run.theme_test or run.driver_test;
+        run.config_test or run.theme_test or run.font_test or run.driver_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -1810,7 +1821,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 51;
+const action_capacity_base: usize = 58;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 
@@ -1831,7 +1842,7 @@ const search_scratch_capacity: usize = 1024 * 1024;
 const search_tick_budget: usize = 4;
 const search_candidate_budget: usize = 32;
 const semantic_element_capacity: usize = sidebar_element_capacity + terminal_link_capacity +
-    search_highlight_capacity + 12;
+    search_highlight_capacity + 13;
 const pane_ui_capacity: usize = 64;
 const tab_name_capacity: usize = 256;
 const palette_input_capacity: usize = 256;
@@ -2896,6 +2907,207 @@ fn configuredFamily(session_layer: ?[]const u8, file: ?[]const u8) []const u8 {
     return config.Layer.resolve([]const u8, "", file, session_layer);
 }
 
+/// What a `font.fallbacks` family that is not installed reports. The family is
+/// skipped and the rest of the chain still applies.
+const missing_fallback_message = "font.fallbacks: a family is not installed; it is skipped";
+
+/// The font settings that decide which face is built, as borrowed values.
+/// `FontSettings` owns a copy; `fontValuesFrom` borrows a parsed file.
+const FontValues = struct {
+    /// The primary family after the `--font` session layer; empty is bundled.
+    family: []const u8 = "",
+    bold: []const u8 = "",
+    italic: []const u8 = "",
+    bold_italic: []const u8 = "",
+    fallbacks: []const []const u8 = &.{},
+    points: f32 = config.default_font_points,
+    ligatures: bool = true,
+    builtin_symbols: bool = true,
+
+    /// Identifies the face these values build at `scale`: everything but
+    /// ligatures, which `font.Manager.setLigatures` toggles without a rebuild.
+    fn faceKey(self: FontValues, scale: f32) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        for ([_][]const u8{ self.family, self.bold, self.italic, self.bold_italic }) |text| {
+            hasher.update(text);
+            hasher.update(&.{0});
+        }
+        for (self.fallbacks) |family| {
+            hasher.update(family);
+            hasher.update(&.{1});
+        }
+        hasher.update(std.mem.asBytes(&self.points));
+        hasher.update(std.mem.asBytes(&scale));
+        hasher.update(&.{@intFromBool(self.builtin_symbols)});
+        return hasher.final();
+    }
+
+    /// Whether `self` and `other` build the same face at any one scale.
+    fn sameFace(self: FontValues, other: FontValues) bool {
+        return self.faceKey(1) == other.faceKey(1);
+    }
+
+    /// The manager request for these values with `family` as the primary
+    /// (the committed family, or the picker's preview). Borrows every string.
+    fn request(self: FontValues, family: []const u8, size: font.Size, home_dir: ?[]const u8) font.Request {
+        return .{
+            .family = family,
+            .bold_family = self.bold,
+            .italic_family = self.italic,
+            .bold_italic_family = self.bold_italic,
+            .size = size,
+            .home_dir = home_dir,
+            .atlas_width_px = atlas_width_px,
+            .atlas_height_px = atlas_height_px,
+            .fallbacks = self.fallbacks,
+            .ligatures = self.ligatures,
+            .builtin_symbols = self.builtin_symbols,
+        };
+    }
+};
+
+/// The font values a parsed settings file and the `--font` session layer
+/// resolve to. Borrows from both.
+fn fontValuesFrom(session_family: ?[]const u8, settings: config.Settings) FontValues {
+    return .{
+        .family = configuredFamily(session_family, settings.font_family),
+        .bold = settings.font_bold,
+        .italic = settings.font_italic,
+        .bold_italic = settings.font_bold_italic,
+        .fallbacks = settings.font_fallbacks,
+        .points = settings.font_size,
+        .ligatures = settings.font_ligatures,
+        .builtin_symbols = settings.font_nerd_symbols,
+    };
+}
+
+/// An owned copy of `FontValues`, so the values outlive the config they came
+/// from. `App` owns the committed one and each font `Load` owns its own,
+/// because its worker reads it while the main thread may replace the app's.
+const FontSettings = struct {
+    arena: std.heap.ArenaAllocator,
+    values: FontValues,
+
+    /// Deep-copy `source`; the caller owns the result and calls `deinit`.
+    fn init(gpa: Allocator, source: FontValues) Allocator.Error!FontSettings {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
+        var values = source;
+        values.family = try allocator.dupe(u8, source.family);
+        values.bold = try allocator.dupe(u8, source.bold);
+        values.italic = try allocator.dupe(u8, source.italic);
+        values.bold_italic = try allocator.dupe(u8, source.bold_italic);
+        const fallbacks = try allocator.alloc([]const u8, source.fallbacks.len);
+        for (fallbacks, source.fallbacks) |*slot, family| slot.* = try allocator.dupe(u8, family);
+        values.fallbacks = fallbacks;
+        return .{ .arena = arena, .values = values };
+    }
+
+    fn deinit(self: *FontSettings) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// The most families the font picker lists, the bundled entry included.
+const font_choice_capacity: usize = 256;
+/// The longest family name the picker lists, in bytes.
+const font_family_capacity: usize = 96;
+/// The picker's value for the bundled face, which `font.family` spells as an
+/// empty string. Parenthesised so no installed family can share it.
+const bundled_font_value = "(bundled)";
+const bundled_font_label = "JetBrains Mono (bundled)";
+
+const font_pick_action = "font.pick";
+const font_size_increase_action = "font.size.increase";
+const font_size_decrease_action = "font.size.decrease";
+const font_size_reset_action = "font.size.reset";
+const font_ligatures_toggle_action = "font.ligatures.toggle";
+const font_symbols_toggle_action = "font.symbols.toggle";
+const font_fallbacks_action = "font.fallbacks";
+
+/// Whether an installed family name can be listed and written back as a
+/// `font.family` value that the settings parser reads back unchanged.
+fn usableFontFamilyName(name: []const u8) bool {
+    if (name.len == 0 or name.len > font_family_capacity) return false;
+    if (name[0] == ' ' or name[name.len - 1] == ' ') return false;
+    if (std.mem.eql(u8, name, bundled_font_value)) return false;
+    if (!std.unicode.utf8ValidateSlice(name)) return false;
+    for (name) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == '"') return false;
+    }
+    return true;
+}
+
+/// The families `font.pick` offers: the bundled face and every installed
+/// monospace family from the font catalog, sorted, with the committed family
+/// first so opening the picker previews what is already drawn.
+///
+/// Heap-allocated once by `App.init` and owned by `App`; the `font.pick`
+/// registry entry borrows `choices`, and `App.setFontChoices` re-points it
+/// after every rebuild. Rebuilt only while the palette is closed, because an
+/// open picker's rows are indices into it. Main thread only.
+const FontChoices = struct {
+    names: [font_choice_capacity][font_family_capacity]u8 = undefined,
+    choices: [font_choice_capacity]inputmod.PaletteChoice = undefined,
+    count: usize = 0,
+
+    fn slice(self: *const FontChoices) []const inputmod.PaletteChoice {
+        return self.choices[0..self.count];
+    }
+
+    /// Relist from `catalog` with `current` (a `font.family` value) first.
+    /// Never fails: without memory to list the catalog, only the bundled face
+    /// is offered.
+    fn rebuild(self: *FontChoices, gpa: Allocator, catalog: *const font.Catalog, current: []const u8) void {
+        self.choices[0] = .{ .label = bundled_font_label, .value = bundled_font_value };
+        self.count = 1;
+        const families = catalog.monospaceFamilies(gpa, font_choice_capacity - 1) catch |err| {
+            font.log.warn("the installed font families could not be listed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer gpa.free(families);
+        for (families) |family| {
+            if (!usableFontFamilyName(family)) continue;
+            const stored = self.names[self.count][0..family.len];
+            @memcpy(stored, family);
+            self.choices[self.count] = .{ .label = stored, .value = stored };
+            self.count += 1;
+        }
+        const first = self.find(current) orelse return;
+        const chosen = self.choices[first];
+        var cursor = first;
+        while (cursor > 0) : (cursor -= 1) self.choices[cursor] = self.choices[cursor - 1];
+        self.choices[0] = chosen;
+    }
+
+    /// The choice for a `font.family` value: the bundled entry for an empty
+    /// one, else the listed family whose name matches ignoring case.
+    fn find(self: *const FontChoices, family: []const u8) ?usize {
+        for (self.slice(), 0..) |choice, index| {
+            const listed = familyForChoice(choice.value);
+            if (family.len == 0 and listed.len == 0) return index;
+            if (family.len != 0 and std.ascii.eqlIgnoreCase(listed, family)) return index;
+        }
+        return null;
+    }
+};
+
+/// Whether any configured fallback family is not installed, by the catalog the
+/// drawn face was resolved from.
+fn missingFallback(fonts: *const font.Manager, fallbacks: []const []const u8) bool {
+    for (fallbacks) |family| {
+        if (fonts.catalog.findFamily(family) == null) return true;
+    }
+    return false;
+}
+
+/// The `font.family` value a picker choice stands for.
+fn familyForChoice(value: []const u8) []const u8 {
+    return if (std.mem.eql(u8, value, bundled_font_value)) "" else value;
+}
+
 fn chordErrorMessage(err: inputmod.ChordError) []const u8 {
     return switch (err) {
         error.EmptyChord => "keybind: empty chord",
@@ -3481,13 +3693,41 @@ const App = struct {
     /// The scratchpad heights in percent for the two presentations.
     scratchpad_percent_small: u8 = 50,
     scratchpad_percent_large: u8 = 90,
-    /// The face's size in points (`font.size`).
-    font_points: f32 = config.default_font_points,
-    /// Owned storage behind `family`.
-    family_owned: []u8,
-    /// Whether `family` came from the settings file rather than `--font`, so a
+    /// The committed font settings: the file layer, `--font`, and every font
+    /// command since. Owned; replaced as a whole. Main thread.
+    font_settings: FontSettings,
+    /// `FontValues.faceKey` of the face `fonts` was built from, so a request
+    /// for the face already drawn (a no-op reload, a reverted preview that
+    /// never landed) starts no worker.
+    font_loaded_key: u64,
+    /// Font workers started, so the deterministic check can prove that a
+    /// command's own config reload did not build the face a second time.
+    font_load_count: usize = 0,
+    /// Whether the family came from the settings file rather than `--font`, so a
     /// missing family is reported against the file.
     family_from_file: bool = false,
+    /// The families `font.pick` offers. Owned; the registry borrows its list.
+    font_choices: *FontChoices,
+    /// `font.pick`'s registry index, the definition its picker step names.
+    font_pick_index: usize,
+    /// The picker choice whose family is being previewed, or null when the
+    /// committed family is what should be drawn.
+    font_preview_choice: ?usize = null,
+    /// The keyboard selection and hover last seen in the font picker, so
+    /// whichever moved most recently decides the preview, as for themes.
+    font_seen_selected: ?usize = null,
+    font_seen_hover: ?usize = null,
+    /// The pointer moved since the font picker last looked at the hover. A
+    /// previewed face has other cell metrics, so the dialog's rows move under
+    /// a still pointer; only a real movement may change the preview, or the
+    /// preview would flip between two faces forever.
+    font_hover_moved: bool = false,
+    /// Set while a font picker choice is being committed: the palette closes
+    /// before the action runs, and that close must not revert the preview the
+    /// action is about to keep.
+    font_pick_committing: bool = false,
+    /// The picker's `palette.preview` line, copied from the drawn family.
+    font_preview_label: [palette_label_capacity]u8 = undefined,
     /// A font change arrived while a load was in flight; request again when
     /// that load lands so the newest settings win.
     font_reload_pending: bool = false,
@@ -3502,7 +3742,7 @@ const App = struct {
     context_menu_pointer_owned: bool = false,
     palette_row_ids: [palette_action_capacity][palette_semantic_capacity]u8 = undefined,
     palette_row_labels: [palette_action_capacity][palette_label_capacity]u8 = undefined,
-    palette_choice_ids: [palette_action_capacity][palette_action_capacity][palette_semantic_capacity]u8 = undefined,
+    palette_choice_ids: [palette_visible_rows][palette_semantic_capacity]u8 = undefined,
     search_query: ui.Input,
     search_visible: bool = false,
     search_case: term.SearchCase = .ascii_insensitive,
@@ -3567,8 +3807,7 @@ const App = struct {
     /// Font discovery is app-global. Child and scratchpad spawn jobs live in
     /// their originating workspace presentation records.
     font_load: ?*Load,
-    /// The family and display scale the current face was resolved at.
-    family: []const u8,
+    /// The display scale the current face is resolved at.
     font_scale: f32,
     home_dir: ?[]const u8,
     /// The instant the blink phase is measured from.
@@ -3674,8 +3913,8 @@ const App = struct {
         }
         const session_font_family: ?[]const u8 = if (options.run.font_family.len == 0) null else options.run.font_family;
         var family_from_file = session_font_family == null and loaded_config.settings.font_family != null;
-        var configured_family = configuredFamily(session_font_family, loaded_config.settings.font_family);
-        var configured_points = loaded_config.settings.font_size;
+        const built_in_font = fontValuesFrom(session_font_family, .{});
+        var font_values = fontValuesFrom(session_font_family, loaded_config.settings);
         var font_diagnostic: ?config.Diagnostic = null;
 
         // Opening a face means walking every font directory on the machine and
@@ -3691,13 +3930,12 @@ const App = struct {
                 job.* = .{
                     .allocator = allocator,
                     .io = io,
-                    .font_request = .{
-                        .family = configured_family,
-                        .size = try font.Size.init(configured_points, scale),
-                        .home_dir = env.get("HOME"),
-                        .atlas_width_px = atlas_width_px,
-                        .atlas_height_px = atlas_height_px,
-                    },
+                    // Joined below, so the request may borrow `loaded_config`.
+                    .font_request = font_values.request(
+                        font_values.family,
+                        try font.Size.init(font_values.points, scale),
+                        env.get("HOME"),
+                    ),
                 };
                 try job.start();
                 job.thread.?.join();
@@ -3708,15 +3946,14 @@ const App = struct {
                     // the app from starting: retry once with the built-in
                     // request and report the setting. The errdefer above
                     // releases the job on the error return.
-                    const configured = family_from_file or configured_points != font_points;
+                    const configured = family_from_file or !font_values.sameFace(built_in_font);
                     if (attempt != 0 or !configured) return error.NoFaceAvailable;
                     allocator.destroy(job);
                     font_diagnostic = .{
                         .line = @max(loaded_config.lines.get(.font_family), loaded_config.lines.get(.font_size)),
                         .message = "font: the configured face could not be loaded",
                     };
-                    configured_family = session_font_family orelse "";
-                    configured_points = font_points;
+                    font_values = built_in_font;
                     family_from_file = false;
                     continue;
                 };
@@ -3726,11 +3963,19 @@ const App = struct {
             }
         };
         errdefer fonts.deinit();
-        if (family_from_file and configured_family.len != 0 and fonts.isFallback()) {
+        fonts.setLigatures(font_values.ligatures);
+        if (family_from_file and font_values.family.len != 0 and fonts.isFallback()) {
             font_diagnostic = .{ .line = loaded_config.lines.get(.font_family), .message = missing_family_message };
+        } else if (font_diagnostic == null and missingFallback(&fonts, font_values.fallbacks)) {
+            font_diagnostic = .{ .line = loaded_config.lines.get(.font_fallbacks), .message = missing_fallback_message };
         }
-        const family_owned = try allocator.dupe(u8, configured_family);
-        errdefer allocator.free(family_owned);
+        var font_settings = try FontSettings.init(allocator, font_values);
+        errdefer font_settings.deinit();
+        const font_loaded_key = font_values.faceKey(scale);
+        const font_choices = try allocator.create(FontChoices);
+        errdefer allocator.destroy(font_choices);
+        font_choices.* = .{};
+        font_choices.rebuild(allocator, &fonts.catalog, font_settings.values.family);
         const config_path_owned: ?[]u8 = if (config_path) |path| try allocator.dupe(u8, path) else null;
         errdefer if (config_path_owned) |path| allocator.free(path);
         log.info("drawing with {s}, {d}x{d}px cells, from {s}{s}", .{
@@ -4107,6 +4352,47 @@ const App = struct {
             .handler = themePickAction,
             .palette = themePickCommand(theme_catalog),
         });
+        const font_pick_index = actions.definitions().len;
+        try actions.register(.{
+            .name = font_pick_action,
+            .label = "Font: Change Family",
+            .handler = fontPickAction,
+            .palette = fontPickCommand(font_choices),
+        });
+        try actions.register(.{
+            .name = font_size_increase_action,
+            .label = "Font: Increase Size",
+            .handler = fontSizeIncreaseAction,
+        });
+        try actions.register(.{
+            .name = font_size_decrease_action,
+            .label = "Font: Decrease Size",
+            .handler = fontSizeDecreaseAction,
+        });
+        try actions.register(.{
+            .name = font_size_reset_action,
+            .label = "Font: Reset Size",
+            .handler = fontSizeResetAction,
+        });
+        try actions.register(.{
+            .name = font_ligatures_toggle_action,
+            .label = "Font: Toggle Ligatures",
+            .handler = fontLigaturesToggleAction,
+        });
+        try actions.register(.{
+            .name = font_symbols_toggle_action,
+            .label = "Font: Toggle Built-in Symbols",
+            .handler = fontSymbolsToggleAction,
+        });
+        try actions.register(.{
+            .name = font_fallbacks_action,
+            .label = "Font: Configure Fallbacks",
+            .handler = fontFallbacksAction,
+            .palette = .{ .argument = .{ .input = .{
+                .name = "families",
+                .prompt = "Fallback families, comma-separated (none clears)",
+            } } },
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -4210,8 +4496,10 @@ const App = struct {
             .theme_pick_index = theme_pick_index,
             .scratchpad_percent_small = loaded_config.settings.scratchpad_size,
             .scratchpad_percent_large = loaded_config.settings.scratchpad_large_size,
-            .font_points = configured_points,
-            .family_owned = family_owned,
+            .font_settings = font_settings,
+            .font_loaded_key = font_loaded_key,
+            .font_choices = font_choices,
+            .font_pick_index = font_pick_index,
             .family_from_file = family_from_file,
             .binding_table = binding_table,
             .binding_profile = binding_profile,
@@ -4225,7 +4513,6 @@ const App = struct {
             .pending_child_bytes = .empty,
             .pending_child_offset = 0,
             .font_load = null,
-            .family = family_owned,
             .font_scale = scale,
             .home_dir = env.get("HOME"),
             .blink_epoch_ns = Io.Clock.real.now(io).nanoseconds,
@@ -4239,6 +4526,7 @@ const App = struct {
         app.resolveTheme();
         app.theme_catalog.order(app.activeThemeName());
         app.setThemeChoices();
+        app.setFontChoices();
         app.refreshConfigError();
         try app.syncGrid();
         if (testdriver.isEnabled(options.run.test_driver_endpoint != null)) {
@@ -4355,9 +4643,10 @@ const App = struct {
         self.binding_table.deinit();
         self.config_current.deinit();
         if (self.config_path) |path| self.allocator.free(path);
-        self.allocator.free(self.family_owned);
+        self.font_settings.deinit();
         self.allocator.free(self.action_definitions);
         self.allocator.destroy(self.theme_catalog);
+        self.allocator.destroy(self.font_choices);
         self.overlay_grid.deinit();
         for (self.workspace_presentations.items) |presentation| {
             for (presentation.pane_renderers.items) |*pane_renderer| pane_renderer.deinit();
@@ -4677,13 +4966,22 @@ const App = struct {
     /// rasterised again rather than scaled up. The request is polled by the
     /// loop instead of waited on, so the frame that notices the window moved is
     /// not the frame that blocks on the scan.
+    ///
+    /// The face wanted is the committed settings with the font picker's
+    /// previewed family, if any. A request for the face already drawn, or the
+    /// one already being built, starts nothing, so a font command's own config
+    /// reload and a preview that returns to the drawn family cost no rebuild.
     fn requestFontReload(self: *App) void {
-        if (self.font_load != null) {
-            log.debug("a load is already in flight; requesting again when it lands", .{});
-            self.font_reload_pending = true;
+        const wanted = self.wantedFontKey();
+        if (self.font_load) |job| {
+            // When the job lands, whatever is wanted then is requested again.
+            self.font_reload_pending = job.font_key != wanted;
+            if (self.font_reload_pending) log.debug("a load is already in flight; requesting again when it lands", .{});
             return;
         }
-        const size = font.Size.init(self.font_points, self.font_scale) catch |err| {
+        self.font_reload_pending = false;
+        if (wanted == self.font_loaded_key) return;
+        const size = font.Size.init(self.font_settings.values.points, self.font_scale) catch |err| {
             log.err("a display scale of {d:.2} is not a usable font size: {s}", .{
                 self.font_scale,
                 @errorName(err),
@@ -4694,22 +4992,21 @@ const App = struct {
             log.warn("no memory to re-load the font: {s}", .{@errorName(err)});
             return;
         };
-        const family = self.allocator.dupe(u8, self.family) catch |err| {
+        var values = self.font_settings.values;
+        values.family = self.drawnFamily();
+        const owned = FontSettings.init(self.allocator, values) catch |err| {
             log.warn("no memory to re-load the font: {s}", .{@errorName(err)});
             self.allocator.destroy(job);
             return;
         };
+        // The request borrows the job's copy, whose strings live as long as
+        // the job does, whatever happens to the app's settings meanwhile.
         job.* = .{
             .allocator = self.allocator,
             .io = self.io,
-            .font_family_owned = family,
-            .font_request = .{
-                .family = family,
-                .size = size,
-                .home_dir = self.home_dir,
-                .atlas_width_px = atlas_width_px,
-                .atlas_height_px = atlas_height_px,
-            },
+            .font_settings_owned = owned,
+            .font_key = wanted,
+            .font_request = owned.values.request(owned.values.family, size, self.home_dir),
         };
         job.start() catch |err| {
             log.warn("could not start the worker that re-loads the font: {s}", .{@errorName(err)});
@@ -4718,7 +5015,12 @@ const App = struct {
             return;
         };
         self.font_load = job;
-        log.info("re-loading the face at display scale {d:.2}", .{self.font_scale});
+        self.font_load_count += 1;
+        log.info("re-loading the face ({s}, {d:.1} points) at display scale {d:.2}", .{
+            if (values.family.len == 0) "bundled" else values.family,
+            values.points,
+            self.font_scale,
+        });
     }
 
     /// Take whatever a finished job produced, and say whether the screen has to
@@ -4801,6 +5103,7 @@ const App = struct {
             job.thread = null;
         }
         var changed = false;
+        var landed = false;
         if (job.fonts) |fonts| {
             self.fonts.deinit();
             self.fonts = fonts;
@@ -4826,13 +5129,13 @@ const App = struct {
                 self.fonts.metrics().cell.width_px,
                 self.fonts.metrics().cell.height_px,
             });
+            self.font_loaded_key = job.font_key;
+            // The ligature setting may have changed while the face was built.
+            self.fonts.setLigatures(self.font_settings.values.ligatures);
             self.syncGrid() catch |err| {
                 log.warn("the grid could not be resized for the new face: {s}", .{@errorName(err)});
             };
-            self.font_diagnostic = if (self.family_from_file and self.family.len != 0 and self.fonts.isFallback())
-                .{ .line = self.config_current.lines.get(.font_family), .message = missing_family_message }
-            else
-                null;
+            landed = true;
             changed = true;
         } else if (job.font_failure != null) {
             // The previous manager stays: the screen keeps drawing with the
@@ -4847,6 +5150,10 @@ const App = struct {
         job.freeSpawnInputs();
         self.allocator.destroy(job);
         self.font_load = null;
+        if (landed) {
+            self.font_diagnostic = null;
+            self.refreshFontDiagnostic();
+        }
         if (changed) {
             self.refreshConfigError();
             self.invalidateUi();
@@ -5272,7 +5579,9 @@ const App = struct {
                     .choices => |choice_argument| choice_argument.values,
                     else => return null,
                 };
-                break :blk @intCast(@min(values.len, palette_visible_rows) + 4);
+                // The font picker adds its `palette.preview` line.
+                const preview_rows: usize = if (step.definition_index == self.font_pick_index) 1 else 0;
+                break :blk @intCast(@min(values.len, palette_visible_rows) + 4 + preview_rows);
             },
         };
         const height = @min(wanted_height, canvas.height - 2);
@@ -5513,10 +5822,11 @@ const App = struct {
                 const start = if (step.selected < visible_count) 0 else step.selected - visible_count + 1;
                 for (palette_argument_meta.values[start .. start + visible_count], 0..) |choice, row| {
                     const choice_index = start + row;
-                    if (step.definition_index >= self.palette_choice_ids.len or
-                        choice_index >= self.palette_choice_ids[step.definition_index].len) break;
+                    // Ids are stored per visible row: only those rows are
+                    // in the tree, however long the list is.
+                    if (row >= self.palette_choice_ids.len) break;
                     const id_text = try std.fmt.bufPrint(
-                        &self.palette_choice_ids[step.definition_index][choice_index],
+                        &self.palette_choice_ids[row],
                         "palette.choice.{d}.{d}",
                         .{ step.definition_index, choice_index },
                     );
@@ -5546,6 +5856,25 @@ const App = struct {
                         .hovered = .{ .foreground = .strong, .underline = .accent },
                         .focused = .{ .foreground = .on_accent, .background = .accent },
                     });
+                }
+                // The font picker names the family the window is drawn with
+                // once the highlighted one has loaded, so a person (and the
+                // test driver) can tell a preview from a load in progress.
+                const preview_y = bounds.y + 2 + @as(u32, @intCast(visible_count));
+                if (step.definition_index == self.font_pick_index and preview_y + 1 < bounds.y + bounds.height) {
+                    if (self.fontPreviewLine()) |line| {
+                        const preview_runs = [_]ui.Run{.{
+                            .text = line,
+                            .style = .{ .foreground = .muted },
+                        }};
+                        try self.ui_tree.addText(.{
+                            .id = .{ .value = "palette.preview" },
+                            .parent = dialog_id,
+                            .role = "status",
+                            .label = line,
+                            .bounds = .{ .x = inner_x, .y = preview_y, .width = inner_width, .height = 1 },
+                        }, .{ .runs = &preview_runs });
+                    }
                 }
             },
         }
@@ -6134,6 +6463,7 @@ const App = struct {
     fn composeUi(self: *App) !void {
         try self.composeUiTree();
         self.syncThemePreview();
+        if (self.syncFontPreview()) try self.composeUiTree();
     }
 
     fn composeUiTree(self: *App) !void {
@@ -7366,26 +7696,88 @@ const App = struct {
         self.scratchpad_percent_large = settings.scratchpad_large_size;
         if (sizes_changed and self.scratchpadVisible()) try self.syncGrid();
 
-        const family = configuredFamily(self.session_font_family, settings.font_family);
-        const from_file = self.session_font_family == null and settings.font_family != null;
-        if (!std.mem.eql(u8, family, self.family) or settings.font_size != self.font_points) {
-            const owned = try self.allocator.dupe(u8, family);
-            self.allocator.free(self.family_owned);
-            self.family_owned = owned;
-            self.family = owned;
-            self.font_points = settings.font_size;
-            self.family_from_file = from_file;
-            self.font_diagnostic = null;
-            log.info("the font settings changed; re-loading the face at {d:.1} points", .{self.font_points});
-            self.requestFontReload();
-        } else {
-            self.family_from_file = from_file;
-            // The family line may have moved within the file.
-            if (self.font_diagnostic != null and from_file) {
-                self.font_diagnostic.?.line = self.config_current.lines.get(.font_family);
+        // A font command writes its key and commits the same value first, so
+        // the reload its own write causes finds nothing to change here.
+        const values = fontValuesFrom(self.session_font_family, settings);
+        self.family_from_file = self.session_font_family == null and settings.font_family != null;
+        const face_changed = !values.sameFace(self.font_settings.values);
+        if (face_changed or values.ligatures != self.font_settings.values.ligatures) {
+            try self.commitFontValues(values);
+            if (face_changed) {
+                self.font_diagnostic = null;
+                log.info("the font settings changed; re-loading the face at {d:.1} points", .{values.points});
             }
+        } else {
+            // A line may have moved within the file.
+            self.refreshFontDiagnostic();
         }
         self.reloadThemes(true);
+    }
+
+    /// Make `values` the committed font settings: toggle ligatures in place
+    /// and rebuild the face only when something else changed.
+    fn commitFontValues(self: *App, values: FontValues) !void {
+        const next = try FontSettings.init(self.allocator, values);
+        const ligatures_changed = next.values.ligatures != self.font_settings.values.ligatures;
+        self.font_settings.deinit();
+        self.font_settings = next;
+        if (ligatures_changed) self.applyLigatures();
+        self.requestFontReload();
+    }
+
+    /// Shape with the committed ligature setting from the next frame. Every
+    /// grid caches shaped rows, so each is invalidated, in every workspace.
+    fn applyLigatures(self: *App) void {
+        self.fonts.setLigatures(self.font_settings.values.ligatures);
+        for (self.workspace_presentations.items) |presentation| {
+            for (presentation.pane_renderers.items) |*record| record.grid.invalidate();
+            presentation.scratchpad_grid.invalidate();
+        }
+        self.overlay_grid.invalidate();
+        self.scheduler.invalidate();
+        self.needs_present = true;
+        self.invalidateUi();
+    }
+
+    /// The family to draw: the font picker's highlighted family while it
+    /// previews, else the committed one.
+    fn drawnFamily(self: *const App) []const u8 {
+        if (self.font_preview_choice) |index| {
+            if (index < self.font_choices.count) return familyForChoice(self.font_choices.choices[index].value);
+        }
+        return self.font_settings.values.family;
+    }
+
+    /// The face key the screen should be drawing at this scale.
+    fn wantedFontKey(self: *const App) u64 {
+        var values = self.font_settings.values;
+        values.family = self.drawnFamily();
+        return values.faceKey(self.font_scale);
+    }
+
+    /// Whether the face on screen is the one wanted, with nothing in flight.
+    fn fontSettled(self: *const App) bool {
+        return self.font_load == null and !self.font_reload_pending and self.font_loaded_key == self.wantedFontKey();
+    }
+
+    /// Report a configured family or fallback that is not installed, against
+    /// the line that names it. Only meaningful once the drawn face is the
+    /// committed one; while a load or a preview is pending the last report
+    /// stands, and a face that failed to build keeps its own report.
+    fn refreshFontDiagnostic(self: *App) void {
+        if (self.font_load != null or self.font_preview_choice != null) return;
+        const lines = &self.config_current.lines;
+        if (self.font_loaded_key != self.wantedFontKey()) {
+            if (self.font_diagnostic) |*diagnostic| diagnostic.line = @max(lines.get(.font_family), lines.get(.font_size));
+            return;
+        }
+        const values = self.font_settings.values;
+        self.font_diagnostic = if (self.family_from_file and values.family.len != 0 and self.fonts.isFallback())
+            .{ .line = lines.get(.font_family), .message = missing_family_message }
+        else if (missingFallback(&self.fonts, values.fallbacks))
+            .{ .line = lines.get(.font_fallbacks), .message = missing_fallback_message }
+        else
+            null;
     }
 
     /// The user theme directory for this run, or null when the run has no
@@ -7569,6 +7961,198 @@ const App = struct {
         }
         self.refreshConfigError();
         try self.refreshActiveUi();
+    }
+
+    /// The highlighted choice while the font picker is open, else null.
+    fn fontPickerSelection(self: *const App) ?usize {
+        return switch (self.palette_step) {
+            .choices => |step| if (step.definition_index == self.font_pick_index) step.selected else null,
+            else => null,
+        };
+    }
+
+    /// Point the `font.pick` registry entry at the current family list.
+    fn setFontChoices(self: *App) void {
+        self.action_definitions[self.font_pick_index].palette = fontPickCommand(self.font_choices);
+    }
+
+    fn fontPickCommand(choices: *const FontChoices) inputmod.PaletteCommand {
+        return .{ .argument = .{ .choices = .{
+            .name = "family",
+            .prompt = "Font family",
+            .values = choices.slice(),
+        } } };
+    }
+
+    /// Relist the installed families from the drawn face's catalog. Only while
+    /// the palette is closed: an open picker's rows are indices into the list.
+    fn rebuildFontChoices(self: *App) void {
+        if (self.paletteVisible()) return;
+        self.font_choices.rebuild(self.allocator, &self.fonts.catalog, self.font_settings.values.family);
+        self.setFontChoices();
+    }
+
+    /// Keep the face following what the font picker highlights, by keyboard
+    /// or by hover, and return to the committed family once the picker
+    /// closes without a choice. Called after every UI composition; returns
+    /// whether the wanted face changed, so the frame can be composed again
+    /// with the preview line hidden until that face lands.
+    fn syncFontPreview(self: *App) bool {
+        const before = self.font_preview_choice;
+        if (self.fontPickerSelection()) |selected| {
+            var hovered: ?usize = null;
+            for (self.ui_tree.elements()) |element| {
+                if (!element.state.hovered) continue;
+                hovered = paletteChoiceSemanticIndex(element.id.value, self.font_pick_index);
+            }
+            if (self.font_seen_selected == null or self.font_seen_selected.? != selected) {
+                self.font_preview_choice = selected;
+            } else if (hovered) |index| {
+                if (self.font_hover_moved and (self.font_seen_hover == null or self.font_seen_hover.? != index)) self.font_preview_choice = index;
+            }
+            self.font_seen_selected = selected;
+            if (self.font_hover_moved) self.font_seen_hover = hovered;
+            self.font_hover_moved = false;
+        } else {
+            self.font_seen_selected = null;
+            self.font_seen_hover = null;
+            self.font_hover_moved = false;
+            // A committing choice keeps its preview: the action adopts it.
+            if (!self.font_pick_committing) self.font_preview_choice = null;
+        }
+        if (std.meta.eql(before, self.font_preview_choice)) return false;
+        self.requestFontReload();
+        return true;
+    }
+
+    /// The `palette.preview` line: which family the window is drawn with,
+    /// once the highlighted family has landed. Null while it is loading.
+    fn fontPreviewLine(self: *App) ?[]const u8 {
+        if (!self.fontSettled()) return null;
+        return std.fmt.bufPrint(&self.font_preview_label, "Showing {s}{s}", .{
+            self.fonts.familyName(),
+            if (self.fonts.isFallback()) " (bundled)" else "",
+        }) catch self.font_preview_label[0..];
+    }
+
+    /// Commit a font command's change, save its key and redraw. The live
+    /// state changes first, so the reload the write causes is a no-op.
+    fn commitFontCommand(self: *App, values: FontValues, key: config.Key, value: []const u8) !void {
+        try self.commitFontValues(values);
+        if (self.config_path) |path| {
+            config.writeDocumentValue(self.io, self.allocator, path, key, value) catch |err| {
+                log.warn("the font setting could not be saved to the config file: {s}", .{@errorName(err)});
+                self.setWorkspaceStatus("Font applied; config file not updated");
+            };
+        } else {
+            log.info("no settings file for this run; the font change is not saved", .{});
+        }
+        self.refreshFontDiagnostic();
+        self.refreshConfigError();
+        try self.refreshActiveUi();
+    }
+
+    fn fontPickAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        defer self.font_pick_committing = false;
+        const value = argument(invocation, "family") orelse return;
+        const requested = familyForChoice(value);
+        // Any installed family can be named (a keybinding may), not only a
+        // listed one; the bundled face is the empty family.
+        if (requested.len != 0 and (!usableFontFamilyName(requested) or self.fonts.catalog.findFamily(requested) == null)) {
+            self.setWorkspaceStatus("No such font family");
+            return;
+        }
+        var family_buffer: [font_family_capacity]u8 = undefined;
+        const family = family_buffer[0..requested.len];
+        @memcpy(family, requested);
+        // The preview, if any, is adopted: the committed family is now it.
+        self.font_preview_choice = null;
+        var values = self.font_settings.values;
+        values.family = configuredFamily(self.session_font_family, family);
+        self.family_from_file = self.session_font_family == null;
+        if (self.session_font_family != null) self.setWorkspaceStatus("Saved; --font overrides it for this run");
+        try self.commitFontCommand(values, .font_family, family);
+        self.rebuildFontChoices();
+    }
+
+    fn stepFontSize(self: *App, points: f32) !void {
+        var values = self.font_settings.values;
+        values.points = points;
+        var buffer: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "{d}", .{points});
+        try self.commitFontCommand(values, .font_size, text);
+    }
+
+    fn fontSizeIncreaseAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        try self.stepFontSize(config.stepFontPoints(self.font_settings.values.points, .increase));
+    }
+
+    fn fontSizeDecreaseAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        try self.stepFontSize(config.stepFontPoints(self.font_settings.values.points, .decrease));
+    }
+
+    /// Back to the built-in size, written as `font.size = 14` so the file and
+    /// the window agree rather than the file still naming the old size.
+    fn fontSizeResetAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        try self.stepFontSize(config.default_font_points);
+    }
+
+    fn fontLigaturesToggleAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        var values = self.font_settings.values;
+        values.ligatures = !values.ligatures;
+        try self.commitFontCommand(values, .font_ligatures, if (values.ligatures) "true" else "false");
+        self.setWorkspaceStatus(if (values.ligatures) "Ligatures on" else "Ligatures off");
+    }
+
+    fn fontSymbolsToggleAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        var values = self.font_settings.values;
+        values.builtin_symbols = !values.builtin_symbols;
+        try self.commitFontCommand(values, .font_nerd_symbols, if (values.builtin_symbols) "true" else "false");
+        self.setWorkspaceStatus(if (values.builtin_symbols) "Built-in symbols on" else "Built-in symbols off");
+    }
+
+    /// Set `font.fallbacks` from a comma-separated list, or clear it with
+    /// `none`. Names are written as typed (trimmed); one that is not
+    /// installed is skipped by the font manager and reported in the sidebar.
+    fn fontFallbacksAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const text = argument(invocation, "families") orelse return;
+        var names: [config.max_font_fallbacks][]const u8 = undefined;
+        const families: []const []const u8 = if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, text, " \t"), "none"))
+            &.{}
+        else
+            config.splitFallbacks(text, &names) catch {
+                self.setWorkspaceStatus("At most 8 fallback families");
+                try self.refreshActiveUi();
+                return;
+            };
+        for (families) |family| {
+            if (std.mem.indexOfScalar(u8, family, '"') != null) {
+                self.setWorkspaceStatus("A family name cannot contain a quote");
+                try self.refreshActiveUi();
+                return;
+            }
+        }
+        var buffer: [config.max_string_bytes]u8 = undefined;
+        const value = config.formatFallbacks(&buffer, families) catch {
+            self.setWorkspaceStatus("Fallback list is too long");
+            try self.refreshActiveUi();
+            return;
+        };
+        var values = self.font_settings.values;
+        values.fallbacks = families;
+        try self.commitFontCommand(values, .font_fallbacks, value);
     }
 
     fn configOpenAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
@@ -9075,6 +9659,9 @@ const App = struct {
         clearPaletteInput(&self.palette_argument);
         self.palette_model.refresh("");
         self.palette_model.selectFirst();
+        // Installed families can change between openings (a font installed
+        // or a reload's rescan); the list is fixed while the palette is open.
+        self.rebuildFontChoices();
         self.palette_content_width = self.paletteContentWidth();
         self.palette_step = .commands;
         self.ui_tree.clearFocus();
@@ -9183,6 +9770,15 @@ const App = struct {
                 invocation_arguments = arguments[0..1];
             },
         }
+
+        // Choosing a font keeps its preview through the close below; the
+        // action adopts it, and if it does not, the preview reverts here.
+        const committing_font = definition_index == self.font_pick_index;
+        if (committing_font) self.font_pick_committing = true;
+        defer if (committing_font) {
+            self.font_pick_committing = false;
+            if (self.syncFontPreview()) self.invalidateUi();
+        };
 
         // Keep Input bytes alive through invocation, but remove the modal
         // before a command composes its own UI (for example Rename tab).
@@ -11197,6 +11793,10 @@ const App = struct {
     /// React to one event. Returns whether the loop should keep running.
     fn handle(self: *App, event: platform.Event) !bool {
         switch (event) {
+            .mouse_motion => self.font_hover_moved = true,
+            else => {},
+        }
+        switch (event) {
             .driver_wake => {
                 self.drainDriverRequests();
                 self.pollDriverPending();
@@ -12838,7 +13438,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     const grid_size = self.activeLive().terminal().gridSize();
     const fixed_setup = self.window.state.logical.width == ui_test_width and
         self.window.state.logical.height == ui_test_height and
-        !self.window.isVisible() and !self.scheduler.force and self.family.len == 0 and
+        !self.window.isVisible() and !self.scheduler.force and self.font_settings.values.family.len == 0 and
         self.activeLive().child() == null;
     failures += reportCheck(out, fixed_setup, "ui-test: fixed hidden {d}x{d}, bundled font request, no child, force redraw off; got {d}x{d}, visible {}, family '{s}', child {}, force {}", .{
         ui_test_width,
@@ -12846,7 +13446,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         self.window.state.logical.width,
         self.window.state.logical.height,
         self.window.isVisible(),
-        self.family,
+        self.font_settings.values.family,
         self.activeLive().child() != null,
         self.scheduler.force,
     });
@@ -12867,7 +13467,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 52 and
+    failures += reportCheck(out, registered_actions.len == 59 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -12919,7 +13519,14 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[48].name, config_open_action) and
         std.mem.eql(u8, registered_actions[49].name, config_reload_action) and
         std.mem.eql(u8, registered_actions[50].name, theme_pick_action) and
-        std.mem.eql(u8, registered_actions[51].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[51].name, font_pick_action) and
+        std.mem.eql(u8, registered_actions[52].name, font_size_increase_action) and
+        std.mem.eql(u8, registered_actions[53].name, font_size_decrease_action) and
+        std.mem.eql(u8, registered_actions[54].name, font_size_reset_action) and
+        std.mem.eql(u8, registered_actions[55].name, font_ligatures_toggle_action) and
+        std.mem.eql(u8, registered_actions[56].name, font_symbols_toggle_action) and
+        std.mem.eql(u8, registered_actions[57].name, font_fallbacks_action) and
+        std.mem.eql(u8, registered_actions[58].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -15701,6 +16308,10 @@ const ConfigWait = union(enum) {
     fonts_idle,
     /// The committed theme's palette is this one.
     theme: theme.Palette,
+    /// The face on screen is the wanted one and no font worker is running.
+    font_settled,
+    /// Settled, and drawn with this family.
+    drawn_family: []const u8,
 };
 
 fn configWaitMet(self: *App, condition: ConfigWait) !bool {
@@ -15715,6 +16326,8 @@ fn configWaitMet(self: *App, condition: ConfigWait) !bool {
         .cell_height_above => |height| self.font_load == null and self.fonts.metrics().cell.height_px > height,
         .fonts_idle => self.font_load == null,
         .theme => |palette| self.theme_palette.eql(palette),
+        .font_settled => self.fontSettled(),
+        .drawn_family => |name| self.fontSettled() and std.mem.eql(u8, self.fonts.familyName(), name),
     };
 }
 
@@ -16123,6 +16736,295 @@ fn themeTest(self: *App, io: Io, out: *Writer) !u8 {
         try waitForConfig(self, io, out, .{ .theme = auto_expected }) and self.configErrorText() == null, "auto:dracula,solarized-light resolved to the {s} theme", .{if (prefers_light) "light" else "dark"});
 
     out.print("theme-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
+/// The deterministic peer behind `--font-test`'s terminals. Its second row is
+/// a ligature run the bundled JetBrains Mono joins.
+const font_test_script =
+    "stty -echo; " ++
+    "printf 'FONT-READY\\r\\n'; " ++
+    "printf 'LIGA a => b != c -> d\\r\\n'; " ++
+    "while IFS= read -r line; do printf 'FONT-ECHO:%s\\r\\n' \"$line\"; done";
+
+/// The settings `--font-test` starts with: every font key at its default.
+const font_test_initial = "# --font-test settings\n";
+
+/// The installed family `--font-test` previews and commits. The Linux gate
+/// installs `fonts-dejavu-core`, and it is monospaced with its own metrics.
+const font_test_family = "DejaVu Sans Mono";
+
+/// A private absolute path for `--font-test`'s settings file.
+fn fontTestPath(io: Io, env: EnvSource, buffer: []u8) ![]const u8 {
+    const base = firstEnv(env, temp_dir_vars[0..]) orelse "/tmp";
+    const root = if (base.len != 0 and base[0] == '/') base else "/tmp";
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = try generateRunId(io, &id_buffer);
+    return std.fmt.bufPrint(buffer, "{s}/conduit-font-test-{s}/conduit/config", .{ root, id });
+}
+
+/// Remove `--font-test`'s private directory: two levels above the file.
+fn removeFontTestDir(io: Io, path: []const u8) void {
+    const conduit_dir = config.directoryOf(path) orelse return;
+    const root = config.directoryOf(conduit_dir) orelse return;
+    if (std.mem.indexOf(u8, root, "conduit-font-test-") == null) return;
+    Dir.cwd().deleteTree(io, root) catch |err| {
+        log.warn("could not remove the font-test directory: {s}", .{@errorName(err)});
+    };
+}
+
+fn fontCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("font-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// Whether the settings file reads exactly `expected`.
+fn fontFileIs(io: Io, path: []const u8, expected: []const u8) bool {
+    var buffer: [4096]u8 = undefined;
+    const text = Dir.cwd().readFile(io, path, &buffer) catch return false;
+    return std.mem.eql(u8, text, expected);
+}
+
+/// Open the palette by its chord, type `label` and press Enter, after checking
+/// that the typed label ranked its own command first.
+fn runPaletteCommandByKeyboard(self: *App, io: Io, out: *Writer, label: [:0]const u8) !bool {
+    if (!try paletteChord(self, io, out)) return false;
+    if (!try postPaletteText(self, io, out, label)) return false;
+    const selected = self.palette_model.selectedDefinitionIndex() orelse return false;
+    if (!std.mem.eql(u8, self.actions.definitions()[selected].label, label)) return false;
+    return postNamedKey(self, io, out, .enter, .{});
+}
+
+/// The pixels of terminal row `row` across the pane, in the frame.
+fn terminalRowRect(self: *const App, row: u16) render.PixelRect {
+    const cell = self.fonts.metrics().cell;
+    const x = self.sidebarOriginColumns() * cell.width_px;
+    return .{
+        .x = @floatFromInt(x),
+        .y = @floatFromInt(@as(u32, row) * cell.height_px),
+        .width = @floatFromInt(self.size.width - @min(self.size.width, x)),
+        .height = @floatFromInt(cell.height_px),
+    };
+}
+
+/// One font command whose own config write must not build the face twice:
+/// after the watcher reloads the file it wrote, no further worker started.
+fn fontReloadIsNoop(self: *App, io: Io, out: *Writer, reloads_before: usize, loads_after_command: usize) !bool {
+    if (!try waitForConfig(self, io, out, .{ .reloads = reloads_before + 1 })) return false;
+    if (!try waitForConfig(self, io, out, .font_settled)) return false;
+    return self.font_load_count == loads_after_command and self.configErrorText() == null;
+}
+
+/// One size command's effect: the committed points, the cell height moving
+/// the expected way, the file's `font.size` line and a no-op reload of it.
+const FontSizeExpectation = struct {
+    how: []const u8,
+    points: f32,
+    file: []const u8,
+    height_before: u32,
+    height: std.math.Order,
+    reloads_before: usize,
+    loads_after: usize,
+};
+
+fn checkFontSizeStep(self: *App, io: Io, out: *Writer, failures: *usize, path: []const u8, step: FontSizeExpectation) !void {
+    const settled = try waitForConfig(self, io, out, .font_settled);
+    const height = self.fonts.metrics().cell.height_px;
+    fontCheck(out, failures, settled and self.font_settings.values.points == step.points and
+        std.math.order(height, step.height_before) == step.height, "{s} set {d} points: cell height {d}px -> {d}px", .{ step.how, step.points, step.height_before, height });
+    fontCheck(out, failures, fontFileIs(io, path, step.file), "the settings file reads font.size = {d} with its comment kept", .{step.points});
+    fontCheck(out, failures, try fontReloadIsNoop(self, io, out, step.reloads_before, step.loads_after), "the reload of that write rebuilt nothing", .{});
+}
+
+/// Exercise TASK-40 end to end through real SDL keys and pointer events:
+/// size increase, decrease and reset by chord, by the palette by keyboard and
+/// by a clicked palette row, with cell-metric readback and the file after
+/// each; ligatures toggled in place with frame readback; built-in symbols
+/// rebuilt; fallbacks through the free-text step; and the family picker's
+/// keyboard preview, Escape revert, hover preview and mouse commit.
+fn fontTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    const path_copy = self.config_path orelse {
+        out.writeAll("font-test: FAIL no settings path\n") catch {};
+        return 1;
+    };
+    var path_buffer: [path_capacity]u8 = undefined;
+    @memcpy(path_buffer[0..path_copy.len], path_copy);
+    const path = path_buffer[0..path_copy.len];
+
+    try self.drawFrame();
+    fontCheck(out, &failures, try waitForPanes(self, io, out, .{ .focused_text = "LIGA a" }), "the real font-test child became ready", .{});
+    fontCheck(out, &failures, try waitForConfig(self, io, out, .font_settled) and self.font_settings.values.points == config.default_font_points and
+        self.font_settings.values.family.len == 0 and self.fonts.isFallback(), "startup drew the bundled face at the built-in 14 points", .{});
+
+    // Size: increase, decrease and reset by chord, by palette and by mouse.
+    const zoom: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true },
+    };
+    var zoom_shift = zoom;
+    zoom_shift.shift = true;
+    const base_height = self.fonts.metrics().cell.height_px;
+    var reloads = self.config_reload_count;
+    var height = self.fonts.metrics().cell.height_px;
+    _ = try postKey(self, io, out, '=', zoom);
+    try checkFontSizeStep(self, io, out, &failures, path, .{ .how = "the increase chord", .points = 15, .file = font_test_initial ++ "font.size = 15\n", .height_before = height, .height = .gt, .reloads_before = reloads, .loads_after = self.font_load_count });
+
+    reloads = self.config_reload_count;
+    height = self.fonts.metrics().cell.height_px;
+    _ = try postKey(self, io, out, '=', zoom_shift);
+    try checkFontSizeStep(self, io, out, &failures, path, .{ .how = "the increase chord with Shift (Ctrl+Plus)", .points = 16, .file = font_test_initial ++ "font.size = 16\n", .height_before = height, .height = .gt, .reloads_before = reloads, .loads_after = self.font_load_count });
+
+    reloads = self.config_reload_count;
+    height = self.fonts.metrics().cell.height_px;
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Decrease Size"), "Font: Decrease Size ran from the palette by keyboard", .{});
+    try checkFontSizeStep(self, io, out, &failures, path, .{ .how = "the palette's Decrease Size", .points = 15, .file = font_test_initial ++ "font.size = 15\n", .height_before = height, .height = .lt, .reloads_before = reloads, .loads_after = self.font_load_count });
+
+    reloads = self.config_reload_count;
+    height = self.fonts.metrics().cell.height_px;
+    _ = try postKey(self, io, out, '-', zoom);
+    try checkFontSizeStep(self, io, out, &failures, path, .{ .how = "the decrease chord", .points = 14, .file = font_test_initial ++ "font.size = 14\n", .height_before = height, .height = .lt, .reloads_before = reloads, .loads_after = self.font_load_count });
+    fontCheck(out, &failures, self.fonts.metrics().cell.height_px == base_height, "14 points is the startup cell height again ({d}px)", .{base_height});
+
+    reloads = self.config_reload_count;
+    height = self.fonts.metrics().cell.height_px;
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Increase Size"), "Font: Increase Size ran from the palette by keyboard", .{});
+    try checkFontSizeStep(self, io, out, &failures, path, .{ .how = "the palette's Increase Size", .points = 15, .file = font_test_initial ++ "font.size = 15\n", .height_before = height, .height = .gt, .reloads_before = reloads, .loads_after = self.font_load_count });
+
+    reloads = self.config_reload_count;
+    height = self.fonts.metrics().cell.height_px;
+    _ = try postKey(self, io, out, '0', zoom);
+    try checkFontSizeStep(self, io, out, &failures, path, .{ .how = "the reset chord", .points = 14, .file = font_test_initial ++ "font.size = 14\n", .height_before = height, .height = .lt, .reloads_before = reloads, .loads_after = self.font_load_count });
+
+    reloads = self.config_reload_count;
+    height = self.fonts.metrics().cell.height_px;
+    _ = try postKey(self, io, out, '=', zoom);
+    try checkFontSizeStep(self, io, out, &failures, path, .{ .how = "the increase chord again", .points = 15, .file = font_test_initial ++ "font.size = 15\n", .height_before = height, .height = .gt, .reloads_before = reloads, .loads_after = self.font_load_count });
+    reloads = self.config_reload_count;
+    height = self.fonts.metrics().cell.height_px;
+    fontCheck(out, &failures, try clickPaletteCommand(self, io, out, font_size_reset_action, null), "Font: Reset Size ran from a clicked palette row", .{});
+    try checkFontSizeStep(self, io, out, &failures, path, .{ .how = "the clicked Reset Size", .points = 14, .file = font_test_initial ++ "font.size = 14\n", .height_before = height, .height = .lt, .reloads_before = reloads, .loads_after = self.font_load_count });
+    fontCheck(out, &failures, self.fonts.metrics().cell.height_px == base_height, "reset restored the built-in cell height ({d}px)", .{base_height});
+
+    // Ligatures toggle in place: no rebuild, and the `=>` row redraws.
+    const ligature_row = terminalRowRect(self, 1);
+    const joined = try themeFrame(self);
+    defer self.allocator.free(joined);
+    reloads = self.config_reload_count;
+    var loads = self.font_load_count;
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Toggle Ligatures"), "Font: Toggle Ligatures ran from the palette by keyboard", .{});
+    const plain = try themeFrame(self);
+    defer self.allocator.free(plain);
+    const ligature_pixels = countDifferingPixelsInRect(joined, plain, self.size, ligature_row);
+    fontCheck(out, &failures, !self.font_settings.values.ligatures and !self.fonts.ligatures() and self.font_load_count == loads and
+        ligature_pixels > 0, "ligatures went off without a rebuild and the `=>` row redrew ({d} pixels changed)", .{ligature_pixels});
+    fontCheck(out, &failures, fontFileIs(io, path, font_test_initial ++ "font.size = 14\nfont.ligatures = false\n"), "the settings file reads font.ligatures = false", .{});
+    fontCheck(out, &failures, try fontReloadIsNoop(self, io, out, reloads, loads), "the reload of that write rebuilt nothing", .{});
+    reloads = self.config_reload_count;
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Toggle Ligatures"), "Font: Toggle Ligatures ran again", .{});
+    const rejoined = try themeFrame(self);
+    defer self.allocator.free(rejoined);
+    fontCheck(out, &failures, self.fonts.ligatures() and countDifferingPixelsInRect(plain, rejoined, self.size, ligature_row) > 0 and
+        countDifferingPixelsInRect(joined, rejoined, self.size, ligature_row) == 0 and
+        fontFileIs(io, path, font_test_initial ++ "font.size = 14\nfont.ligatures = true\n"), "ligatures came back on, drew the joined row again and were saved", .{});
+    fontCheck(out, &failures, try fontReloadIsNoop(self, io, out, reloads, loads), "the reload of that write rebuilt nothing", .{});
+
+    // Built-in symbols rebuild the face without the sprites.
+    reloads = self.config_reload_count;
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Toggle Built-in Symbols"), "Font: Toggle Built-in Symbols ran from the palette", .{});
+    loads = self.font_load_count;
+    fontCheck(out, &failures, try waitForConfig(self, io, out, .font_settled) and !self.fonts.builtinSymbols() and
+        fontFileIs(io, path, font_test_initial ++ "font.size = 14\nfont.ligatures = true\nfont.nerd_symbols = false\n"), "the face was rebuilt without built-in symbols and font.nerd_symbols = false saved", .{});
+    fontCheck(out, &failures, try fontReloadIsNoop(self, io, out, reloads, loads), "the reload of that write rebuilt nothing", .{});
+    reloads = self.config_reload_count;
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Toggle Built-in Symbols"), "Font: Toggle Built-in Symbols ran again", .{});
+    loads = self.font_load_count;
+    fontCheck(out, &failures, try waitForConfig(self, io, out, .font_settled) and self.fonts.builtinSymbols() and
+        try fontReloadIsNoop(self, io, out, reloads, loads), "built-in symbols came back on", .{});
+
+    // Fallbacks through the free-text step.
+    const symbols_on = font_test_initial ++ "font.size = 14\nfont.ligatures = true\nfont.nerd_symbols = true\n";
+    reloads = self.config_reload_count;
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Configure Fallbacks") and
+        self.palette_step == .input and self.ui_tree.byId(.{ .value = "palette.argument" }) != null, "Font: Configure Fallbacks asked for the families", .{});
+    _ = try postPaletteText(self, io, out, font_test_family ++ " ,, Conduit Missing Family");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    loads = self.font_load_count;
+    const fallbacks = self.font_settings.values.fallbacks;
+    fontCheck(out, &failures, !self.paletteVisible() and fallbacks.len == 2 and std.mem.eql(u8, fallbacks[0], font_test_family) and
+        std.mem.eql(u8, fallbacks[1], "Conduit Missing Family"), "the typed list was trimmed into two fallback families", .{});
+    fontCheck(out, &failures, try waitForConfig(self, io, out, .font_settled) and self.fonts.configuredFallbackCount() == 1, "the rebuilt face opened the installed fallback and skipped the missing one", .{});
+    fontCheck(out, &failures, fontFileIs(io, path, symbols_on ++ "font.fallbacks = " ++ font_test_family ++ ", Conduit Missing Family\n"), "the settings file reads the normalised font.fallbacks list", .{});
+    fontCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads + 1 }) and self.font_load_count == loads and
+        try waitForConfig(self, io, out, .{ .element = "config.error" }), "the reload rebuilt nothing and reported the missing family", .{});
+    const fallback_error = self.ui_tree.byId(.{ .value = "config.error" });
+    fontCheck(out, &failures, fallback_error != null and std.mem.eql(u8, fallback_error.?.label, "config:5: " ++ missing_fallback_message), "config.error names the fallbacks line: '{s}'", .{if (fallback_error) |element| element.label else ""});
+    reloads = self.config_reload_count;
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Configure Fallbacks"), "Font: Configure Fallbacks opened again", .{});
+    _ = try postPaletteText(self, io, out, font_test_family);
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    fontCheck(out, &failures, try waitForConfig(self, io, out, .font_settled) and self.fonts.configuredFallbackCount() == 1 and
+        try waitForConfig(self, io, out, .{ .reloads = reloads + 1 }) and try waitForConfig(self, io, out, .{ .no_element = "config.error" }) and
+        fontFileIs(io, path, symbols_on ++ "font.fallbacks = " ++ font_test_family ++ "\n"), "an installed-only list cleared the error and was saved", .{});
+
+    // The family picker by keyboard: the highlight previews, Escape reverts.
+    const committed_file = symbols_on ++ "font.fallbacks = " ++ font_test_family ++ "\n";
+    fontCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Font: Change Family") and
+        self.fontPickerSelection() == 0, "Font: Change Family opened by keyboard on the drawn family", .{});
+    const pick_index = self.font_pick_index;
+    var first_id_storage: [palette_semantic_capacity]u8 = undefined;
+    const first_id = try std.fmt.bufPrint(&first_id_storage, "palette.choice.{d}.0", .{pick_index});
+    const first_row = self.ui_tree.byId(.{ .value = first_id });
+    const listed = self.font_choices.slice();
+    var all_monospace = listed.len >= 2;
+    for (listed[1..]) |choice| {
+        const file = self.fonts.catalog.findFamily(choice.value) orelse {
+            all_monospace = false;
+            continue;
+        };
+        all_monospace = all_monospace and file.fixed_width;
+    }
+    fontCheck(out, &failures, first_row != null and std.mem.eql(u8, first_row.?.label, bundled_font_label) and all_monospace and
+        self.font_choices.find(font_test_family) != null, "the picker lists the bundled face first and {d} installed monospace families, {s} among them", .{ listed.len - 1, font_test_family });
+    fontCheck(out, &failures, try waitForConfig(self, io, out, .{ .element = "palette.preview" }), "the preview line shows the drawn family", .{});
+    const target = self.font_choices.find(font_test_family) orelse {
+        out.writeAll("font-test: FAIL " ++ font_test_family ++ " is not listed\n") catch {};
+        return 1;
+    };
+    while (self.fontPickerSelection()) |selected| {
+        if (selected == target) break;
+        if (!try postNamedKey(self, io, out, .down, .{})) break;
+    }
+    const preview_settled = try waitForConfig(self, io, out, .{ .drawn_family = font_test_family });
+    const preview_line = self.ui_tree.byId(.{ .value = "palette.preview" });
+    fontCheck(out, &failures, preview_settled and self.fontPickerSelection() == target and
+        std.mem.eql(u8, self.font_settings.values.family, "") and preview_line != null and
+        std.mem.eql(u8, preview_line.?.label, "Showing " ++ font_test_family) and fontFileIs(io, path, committed_file), "Down previewed {s} live ({d}x{d}px cells) while the file stayed unchanged", .{ font_test_family, self.fonts.metrics().cell.width_px, self.fonts.metrics().cell.height_px });
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    fontCheck(out, &failures, !self.paletteVisible() and try waitForConfig(self, io, out, .font_settled) and self.fonts.isFallback() and
+        self.fonts.metrics().cell.height_px == base_height and fontFileIs(io, path, committed_file), "Escape closed the picker and reverted to the bundled face", .{});
+
+    // The picker by mouse: hover previews, a click commits and saves.
+    fontCheck(out, &failures, try clickPaletteCommand(self, io, out, font_pick_action, null) and self.fontPickerSelection() == 0, "the palette hint and the Font: Change Family row opened the picker by mouse", .{});
+    var target_id_storage: [palette_semantic_capacity]u8 = undefined;
+    const target_id = try std.fmt.bufPrint(&target_id_storage, "palette.choice.{d}.{d}", .{ pick_index, self.font_choices.find(font_test_family) orelse 0 });
+    const target_row = self.ui_tree.byId(.{ .value = target_id });
+    if (target_row) |row| {
+        const point = elementCenter(row, self.window.state.scale);
+        _ = try postMotion(self, io, out, .{ .x = point.x, .y = point.y });
+    }
+    fontCheck(out, &failures, target_row != null and try waitForConfig(self, io, out, .{ .drawn_family = font_test_family }) and
+        self.paletteVisible() and fontFileIs(io, path, committed_file), "hovering {s} previewed it live", .{font_test_family});
+    reloads = self.config_reload_count;
+    loads = self.font_load_count;
+    fontCheck(out, &failures, try clickTabsElement(self, io, out, target_id) and !self.paletteVisible() and
+        std.mem.eql(u8, self.font_settings.values.family, font_test_family) and std.mem.eql(u8, self.fonts.familyName(), font_test_family) and
+        self.font_load_count == loads, "clicking {s} committed the previewed face without building it again", .{font_test_family});
+    fontCheck(out, &failures, fontFileIs(io, path, committed_file ++ "font.family = " ++ font_test_family ++ "\n"), "the settings file reads font.family = {s}", .{font_test_family});
+    fontCheck(out, &failures, try fontReloadIsNoop(self, io, out, reloads, loads) and std.mem.eql(u8, self.fonts.familyName(), font_test_family), "the reload of that write rebuilt nothing", .{});
+
+    out.print("font-test: {d} failure(s)\n", .{failures}) catch {};
     out.flush() catch {};
     return if (failures == 0) 0 else 1;
 }
@@ -17370,7 +18272,10 @@ const usage =
     \\  --theme-test                       drive themes: bundled and user Ghostty files,
     \\                                    the palette picker's live preview, revert
     \\                                    and a saved choice through SDL, then exit
-    \\  --right-click=<menu|paste>         what a right click over a terminal does when
+    \\  --font-test                        drive the font commands: size, ligatures,
+    \\                                    symbols, fallbacks and the family picker's
+    \\                                    preview and saved choice through SDL, then exit
+    \\  --right-click=<menu|paste>        what a right click over a terminal does when
     \\                                    the program has not captured the mouse
     \\                                    (default: menu)
     \\  --test-driver=<endpoint>           enable the local JSON-RPC automation server
@@ -17519,6 +18424,11 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         try writeConfigTestFile(init.io, options.run.config_path.?, theme_test_initial);
     }
     defer if (options.run.theme_test) removeThemeTestDir(init.io, options.run.config_path.?);
+    if (options.run.font_test) {
+        options.run.config_path = try fontTestPath(init.io, env, &config_path_buffer);
+        try writeConfigTestFile(init.io, options.run.config_path.?, font_test_initial);
+    }
+    defer if (options.run.font_test) removeFontTestDir(init.io, options.run.config_path.?);
     try platform.setAppMetadata(.{
         .name = app_name,
         .version = version,
@@ -17548,7 +18458,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.ime_test or options.run.sidebar_test or options.run.tabs_test or options.run.panes_test or
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
-                options.run.config_test or options.run.theme_test or options.run.driver_test) return err;
+                options.run.config_test or options.run.theme_test or options.run.font_test or
+                options.run.driver_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
                 "no usable display ({s}): there is no window to draw in. Set DISPLAY, or run under xvfb-run",
@@ -17658,6 +18569,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try configTest(app, init.io, out);
     } else if (options.run.theme_test) {
         check_status = try themeTest(app, init.io, out);
+    } else if (options.run.font_test) {
+        check_status = try fontTest(app, init.io, out);
     } else {
         try app.run(init.io, runDeadline(init.io, options.run.run_ms));
     }
@@ -18083,6 +18996,123 @@ test "--theme-test owns a fixed real-child viewport and its own deterministic ch
     var buffer: [path_capacity]u8 = undefined;
     // Like every built-in check, it never reads the user's settings.
     try std.testing.expectEqual(@as(?[]const u8, null), configPathFor(resolved, env.source(), &buffer));
+}
+
+test "--font-test owns a fixed real-child viewport and its own deterministic child" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--font-test" }, env.source());
+    const resolved = optionsForRun(parsed);
+    try std.testing.expect(parsed.run.font_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--font-test") != null);
+    try std.testing.expectEqual(ui_test_width, resolved.run.width);
+    try std.testing.expect(resolved.run.hidden);
+    try std.testing.expect(wantsChild(resolved));
+    try std.testing.expect(sidebarEnabled(resolved));
+    try std.testing.expect(usesDeterministicScratchpad(resolved));
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
+    defer spec.deinit();
+    try std.testing.expectEqualStrings(font_test_script, spec.argv[2]);
+    var buffer: [path_capacity]u8 = undefined;
+    // Like every built-in check, it never reads the user's settings.
+    try std.testing.expectEqual(@as(?[]const u8, null), configPathFor(resolved, env.source(), &buffer));
+}
+
+test "font values key the face on everything but ligatures" {
+    const fallbacks = [_][]const u8{"DejaVu Sans Mono"};
+    const base: FontValues = .{ .family = "JetBrains Mono", .fallbacks = &fallbacks };
+    var ligatures_off = base;
+    ligatures_off.ligatures = false;
+    try std.testing.expect(base.sameFace(ligatures_off));
+    try std.testing.expectEqual(base.faceKey(1), ligatures_off.faceKey(1));
+    try std.testing.expect(base.faceKey(1) != base.faceKey(2));
+    const changes = [_]FontValues{
+        .{ .family = "DejaVu Sans Mono", .fallbacks = &fallbacks },
+        .{ .family = "JetBrains Mono", .fallbacks = &fallbacks, .points = 15 },
+        .{ .family = "JetBrains Mono", .fallbacks = &fallbacks, .builtin_symbols = false },
+        .{ .family = "JetBrains Mono", .fallbacks = &fallbacks, .bold = "DejaVu Sans Mono" },
+        .{ .family = "JetBrains Mono" },
+        // Moving a byte between two strings still changes the key.
+        .{ .family = "JetBrains Mon", .bold = "o", .fallbacks = &fallbacks },
+    };
+    for (changes) |changed| try std.testing.expect(!base.sameFace(changed));
+
+    // The owned copy outlives its source and builds the same request.
+    var source_family = "Some Family".*;
+    var owned = try FontSettings.init(std.testing.allocator, .{ .family = &source_family, .fallbacks = &fallbacks, .points = 16 });
+    defer owned.deinit();
+    source_family[0] = 'X';
+    try std.testing.expectEqualStrings("Some Family", owned.values.family);
+    const request = owned.values.request(owned.values.family, try font.Size.init(16, 1), null);
+    try std.testing.expectEqualStrings("Some Family", request.family);
+    try std.testing.expectEqualStrings("DejaVu Sans Mono", request.fallbacks[0]);
+
+    // The settings file and `--font` resolve through their layers.
+    const settings: config.Settings = .{ .font_family = "From File", .font_size = 18, .font_nerd_symbols = false };
+    try std.testing.expectEqualStrings("From File", fontValuesFrom(null, settings).family);
+    try std.testing.expectEqualStrings("From Flag", fontValuesFrom("From Flag", settings).family);
+    try std.testing.expectEqual(@as(f32, 18), fontValuesFrom(null, settings).points);
+    try std.testing.expect(!fontValuesFrom(null, settings).builtin_symbols);
+}
+
+fn appendTestFontFile(catalog: *font.Catalog, family: []const u8) !void {
+    const gpa = catalog.gpa;
+    const latin = [_]font.CodepointRange{.{ .first = 0x20, .last = 0x7E }};
+    try catalog.files.ensureUnusedCapacity(gpa, 1);
+    const path = try std.fmt.allocPrintSentinel(gpa, "/fonts/{s}.ttf", .{family}, 0);
+    errdefer gpa.free(path);
+    const owned_family = try gpa.dupe(u8, family);
+    errdefer gpa.free(owned_family);
+    const style = try gpa.dupe(u8, "Regular");
+    errdefer gpa.free(style);
+    const coverage = try gpa.dupe(font.CodepointRange, &latin);
+    catalog.files.appendAssumeCapacity(.{
+        .path = path,
+        .family = owned_family,
+        .style = style,
+        .face_style = .regular,
+        .coverage = coverage,
+        .fixed_width = true,
+    });
+}
+
+test "the font picker lists the bundled face and installed families, the committed one first" {
+    var catalog: font.Catalog = .{ .gpa = std.testing.allocator };
+    defer catalog.deinit();
+    try appendTestFontFile(&catalog, "Zed Mono");
+    try appendTestFontFile(&catalog, "DejaVu Sans Mono");
+    try appendTestFontFile(&catalog, "Bad \"Quoted\" Mono");
+
+    const choices = try std.testing.allocator.create(FontChoices);
+    defer std.testing.allocator.destroy(choices);
+    choices.* = .{};
+    choices.rebuild(std.testing.allocator, &catalog, "");
+    try std.testing.expectEqual(@as(usize, 3), choices.count);
+    try std.testing.expectEqualStrings(bundled_font_label, choices.choices[0].label);
+    try std.testing.expectEqualStrings("DejaVu Sans Mono", choices.choices[1].value);
+    try std.testing.expectEqualStrings("Zed Mono", choices.choices[2].value);
+
+    choices.rebuild(std.testing.allocator, &catalog, "zed mono");
+    try std.testing.expectEqualStrings("Zed Mono", choices.choices[0].value);
+    try std.testing.expectEqualStrings(bundled_font_value, choices.choices[1].value);
+    try std.testing.expectEqualStrings("DejaVu Sans Mono", choices.choices[2].value);
+    try std.testing.expectEqual(@as(?usize, 1), choices.find(""));
+    try std.testing.expectEqual(@as(?usize, null), choices.find("Not Installed"));
+
+    // A family that is not installed leaves the list in order.
+    choices.rebuild(std.testing.allocator, &catalog, "Not Installed");
+    try std.testing.expectEqualStrings(bundled_font_label, choices.choices[0].label);
+}
+
+test "a font picker family must read back as a font.family value" {
+    try std.testing.expect(usableFontFamilyName("DejaVu Sans Mono"));
+    try std.testing.expect(!usableFontFamilyName(""));
+    try std.testing.expect(!usableFontFamilyName(" Leading"));
+    try std.testing.expect(!usableFontFamilyName("Quote\"d"));
+    try std.testing.expect(!usableFontFamilyName("Bell\x07"));
+    try std.testing.expect(!usableFontFamilyName(bundled_font_value));
+    try std.testing.expect(!usableFontFamilyName("x" ** (font_family_capacity + 1)));
+    try std.testing.expectEqualStrings("", familyForChoice(bundled_font_value));
+    try std.testing.expectEqualStrings("Agave", familyForChoice("Agave"));
 }
 
 test "a user theme file name must read back as a theme value" {
@@ -19102,6 +20132,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
         "--menu-test",
         "--config-test",
         "--theme-test",
+        "--font-test",
         "--no-child",
     }, env);
     try testing.expectEqualStrings("echo hi", options.run.command.?);
@@ -19123,6 +20154,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
     try testing.expect(options.run.menu_test);
     try testing.expect(options.run.config_test);
     try testing.expect(options.run.theme_test);
+    try testing.expect(options.run.font_test);
     try testing.expect(options.run.no_child);
 
     // The defaults are the ones a plain run uses: an interactive shell, no
@@ -19147,6 +20179,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
     try testing.expect(!plain.run.menu_test);
     try testing.expect(!plain.run.config_test);
     try testing.expect(!plain.run.theme_test);
+    try testing.expect(!plain.run.font_test);
     try testing.expect(plain.run.config_path == null);
     try testing.expect(!plain.run.no_child);
     try testing.expect(wantsChild(plain));

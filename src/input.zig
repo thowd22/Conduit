@@ -685,6 +685,11 @@ const macos_default_bindings = [_]Binding{
     .{ .chord = .{ .key = .{ .character = 'p' }, .modifiers = .{ .shift = true, .super = true } }, .action = "palette.open" },
     .{ .chord = .{ .key = .{ .named = .f10 }, .modifiers = .{ .shift = true } }, .action = "terminal.context-menu" },
     .{ .chord = .{ .key = .{ .character = ',' }, .modifiers = .{ .super = true } }, .action = "config.open" },
+    .{ .chord = .{ .key = .{ .character = '=' }, .modifiers = .{ .super = true } }, .action = "font.size.increase" },
+    // Command+Plus on a layout where `+` is Shift+`=`.
+    .{ .chord = .{ .key = .{ .character = '=' }, .modifiers = .{ .shift = true, .super = true } }, .action = "font.size.increase" },
+    .{ .chord = .{ .key = .{ .character = '-' }, .modifiers = .{ .super = true } }, .action = "font.size.decrease" },
+    .{ .chord = .{ .key = .{ .character = '0' }, .modifiers = .{ .super = true } }, .action = "font.size.reset" },
 };
 
 const linux_windows_default_bindings = [_]Binding{
@@ -727,6 +732,14 @@ const linux_windows_default_bindings = [_]Binding{
     .{ .chord = .{ .key = .{ .character = 'p' }, .modifiers = .{ .ctrl = true, .shift = true } }, .action = "palette.open" },
     .{ .chord = .{ .key = .{ .named = .f10 }, .modifiers = .{ .shift = true } }, .action = "terminal.context-menu" },
     .{ .chord = .{ .key = .{ .character = ',' }, .modifiers = .{ .ctrl = true } }, .action = "config.open" },
+    // Ctrl+=, Ctrl+- and Ctrl+0 are the zoom chords of browsers and other terminals. The legacy
+    // terminal encoding has no control code for `=` or `0` (both reach a program as the plain
+    // character) and Ctrl+- is not a C0 control on its own key, so no common program loses input.
+    .{ .chord = .{ .key = .{ .character = '=' }, .modifiers = .{ .ctrl = true } }, .action = "font.size.increase" },
+    // Ctrl+Plus on a layout where `+` is Shift+`=`.
+    .{ .chord = .{ .key = .{ .character = '=' }, .modifiers = .{ .ctrl = true, .shift = true } }, .action = "font.size.increase" },
+    .{ .chord = .{ .key = .{ .character = '-' }, .modifiers = .{ .ctrl = true } }, .action = "font.size.decrease" },
+    .{ .chord = .{ .key = .{ .character = '0' }, .modifiers = .{ .ctrl = true } }, .action = "font.size.reset" },
 };
 
 /// Conduit's deterministic shipped bindings for `profile`.
@@ -1752,7 +1765,7 @@ test "platform profiles preserve existing defaults before pane bindings" {
     const macos = defaultBindings(.macos);
     const linux_windows = defaultBindings(.linux_windows);
 
-    try testing.expectEqual(@as(usize, 39), macos.len);
+    try testing.expectEqual(@as(usize, 43), macos.len);
     try testing.expectEqualStrings("clipboard.copy", macos[0].action);
     try testing.expect(bindingKeyEql(.{ .character = 'c' }, macos[0].chord.key));
     try testing.expectEqual(Modifiers{ .super = true }, macos[0].chord.modifiers);
@@ -1781,7 +1794,7 @@ test "platform profiles preserve existing defaults before pane bindings" {
     try testing.expect(bindingKeyEql(.{ .character = 'p' }, macos[36].chord.key));
     try testing.expectEqual(Modifiers{ .shift = true, .super = true }, macos[36].chord.modifiers);
 
-    try testing.expectEqual(@as(usize, 39), linux_windows.len);
+    try testing.expectEqual(@as(usize, 43), linux_windows.len);
     try testing.expectEqualStrings("clipboard.copy", linux_windows[0].action);
     try testing.expect(bindingKeyEql(.{ .character = 'c' }, linux_windows[0].chord.key));
     try testing.expectEqual(Modifiers{ .ctrl = true, .shift = true }, linux_windows[0].chord.modifiers);
@@ -1815,6 +1828,12 @@ test "platform profiles preserve existing defaults before pane bindings" {
     try testing.expectEqualStrings("config.open", linux_windows[38].action);
     try testing.expect(bindingKeyEql(.{ .character = ',' }, linux_windows[38].chord.key));
     try testing.expectEqual(Modifiers{ .ctrl = true }, linux_windows[38].chord.modifiers);
+    for ([_][]const Binding{ &macos_default_bindings, &linux_windows_default_bindings }) |table| {
+        try testing.expectEqualStrings("font.size.increase", table[39].action);
+        try testing.expectEqualStrings("font.size.increase", table[40].action);
+        try testing.expectEqualStrings("font.size.decrease", table[41].action);
+        try testing.expectEqualStrings("font.size.reset", table[42].action);
+    }
     try testing.expectEqual(@as(usize, 0), macos[0].arguments.len);
     try testing.expectEqual(@as(usize, 0), linux_windows[0].arguments.len);
     try testing.expectEqual(
@@ -1871,6 +1890,40 @@ fn backtickKey(mods: platform.Mods, action: platform.KeyAction) platform.KeyEven
         .codepoint = if (mods.shift) '~' else '`',
         .unshifted_codepoint = '`',
     };
+}
+
+fn symbolKey(codepoint: u21, shifted: u21, mods: platform.Mods) platform.KeyEvent {
+    return .{
+        .action = .press,
+        .key = .unidentified,
+        .mods = mods,
+        .codepoint = if (mods.shift) shifted else codepoint,
+        .unshifted_codepoint = codepoint,
+    };
+}
+
+test "font size defaults zoom with the platform modifier and leave the plain keys to the terminal" {
+    const cases = [_]struct { profile: PlatformProfile, raw: platform.KeyEvent, action: []const u8 }{
+        .{ .profile = .linux_windows, .raw = symbolKey('=', '+', .{ .ctrl = true }), .action = "font.size.increase" },
+        .{ .profile = .linux_windows, .raw = symbolKey('=', '+', .{ .ctrl = true, .shift = true }), .action = "font.size.increase" },
+        .{ .profile = .linux_windows, .raw = symbolKey('-', '_', .{ .ctrl = true }), .action = "font.size.decrease" },
+        .{ .profile = .linux_windows, .raw = symbolKey('0', ')', .{ .ctrl = true }), .action = "font.size.reset" },
+        .{ .profile = .macos, .raw = symbolKey('=', '+', .{ .super = true }), .action = "font.size.increase" },
+        .{ .profile = .macos, .raw = symbolKey('=', '+', .{ .shift = true, .super = true }), .action = "font.size.increase" },
+        .{ .profile = .macos, .raw = symbolKey('-', '_', .{ .super = true }), .action = "font.size.decrease" },
+        .{ .profile = .macos, .raw = symbolKey('0', ')', .{ .super = true }), .action = "font.size.reset" },
+    };
+    for (cases) |case| try expectDefaultAction(case.profile, case.raw, case.action, null);
+
+    for ([_]PlatformProfile{ .linux_windows, .macos }) |profile| {
+        try expectDefaultTerminal(profile, symbolKey('=', '+', .{}));
+        try expectDefaultTerminal(profile, symbolKey('-', '_', .{}));
+        try expectDefaultTerminal(profile, symbolKey('0', ')', .{}));
+        try expectDefaultTerminal(profile, symbolKey('=', '+', .{ .shift = true }));
+        try expectDefaultTerminal(profile, symbolKey('-', '_', .{ .alt = true }));
+    }
+    // Ctrl+Shift+- (Ctrl+_) stays the terminal's on Linux and Windows: it is a C0 control.
+    try expectDefaultTerminal(.linux_windows, symbolKey('-', '_', .{ .ctrl = true, .shift = true }));
 }
 
 test "tab defaults route exact platform actions and static arguments" {
