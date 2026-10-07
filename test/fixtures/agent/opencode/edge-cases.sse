@@ -1,0 +1,29 @@
+: Hand-written OpenCode /event stream exercising older and unusual shapes. NOT
+: recorded. permission.updated / permissionID / response are the v1 SDK names
+: (packages/sdk/js/src/gen/types.gen.ts, read 2026-10-07); session.error error
+: names are the documented MessageAbortedError / UnknownError.
+
+data: {"id":"e0","type":"session.status","properties":{"sessionID":"ses_main","status":{"type":"busy"}}}
+
+data: {"id":"e1","type":"session.status","properties":{"sessionID":"ses_other","status":{"type":"idle"}}}
+
+data: {"id":"e2","type":"permission.updated","properties":{"id":"per_legacy","type":"edit","pattern":"src/main.zig","sessionID":"ses_main","messageID":"msg_a1","title":"Edit src/main.zig","metadata":{},"time":{"created":1}}}
+
+data: {"id":"e3","type":"permission.replied","properties":{"sessionID":"ses_main","permissionID":"per_legacy","response":"reject"}}
+
+data: not json at all
+
+data: {"id":"e4","type":"some.future.event","properties":{"sessionID":"ses_main"}}
+
+data: {"id":"e5","type":"session.status","properties":{"sessionID":"ses_main","status":{"type":"retry","attempt":1,"message":"rate limited","next":2}}}
+
+data: {"id":"e6","type":"session.error","properties":{"sessionID":"ses_main","error":{"name":"UnknownError","data":{"message":"provider exploded"}}}}
+
+data: {"id":"e7","type":"session.idle","properties":{"sessionID":"ses_main"}}
+
+data: {"id":"e8","type":"session.status","properties":{"sessionID":"ses_main","status":{"type":"busy"}}}
+
+data: {"id":"e9","type":"session.error","properties":{"sessionID":"ses_main","error":{"name":"MessageAbortedError","data":{"message":"aborted"}}}}
+
+data: {"id":"e10","type":"server.instance.disposed","properties":{"directory":"/work"}}
+

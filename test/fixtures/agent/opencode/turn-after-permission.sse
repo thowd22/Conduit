@@ -1,0 +1,15 @@
+: Hand-written OpenCode /event stream, part 2 of one turn (after the human
+: answered per_1). NOT recorded; see turn-before-permission.sse for sources.
+
+data: {"id":"evt_16","type":"permission.replied","properties":{"sessionID":"ses_main","requestID":"per_1","reply":"once"}}
+
+data: {"id":"evt_17","type":"message.part.updated","properties":{"part":{"id":"prt_t2","sessionID":"ses_main","messageID":"msg_a1","type":"tool","callID":"call_2","tool":"bash","state":{"status":"running","input":{"command":"zig build","description":"Build the project"},"time":{"start":7}}}}}
+
+data: {"id":"evt_18","type":"question.asked","properties":{"id":"que_1","sessionID":"ses_main","questions":[{"question":"Which target should I build?","header":"Target","options":[{"label":"native","description":"This machine"}]}]}}
+
+data: {"id":"evt_19","type":"question.replied","properties":{"sessionID":"ses_main","requestID":"que_1","answers":[["native"]]}}
+
+data: {"id":"evt_20","type":"session.status","properties":{"sessionID":"ses_main","status":{"type":"idle"}}}
+
+data: {"id":"evt_21","type":"session.idle","properties":{"sessionID":"ses_main"}}
+

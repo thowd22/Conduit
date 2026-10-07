@@ -1,0 +1,42 @@
+: Hand-written OpenCode /event stream, part 1 of one turn. NOT recorded from a
+: real opencode: it follows the shapes in packages/opencode/src/server/routes/
+: instance/httpapi/handlers/event.ts and the v1/v2 SDK types.gen.ts read on
+: 2026-10-07 (anomalyco/opencode dev a697115, release v1.18.35).
+
+data: {"id":"evt_00","type":"server.connected","properties":{}}
+
+data: {"id":"evt_01","type":"session.created","properties":{"info":{"id":"ses_main","title":"New session","directory":"/work"}}}
+
+data: {"id":"evt_02","type":"message.updated","properties":{"info":{"id":"msg_u1","sessionID":"ses_main","role":"user","time":{"created":1}}}}
+
+data: {"id":"evt_03","type":"message.part.updated","properties":{"part":{"id":"prt_u1","sessionID":"ses_main","messageID":"msg_u1","type":"text","text":"Fix the build"}}}
+
+data: {"id":"evt_04","type":"session.status","properties":{"sessionID":"ses_main","status":{"type":"busy"}}}
+
+data: {"id":"evt_05","type":"message.updated","properties":{"info":{"id":"msg_a1","sessionID":"ses_main","role":"assistant","time":{"created":2}}}}
+
+data: {"id":"evt_06","type":"message.part.updated","properties":{"part":{"id":"prt_a1","sessionID":"ses_main","messageID":"msg_a1","type":"text","text":"Looking","time":{"start":3}},"delta":"Looking"}}
+
+data: {"id":"evt_07","type":"message.part.delta","properties":{"sessionID":"ses_main","messageID":"msg_a1","partID":"prt_a1","field":"text","delta":" at"}}
+
+data: {"id":"evt_08","type":"message.part.updated","properties":{"part":{"id":"prt_a1","sessionID":"ses_main","messageID":"msg_a1","type":"text",
+data: "text":"Looking at build.zig.","time":{"start":3,"end":4}}}}
+
+data: {"id":"evt_09","type":"message.part.updated","properties":{"part":{"id":"prt_t1","sessionID":"ses_main","messageID":"msg_a1","type":"tool","callID":"call_1","tool":"read","state":{"status":"running","input":{"filePath":"/work/build.zig"},"title":"build.zig","time":{"start":5}}}}}
+
+data: {"id":"evt_10","type":"message.part.updated","properties":{"part":{"id":"prt_t1","sessionID":"ses_main","messageID":"msg_a1","type":"tool","callID":"call_1","tool":"read","state":{"status":"completed","input":{"filePath":"/work/build.zig"},"output":"const std = @import(\"std\");","title":"build.zig","metadata":{},"time":{"start":5,"end":6}}}}}
+
+data: {"id":"evt_11","type":"session.created","properties":{"info":{"id":"ses_child","parentID":"ses_main","title":"explore the tests","directory":"/work"}}}
+
+data: {"id":"evt_12","type":"session.status","properties":{"sessionID":"ses_child","status":{"type":"busy"}}}
+
+data: {"id":"evt_13","type":"session.idle","properties":{"sessionID":"ses_child"}}
+
+event: message
+id: evt_14
+data: {"id":"evt_14","type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_main","permission":"bash","patterns":["zig build"],"metadata":{},"always":["zig *"],"tool":{"messageID":"msg_a1","callID":"call_2"}}}
+
+: keep-alive comment
+
+data: {"id":"evt_15","type":"server.heartbeat","properties":{}}
+

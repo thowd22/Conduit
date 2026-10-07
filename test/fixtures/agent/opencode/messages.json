@@ -1,0 +1,20 @@
+[
+  {
+    "info": {"id": "msg_u1", "sessionID": "ses_main", "role": "user", "time": {"created": 1}},
+    "parts": [
+      {"id": "prt_u1", "sessionID": "ses_main", "messageID": "msg_u1", "type": "text", "text": "Fix the build"},
+      {"id": "prt_u2", "sessionID": "ses_main", "messageID": "msg_u1", "type": "file", "mime": "text/plain", "filename": "build.zig", "url": "file:///work/build.zig", "source": {"type": "file", "path": "build.zig", "text": {"value": "@build.zig", "start": 0, "end": 10}}}
+    ]
+  },
+  {
+    "info": {"id": "msg_a1", "sessionID": "ses_main", "role": "assistant", "time": {"created": 2, "completed": 9}},
+    "parts": [
+      {"id": "prt_s1", "sessionID": "ses_main", "messageID": "msg_a1", "type": "step-start"},
+      {"id": "prt_r1", "sessionID": "ses_main", "messageID": "msg_a1", "type": "reasoning", "text": "thinking", "time": {"start": 2, "end": 3}},
+      {"id": "prt_a1", "sessionID": "ses_main", "messageID": "msg_a1", "type": "text", "text": "Looking at build.zig.", "time": {"start": 3, "end": 4}},
+      {"id": "prt_t1", "sessionID": "ses_main", "messageID": "msg_a1", "type": "tool", "callID": "call_1", "tool": "edit", "state": {"status": "completed", "input": {"filePath": "/work/build.zig", "oldString": "a", "newString": "b"}, "output": "ok", "title": "build.zig", "metadata": {}, "time": {"start": 5, "end": 6}}},
+      {"id": "prt_t2", "sessionID": "ses_main", "messageID": "msg_a1", "type": "tool", "callID": "call_2", "tool": "bash", "state": {"status": "error", "input": {"command": "zig build test"}, "error": "exit 1", "time": {"start": 7, "end": 8}}},
+      {"id": "prt_a2", "sessionID": "ses_main", "messageID": "msg_a1", "type": "text", "text": "", "time": {"start": 8, "end": 9}}
+    ]
+  }
+]
