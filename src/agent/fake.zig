@@ -24,6 +24,11 @@ pub const FakeAdapter = struct {
     installed: bool = true,
     /// Events delivered by successive polls, `poll_batch` at a time.
     script: []const event.Event = &.{},
+    /// Files `launch` asks the owner to write, borrowed.
+    launch_files: []const adapter.LaunchSpec.File = &.{},
+    /// Overrides the scripted process `launch` describes, borrowed. The app's
+    /// fake harness runs a real shell here so its tab has a live child.
+    launch_argv: ?[]const []const u8 = null,
     poll_batch: usize = std.math.maxInt(usize),
     cursor: usize = 0,
 
@@ -115,6 +120,15 @@ pub const FakeAdapter = struct {
     fn launch(ptr: *anyopaque, allocator: Allocator, request: adapter.LaunchRequest) adapter.Error!adapter.LaunchSpec {
         const self = cast(ptr);
         self.launches += 1;
+        const env = try allocator.alloc([]const u8, 1);
+        var entry: [adapter.correlation_env_name.len + 1 + adapter.CorrelationToken.text_len]u8 = undefined;
+        env[0] = try allocator.dupe(u8, request.token.envEntry(&entry));
+        const files = try allocator.dupe(adapter.LaunchSpec.File, self.launch_files);
+        if (self.launch_argv) |scripted| {
+            const argv = try allocator.alloc([]const u8, scripted.len);
+            for (argv, scripted) |*slot, arg| slot.* = try allocator.dupe(u8, arg);
+            return .{ .argv = argv, .env = env, .files = files };
+        }
         const argv_len: usize = if (request.initial_prompt == null) 1 else 3;
         const argv = try allocator.alloc([]const u8, argv_len);
         argv[0] = "fake-agent";
@@ -122,10 +136,7 @@ pub const FakeAdapter = struct {
             argv[1] = "--";
             argv[2] = try allocator.dupe(u8, prompt);
         }
-        const env = try allocator.alloc([]const u8, 1);
-        var entry: [adapter.correlation_env_name.len + 1 + adapter.CorrelationToken.text_len]u8 = undefined;
-        env[0] = try allocator.dupe(u8, request.token.envEntry(&entry));
-        return .{ .argv = argv, .env = env };
+        return .{ .argv = argv, .env = env, .files = files };
     }
 
     fn attach(ptr: *anyopaque, request: adapter.AttachRequest) adapter.Error!void {
@@ -433,4 +444,34 @@ test "a heuristic-only agent follows the PTY baseline through the registry" {
         try testing.expectEqual(@import("state.zig").Source.heuristic, reg.get(id).?.source);
     }
     try testing.expect(reg.get(id).?.hasExited());
+}
+
+test "launch carries the files and argv the owner must write and spawn" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const files = [_]adapter.LaunchSpec.File{
+        .{ .path = "/sink/conduit.js", .bytes = "export default () => {}" },
+        .{ .path = "/sink/hook.sh", .bytes = "#!/bin/sh\n", .executable = true },
+    };
+    const argv = [_][]const u8{ "/bin/sh", "-c", "exec cat" };
+    var fake: FakeAdapter = .{ .launch_files = &files, .launch_argv = &argv };
+    const spec = try fake.asAdapter().launch(arena_state.allocator(), .{
+        .context_kind = .local,
+        .cwd = "/work",
+        .token = adapter.CorrelationToken.fromBytes(@splat(1)),
+    });
+    try testing.expectEqual(@as(usize, 2), spec.files.len);
+    try testing.expectEqualStrings("/sink/conduit.js", spec.files[0].path);
+    try testing.expect(!spec.files[0].executable);
+    try testing.expect(spec.files[1].executable);
+    try testing.expectEqualStrings("exec cat", spec.argv[2]);
+    // The default launch writes nothing.
+    var plain: FakeAdapter = .{};
+    const plain_spec = try plain.asAdapter().launch(arena_state.allocator(), .{
+        .context_kind = .local,
+        .cwd = "/work",
+        .token = adapter.CorrelationToken.fromBytes(@splat(2)),
+    });
+    try testing.expectEqual(@as(usize, 0), plain_spec.files.len);
+    try testing.expectEqualStrings("fake-agent", plain_spec.argv[0]);
 }

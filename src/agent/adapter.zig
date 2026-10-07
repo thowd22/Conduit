@@ -156,6 +156,20 @@ pub const LaunchRequest = struct {
 pub const LaunchSpec = struct {
     argv: []const []const u8,
     env: []const []const u8,
+    /// Files the owner writes before the spawn, in the agent's context
+    /// (TASK-56): an extension, a settings file. Adapters that write nothing
+    /// leave it empty.
+    files: []const File = &.{},
+
+    /// One file a launch needs. `path` is absolute in the agent's context
+    /// and inside the agent's private sink directory; the owner creates its
+    /// parent directories private (0700) and the file owner-only.
+    pub const File = struct {
+        path: []const u8,
+        bytes: []const u8,
+        /// Whether the file must be executable (a hook script).
+        executable: bool = false,
+    };
 };
 
 /// An existing session to adopt: one Conduit launched (and knows the token
