@@ -59,6 +59,7 @@ Conduit/
 │   ├── backlog.zig      backlog.md data layer
 │   ├── palette.zig      allocation-bounded command search and chord formatting
 │   ├── testdriver.zig   in-app automation protocol core
+│   ├── control.zig      TASK-60 harness control API (protocol, queue, server in control/)
 │   └── conduit_test.zig external conduit-test executable composition root
 ├── assets/              files embedded into the binary by build.zig, with their licences
 │   ├── fonts/           bundled JetBrains Mono fallback face (OFL)
@@ -1312,6 +1313,34 @@ other checked-in executable configuration before approving it. Linux is the deve
 evidence platform; native macOS and Windows MCP/driver operation is not claimed until those CI
 runners exercise it.
 
+### `control`
+
+- **Owns** the TASK-60 local control API that harnesses running inside Conduit terminals use:
+  `src/control.zig` (public surface) over `src/control/protocol.zig` (tokens, the enumerated
+  methods, typed requests, fault codes, reply encoding), `src/control/queue.zig` (the bounded
+  connection-to-owner hand-off) and `src/control/server.zig` (listener, connection threads, token
+  registry, `service`/`complete`). The wire contract is in `docs/control-api.md`.
+- **Never** perform an action itself: every accepted request reaches the owner through the
+  `Handler` vtable, which acts through the workspace and its ExecutionContext (invariant 5).
+  Never resolve a path, run a shell, log request text, or address the scratchpad (invariant 7):
+  the scratchpad's child receives no control environment, and a request naming the scratchpad
+  session is refused with `ScratchpadNotAddressable` before it reaches the owner. Never interpret
+  an `agent.event` payload; the agent subsystem owns that (invariant 9).
+- **May depend on** `platform` only (`LocalSocketListener` for the private socket endpoint).
+  Ids cross as plain integers, so it needs neither `workspace` nor `agent`; `app` maps them.
+- **Lands** M6 — TASK-60 part one (protocol, server, docs); part two wires `app`, the
+  `control.enabled` setting, the `conduit` CLI subcommands and MCP tools, and an E2E check.
+
+The endpoint is one 0600 AF_UNIX socket per run inside the run's private 0700 directory
+(`platform.LocalSocketListener` refuses a parent with any group or other permission bit); it
+starts in Debug builds and in release builds only when `control.enabled` is set. Each workspace
+gets a random 128-bit token (owner-supplied entropy) that resolves to that workspace only;
+rotation or workspace close expires it at once, and a request already queued under an expired
+token is refused at `service`. Frames are newline-delimited JSON objects of at most 64 KiB; the
+eight methods are `ping`, `tab.open`, `pane.split`, `view.agent`, `view.backlog`, `tab.status`,
+`notify` and `agent.event`. Windows has no control transport yet: `LocalSocketListener` reports
+`UnsupportedPlatform` until a multi-instance protected named-pipe listener exists.
+
 ---
 
 ## 3. The dependency rule
@@ -1333,7 +1362,7 @@ layout). A module may depend only on modules in a strictly lower layer than its 
                 │
   depth 2   render            session                GPU surface and terminal sessions
                 │
-  depth 1   theme             term                   colours and terminal state
+  depth 1   theme             term       control     colours, terminal state, control API
                 │
   depth 0   platform          pty          config    font       link
 ```
@@ -1585,6 +1614,7 @@ inside the same event loop, so the main thread is that render/UI thread.
 | SSH transport | `workspace`'s ExecutionContext, off-thread | decision-8: the system OpenSSH client in Conduit-owned PTYs and pipes, one ControlMaster per SSH workspace on Linux/macOS; TASK-43 implements it |
 | Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)**; a context `WatchHandle` has no thread and is polled by the `Project` owner |
 | Backlog CLI writes | `backlog.Cli`, worker thread | `ExecutionContext.run` waits for the bounded child; the CLI's file edits return through `Project.poll` |
+| Control API sockets, framing, token resolution | `control.Server`: one listener thread plus one thread per client connection (bounded) | each connection validates a request, submits it with its parse arena to the mutex-guarded `control.Queue`, wakes the owner through `Waker`, and waits for the reply with a deadline (`TimedOut` after it); the owner thread calls `service`, performs each request through the `Handler` vtable, and answers now or later through `complete`; a request the client gave up on is released by the owner's late answer |
 
 **(d)** = derived by applying the AGENTS.md rule "the render/UI thread never blocks on IO" to a
 source of IO. The rule is the constraint; *which* IO runs off-thread and how it hands over is
