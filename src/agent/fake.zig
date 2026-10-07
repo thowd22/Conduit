@@ -45,6 +45,14 @@ pub const FakeAdapter = struct {
     last_permission_request_len: usize = 0,
     last_permission_decision: [event.max_identifier_bytes]u8 = undefined,
     last_permission_decision_len: usize = 0,
+    /// Test-only (TASK-57): answer each `respondPermission` with a
+    /// `permission_resolved` for that request on the next poll, as a real
+    /// harness reports the outcome of an answer. A `reject` decision in the
+    /// script resolves as rejected, anything else as allowed.
+    resolve_on_answer: bool = false,
+    pending_resolution: ?event.PermissionOutcome = null,
+    /// Answers received, for checks.
+    answers: usize = 0,
 
     pub const all_capabilities: adapter.Capabilities = .{
         .detect = true,
@@ -148,13 +156,25 @@ pub const FakeAdapter = struct {
     fn poll(ptr: *anyopaque, queue: *event.EventQueue) adapter.Error!usize {
         const self = cast(ptr);
         var pushed: usize = 0;
-        while (self.cursor < self.script.len and pushed < self.poll_batch) {
+        if (self.pending_resolution) |outcome| {
+            const id = self.last_permission_request[0..self.last_permission_request_len];
+            if (queue.push(.{ .permission_resolved = .{ .id = id, .outcome = outcome } })) |_| {
+                self.pending_resolution = null;
+                pushed += 1;
+            } else |err| switch (err) {
+                error.QueueFull => return pushed,
+                error.EventTooLarge => return error.Protocol,
+            }
+        }
+        var scripted: usize = 0;
+        while (self.cursor < self.script.len and scripted < self.poll_batch) {
             queue.push(self.script[self.cursor]) catch |err| switch (err) {
                 // Kept for the next poll, as a real transport would.
                 error.QueueFull => break,
                 error.EventTooLarge => return error.Protocol,
             };
             self.cursor += 1;
+            scripted += 1;
             pushed += 1;
         }
         return pushed;
@@ -175,6 +195,23 @@ pub const FakeAdapter = struct {
         self.last_permission_request_len = request_id.len;
         @memcpy(self.last_permission_decision[0..decision_id.len], decision_id);
         self.last_permission_decision_len = decision_id.len;
+        self.answers += 1;
+        if (self.resolve_on_answer) self.pending_resolution = self.outcomeOf(request_id, decision_id);
+    }
+
+    /// How the scripted request `request_id` ends when `decision_id` is chosen.
+    fn outcomeOf(self: *const FakeAdapter, request_id: []const u8, decision_id: []const u8) event.PermissionOutcome {
+        for (self.script) |scripted| {
+            const request = switch (scripted) {
+                .permission_request => |p| p,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, request.id, request_id)) continue;
+            for (request.decisions) |decision| {
+                if (std.mem.eql(u8, decision.id, decision_id)) return if (decision.kind == .reject) .rejected else .allowed;
+            }
+        }
+        return .allowed;
     }
 
     fn readPrompt(ptr: *anyopaque, out: []u8) adapter.Error![]const u8 {
@@ -474,4 +511,26 @@ test "launch carries the files and argv the owner must write and spawn" {
     });
     try testing.expectEqual(@as(usize, 0), plain_spec.files.len);
     try testing.expectEqualStrings("fake-agent", plain_spec.argv[0]);
+}
+
+test "resolve_on_answer reports each answer's outcome on the next poll" {
+    const decisions = [_]event.Decision{
+        .{ .id = "allow", .label = "Allow once", .kind = .allow_once },
+        .{ .id = "deny", .label = "Reject", .kind = .reject },
+    };
+    const script = [_]event.Event{.{ .permission_request = .{ .id = "r1", .title = "Run", .decisions = &decisions } }};
+    var fake: FakeAdapter = .{ .script = &script, .resolve_on_answer = true };
+    var queue = try event.EventQueue.init(testing.allocator, testing.io, 4);
+    defer queue.deinit(testing.allocator);
+    const handle = fake.asAdapter();
+    try testing.expectEqual(@as(usize, 1), try handle.poll(&queue));
+    try handle.respondPermission("r1", "deny");
+    try testing.expectEqual(@as(usize, 1), fake.answers);
+    try testing.expectEqual(@as(usize, 1), try handle.poll(&queue));
+    const out = try testing.allocator.alloc(event.StoredEvent, 2);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(@as(usize, 2), queue.drain(out));
+    try testing.expectEqualStrings("r1", out[1].event.permission_resolved.id);
+    try testing.expectEqual(event.PermissionOutcome.rejected, out[1].event.permission_resolved.outcome);
+    try testing.expectEqual(@as(usize, 0), try handle.poll(&queue));
 }

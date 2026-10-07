@@ -36,6 +36,7 @@ const session = @import("session");
 const config = @import("config");
 const platform = @import("platform");
 const inputmod = @import("input");
+const agent_view = @import("agent_view.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -385,10 +386,53 @@ pub const fake_step_ends = [_]usize{ 1, 2, 4, 6, 8 };
 
 /// How many script events `steps` typed lines release.
 pub fn fakeReleased(steps: u64) usize {
-    if (steps == 0) return 0;
-    const index: usize = @intCast(@min(steps, fake_step_ends.len) - 1);
-    return fake_step_ends[index];
+    return fakeReleasedBy(&fake_step_ends, steps);
 }
+
+fn fakeReleasedBy(ends: []const usize, steps: u64) usize {
+    if (steps == 0 or ends.len == 0) return 0;
+    const index: usize = @intCast(@min(steps, ends.len) - 1);
+    return ends[index];
+}
+
+/// The file `--agent-view-test`'s scripted file reference names, inside the
+/// check's private directory (the parent of the sink root).
+pub const fake_view_sample_name = "agent-view-sample.txt";
+/// The line that reference points at.
+pub const fake_view_sample_line = 3;
+
+const fake_view_decisions = [_]agent.Decision{
+    .{ .id = "allow", .label = "Allow once", .kind = .allow_once },
+    .{ .id = "deny", .label = "Reject", .kind = .reject },
+};
+
+/// `--agent-view-test`'s script (TASK-57): one of every event kind the view
+/// shows, two permission requests, and a last step that finishes the turn.
+/// `sample_path` is the file reference's target; the result borrows it and
+/// is allocated in `allocator`.
+pub fn fakeViewScript(allocator: Allocator, sample_path: []const u8) Allocator.Error![]const agent.Event {
+    const script = [_]agent.Event{
+        .{ .status_change = .{ .state = .working, .source = .structured } },
+        .{ .message = .{ .role = .user, .text = "Run the tests and fix whatever fails." } },
+        .{ .message = .{ .role = .assistant, .text = "I will run the test suite first, then read the failing file and fix the smallest thing that makes it pass. The build compiles every module and runs the unit tests in each file." } },
+        .{ .tool_use = .{ .name = "Bash", .summary = "zig build test" } },
+        .{ .message = .{ .role = .assistant, .text = "One test fails in the sample file; the reference below opens it at the failing line." } },
+        .{ .file_reference = .{ .path = sample_path, .line = fake_view_sample_line } },
+        .{ .permission_request = .{ .id = "view-1", .title = "Run: zig build test --summary all", .decisions = &fake_view_decisions } },
+        .{ .subagent = .{ .id = "sub-1", .name = "explore", .phase = .start } },
+        .{ .tool_use = .{ .name = "Grep", .summary = "pub fn main" } },
+        .{ .subagent = .{ .id = "sub-1", .name = "explore", .phase = .stop } },
+        .{ .notification = .{ .title = "Claude", .body = "Claude needs your permission" } },
+        .{ .permission_request = .{ .id = "view-2", .title = "Edit: src/sample.zig", .decisions = &fake_view_decisions } },
+        .{ .message = .{ .role = .assistant, .text = "All tests pass now." } },
+        .{ .status_change = .{ .state = .done, .source = .structured } },
+    };
+    return allocator.dupe(agent.Event, &script);
+}
+
+/// The view script's steps: everything up to the second request, then the
+/// end of the turn.
+pub const fake_view_step_ends = [_]usize{ 12, 14 };
 
 // Owner-side transports ------------------------------------------------------------
 
@@ -554,6 +598,65 @@ pub const Runner = struct {
     /// Owner-thread: its session closed while spawning; destroyed when the
     /// spawn reports back.
     closing: bool = false,
+    /// Owner-thread: the agent view's event log, rows and state (TASK-57).
+    /// Filled as the owner drains events; nothing is re-read from the adapter.
+    view: agent_view.View,
+    /// The fake's release schedule (checks only).
+    fake_step_ends: []const usize = &fake_step_ends,
+    /// Answers waiting for the worker, the adapter's one caller.
+    requests_mutex: Io.Mutex = .init,
+    requests: [request_capacity]Answer = undefined,
+    request_head: usize = 0,
+    request_len: usize = 0,
+
+    /// The longest request or decision id an answer carries; stored events
+    /// refuse longer ones, so no logged request has one.
+    pub const max_answer_id_bytes = 256;
+    pub const request_capacity = 8;
+
+    /// One permission answer on its way to the adapter.
+    pub const Answer = struct {
+        request: [max_answer_id_bytes]u8 = undefined,
+        request_len: usize = 0,
+        decision: [max_answer_id_bytes]u8 = undefined,
+        decision_len: usize = 0,
+    };
+
+    pub const AnswerError = error{ QueueFull, IdTooLong };
+
+    /// Queue the human's answer to permission request `request_id` for the
+    /// worker to send. Owner thread; called only from an explicit gesture.
+    pub fn answerPermission(self: *Runner, request_id: []const u8, decision_id: []const u8) AnswerError!void {
+        if (request_id.len > max_answer_id_bytes or decision_id.len > max_answer_id_bytes) return error.IdTooLong;
+        self.requests_mutex.lockUncancelable(self.io);
+        defer self.requests_mutex.unlock(self.io);
+        if (self.request_len == request_capacity) return error.QueueFull;
+        const slot = &self.requests[(self.request_head + self.request_len) % request_capacity];
+        @memcpy(slot.request[0..request_id.len], request_id);
+        slot.request_len = request_id.len;
+        @memcpy(slot.decision[0..decision_id.len], decision_id);
+        slot.decision_len = decision_id.len;
+        self.request_len += 1;
+    }
+
+    /// Send every queued answer. Worker thread (or a test driving
+    /// `pollOnce`); the adapter is called outside the lock.
+    fn serviceAnswers(self: *Runner) void {
+        while (true) {
+            var answer: Answer = undefined;
+            {
+                self.requests_mutex.lockUncancelable(self.io);
+                defer self.requests_mutex.unlock(self.io);
+                if (self.request_len == 0) return;
+                answer = self.requests[self.request_head];
+                self.request_head = (self.request_head + 1) % request_capacity;
+                self.request_len -= 1;
+            }
+            self.adapter().respondPermission(answer.request[0..answer.request_len], answer.decision[0..answer.decision_len]) catch |err| {
+                log.debug("a permission answer was not delivered: {s}", .{@errorName(err)});
+            };
+        }
+    }
 
     /// The type-erased adapter.
     pub fn adapter(self: *Runner) agent.Adapter {
@@ -650,6 +753,7 @@ pub const Runner = struct {
     /// side channel has into the queue. Public so tests can drive a runner
     /// without its thread.
     pub fn pollOnce(self: *Runner) void {
+        if (!self.needs_attach or self.attached) self.serviceAnswers();
         if (!self.polling) return;
         if (self.needs_attach and !self.attached) {
             if (self.attach_attempts >= max_attach_attempts) {
@@ -672,7 +776,7 @@ pub const Runner = struct {
             self.attached = true;
         }
         if (self.backend == .fake) {
-            const released = fakeReleased(self.fakeSteps());
+            const released = fakeReleasedBy(self.fake_step_ends, self.fakeSteps());
             const fake = &self.backend.fake;
             fake.poll_batch = released -| fake.cursor;
         }
@@ -706,6 +810,7 @@ pub const Runner = struct {
             else => {},
         }
         self.queue.deinit(self.allocator);
+        self.view.deinit();
         self.arena.deinit();
         if (self.sink_dir.len != 0) {
             // The sink is private run state: gone with the agent.
@@ -833,6 +938,8 @@ pub const InitOptions = struct {
     sink_root: ?[]const u8 = null,
     /// Offer the scripted fake harness (deterministic checks only).
     fake_enabled: bool = false,
+    /// Give the fake `--agent-view-test`'s script instead of TASK-56's.
+    fake_view: bool = false,
     wake: Wake = .{},
 };
 
@@ -877,6 +984,7 @@ pub const Runtime = struct {
     os_notifications: usize = 0,
     sink_root: ?[]u8,
     fake_enabled: bool,
+    fake_view: bool = false,
     wake: Wake,
     /// The agent the last notification activation or `agent.focus` chose,
     /// for TASK-58's manager to select.
@@ -904,6 +1012,7 @@ pub const Runtime = struct {
             .registry = agent.Registry.init(allocator),
             .sink_root = sink_root,
             .fake_enabled = options.fake_enabled,
+            .fake_view = options.fake_view,
             .wake = options.wake,
             .drained = drained,
         };
@@ -1030,6 +1139,8 @@ pub const Runtime = struct {
         errdefer self.allocator.destroy(runner);
         var queue = try agent.EventQueue.init(self.allocator, self.io, queue_capacity);
         errdefer queue.deinit(self.allocator);
+        var view = try agent_view.View.init(self.allocator, agent_view.default_entry_capacity, agent_view.default_byte_budget);
+        errdefer view.deinit();
         runner.* = .{
             .allocator = self.allocator,
             .io = self.io,
@@ -1045,6 +1156,7 @@ pub const Runtime = struct {
             .queue = queue,
             .arena = .init(self.allocator),
             .wake = self.wake,
+            .view = view,
         };
         errdefer runner.arena.deinit();
         try self.initBackend(runner, request);
@@ -1054,12 +1166,23 @@ pub const Runtime = struct {
 
     fn initBackend(self: *Runtime, runner: *Runner, request: LaunchRequest) LaunchError!void {
         switch (request.choice) {
-            .fake => runner.backend = .{ .fake = .{
-                .harness_value = .claude_code,
-                .script = &fake_script,
-                .poll_batch = 0,
-                .launch_argv = &fake_argv,
-            } },
+            .fake => {
+                runner.backend = .{ .fake = .{
+                    .harness_value = .claude_code,
+                    .script = &fake_script,
+                    .poll_batch = 0,
+                    .launch_argv = &fake_argv,
+                    .resolve_on_answer = true,
+                } };
+                if (self.fake_view) {
+                    const root = self.sink_root orelse return error.NoSinkRoot;
+                    const parent = std.fs.path.dirnamePosix(root) orelse root;
+                    const arena = runner.arena.allocator();
+                    const sample = try std.fmt.allocPrint(arena, "{s}/{s}", .{ parent, fake_view_sample_name });
+                    runner.backend.fake.script = try fakeViewScript(arena, sample);
+                    runner.fake_step_ends = &fake_view_step_ends;
+                }
+            },
             .harness => |harness| switch (harness) {
                 .claude_code => {
                     var config_buffer: [Dir.max_path_bytes]u8 = undefined;
@@ -1161,6 +1284,14 @@ pub const Runtime = struct {
         runner.start() catch |err| {
             log.warn("the agent's side channel worker did not start: {s}", .{@errorName(err)});
         };
+    }
+
+    /// The runner of a registered agent, if it still has one.
+    pub fn runnerForAgent(self: *const Runtime, id: AgentId) ?*Runner {
+        for (self.runners.items) |runner| {
+            if (runner.agent_id == id and !runner.closing) return runner;
+        }
+        return null;
     }
 
     /// The runner of a session, if a launched agent lives there.
@@ -1305,6 +1436,14 @@ pub const Runtime = struct {
             log.debug("an agent event was not applied: {s}", .{@errorName(err)});
             return;
         };
+        // The view logs every structured event, and a state change only when
+        // it changed something, so a heuristic tick does not fill the log.
+        if (ev != .status_change or applied.outcome == .changed) {
+            if (self.runnerForAgent(id)) |runner| {
+                runner.view.log.append(ev) catch |err| log.debug("an event was not logged for the view: {s}", .{@errorName(err)});
+                self.changed = true;
+            }
+        }
         const record = self.registry.get(id) orelse return;
         if (applied.outcome == .changed) {
             self.changed = true;
@@ -1651,4 +1790,58 @@ test "a fake agent's launch writes its files and its events become glyph states 
     runtime.sessionClosed(key, session_id);
     try testing.expect(runtime.agentForSession(key, session_id) == null);
     try testing.expectEqual(@as(usize, 0), runtime.runners.items.len);
+}
+
+test "the view log fills from drained events and an answer reaches the adapter through the worker's queue" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPath(testing.io, &root_buffer);
+    var sink_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const sink_root = try std.fmt.bufPrint(&sink_buffer, "{s}/agents", .{root_buffer[0..tmp_path_len]});
+
+    var runtime = try Runtime.init(testing.allocator, testing.io, .{ .sink_root = sink_root, .fake_enabled = true, .fake_view = true });
+    defer runtime.deinit();
+    const key = WorkspaceKey.fromOrdinal(0);
+    const session_id = SessionId.fromOrdinal(1);
+    const runner = try runtime.createRunner(.{ .choice = .fake, .workspace = key, .session = session_id, .context_kind = .local, .cwd = "/" });
+    _ = try runner.prepare(&.{"PATH=/bin"});
+    const id = try runtime.register(runner, .{ .workspace = key, .session = session_id, .session_kind = .agent_terminal, .scratchpad = .first });
+    try testing.expect(runtime.runnerForAgent(id) == runner);
+    // The view script names the sample beside the sink root.
+    const reference = runner.backend.fake.script[5].file_reference;
+    try testing.expect(std.mem.endsWith(u8, reference.path, "/" ++ fake_view_sample_name));
+    try testing.expectEqual(@as(?u32, fake_view_sample_line), reference.line);
+
+    var steps_path: [Dir.max_path_bytes]u8 = undefined;
+    const steps = try std.fmt.bufPrint(&steps_path, "{s}/steps", .{runner.sink_dir});
+    try Dir.cwd().writeFile(testing.io, .{ .sub_path = steps, .data = "x" });
+    var rounds: usize = 0;
+    while (rounds < 4) : (rounds += 1) {
+        runner.pollOnce();
+        _ = runtime.poll(0);
+    }
+    // Twelve events, the status change among them, all logged in order.
+    const log_view = &runner.view.log;
+    try testing.expectEqual(@as(usize, 12), log_view.count());
+    try testing.expectEqual(agent.Event.Kind.status_change, std.meta.activeTag(log_view.at(0).event));
+    const request = log_view.at(6);
+    try testing.expectEqualStrings("view-1", request.event.permission_request.id);
+
+    try runner.answerPermission("view-1", "deny");
+    try testing.expect(log_view.markAnswered(request.seq, 1));
+    runner.pollOnce();
+    _ = runtime.poll(0);
+    const answer = runner.backend.fake.permissionAnswer();
+    try testing.expectEqualStrings("view-1", answer.request);
+    try testing.expectEqualStrings("deny", answer.decision);
+    try testing.expectEqual(@as(?agent.PermissionOutcome, .rejected), request.outcome);
+    // The resolution settled the request rather than adding a row.
+    try testing.expectEqual(@as(usize, 12), log_view.count());
+
+    // The queue is bounded and refuses ids no stored event can carry.
+    var index: usize = 0;
+    while (index < Runner.request_capacity) : (index += 1) try runner.answerPermission("r", "d");
+    try testing.expectError(error.QueueFull, runner.answerPermission("r", "d"));
+    try testing.expectError(error.IdTooLong, runner.answerPermission("r" ** (Runner.max_answer_id_bytes + 1), "d"));
 }
