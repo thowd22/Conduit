@@ -762,6 +762,22 @@ deterministic Linux `--agent-manager-test` covers two workspaces and two fake ag
 PTYs and SDL events; the seventeenth scenario `agent-manager` opens it by chord and clicks a row.
 Ages refresh only on redraws; a real harness's `sendInput` and macOS/Windows are unverified.
 
+TASK-67 adds `zig build bench` (ReleaseSafe by default; four benchmark processes run by
+`bench/runner.zig`: throughput through `term` alone and with grid frames at the `FramePacer`
+cadence, frame time for 1/4/9 panes at 1920x1080 scale 1 and 2, idle-session memory with a full
+scrollback, and `conduit-test` launch-to-prompt startup) and `zig build bench-check`, which
+enforces `bench/budgets.zig`; the method, reference numbers (Ryzen 7 5700G, llvmpipe, indicative
+GPU numbers) and budgets are in `docs/performance.md`. Profiling found the glyph atlas scanning
+every slot per lookup and its allocator narrowing free columns, which evicted and even failed CJK
+glyphs at scale 2 with most of the atlas free; the atlas now has a key index and cuts along the
+shorter leftover (CJK full frame 7.6 → 5.0 ms; 1,800 CJK glyphs at scale 2 into a 1024² atlas
+went from 738 failed insertions to 1). A workspace test floods 64 MiB through a real PTY while
+typing a sentinel every 100 ms and proves every sentinel arrives in order with the allocator peak
+under 1 MiB and RSS growth under 32 MiB, and the `output-flood` e2e scenario types a command
+during its flood. `bench-check` is not yet in CI (hosted runners are not the reference machine).
+Follow-ups noted for `app`: a 2048² atlas at scale ≥ 1.5, a driver wake when a `Load` finishes
+instead of waiting for the 16 ms poll, and region-only atlas uploads.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
