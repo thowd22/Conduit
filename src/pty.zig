@@ -3501,6 +3501,11 @@ test "a reader waiting for room is woken even when the owner empties the ring an
         const park_deadline = sys.monotonicMillis() + 5000;
         while (posix.park.word.load(.acquire) != ReaderPark.parked) {
             if (sys.monotonicMillis() > park_deadline) return error.TimedOut;
+            // A reader that found the ring full *before* the park was armed is waiting for
+            // room, not parked, and nothing else wakes it. A spurious wake makes it try the
+            // append again, fail again and, now that the park is armed, park. No byte is
+            // taken, so the ring is exactly full when the check below runs.
+            if (posix.queue.len() == PosixPty.queue_capacity) PosixPty.notify(posix.reader_wake);
             std.Thread.yield() catch {
                 // Yielding only shortens the spin; a failed yield still waits correctly.
             };
