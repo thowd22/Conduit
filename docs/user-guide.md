@@ -177,6 +177,43 @@ When a program has captured the mouse, a plain right click is sent to the progra
 click still opens the menu. Setting `mouse.right_click = paste` (or starting with
 `--right-click=paste`) makes a right click paste instead.
 
+## Agent view
+
+An agent launched with **Agent: launch** runs in its own tab as a real terminal. Ctrl+Shift+A
+(Cmd+Shift+A), or **Agent: toggle view** in the palette, replaces that pane's terminal with the
+agent view: the same session shown as structured, terminal-styled rows built from the events the
+agent's harness reports. The terminal keeps running underneath, and the same chord or command
+switches back to it.
+
+- **Messages** start with who wrote them (`you ›`, the harness's name such as `claude ›`, or
+  `system ›`) and wrap at the pane width; this is the one place Conduit wraps text. **Tool uses**
+  read `⚙ <tool> <summary>`; subagents starting and finishing, notifications (`▪`), state
+  changes (`· working`) and the agent's exit are dim lines.
+- **File references** (`↳ path:line`) open in a new tab at that line, like a terminal file
+  reference (`vi +<line> -- <path>`); click one, or Tab to it and press Enter. A relative path
+  is resolved against the agent's directory.
+- **Permission requests** show the request (`? Run: …`) and one clickable choice per answer the
+  harness offers (for example **Allow once** and **Reject**). Click one, or press Tab to reach the
+  first choice of the oldest open request, Left/Right or Tab to move, and Enter to answer. The
+  answer goes to the harness; the row then shows what was sent and, once the harness reports it,
+  the outcome (`✓ allowed`, `× rejected`, `↷ answered in the terminal`). A request answered in
+  the agent's own terminal first loses its choices the same way. A harness that cannot take
+  answers from Conduit shows its choices as plain text; answer it in the terminal.
+- **Scrolling**: Up/Down by a row, PageUp/PageDown by a screen, Home/End to the ends, or the
+  mouse wheel. The view follows new events while it is at the bottom.
+- **Selecting and copying**: drag across rows, or Shift+arrows from the top visible row, then
+  Ctrl+Shift+C (Cmd+C) or Ctrl+C. Rows are copied as plain text joined by newlines. Escape clears
+  the selection.
+- **Search**: Ctrl+Shift+F (Cmd+F) searches the view's rows instead of the terminal, with the
+  same field, next/previous keys and controls. Matches are literal and do not span wrapped rows;
+  regular expressions search the raw terminal only.
+
+The view is not a terminal: other keys and typed text over it reach nobody, except Ctrl+C with
+nothing selected, which still interrupts the agent. Paste into the raw terminal after switching
+back. The view keeps the agent's most recent 4,096 events (4 MiB of text); older ones are dropped
+with a note at the top. Transcript text is display only: nothing in it can open a file or answer a
+request without your click or key.
+
 ## Settings view
 
 Ctrl+Shift+, (Cmd+Shift+,) or the palette's **Settings** opens a dialog listing every setting,
@@ -312,6 +349,7 @@ command except the fixed ones at the end can be rebound or unbound with `keybind
 | Font: Decrease Size | `font.size.decrease` | Ctrl+- |
 | Font: Reset Size | `font.size.reset` | Ctrl+0 |
 | Open terminal search (fixed) | `search.open` | Ctrl+Shift+F |
+| Agent: toggle view | `agent.view` | Ctrl+Shift+A |
 
 ### macOS
 
@@ -347,6 +385,7 @@ macOS chords are the shipped defaults for macOS builds; they have not been run o
 | Font: Decrease Size | `font.size.decrease` | Cmd+- |
 | Font: Reset Size | `font.size.reset` | Cmd+0 |
 | Open terminal search (fixed) | `search.open` | Cmd+F |
+| Agent: toggle view | `agent.view` | Cmd+Shift+A |
 
 ### Commands with no default chord
 
@@ -375,4 +414,5 @@ These belong to the surface that has focus and are not rebindable yet. All platf
 | Tab rename field | Enter saves; Escape cancels |
 | Sidebar (once focused) | Tab/Shift+Tab move; Up/Down between workspaces; Enter activates |
 | Scratchpad (shown) | Escape hides it |
+| Agent view | Up/Down, PageUp/PageDown, Home/End scroll; Tab/Shift+Tab move between references and choices; Left/Right between a request's choices; Enter opens or answers; Shift+arrows select; Escape clears |
 | Any text field | Left/Right/Home/End (Shift extends the selection), Backspace, Delete; Ctrl+A / Ctrl+C / Ctrl+V (Cmd on macOS) select all, copy, paste |

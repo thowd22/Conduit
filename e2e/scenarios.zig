@@ -514,6 +514,43 @@ const agent_notifications_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-57: the same fake agent, stepped to its first permission request,
+// then shown as the structured agent view by its chord. The request's
+// "Allow once" decision is clicked; the row then shows the outcome in place
+// of its controls, and the chord returns to the raw terminal underneath.
+const agent_view_id = "agent.view.1";
+const agent_view_allow_id = agent_view_id ++ ".perm.fake-1.allow";
+const agent_view_outcome_id = agent_view_id ++ ".perm.fake-1.outcome";
+
+const agent_view_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "Agent: launch" },
+    .{ .key = "ENTER" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "palette.argument", .state = "exists", .equals = true } },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.idle", .state = "exists", .equals = true } },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-AGENT-READY" } },
+    .{ .type_text = "one" },
+    .{ .key = "ENTER" },
+    .{ .type_text = "two" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.waiting_permission", .state = "exists", .equals = true } },
+    .{ .key = "CTRL+SHIFT+a" },
+    .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = agent_view_allow_id, .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .click = agent_view_allow_id },
+    .{ .wait_element = .{ .id = agent_view_outcome_id, .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = agent_view_allow_id, .state = "exists", .equals = false } },
+    .screenshot,
+    .{ .key = "CTRL+SHIFT+a" },
+    .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = false } },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-STEP 2" } },
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -592,7 +629,35 @@ pub const all = [_]Scenario{
         .command = deterministic_shell,
         .steps = &agent_notifications_steps,
     },
+    .{
+        .name = "agent-view",
+        .launch_env = &agent_notifications_env,
+        .command = deterministic_shell,
+        .steps = &agent_view_steps,
+    },
 };
+
+test "the agent view scenario opens the view by chord and answers by a click" {
+    const scenario = all[15];
+    try std.testing.expectEqualStrings("agent-view", scenario.name);
+    try std.testing.expectEqual(@as(usize, 16), all.len);
+    var chords: usize = 0;
+    var clicked = false;
+    var outcome = false;
+    for (scenario.steps) |step| switch (step) {
+        .key => |key| if (std.mem.eql(u8, key, "CTRL+SHIFT+a")) {
+            chords += 1;
+        },
+        .click => |id| if (std.mem.eql(u8, id, agent_view_allow_id)) {
+            clicked = true;
+        },
+        .wait_element => |wait| if (std.mem.eql(u8, wait.id, agent_view_outcome_id) and wait.equals) {
+            outcome = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(chords == 2 and clicked and outcome);
+}
 
 test "the agent scenario enables the fake only for launch and walks every glyph to done" {
     const scenario = all[14];

@@ -96,12 +96,15 @@ const agent = @import("agent");
 /// SSH workspaces' pure helpers: the connection manager's host list and
 /// choice values and how a connection state is shown (TASK-43, TASK-44).
 const remote = @import("remote.zig");
+/// The agent view's log, rows, selection and search model (TASK-57).
+const agent_view = @import("agent_view.zig");
 const ssh = workspace.ssh;
 
 test {
     _ = git;
     _ = app_agents;
     _ = remote;
+    _ = agent_view;
 }
 /// The input module, imported under a name that does not collide with the app's
 /// `input` buffer field. A module shadowed by a local reads as "the buffer"
@@ -338,6 +341,10 @@ pub const Run = struct {
     /// mouse, a hot-reloaded notification switch, a background tab's OSC 777
     /// and the OS notification seam, through real PTYs and SDL events.
     agent_test: bool = false,
+    /// Exercise TASK-57: the fake agent's structured view, by chord, palette,
+    /// keyboard and mouse. Runs in `--agent-test`'s environment (the flag
+    /// sets `agent_test` too) with the view script instead of TASK-56's.
+    agent_view_test: bool = false,
     /// The private directory `--agent-test` keeps its agent sinks and its
     /// background-tab trigger in. Not a command-line flag: `runApp` sets it.
     agent_test_dir: ?[]const u8 = null,
@@ -601,6 +608,9 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.git_test = true;
         } else if (std.mem.eql(u8, arg, "--agent-test")) {
             run.agent_test = true;
+        } else if (std.mem.eql(u8, arg, "--agent-view-test")) {
+            run.agent_test = true;
+            run.agent_view_test = true;
         } else if (std.mem.eql(u8, arg, "--ssh-test")) {
             run.ssh_test = true;
         } else if (std.mem.eql(u8, arg, "--font-test")) {
@@ -1971,6 +1981,20 @@ const remote_save_profile_action = "remote.save-profile";
 const remote_reconnect_action = "remote.reconnect";
 const remote_disconnect_action = "remote.disconnect";
 const remote_show_connection_action = "remote.show-connection";
+const agent_view_action = "agent.view";
+const agent_view_answer_action = "agent.view.answer";
+const agent_view_open_ref_action = "agent.view.open-ref";
+/// The most agent-view elements one frame registers: the surfaces, visible
+/// rows and their controls of every pane that shows a view.
+const agent_view_element_capacity: usize = 384;
+const agent_view_id_capacity: usize = 112;
+/// What a view element's id addresses (TASK-57).
+const AgentViewTarget = struct {
+    agent: agent.AgentId,
+    seq: u64,
+    decision: ?u8 = null,
+};
+const AgentViewSlot = struct { len: u16 = 0, target: ?AgentViewTarget = null };
 /// The connection manager's list: hosts, profiles, recent destinations and
 /// the `user@host` row.
 const remote_choice_capacity: usize = remote.max_hosts + config.max_remote_profiles + config.max_remote_recent + 1;
@@ -2027,7 +2051,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 73;
+const action_capacity_base: usize = 76;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 const settings_open_action = "settings.open";
@@ -2147,7 +2171,11 @@ const search_candidate_budget: usize = 32;
 // The second `sidebar_element_capacity` is the TASK-76 branch rows: at most
 // one per tab row.
 const semantic_element_capacity: usize = sidebar_element_capacity + terminal_link_capacity +
-    search_highlight_capacity + 13 + settings_visible_capacity + 4 + sidebar_element_capacity;
+    search_highlight_capacity + 13 + settings_visible_capacity + 4 + sidebar_element_capacity +
+    agent_view_element_capacity;
+/// Copied Run descriptors per frame: the preedit's three, a few chrome
+/// rows, and up to four per agent-view row (TASK-57).
+const semantic_run_capacity: usize = 6 + 4 * agent_view_element_capacity;
 
 /// The vertical gap, in logical pixels, above every workspace after the first
 /// in the sidebar (TASK-77). It is scaled by the window scale where it is
@@ -3633,6 +3661,7 @@ fn buildConfiguredBindings(
     // with the others; it goes first so a file line can still rebind or unbind
     // it.
     try overrides.append(allocator, .{ .chord = notificationsChord(profile), .action = notifications_open_action });
+    try overrides.append(allocator, .{ .chord = agentViewChord(profile), .action = agent_view_action });
     for (loaded.keybinds.items) |keybind| {
         const chord = inputmod.parseChord(keybind.chord) catch |err| {
             loaded.addDiagnostic(keybind.line, "{s}", .{chordErrorMessage(err)});
@@ -3689,6 +3718,14 @@ fn agentSinkRoot(io: Io, env: EnvSource, options: Options, buffer: []u8) ?[]cons
 
 /// Ctrl+Shift+N on Linux and Windows, Cmd+Shift+N on macOS: the notification
 /// list (TASK-56). Free in both shipped default tables.
+/// TASK-57's view toggle, an app default beside the list chord.
+fn agentViewChord(profile: inputmod.PlatformProfile) inputmod.Chord {
+    return switch (profile) {
+        .macos => .{ .key = .{ .character = 'a' }, .modifiers = .{ .shift = true, .super = true } },
+        .linux_windows => .{ .key = .{ .character = 'a' }, .modifiers = .{ .ctrl = true, .shift = true } },
+    };
+}
+
 fn notificationsChord(profile: inputmod.PlatformProfile) inputmod.Chord {
     return switch (profile) {
         .macos => .{ .key = .{ .character = 'n' }, .modifiers = .{ .shift = true, .super = true } },
@@ -4361,6 +4398,18 @@ const App = struct {
     notifications_pointer_owned: bool = false,
     notification_row_ids: [notification_visible_rows][palette_semantic_capacity]u8 = undefined,
     notification_row_labels: [notification_visible_rows][notification_row_label_capacity]u8 = undefined,
+    /// TASK-57: element ids and their targets for the agent views of the
+    /// last two frames (ids must outlive one frame for focus reconciliation).
+    agent_view_index: usize = 0,
+    agent_view_ids: [2][agent_view_element_capacity][agent_view_id_capacity]u8 = undefined,
+    agent_view_targets: [2][agent_view_element_capacity]AgentViewSlot = undefined,
+    agent_view_used: [2]usize = .{ 0, 0 },
+    agent_view_generation: usize = 0,
+    /// The agent whose view a drag is selecting in, from press to release.
+    agent_view_pointer: ?agent.AgentId = null,
+    /// The agent whose view the open search searches, instead of a terminal.
+    search_view: ?agent.AgentId = null,
+    agent_view_matches: [search_match_capacity]agent_view.Match = undefined,
     /// Whether the window has keyboard focus, from SDL's focus events.
     window_focused: bool = true,
     /// A check's stand-in for the window's focus, or null for the real one.
@@ -4678,7 +4727,7 @@ const App = struct {
 
         var ui_canvas = try ui.Canvas.init(allocator, canvas_size.cols, canvas_size.rows);
         errdefer ui_canvas.deinit();
-        var ui_tree = try ui.Tree.init(allocator, semantic_element_capacity, 6);
+        var ui_tree = try ui.Tree.init(allocator, semantic_element_capacity, semantic_run_capacity);
         errdefer ui_tree.deinit();
 
         const action_capacity: usize = if (options.run.ui_test or options.run.driver_test) action_capacity_base + 1 else action_capacity_base;
@@ -5146,6 +5195,26 @@ const App = struct {
             .label = "Remote: show connection",
             .handler = remoteShowConnectionAction,
         });
+        // TASK-57: the structured view over an agent's terminal, and the two
+        // semantic actions its controls dispatch.
+        const agent_view_index = actions.definitions().len;
+        try actions.register(.{
+            .name = agent_view_action,
+            .label = "Agent: toggle view",
+            .handler = agentViewToggleAction,
+        });
+        try actions.register(.{
+            .name = agent_view_answer_action,
+            .label = "Answer agent permission",
+            .handler = agentViewAnswerAction,
+            .palette = null,
+        });
+        try actions.register(.{
+            .name = agent_view_open_ref_action,
+            .label = "Open agent file reference",
+            .handler = agentViewOpenRefAction,
+            .palette = null,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -5229,6 +5298,7 @@ const App = struct {
             .sink_root = agentSinkRoot(io, env, options, &sink_root_buffer),
             .fake_enabled = options.run.agent_test or (options.run.test_driver_endpoint != null and
                 std.mem.eql(u8, env.get(fake_agent_env) orelse "", "1")),
+            .fake_view = options.run.agent_view_test,
         });
         errdefer agents.deinit();
         agents.settings = loaded_config.settings.notifications;
@@ -5244,6 +5314,7 @@ const App = struct {
             .agent_prompt_index = agent_prompt_index,
             .agent_stop_index = agent_stop_index,
             .agent_focus_index = agent_focus_index,
+            .agent_view_index = agent_view_index,
             .remote_connect_index = remote_connect_index,
             .remote_address_index = remote_address_index,
             .remote_save_index = remote_save_index,
@@ -7642,6 +7713,697 @@ const App = struct {
 
     // The notification list --------------------------------------------------
 
+    // The agent view (TASK-57) ------------------------------------------------
+
+    /// The runner of the agent in the presented pane, view shown or not.
+    fn presentedAgentRunner(self: *App) ?*app_agents.Runner {
+        if (self.scratchpadVisible() or self.connectionVisible()) return null;
+        return self.agents.runnerForSession(self.activePresentation().key, self.presentedSessionId());
+    }
+
+    /// The runner whose view replaces the presented pane's terminal.
+    fn presentedAgentView(self: *App) ?*app_agents.Runner {
+        const runner = self.presentedAgentRunner() orelse return null;
+        return if (runner.view.active) runner else null;
+    }
+
+    /// The runner whose view replaces `id`'s terminal in the active workspace.
+    fn agentViewForSession(self: *App, id: session.SessionId) ?*app_agents.Runner {
+        const runner = self.agents.runnerForSession(self.activePresentation().key, id) orelse return null;
+        return if (runner.view.active and runner.agent_id != null) runner else null;
+    }
+
+    /// The pane layout showing `runner`'s view, if one does.
+    fn agentViewLayout(self: *App, runner: *const app_agents.Runner) ?workspace.PaneLayout {
+        if (runner.workspace != self.activePresentation().key) return null;
+        for (self.pane_layouts[0..self.pane_layout_count]) |layout| {
+            if (layout.pane_id == connection_pane_id) continue;
+            if (layout.session_id == runner.session) return layout;
+        }
+        return null;
+    }
+
+    fn agentViewRect(layout: workspace.PaneLayout) ui.Rect {
+        return .{ .x = layout.rect.col, .y = layout.rect.row, .width = layout.rect.cols, .height = layout.rect.rows };
+    }
+
+    /// The view and pane under a device-pixel point, when the point is over a
+    /// pane that shows an agent view.
+    fn agentViewAt(self: *App, point: ui.Point) ?struct { runner: *app_agents.Runner, layout: workspace.PaneLayout } {
+        for (self.pane_layouts[0..self.pane_layout_count]) |layout| {
+            if (layout.pane_id == connection_pane_id) continue;
+            if (!self.pointInCellRect(point, agentViewRect(layout))) continue;
+            const runner = self.agentViewForSession(layout.session_id) orelse return null;
+            return .{ .runner = runner, .layout = layout };
+        }
+        return null;
+    }
+
+    /// The row and cell a point names inside a view, clamped to its rows.
+    fn agentViewPosition(self: *const App, view: *const agent_view.View, rect: ui.Rect, point: ui.Point) agent_view.Position {
+        const cell = self.fonts.metrics().cell;
+        const x: u32 = if (point.x <= 0) 0 else @intCast(point.x);
+        const y: u32 = if (point.y <= 0) 0 else @intCast(point.y);
+        const col = std.math.clamp(x / @max(cell.width_px, 1), rect.x, rect.right()) - rect.x;
+        const line = std.math.clamp(y / @max(cell.height_px, 1), rect.y, rect.bottom() -| 1) - rect.y;
+        const last = view.rowCount() -| 1;
+        return .{ .row = @min(view.top + line, last), .col = col };
+    }
+
+    /// Reserve the next id and target slot for a view element this frame.
+    fn nextAgentViewId(self: *App, comptime format: []const u8, args: anytype, target: ?AgentViewTarget) ?[]const u8 {
+        const generation = self.agent_view_generation;
+        const slot = self.agent_view_used[generation];
+        if (slot >= agent_view_element_capacity) return null;
+        const text = std.fmt.bufPrint(&self.agent_view_ids[generation][slot], format, args) catch return null;
+        self.agent_view_targets[generation][slot] = .{ .len = @intCast(text.len), .target = target };
+        self.agent_view_used[generation] += 1;
+        return text;
+    }
+
+    /// What a view element id addresses, from this frame or the one before.
+    fn agentViewTarget(self: *const App, id: []const u8) ?AgentViewTarget {
+        const current = self.agent_view_generation;
+        for ([_]usize{ current, 1 - current }) |generation| {
+            for (0..self.agent_view_used[generation]) |slot| {
+                const entry = self.agent_view_targets[generation][slot];
+                const target = entry.target orelse continue;
+                if (std.mem.eql(u8, self.agent_view_ids[generation][slot][0..entry.len], id)) return target;
+            }
+        }
+        return null;
+    }
+
+    fn agentViewRole(tone: agent_view.Tone) theme.Role {
+        return switch (tone) {
+            .normal => .foreground,
+            .user => .accent,
+            .assistant => .green,
+            .system => .muted,
+            .tool => .cyan,
+            .reference => .blue,
+            .attention => .attention,
+            .dim => .muted,
+            .success => .green,
+            .danger => .danger,
+        };
+    }
+
+    /// The painted runs of one row: its prefix and body tones, with the
+    /// selected cells on the selection background. At most four runs.
+    fn agentViewRuns(row: *const agent_view.Row, selected: ?agent_view.Selection, row_index: usize, out: *[4]ui.Run) []const ui.Run {
+        const text = row.text;
+        if (text.len == 0) return out[0..0];
+        var cuts: [4]usize = .{ 0, row.prefix_len, text.len, text.len };
+        var cut_count: usize = 2;
+        if (selected) |selection| {
+            if (selection.columnsOn(row_index, agent_view.displayCells(text))) |columns| {
+                cuts[2] = agent_view.byteAtCell(text, columns.start);
+                cuts[3] = agent_view.byteAtCell(text, columns.end);
+                cut_count = 4;
+            }
+        }
+        var bounds: [6]usize = undefined;
+        bounds[0] = 0;
+        bounds[1] = text.len;
+        var bound_count: usize = 2;
+        for (cuts[1..cut_count]) |cut| {
+            if (cut == 0 or cut >= text.len) continue;
+            if (std.mem.indexOfScalar(usize, bounds[0..bound_count], cut) != null) continue;
+            bounds[bound_count] = cut;
+            bound_count += 1;
+        }
+        std.mem.sort(usize, bounds[0..bound_count], {}, std.sort.asc(usize));
+        var count: usize = 0;
+        for (bounds[0 .. bound_count - 1], bounds[1..bound_count]) |start, end| {
+            if (count == out.len) break;
+            const in_selection = cut_count == 4 and start >= cuts[2] and end <= cuts[3];
+            const tone = if (start < row.prefix_len) row.prefix_tone else row.tone;
+            out[count] = .{ .text = text[start..end], .style = .{
+                .foreground = if (in_selection) .strong else agentViewRole(tone),
+                .background = if (in_selection) .selection else null,
+                .face_style = if (start < row.prefix_len and row.kind == .message) .bold else .regular,
+            } };
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    /// A harness id as part of a semantic id, or null when it cannot be one
+    /// (whitespace, controls or too long); the caller then names the element
+    /// by its log position instead.
+    fn agentViewIdPart(text: []const u8) ?[]const u8 {
+        if (text.len == 0 or text.len > 40) return null;
+        _ = ui.Id.parse(text) catch return null;
+        return text;
+    }
+
+    /// Register one agent view over `layout`: a surface hiding the terminal,
+    /// then one element per visible row (TASK-57).
+    fn composeAgentView(self: *App, layout: workspace.PaneLayout, runner: *app_agents.Runner, pane_id: ui.Id) !void {
+        const agent_id = runner.agent_id orelse return;
+        const record = self.agents.registry.get(agent_id) orelse return;
+        const number = @intFromEnum(agent_id);
+        const rect = agentViewRect(layout);
+        if (rect.width == 0 or rect.height == 0) return;
+        const view = &runner.view;
+        if (view.rows.stale(&view.log, rect.width)) {
+            var name_buffer: [32]u8 = undefined;
+            const speaker = agent_view.speakerName(&name_buffer, self.agents.displayName(record));
+            try view.rows.build(&view.log, rect.width, speaker);
+            if (view.selection) |selection| {
+                const last = view.rowCount() -| 1;
+                if (selection.anchor.row > last or selection.caret.row > last) view.selection = null;
+            }
+            if (self.search_view == agent_id) self.findAgentViewMatches(runner, false);
+        }
+        view.settle(rect.height);
+
+        const surface_text = self.nextAgentViewId("agent.view.{d}", .{number}, null) orelse return;
+        const surface_id: ui.Id = .{ .value = surface_text };
+        try self.ui_tree.addSurface(.{
+            .id = surface_id,
+            .parent = pane_id,
+            .role = "agent_view",
+            .label = "Agent view",
+            .bounds = rect,
+        }, .{ .rect = rect, .fill = .background });
+
+        if (view.rowCount() == 0) {
+            // A harness with no structured channel yet (or a quiet one) has
+            // nothing to show; say where the session is instead of a blank.
+            const empty_label = "· no structured events yet; the terminal has the full session";
+            const empty_runs = [_]ui.Run{.{ .text = empty_label, .style = .{ .foreground = .muted } }};
+            const id_text = self.nextAgentViewId("agent.view.{d}.empty", .{number}, null) orelse return;
+            try self.ui_tree.addText(.{
+                .id = .{ .value = id_text },
+                .parent = surface_id,
+                .role = "agent_row",
+                .label = empty_label,
+                .bounds = .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = 1 },
+            }, .{ .runs = &empty_runs });
+            return;
+        }
+        const answerable = record.capabilities.respond_permission;
+        const end = @min(view.rowCount(), view.top + rect.height);
+        var row_index = view.top;
+        while (row_index < end) : (row_index += 1) {
+            const row = &view.rows.items[row_index];
+            const bounds: ui.Rect = .{ .x = rect.x, .y = rect.y + @as(u32, @intCast(row_index - view.top)), .width = rect.width, .height = 1 };
+            switch (row.kind) {
+                .reference => {
+                    const id_text = self.nextAgentViewId("agent.view.{d}.ref.{d}", .{ number, row.seq }, .{ .agent = agent_id, .seq = row.seq }) orelse return;
+                    const id: ui.Id = .{ .value = id_text };
+                    try self.ui_tree.addInteractiveText(.{
+                        .id = id,
+                        .parent = surface_id,
+                        .role = "agent_ref",
+                        .label = row.text,
+                        .action = agent_view_open_ref_action,
+                        .bounds = bounds,
+                    }, .{
+                        .id = id,
+                        .label = row.text,
+                        .action = agent_view_open_ref_action,
+                        .normal = .{ .foreground = .blue },
+                        .hovered = .{ .foreground = .strong, .underline = .accent },
+                        .focused = .{ .foreground = .on_accent, .background = .accent },
+                    });
+                },
+                .permission_choices, .permission_outcome => {
+                    const entry = view.log.bySeq(row.seq) orelse continue;
+                    if (entry.event != .permission_request) continue;
+                    const request = entry.event.permission_request;
+                    var request_part_buffer: [24]u8 = undefined;
+                    const request_part = agentViewIdPart(request.id) orelse
+                        (std.fmt.bufPrint(&request_part_buffer, "r{d}", .{row.seq}) catch continue);
+                    var runs: [4]ui.Run = undefined;
+                    if (row.kind == .permission_outcome) {
+                        const id_text = self.nextAgentViewId("agent.view.{d}.perm.{s}.outcome", .{ number, request_part }, null) orelse return;
+                        try self.ui_tree.addText(.{
+                            .id = .{ .value = id_text },
+                            .parent = surface_id,
+                            .role = "agent_outcome",
+                            .label = row.text,
+                            .bounds = bounds,
+                        }, .{ .runs = agentViewRuns(row, view.selection, row_index, &runs) });
+                        continue;
+                    }
+                    const row_text = self.nextAgentViewId("agent.view.{d}.row.{d}", .{ number, row_index }, null) orelse return;
+                    try self.ui_tree.addText(.{
+                        .id = .{ .value = row_text },
+                        .parent = surface_id,
+                        .role = "agent_row",
+                        .label = row.text,
+                        .bounds = bounds,
+                    }, .{ .runs = agentViewRuns(row, view.selection, row_index, &runs) });
+                    // A harness that cannot take answers here keeps its
+                    // choices as plain text: the human answers in its TUI.
+                    if (!answerable) continue;
+                    for (row.choices[0..row.choice_count]) |choice| {
+                        const decision = request.decisions[choice.index];
+                        var decision_part_buffer: [8]u8 = undefined;
+                        const decision_part = agentViewIdPart(decision.id) orelse
+                            (std.fmt.bufPrint(&decision_part_buffer, "d{d}", .{choice.index}) catch continue);
+                        const id_text = self.nextAgentViewId("agent.view.{d}.perm.{s}.{s}", .{ number, request_part, decision_part }, .{
+                            .agent = agent_id,
+                            .seq = row.seq,
+                            .decision = choice.index,
+                        }) orelse return;
+                        const id: ui.Id = .{ .value = id_text };
+                        const label = row.text[agent_view.byteAtCell(row.text, choice.col)..agent_view.byteAtCell(row.text, choice.col + choice.cells)];
+                        try self.ui_tree.addInteractiveText(.{
+                            .id = id,
+                            .parent = surface_id,
+                            .role = "agent_decision",
+                            .label = label,
+                            .action = agent_view_answer_action,
+                            .bounds = .{ .x = rect.x + choice.col, .y = bounds.y, .width = @min(choice.cells, rect.width -| choice.col), .height = 1 },
+                        }, .{
+                            .id = id,
+                            .label = label,
+                            .action = agent_view_answer_action,
+                            .normal = .{ .foreground = .accent, .face_style = .bold },
+                            .hovered = .{ .foreground = .strong, .underline = .accent },
+                            .focused = .{ .foreground = .on_accent, .background = .accent },
+                        });
+                    }
+                },
+                else => {
+                    const id_text = self.nextAgentViewId("agent.view.{d}.row.{d}", .{ number, row_index }, null) orelse return;
+                    var runs: [4]ui.Run = undefined;
+                    try self.ui_tree.addText(.{
+                        .id = .{ .value = id_text },
+                        .parent = surface_id,
+                        .role = "agent_row",
+                        .label = row.text,
+                        .bounds = bounds,
+                    }, .{ .runs = agentViewRuns(row, view.selection, row_index, &runs) });
+                },
+            }
+        }
+
+        // Search matches over the view's rows, as decorations like the
+        // terminal's: same ids, same activation.
+        if (self.search_visible and self.search_view == agent_id) {
+            var semantic_index: usize = 0;
+            for (self.agent_view_matches[0..self.search_match_count], 0..) |match, match_index| {
+                if (match.row < view.top or match.row >= end) continue;
+                if (semantic_index == self.search_highlight_ids[0].len or match.col >= rect.width) break;
+                const id_text = try std.fmt.bufPrint(
+                    &self.search_highlight_ids[self.search_highlight_id_generation][semantic_index],
+                    "search.match.{d}.{d}",
+                    .{ match_index, match.row },
+                );
+                semantic_index += 1;
+                const id: ui.Id = .{ .value = id_text };
+                const active = match_index == self.search_active_index;
+                try self.ui_tree.addInteractiveText(.{
+                    .id = id,
+                    .role = "search_match",
+                    .label = "Search match",
+                    .selected = active,
+                    .action = search_activate_match_action,
+                    .bounds = .{
+                        .x = rect.x + match.col,
+                        .y = rect.y + @as(u32, @intCast(match.row - view.top)),
+                        .width = @min(match.cells, rect.width - match.col),
+                        .height = 1,
+                    },
+                }, .{
+                    .id = id,
+                    .label = "Search match",
+                    .action = search_activate_match_action,
+                    .paint = .decorations_only,
+                    .normal = if (active)
+                        .{ .underline = .accent, .overline = .accent }
+                    else
+                        .{ .underline = .attention },
+                    .hovered = .{ .underline = .strong, .overline = .strong },
+                    .focused = .{ .underline = .accent, .overline = .accent },
+                });
+            }
+        }
+    }
+
+    /// The view's height in rows, for scrolling by keys.
+    fn agentViewHeight(self: *App, runner: *const app_agents.Runner) u32 {
+        const layout = self.agentViewLayout(runner) orelse return 1;
+        return @max(layout.rect.rows, 1);
+    }
+
+    /// The interactive view elements of this frame in order: references and
+    /// decisions, the Tab stops.
+    fn agentViewStops(self: *App, number: u64, out: [][]const u8) [][]const u8 {
+        var prefix_buffer: [32]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buffer, "agent.view.{d}.", .{number}) catch return out[0..0];
+        var count: usize = 0;
+        for (self.ui_tree.elements()) |element| {
+            if (count == out.len) break;
+            if (!element.primitive.isInteractive() or !std.mem.startsWith(u8, element.id.value, prefix)) continue;
+            out[count] = element.id.value;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    /// Move keyboard focus among the view's controls. With nothing focused
+    /// the first undecided permission choice is the first stop, since a
+    /// waiting agent is what the view most often needs.
+    fn moveAgentViewFocus(self: *App, runner: *app_agents.Runner, forward: bool, decisions_only: bool) !void {
+        const number = @intFromEnum(runner.agent_id orelse return);
+        var storage: [agent_view_element_capacity][]const u8 = undefined;
+        const all_stops = self.agentViewStops(number, &storage);
+        var filtered: [agent_view_element_capacity][]const u8 = undefined;
+        var stops: [][]const u8 = all_stops;
+        const focused = if (self.ui_tree.focusedElement()) |element| element.id.value else null;
+        if (decisions_only) {
+            // Left and Right stay within the focused request's choices.
+            const base = if (focused) |id| (if (std.mem.lastIndexOfScalar(u8, id, '.')) |dot| id[0 .. dot + 1] else id) else null;
+            var count: usize = 0;
+            for (all_stops) |id| {
+                if (std.mem.indexOf(u8, id, ".perm.") == null) continue;
+                if (base) |prefix| if (!std.mem.startsWith(u8, id, prefix)) continue;
+                filtered[count] = id;
+                count += 1;
+            }
+            stops = filtered[0..count];
+        }
+        if (stops.len == 0) return;
+        var target: []const u8 = stops[0];
+        if (focused) |id| {
+            for (stops, 0..) |stop, index| {
+                if (!std.mem.eql(u8, stop, id)) continue;
+                target = if (forward)
+                    stops[(index + 1) % stops.len]
+                else
+                    stops[(index + stops.len - 1) % stops.len];
+                break;
+            }
+        } else {
+            for (stops) |stop| if (std.mem.indexOf(u8, stop, ".perm.") != null) {
+                target = stop;
+                break;
+            };
+        }
+        var copy: [agent_view_id_capacity]u8 = undefined;
+        const kept = copy[0..target.len];
+        @memcpy(kept, target);
+        if (self.ui_tree.focus(.{ .value = kept })) try self.refreshActiveUi();
+    }
+
+    /// Keys while a view is presented (TASK-57): scrolling, Shift+arrow
+    /// selection, Tab/Left/Right between controls, Enter to activate and
+    /// Escape to let go. A view is not a terminal, so other keys stop here,
+    /// except Ctrl+C without a view selection, which still interrupts the
+    /// agent (invariant 8). Returns whether the key was the view's.
+    fn routeAgentViewKey(self: *App, key: platform.KeyEvent) !bool {
+        const runner = self.presentedAgentView() orelse return false;
+        if (self.ui_tree.focusedElement()) |element| {
+            if (!std.mem.startsWith(u8, element.id.value, "agent.view.")) return false;
+        }
+        if (key.action == .release) {
+            const owned = if (uiKeyIdentity(key)) |identity| self.terminal_key_state.indexOf(identity) != null else false;
+            return !owned;
+        }
+        const view = &runner.view;
+        const height = self.agentViewHeight(runner);
+        const shift = key.mods.shift and !key.mods.ctrl and !key.mods.alt and !key.mods.super;
+        const plain = !key.mods.shift and !key.mods.ctrl and !key.mods.alt and !key.mods.super;
+        const page: isize = @intCast(@max(height -| 1, 1));
+        switch (key.key) {
+            .up, .down, .left, .right => {
+                if (shift) {
+                    self.extendAgentViewSelection(runner, key.key, height);
+                } else if (plain) switch (key.key) {
+                    .up => view.scrollBy(-1, height),
+                    .down => view.scrollBy(1, height),
+                    .left => try self.moveAgentViewFocus(runner, false, true),
+                    .right => try self.moveAgentViewFocus(runner, true, true),
+                    else => unreachable,
+                };
+            },
+            .page_up => if (plain) view.scrollBy(-page, height),
+            .page_down => if (plain) view.scrollBy(page, height),
+            .home => if (plain) view.scrollToTop(),
+            .end => if (plain) view.scrollToBottom(height),
+            .tab => if (plain or shift) try self.moveAgentViewFocus(runner, !key.mods.shift, false),
+            .enter => if (plain) {
+                if (self.ui_tree.activateFocused()) |activation| {
+                    try self.dispatchAction(activation.action, .{ .source = .keybinding, .origin = activation.id });
+                    return true;
+                }
+            },
+            .escape => if (plain) {
+                view.selection = null;
+                self.ui_tree.clearFocus();
+            },
+            else => {
+                const interrupt = key.mods.ctrl and !key.mods.shift and !key.mods.alt and !key.mods.super and
+                    (key.unshifted_codepoint == 'c' or key.codepoint == 'c');
+                if (interrupt) {
+                    const selected = view.selection != null and !view.selection.?.isEmpty();
+                    if (!selected) return false;
+                    try self.copyAgentViewSelection(runner);
+                    view.selection = null;
+                }
+            },
+        }
+        try self.refreshActiveUi();
+        return true;
+    }
+
+    /// Shift+arrows grow the selection from where it is, or from the first
+    /// visible row's start when there is none.
+    fn extendAgentViewSelection(self: *App, runner: *app_agents.Runner, key: platform.Key, height: u32) void {
+        _ = self;
+        const view = &runner.view;
+        if (view.rowCount() == 0) return;
+        var selection = view.selection orelse agent_view.Selection{
+            .anchor = .{ .row = view.top, .col = 0 },
+            .caret = .{ .row = view.top, .col = 0 },
+        };
+        const last = view.rowCount() - 1;
+        switch (key) {
+            .up => selection.caret.row -|= 1,
+            .down => selection.caret.row = @min(selection.caret.row + 1, last),
+            .left => selection.caret.col -|= 1,
+            .right => selection.caret.col = @min(selection.caret.col + 1, view.rows.items[selection.caret.row].cells()),
+            else => {},
+        }
+        selection.caret.col = @min(selection.caret.col, view.rows.items[selection.caret.row].cells());
+        view.selection = selection;
+        view.reveal(selection.caret.row, height);
+    }
+
+    fn copyAgentViewSelection(self: *App, runner: *app_agents.Runner) !void {
+        const text = (try runner.view.selectionText(self.allocator)) orelse return;
+        defer self.allocator.free(text);
+        platform.setClipboardText(self.allocator, text) catch |err| {
+            log.warn("copy of {d} agent-view byte(s) failed: {s}", .{ text.len, @errorName(err) });
+            return;
+        };
+        log.info("copied {d} byte(s) from the agent view to the clipboard", .{text.len});
+    }
+
+    /// Pointer events over a view: hover and clicks on its controls, drag to
+    /// select, the wheel to scroll, and no text reaching the hidden
+    /// terminal. Null leaves the event to the ordinary routes.
+    fn handleAgentViewUiEvent(self: *App, event: platform.Event) !?bool {
+        const tree = self.activeUiTree();
+        switch (event) {
+            .mouse_motion => |motion| {
+                const point = devicePointerPoint(motion.x, motion.y, self.window.state.scale);
+                if (self.agent_view_pointer) |id| {
+                    const runner = self.agents.runnerForAgent(id) orelse {
+                        self.agent_view_pointer = null;
+                        return true;
+                    };
+                    const layout = self.agentViewLayout(runner) orelse return true;
+                    if (runner.view.selection) |*selection| {
+                        const caret = self.agentViewPosition(&runner.view, agentViewRect(layout), point);
+                        if (!std.meta.eql(caret, selection.caret)) {
+                            selection.caret = caret;
+                            try self.refreshActiveUi();
+                        }
+                    }
+                    return true;
+                }
+                if (self.ui_pointer_owned) return null;
+                if (self.agentViewAt(point) == null) return null;
+                const before = uiInteractionState(tree);
+                tree.pointerMoved(point);
+                if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                return true;
+            },
+            .mouse_button => |button| {
+                const point = devicePointerPoint(button.x, button.y, self.window.state.scale);
+                if (self.agent_view_pointer != null) {
+                    if (button.action == .release and button.button == .left) self.agent_view_pointer = null;
+                    return true;
+                }
+                if (self.ui_pointer_owned) return null;
+                const hit = self.agentViewAt(point) orelse return null;
+                if (button.button != .left or button.action != .press) return true;
+                const tab_id = self.activeWorkspace().activeTabId() orelse return true;
+                if (self.activeWorkspace().focusedPaneId(tab_id) != hit.layout.pane_id) {
+                    var pane_id_buffer: [pane_semantic_capacity]u8 = undefined;
+                    const pane_semantic = try paneSemanticId(&pane_id_buffer, self.activePresentation().key, hit.layout.pane_id);
+                    try self.dispatchAction(pane_activate_action, .{ .source = .mouse, .origin = .{ .value = pane_semantic } });
+                    if (self.activeWorkspace().focusedPaneId(tab_id) != hit.layout.pane_id) {
+                        self.ui_pointer_owned = true;
+                        return true;
+                    }
+                }
+                if (tree.hitTest(point)) |element| {
+                    if (element.primitive.isInteractive() and std.mem.startsWith(u8, element.id.value, "agent.view.")) {
+                        const before = uiInteractionState(tree);
+                        tree.pointerPressed(point);
+                        self.ui_pointer_owned = true;
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        return true;
+                    }
+                }
+                tree.clearFocus();
+                const position = self.agentViewPosition(&hit.runner.view, agentViewRect(hit.layout), point);
+                hit.runner.view.selection = .{ .anchor = position, .caret = position };
+                self.agent_view_pointer = hit.runner.agent_id;
+                try self.refreshActiveUi();
+                return true;
+            },
+            .wheel => |wheel| {
+                const point = devicePointerPoint(wheel.x, wheel.y, self.window.state.scale);
+                const hit = self.agentViewAt(point) orelse return null;
+                if (wheel.dy == 0) return true;
+                var up = wheel.dy > 0;
+                if (wheel.flipped) up = !up;
+                hit.runner.view.scrollBy(if (up) -3 else 3, @max(hit.layout.rect.rows, 1));
+                try self.refreshActiveUi();
+                return true;
+            },
+            .text_input, .text_editing, .candidates => {
+                if (self.presentedAgentView() == null or tree.focusedInput() != null) return null;
+                return true;
+            },
+            else => return null,
+        }
+    }
+
+    fn agentViewToggleAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        const runner = self.presentedAgentRunner() orelse {
+            self.setWorkspaceStatus("no agent in this pane");
+            try self.refreshActiveUi();
+            return;
+        };
+        if (runner.agent_id == null) return;
+        runner.view.active = !runner.view.active;
+        runner.view.follow = true;
+        runner.view.selection = null;
+        self.agent_view_pointer = null;
+        self.ui_tree.clearFocus();
+        self.composition.cancel();
+        try self.refreshActiveUi();
+        try self.syncTextInput();
+    }
+
+    /// Answer a permission request from a click or Enter on one of its
+    /// decisions. Only a gesture on the element reaches here: the origin
+    /// names the decision, and nothing in the transcript can.
+    fn agentViewAnswerAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const origin = invocation.origin orelse return;
+        const target = self.agentViewTarget(origin.value) orelse return;
+        const index = target.decision orelse return;
+        const runner = self.agents.runnerForAgent(target.agent) orelse return;
+        const entry = runner.view.log.bySeq(target.seq) orelse return;
+        if (entry.event != .permission_request or entry.answered != null or entry.outcome != null) return;
+        const request = entry.event.permission_request;
+        if (index >= request.decisions.len) return;
+        runner.answerPermission(request.id, request.decisions[index].id) catch |err| {
+            log.warn("a permission answer was not queued: {s}", .{@errorName(err)});
+            self.setWorkspaceStatus("the answer could not be sent; answer in the terminal");
+            try self.refreshActiveUi();
+            return;
+        };
+        _ = runner.view.log.markAnswered(target.seq, index);
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+    }
+
+    /// Open a file reference from the view in a new tab at its line, exactly
+    /// as a terminal file reference opens (decision-5).
+    fn agentViewOpenRefAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const origin = invocation.origin orelse return;
+        const target = self.agentViewTarget(origin.value) orelse return;
+        const runner = self.agents.runnerForAgent(target.agent) orelse return;
+        const entry = runner.view.log.bySeq(target.seq) orelse return;
+        if (entry.event != .file_reference) return;
+        const reference = entry.event.file_reference;
+        if (!try self.openAgentFileReference(runner, reference.path, reference.line)) return;
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+    }
+
+    /// The editor tab for one agent file reference. A relative path is the
+    /// harness's, so it resolves against the agent session's tracked cwd, or
+    /// the cwd the agent was launched in. Returns false when nothing changed.
+    fn openAgentFileReference(self: *App, runner: *app_agents.Runner, reference_path: []const u8, line: ?u32) !bool {
+        var path_storage: [file_reference_path_max_bytes]u8 = undefined;
+        if (reference_path.len > path_storage.len) return false;
+        @memcpy(path_storage[0..reference_path.len], reference_path);
+        const path = path_storage[0..reference_path.len];
+        if (self.activePresentation().load != null) {
+            log.debug("agent file reference ignored while another load is in flight", .{});
+            return false;
+        }
+        if (self.remoteNotReady()) return false;
+        const source = self.activeWorkspace().sessionById(runner.session);
+        const tracked = if (source) |live| live.workingDirectory() else null;
+        const cwd = try self.allocator.dupe(u8, tracked orelse runner.cwd);
+        var cwd_owned = true;
+        defer if (cwd_owned) self.allocator.free(cwd);
+        const argv = buildFileReferenceArgv(self.allocator, path, line, cwd) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsafePath, error.PathTooLong => {
+                log.debug("agent file reference of {d} byte(s) was not opened: {s}", .{ path.len, @errorName(err) });
+                return false;
+            },
+        };
+        cwd_owned = false;
+        return self.openEditorTab(fileReferenceLabel(path), cwd, argv);
+    }
+
+    /// Search the presented view's rows instead of the terminal (TASK-57).
+    /// Literal only; regex stays a terminal feature. `reveal` scrolls to the
+    /// active match.
+    fn findAgentViewMatches(self: *App, runner: *app_agents.Runner, reveal: bool) void {
+        self.search_view = runner.agent_id;
+        self.search_progress = .complete;
+        self.search_failure = null;
+        if (self.search_query.text().len == 0) {
+            self.search_match_count = 0;
+            return;
+        }
+        if (self.search_mode == .regex) {
+            self.search_match_count = 0;
+            self.search_failure = "regex searches the terminal only";
+            return;
+        }
+        const found = agent_view.findMatches(runner.view.rows.items, self.search_query.text(), self.search_case == .sensitive, &self.agent_view_matches);
+        self.search_match_count = found.count;
+        self.search_truncated = found.truncated;
+        if (self.search_active_index >= found.count) self.search_active_index = 0;
+        if (reveal) self.revealAgentViewMatch(runner);
+    }
+
+    fn revealAgentViewMatch(self: *App, runner: *app_agents.Runner) void {
+        if (self.search_active_index >= self.search_match_count) return;
+        runner.view.reveal(self.agent_view_matches[self.search_active_index].row, self.agentViewHeight(runner));
+    }
+
     fn notificationsVisible(self: *const App) bool {
         return self.notifications_visible;
     }
@@ -8697,6 +9459,8 @@ const App = struct {
 
     fn composeSearchHighlights(self: *App) !void {
         if (!self.search_visible or self.search_match_count == 0) return;
+        // A view's matches are its own rows', registered with the view.
+        if (self.search_view != null) return;
         const rect = self.presentedCellRect() orelse return;
         const terminal = self.presentedLive().terminalConst();
         const viewport = terminal.viewport();
@@ -8763,14 +9527,14 @@ const App = struct {
         try self.ui_tree.addSurface(.{
             .id = dialog_id,
             .role = "dialog",
-            .label = "Find in scrollback",
+            .label = if (self.search_view != null) "Find in agent view" else "Find in scrollback",
             .bounds = bounds,
         }, .{
             .rect = bounds,
             .fill = .background,
             .border = if (layout.bordered) .single else .none,
             .border_style = .{ .foreground = .border, .background = .background },
-            .title = if (layout.bordered) " Find in scrollback " else null,
+            .title = if (!layout.bordered) null else if (self.search_view != null) " Find in agent view " else " Find in scrollback ",
             .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
         });
 
@@ -8880,6 +9644,8 @@ const App = struct {
         try self.ui_tree.beginFrame(self.uiGeometry());
         self.terminal_link_id_generation = (self.terminal_link_id_generation + 1) % self.terminal_link_ids.len;
         self.search_highlight_id_generation = (self.search_highlight_id_generation + 1) % self.search_highlight_ids.len;
+        self.agent_view_generation = 1 - self.agent_view_generation;
+        self.agent_view_used[self.agent_view_generation] = 0;
         self.terminal_link_target_count = 0;
         self.terminal_link_text_len = 0;
         const canvas_bounds = self.ui_canvas.bounds();
@@ -9251,6 +10017,10 @@ const App = struct {
                 .label = "",
                 .action = pane_activate_action,
             });
+            if (self.agentViewForSession(layout.session_id)) |runner| {
+                try self.composeAgentView(layout, runner, id);
+                continue;
+            }
             if (self.activeWorkspace().sessionById(layout.session_id)) |live| {
                 try self.composeTerminalLinks(
                     live.terminalConst(),
@@ -9405,7 +10175,9 @@ const App = struct {
         try self.composeSearchBar();
 
         const text = self.composition.preedit();
-        if (!self.paletteVisible() and !self.settingsVisible() and !self.search_visible and text.len != 0 and std.unicode.utf8ValidateSlice(text)) {
+        if (!self.paletteVisible() and !self.settingsVisible() and !self.search_visible and self.presentedAgentView() == null and
+            text.len != 0 and std.unicode.utf8ValidateSlice(text))
+        {
             if (self.presentedLive().terminal().cursor().position) |cursor| {
                 if (self.presentedCellRect()) |presented_rect| {
                     const presented_right = presented_rect.right();
@@ -10127,6 +10899,8 @@ const App = struct {
             },
             .consumed => {},
             .terminal => |press| {
+                if (!self.paletteVisible() and !self.search_visible and !self.contextMenuVisible() and
+                    !self.notificationsVisible() and !modal and try self.routeAgentViewKey(key)) return;
                 if (try self.routeFocusedUiKey(key, translated)) return;
                 if (self.paletteVisible() or self.search_visible or self.contextMenuVisible() or self.notificationsVisible()) return;
                 const presented = self.presentedLive();
@@ -10888,6 +11662,7 @@ const App = struct {
             log.info("copied {d} byte(s) from focused input to the clipboard", .{text.len});
             return;
         }
+        if (self.presentedAgentView()) |runner| return self.copyAgentViewSelection(runner);
         if (!self.presentedLive().terminal().hasSelection()) return;
         const copied = self.copySelectionTo(.standard) catch |err| {
             log.warn("terminal selection copy failed: {s}", .{@errorName(err)});
@@ -10917,6 +11692,9 @@ const App = struct {
             try self.refreshActiveUi();
             return;
         }
+        // The view shows no terminal to paste into; the raw terminal takes
+        // pastes once the view is toggled off.
+        if (self.presentedAgentView() != null) return;
         self.paste(.standard);
     }
 
@@ -12030,6 +12808,7 @@ const App = struct {
         self.search_needs_sync = false;
         self.search_restart_on_sync = false;
         self.search_follow_pending = false;
+        self.search_view = null;
     }
 
     fn startSearchPage(
@@ -12068,7 +12847,13 @@ const App = struct {
     fn restartSearch(self: *App) void {
         self.stopSearchEngine();
         self.search_failure = null;
-        if (!self.search_visible or self.search_query.text().len == 0) return;
+        if (!self.search_visible) return;
+        if (self.presentedAgentView()) |runner| {
+            self.search_active_index = 0;
+            self.findAgentViewMatches(runner, true);
+            return;
+        }
+        if (self.search_query.text().len == 0) return;
 
         const live = self.presentedLive();
         (switch (self.search_mode) {
@@ -12290,6 +13075,15 @@ const App = struct {
 
     fn moveSearchSelection(self: *App, next: bool) !void {
         if (!self.search_visible or self.search_match_count == 0) return;
+        if (self.search_view) |id| {
+            const count = self.search_match_count;
+            self.search_active_index = if (next) (self.search_active_index + 1) % count else (self.search_active_index + count - 1) % count;
+            if (self.agents.runnerForAgent(id)) |runner| self.revealAgentViewMatch(runner);
+            try self.composeUi();
+            if (self.ui_tree.focus(.{ .value = "search.query" })) try self.composeUi();
+            self.invalidateUi();
+            return;
+        }
         if (self.search_page_scan != null) return;
 
         if (next and self.search_active_index + 1 < self.search_match_count) {
@@ -13463,7 +14257,11 @@ const App = struct {
         const index = searchMatchSemanticIndex(origin.value) orelse return;
         if (index >= self.search_match_count) return;
         self.search_active_index = index;
-        _ = self.revealActiveSearchMatch();
+        if (self.search_view) |id| {
+            if (self.agents.runnerForAgent(id)) |runner| self.revealAgentViewMatch(runner);
+        } else {
+            _ = self.revealActiveSearchMatch();
+        }
         try self.composeUi();
         if (self.ui_tree.focus(.{ .value = "search.query" })) try self.composeUi();
         self.invalidateUi();
@@ -14676,6 +15474,8 @@ const App = struct {
             return;
         }
         if (self.paletteVisible() or self.settingsVisible() or self.search_visible) return;
+        // A view is not a terminal: text typed over it reaches nobody.
+        if (self.presentedAgentView() != null) return;
         self.presentedLive().terminal().userInput();
         queueCommittedText(&self.pending_committed_text, text);
         self.invalidateUi();
@@ -15040,6 +15840,9 @@ const App = struct {
             }
         }
         if (self.scratchpadVisible() and !self.closeModalActive()) return self.handleScratchpadUiEvent(event);
+        if (!self.closeModalActive()) {
+            if (try self.handleAgentViewUiEvent(event)) |consumed| return consumed;
+        }
         switch (event) {
             .mouse_motion => |motion| {
                 const point = devicePointerPoint(motion.x, motion.y, self.window.state.scale);
@@ -17088,7 +17891,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 74 and
+    failures += reportCheck(out, registered_actions.len == 77 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -17162,7 +17965,10 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[70].name, remote_reconnect_action) and
         std.mem.eql(u8, registered_actions[71].name, remote_disconnect_action) and
         std.mem.eql(u8, registered_actions[72].name, remote_show_connection_action) and
-        std.mem.eql(u8, registered_actions[73].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[73].name, agent_view_action) and
+        std.mem.eql(u8, registered_actions[74].name, agent_view_answer_action) and
+        std.mem.eql(u8, registered_actions[75].name, agent_view_open_ref_action) and
+        std.mem.eql(u8, registered_actions[76].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -18364,6 +19170,32 @@ fn ellipsizeToCells(buffer: []u8, text: []const u8, cells: u32) []const u8 {
         }
     }
     return text;
+}
+
+test "agent view rows paint their prefix, body and selection as separate runs" {
+    const first: agent_view.Row = .{ .kind = .message, .seq = 1, .text = "fake › hello world", .prefix_len = "fake › ".len, .prefix_tone = .assistant, .tone = .normal };
+    const continuation: agent_view.Row = .{ .kind = .message, .seq = 1, .text = "       again", .prefix_len = 7, .prefix_tone = .normal, .tone = .normal };
+    var runs: [4]ui.Run = undefined;
+    const plain = App.agentViewRuns(&first, null, 0, &runs);
+    try std.testing.expectEqual(@as(usize, 2), plain.len);
+    try std.testing.expectEqualStrings("fake › ", plain[0].text);
+    try std.testing.expectEqual(theme.Role.green, plain[0].style.foreground);
+    try std.testing.expect(plain[1].style.background == null);
+
+    // Selected from cell 9 of row 0 through cell 9 of row 1.
+    const selection: agent_view.Selection = .{ .anchor = .{ .row = 0, .col = 9 }, .caret = .{ .row = 1, .col = 9 } };
+    const head = App.agentViewRuns(&first, selection, 0, &runs);
+    try std.testing.expectEqual(@as(usize, 3), head.len);
+    try std.testing.expectEqualStrings("he", head[1].text);
+    try std.testing.expectEqualStrings("llo world", head[2].text);
+    try std.testing.expectEqual(@as(?theme.Role, .selection), head[2].style.background);
+    var more: [4]ui.Run = undefined;
+    const tail = App.agentViewRuns(&continuation, selection, 1, &more);
+    try std.testing.expectEqual(@as(usize, 3), tail.len);
+    try std.testing.expectEqual(@as(?theme.Role, .selection), tail[0].style.background);
+    try std.testing.expectEqual(@as(?theme.Role, .selection), tail[1].style.background);
+    try std.testing.expectEqualStrings("ag", tail[1].text);
+    try std.testing.expect(tail[2].style.background == null);
 }
 
 test "branch labels are ellipsized to the row's cells" {
@@ -20837,6 +21669,10 @@ const AgentWait = union(enum) {
     reloads: usize,
     active_tab: workspace.TabId,
     active_workspace: workspace.WorkspaceKey,
+    /// An element `id` whose label contains `text` (TASK-57).
+    label: struct { id: []const u8, text: []const u8 },
+    /// Some element whose id starts with `prefix` and whose label contains `text`.
+    role_label: struct { prefix: []const u8, text: []const u8 },
 };
 
 const AgentOsTrace = struct {
@@ -20861,6 +21697,8 @@ fn agentWaitMet(self: *App, trace: *const AgentOsTrace, condition: AgentWait) bo
         .reloads => |count| self.config_reload_count >= count,
         .active_tab => |id| self.activeWorkspace().activeTabId() == id,
         .active_workspace => |key| self.workspace_registry.activeKey() == key,
+        .label => |want| if (self.ui_tree.byId(.{ .value = want.id })) |element| std.mem.indexOf(u8, element.label, want.text) != null else false,
+        .role_label => |want| viewElement(self, want.prefix, want.text) != null,
     };
 }
 
@@ -21092,6 +21930,245 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     try writePngOffThread(self.allocator, io, screenshot_path, screenshot_pixels, self.size);
     out.print("agent-test: screenshot {s}\n", .{screenshot_path}) catch {};
     out.print("agent-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
+// --agent-view-test (TASK-57) --------------------------------------------------
+
+fn viewCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("agent-view-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// The first element whose id starts with `prefix` and whose label contains
+/// `text`.
+fn viewElement(self: *const App, prefix: []const u8, text: []const u8) ?*const ui.Element {
+    for (self.ui_tree.elements()) |*element| {
+        if (!std.mem.startsWith(u8, element.id.value, prefix)) continue;
+        if (std.mem.indexOf(u8, element.label, text) != null) return element;
+    }
+    return null;
+}
+
+fn viewChordKey(self: *App, io: Io, out: *Writer, codepoint: u21) !bool {
+    const mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .shift = true, .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    return postKey(self, io, out, codepoint, mods);
+}
+
+/// Exercise TASK-57 through real PTYs and SDL events: the fake agent's
+/// structured view toggled by chord and palette, scrolled by keys, both
+/// permission requests answered (keyboard, then mouse) through the runner's
+/// worker to the adapter, a file reference opened in vi at its line, a drag
+/// selection copied and pasted into the raw terminal, a search over the
+/// view's rows, and the raw terminal intact underneath.
+fn agentViewTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    var os_trace: AgentOsTrace = .{};
+    self.agents.notifier = .{ .context = &os_trace, .notify_fn = AgentOsTrace.record };
+    defer self.agents.notifier = .{ .notify_fn = App.discardOsNotification };
+    var editor_trace: EditorSpawnTrace = .{};
+    self.editor_spawn_observer = .{ .context = &editor_trace, .observe_fn = recordEditorSpawn };
+    defer self.editor_spawn_observer = .{};
+    const test_dir = self.agentTestDir() orelse return 1;
+
+    // The file the script's reference names, at the line it names.
+    var sample_buffer: [path_capacity]u8 = undefined;
+    const sample = try std.fmt.bufPrint(&sample_buffer, "{s}/{s}", .{ test_dir, app_agents.fake_view_sample_name });
+    try Dir.cwd().writeFile(io, .{ .sub_path = sample, .data = "line one\nline two\nVIEW-SAMPLE-FAILING-LINE\nline four\n" });
+
+    try self.drawFrame();
+    viewCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "AGENT-TEST-READY" }), "the first tab's real PTY peer became ready", .{});
+    viewCheck(out, &failures, try launchFakeAgentByMouse(self, io, out) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.idle" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-AGENT-READY" }), "the fake agent launched by mouse in its own tab", .{});
+    const model = self.activeWorkspace();
+    const key = self.workspace_registry.activeKey() orelse return 1;
+    const agent_tab = model.activeTabId() orelse return 1;
+    const agent_session = model.focusedPaneSessionId(agent_tab) orelse return 1;
+    const runner = self.agents.runnerForSession(key, agent_session) orelse return 1;
+
+    // One typed line releases the transcript up to the second request.
+    _ = try agentTypeLine(self, io, out, "go");
+    viewCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.waiting_permission" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-STEP 1" }), "the scripted events arrived while the raw terminal showed", .{});
+
+    // AC5 by chord: the view replaces the terminal.
+    _ = try viewChordKey(self, io, out, 'a');
+    viewCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "agent.view.1" }), "the chord showed the structured view agent.view.1", .{});
+    try self.drawFrame();
+    viewCheck(out, &failures, viewElement(self, "agent.view.1.perm.view-1.allow", "Allow once") != null and
+        viewElement(self, "agent.view.1.perm.view-1.deny", "Reject") != null and
+        viewElement(self, "agent.view.1.perm.view-2.allow", "Allow once") != null, "both pending requests show one control per harness decision", .{});
+    const pending_pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(pending_pixels);
+
+    // AC1: every event kind is terminal-styled rows.
+    const kinds = [_]struct { prefix: []const u8, text: []const u8, what: []const u8 }{
+        .{ .prefix = "agent.view.1.row.", .text = "⚙ Bash zig build test", .what = "tool use" },
+        .{ .prefix = "agent.view.1.row.", .text = "fake › One test fails", .what = "assistant message" },
+        .{ .prefix = "agent.view.1.ref.", .text = app_agents.fake_view_sample_name ++ ":3", .what = "file reference" },
+        .{ .prefix = "agent.view.1.row.", .text = "? Run: zig build test --summary all", .what = "permission title" },
+        .{ .prefix = "agent.view.1.row.", .text = "◆ subagent explore started", .what = "subagent start" },
+        .{ .prefix = "agent.view.1.row.", .text = "◇ subagent explore finished", .what = "subagent stop" },
+        .{ .prefix = "agent.view.1.row.", .text = "▪ Claude: Claude needs your permission", .what = "notification" },
+    };
+    for (kinds) |kind| viewCheck(out, &failures, viewElement(self, kind.prefix, kind.text) != null, "a {s} row: '{s}'", .{ kind.what, kind.text });
+
+    // Scrolling by keys: Home shows the first rows, End returns to the newest.
+    _ = try postNamedKey(self, io, out, .home, .{});
+    try self.drawFrame();
+    viewCheck(out, &failures, viewElement(self, "agent.view.1.row.0", "· working") != null and
+        viewElement(self, "agent.view.1.row.", "you › Run the tests") != null, "Home scrolled to the first rows (status, then the human's message)", .{});
+    _ = try postNamedKey(self, io, out, .page_down, .{});
+    _ = try postNamedKey(self, io, out, .up, .{});
+    _ = try postNamedKey(self, io, out, .end, .{});
+    try self.drawFrame();
+    viewCheck(out, &failures, self.ui_tree.byId(.{ .value = "agent.view.1.perm.view-2.deny" }) != null and
+        self.ui_tree.byId(.{ .value = "agent.view.1.row.0" }) == null, "End scrolled back to the newest rows", .{});
+
+    // Keys and text over the view never reach the hidden terminal.
+    try self.window.postTextInput("zzq");
+    _ = try pumpUntil(self, io, out, .text_input, self_test_event_budget_ms);
+    _ = try postKey(self, io, out, 'x', .{});
+
+    // AC3 by keyboard: Tab to the first request's second decision, Enter.
+    _ = try postNamedKey(self, io, out, .tab, .{});
+    _ = try postNamedKey(self, io, out, .tab, .{});
+    const focused_second = if (self.ui_tree.focusedElement()) |element| std.mem.eql(u8, element.id.value, "agent.view.1.perm.view-1.deny") else false;
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    const rejected = try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = "agent.view.1.perm.view-1.outcome", .text = "Reject: rejected" } });
+    const fake = &runner.backend.fake;
+    const keyboard_answer = fake.permissionAnswer();
+    viewCheck(out, &failures, focused_second and rejected and std.mem.eql(u8, keyboard_answer.request, "view-1") and
+        std.mem.eql(u8, keyboard_answer.decision, "deny") and self.ui_tree.byId(.{ .value = "agent.view.1.perm.view-1.deny" }) == null, "Tab, Tab, Enter answered view-1 with the harness's 'deny'; the adapter got it and the row shows the outcome without controls (focused {})", .{focused_second});
+
+    // AC3 by mouse: a click on the second request's first decision.
+    viewCheck(out, &failures, try clickTabsElement(self, io, out, "agent.view.1.perm.view-2.allow") and
+        try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = "agent.view.1.perm.view-2.outcome", .text = "Allow once: allowed" } }) and
+        std.mem.eql(u8, fake.permissionAnswer().request, "view-2") and std.mem.eql(u8, fake.permissionAnswer().decision, "allow") and
+        fake.answers == 2, "a click answered view-2 with 'allow' through the worker; two answers reached the adapter", .{});
+
+    // AC4: drag across the two rows of the first long message and copy.
+    _ = try postNamedKey(self, io, out, .home, .{});
+    try self.drawFrame();
+    const first_row = viewElement(self, "agent.view.1.row.", "fake › I will run") orelse {
+        viewCheck(out, &failures, false, "the long message's first row is visible", .{});
+        return 1;
+    };
+    var first_label_buffer: [512]u8 = undefined;
+    const first_label = try std.fmt.bufPrint(&first_label_buffer, "{s}", .{first_row.label});
+    const first_bounds = first_row.bounds;
+    var second_id_buffer: [agent_view_id_capacity]u8 = undefined;
+    const row_number = std.fmt.parseUnsigned(usize, first_row.id.value["agent.view.1.row.".len..], 10) catch 0;
+    const second_id = try std.fmt.bufPrint(&second_id_buffer, "agent.view.1.row.{d}", .{row_number + 1});
+    const second_row = self.ui_tree.byId(.{ .value = second_id }) orelse return 1;
+    var second_label_buffer: [512]u8 = undefined;
+    const second_label = std.mem.trimEnd(u8, try std.fmt.bufPrint(&second_label_buffer, "{s}", .{second_row.label}), " ");
+    const second_bounds = second_row.bounds;
+    const scale = self.window.state.scale.factor;
+    const start_x = (@as(f32, @floatFromInt(first_bounds.x)) + 1) / scale;
+    const start_y = (@as(f32, @floatFromInt(first_bounds.y)) + @as(f32, @floatFromInt(first_bounds.height)) / 2) / scale;
+    const end_x = (@as(f32, @floatFromInt(second_bounds.x + @as(i32, @intCast(second_bounds.width)))) - 1) / scale;
+    const end_y = (@as(f32, @floatFromInt(second_bounds.y)) + @as(f32, @floatFromInt(second_bounds.height)) / 2) / scale;
+    const dragged = try postButton(self, io, out, .{ .button = .left, .action = .press, .x = start_x, .y = start_y }) and
+        try postMotion(self, io, out, .{ .buttons = .{ .left = true }, .x = end_x, .y = end_y }) and
+        try postButton(self, io, out, .{ .button = .left, .action = .release, .x = end_x, .y = end_y });
+    _ = try viewChordKey(self, io, out, 'c');
+    const copied = clipboardNow(self) catch try self.allocator.dupe(u8, "");
+    defer self.allocator.free(copied);
+    var expected_buffer: [1024]u8 = undefined;
+    const expected_copy = try std.fmt.bufPrint(&expected_buffer, "{s}\n{s}", .{ first_label, second_label });
+    viewCheck(out, &failures, dragged and std.mem.eql(u8, copied, expected_copy), "a drag over two rows copied them newline-joined ({d} byte(s))", .{copied.len});
+    try self.drawFrame();
+    const selection_pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(selection_pixels);
+
+    // AC4 by keyboard: Shift+Down from the top row selects the human's whole
+    // message row; one line, so it can be pasted without a confirmation.
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try postNamedKey(self, io, out, .home, .{});
+    _ = try postNamedKey(self, io, out, .down, .{});
+    _ = try postNamedKey(self, io, out, .down, .{});
+    _ = try postNamedKey(self, io, out, .down, .{ .shift = true });
+    _ = try viewChordKey(self, io, out, 'c');
+    const line_copied = clipboardNow(self) catch try self.allocator.dupe(u8, "");
+    defer self.allocator.free(line_copied);
+    viewCheck(out, &failures, std.mem.eql(u8, line_copied, "you › Run the tests and fix whatever fails."), "Shift+Down selected one row and the copy chord copied '{s}'", .{line_copied});
+
+    // Search the view's rows: highlight, navigate, close.
+    _ = try viewChordKey(self, io, out, 'f');
+    const search_open = try waitForAgent(self, io, out, &os_trace, .{ .element = "search.dialog" });
+    try self.window.postTextInput("test");
+    _ = try pumpUntil(self, io, out, .text_input, self_test_event_budget_ms);
+    try self.drawFrame();
+    const first_match = viewElement(self, "search.match.", "Search match");
+    const first_status = std.mem.indexOf(u8, (self.ui_tree.byId(.{ .value = "search.status" }) orelse return 1).label, "1/") != null;
+    viewCheck(out, &failures, search_open and first_match != null and first_status and self.search_view != null and
+        self.search_match_count >= 3, "search over the view found {d} highlighted matches of 'test', the first active", .{self.search_match_count});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    try self.drawFrame();
+    const second_status = std.mem.indexOf(u8, (self.ui_tree.byId(.{ .value = "search.status" }) orelse return 1).label, "2/") != null;
+    viewCheck(out, &failures, second_status and self.search_active_index == 1, "Enter moved to the next match", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    viewCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element_absent = "search.dialog" }) and
+        self.ui_tree.byId(.{ .value = "agent.view.1" }) != null, "Escape closed the search and the view stayed", .{});
+
+    // AC2: a click on the file reference opens vi at its line in a new tab.
+    const reference = viewElement(self, "agent.view.1.ref.", app_agents.fake_view_sample_name) orelse return 1;
+    var reference_id_buffer: [agent_view_id_capacity]u8 = undefined;
+    const reference_id = try std.fmt.bufPrint(&reference_id_buffer, "{s}", .{reference.id.value});
+    var expected_argv_buffer: [path_capacity + 32]u8 = undefined;
+    const expected_argv = try std.fmt.bufPrint(&expected_argv_buffer, "vi +{d} -- {s}", .{ app_agents.fake_view_sample_line, sample });
+    viewCheck(out, &failures, try clickTabsElement(self, io, out, reference_id) and editor_trace.calls == 1 and
+        std.mem.eql(u8, editor_trace.argv(), expected_argv), "a click on the reference spawned '{s}'", .{editor_trace.argv()});
+    viewCheck(out, &failures, model.activeTabId() != agent_tab and
+        try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "VIEW-SAMPLE-FAILING-LINE" }), "the new tab drew the file in vi", .{});
+
+    // Back to the agent: its view is still shown.
+    var tab_id_buffer: [workspace_semantic_capacity]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, try tabSemanticId(&tab_id_buffer, key, agent_tab));
+    viewCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .active_tab = agent_tab }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "agent.view.1" }), "the agent's tab still shows its view", .{});
+
+    // AC5 by palette: back to the raw terminal, intact, with none of the
+    // keys typed over the view.
+    _ = try runPaletteCommandByKeyboard(self, io, out, "Agent: toggle view");
+    viewCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element_absent = "agent.view.1" }) and
+        self.activeLive().terminal().visibleTextContains("FAKE-STEP 1") and
+        self.activeLive().terminal().visibleTextContains("FAKE-AGENT-READY") and
+        !self.activeLive().terminal().visibleTextContains("zzq") and
+        !self.activeLive().terminal().visibleTextContains("FAKE-STEP 2"), "the palette toggled back to the raw terminal, intact and untouched by view keys", .{});
+
+    // The copied row pastes into the raw terminal; Enter makes it a line
+    // the fake reads, which releases the end of the turn.
+    _ = try viewChordKey(self, io, out, 'v');
+    const pasted = try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "Run the tests and fix whatever fails." });
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    viewCheck(out, &failures, pasted and try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-STEP 2" }), "the copied row arrived in the raw terminal by the paste chord", .{});
+
+    // The view follows new events at the bottom.
+    _ = try viewChordKey(self, io, out, 'a');
+    viewCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = "agent.view.1", .text = "" } }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .role_label = .{ .prefix = "agent.view.1.row.", .text = "fake › All tests pass now." } }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .role_label = .{ .prefix = "agent.view.1.row.", .text = "· done" } }), "the view showed the end of the turn as it arrived", .{});
+    _ = try viewChordKey(self, io, out, 'a');
+    viewCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element_absent = "agent.view.1" }), "the chord toggled back to the raw terminal", .{});
+
+    var screenshot_path_buffer: [path_capacity]u8 = undefined;
+    var id_buffer: [path_capacity]u8 = undefined;
+    const run_id = try generateRunId(io, &id_buffer);
+    const screenshot_path = try std.fmt.bufPrint(&screenshot_path_buffer, "{s}{c}agent-view-test-{s}.png", .{ fallback_log_dir, std.fs.path.sep, run_id });
+    try writePngOffThread(self.allocator, io, screenshot_path, pending_pixels, self.size);
+    var selection_path_buffer: [path_capacity]u8 = undefined;
+    const selection_path = try std.fmt.bufPrint(&selection_path_buffer, "{s}{c}agent-view-test-{s}-selection.png", .{ fallback_log_dir, std.fs.path.sep, run_id });
+    try writePngOffThread(self.allocator, io, selection_path, selection_pixels, self.size);
+    out.print("agent-view-test: screenshot {s}\n", .{screenshot_path}) catch {};
+    out.print("agent-view-test: screenshot {s}\n", .{selection_path}) catch {};
+    out.print("agent-view-test: {d} failure(s)\n", .{failures}) catch {};
     out.flush() catch {};
     return if (failures == 0) 0 else 1;
 }
@@ -23370,6 +24447,9 @@ const usage =
     \\  --agent-test                       drive a scripted fake agent: live sidebar glyphs,
     \\                                    the notification list by chord, palette and
     \\                                    mouse, settings switches and OSC 777, then exit
+    \\  --agent-view-test                  drive the fake agent's structured view: rows,
+    \\                                    scrolling, permission answers by keyboard and
+    \\                                    mouse, a file reference, copy and search
     \\  --ssh-test                         drive SSH workspaces against a throwaway sshd
     \\                                    container: connect, prompts, remote panes and
     \\                                    scratchpad, loss and reconnect, then exit
@@ -23695,6 +24775,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try settingsTest(app, init.io, out);
     } else if (options.run.git_test) {
         check_status = try gitTest(app, init.io, out);
+    } else if (options.run.agent_view_test) {
+        check_status = try agentViewTest(app, init.io, out);
     } else if (options.run.agent_test) {
         check_status = try agentTest(app, init.io, out);
     } else if (options.run.ssh_test) {

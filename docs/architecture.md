@@ -369,6 +369,42 @@ nothing else is a legal dependency.
   permissions), `runnerForSession(...).adapter()` (respond, send input — from that runner's
   worker), `createRunner` + `register` + the `Load.agent_runner` spawn path, `observe`,
   `notifications`, `selected_agent`, `displayName`, `workspaceState`.
+- **Agent view (TASK-57).** `src/agent_view.zig` (a file of `app`) is the view's model, with no
+  semantic-tree code: `EventLog` (per agent, at most 4,096 entries and 4 MiB of copied text, the
+  oldest dropped and counted; a `permission_resolved` settles its logged request instead of
+  adding an entry; `markAnswered` records the human's choice), `Rows` (terminal-styled rows
+  rebuilt from the log only when its generation or the pane width changed, in an arena reset per
+  rebuild: speaker prefixes, wrapped message bodies — the one place UI text wraps, because a
+  transcript is content — tool uses, `↳ path:line` references left-ellipsized to one row,
+  permission titles, choice rows with each decision's cell span, outcome rows, dim
+  subagent/notification/status/exit lines), `Selection` over (row, cell) positions,
+  `findMatches` (literal, per row, bounded) and `View` (active flag, `top`, `follow`,
+  `selection`, `selectionText`). Each `app_agents.Runner` owns a `view: agent_view.View`;
+  `Runtime.applyAndAnnounce` appends every event it applies (a state change only when it changed
+  the state) to that runner's log on the owner thread, so nothing is re-read from an adapter.
+  Answers: `Runner.answerPermission(request_id, decision_id)` queues into a bounded (8),
+  mutex-guarded request ring that the runner's worker drains in `pollOnce` before polling, so the
+  adapter keeps one caller; `runnerForAgent(id)` finds a runner by agent. In `main.zig`,
+  `agent.view` (Ctrl+Shift+A / Cmd+Shift+A, an app default like the notifications chord, and
+  palette "Agent: toggle view") flips the presented agent's `view.active`; `composeUiTree` then
+  registers, in place of that pane's terminal links, an opaque `Surface` `agent.view.<agent id>`
+  over the pane and one element per visible row: `Text` `agent.view.<a>.row.<n>`,
+  `InteractiveText` `agent.view.<a>.ref.<seq>` (action `agent.view.open-ref`), per-decision
+  `InteractiveText` `agent.view.<a>.perm.<request>.<decision>` (action `agent.view.answer`; only
+  when the adapter has `respond_permission`) and `Text` `agent.view.<a>.perm.<request>.outcome`.
+  Element ids and their targets (agent, log seq, decision index) live in a two-generation buffer so
+  focus survives recomposition; actions resolve their origin id through it, never through
+  transcript text. The selection is painted as `selection`-background runs inside each row's
+  `Text` (no new primitive or decoration role); search over a view registers the same
+  `search.match.<n>.<row>` decorations as terminal search. `handleAgentViewUiEvent` owns pointer
+  events over a view (control presses go through the tree's press/release activation; other
+  presses start a drag selection; the wheel scrolls; text input is swallowed), and
+  `routeAgentViewKey` takes unbound keys (scroll, Shift+arrow selection, Tab/Left/Right focus,
+  Enter, Escape) while forwarding Ctrl+C without a view selection to the terminal (invariant 8).
+  `clipboard.copy` copies the view selection; `search.open` searches the view's rows. The
+  terminal keeps rendering and running beneath the surface. API for TASK-58/59:
+  `runner.view.active`/`log`/`rows`, `Runner.answerPermission`, `Runtime.runnerForAgent`, and the
+  `agent.view` action.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
@@ -387,7 +423,7 @@ nothing else is a legal dependency.
   editor tabs), TASK-36 (bounded literal and regex search UI); M4 — TASK-40 (font settings,
   commands and family picker), TASK-41 (settings view and keybinding editor); TASK-76 (git branch
   rows and the secondary small face), TASK-77 (sidebar workspace gap); M6 — TASK-56 (agent runtime,
-  sidebar glyphs and notifications).
+  sidebar glyphs and notifications), TASK-57 (the structured agent view).
 
 ### `platform`
 
@@ -565,6 +601,11 @@ nothing else is a legal dependency.
   test driver's `inspect` JSON and accessibility all read the same shifted geometry, and
   `Tree.render` stamps the same shift on every canvas cell the element paints. Pixels a shift
   uncovers belong to no element.
+- **Selections over composed text are runs.** A product view that lets the human select its
+  text (TASK-57's agent view) splits each row's `Text` into runs at the selection's cells and
+  gives the selected run the `selection` background; `ui` needs no selection primitive or
+  decoration role for it. The `Tree`'s copied-run capacity is the caller's (`main.zig` sizes it
+  for four runs per agent-view row).
 - **Lands** M2 — TASK-18 (primitives), TASK-19 (tree, hit testing, hover, focus); M3 — TASK-28
   (semantic selected state used by the first composed workspace view); TASK-76 (small text),
   TASK-77 (sub-cell element offsets).
@@ -1070,7 +1111,9 @@ nothing else is a legal dependency.
     OSC 133 command start and prompt, human input, quiet ticks, child exit) to heuristic
     `status_change`, `notification` and `exited` events. Pure; the caller supplies timestamps.
   - `fake.zig`: `FakeAdapter`, a scripted implementation of every method used by the unit tests
-    and available to later fake-adapter E2E scenarios.
+    and available to later fake-adapter E2E scenarios. With `resolve_on_answer` (TASK-57) it
+    answers each `respondPermission` with a `permission_resolved` on its next poll (rejected for
+    a `reject` decision, allowed otherwise), as a real harness reports an answer's outcome.
   - `opencode.zig` (TASK-78): `OpenCodeAdapter`, OpenCode's structured side channel through the
     HTTP server its TUI starts when given `--port`. `launch` describes
     `opencode --port P --hostname 127.0.0.1 [--prompt …]` (or `opencode serve …` headless) with
@@ -1908,14 +1951,14 @@ Which level proves what, by concern:
 
 Rules that apply to all levels:
 
-- The twenty-four verified Linux headless app checks are `--grid-test`, `--self-test`,
+- The twenty-five verified Linux headless app checks are `--grid-test`, `--self-test`,
   `--scroll-test`, `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`,
   `--sidebar-test`, `--tabs-test`, `--panes-test`, `--palette-test`, `--scratchpad-test`,
   `--workspaces-test`, `--links-test`, `--search-test`, `--menu-test`, `--config-test`,
-  `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test` and
-  `--driver-test`; the scripted `zig build e2e` runner has fifteen scenarios, the latest being
-  `font-coverage`, `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch` and
-  `agent-notifications`. Real-window checks use
+  `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`,
+  `--agent-view-test`, `--ssh-test` and `--driver-test`; the scripted `zig build e2e` runner has
+  sixteen scenarios, the latest being `font-coverage`, `theme-picker`, `font-picker`,
+  `settings-view`, `sidebar-branch`, `agent-notifications` and `agent-view`. Real-window checks use
   Xvfb locally; `--clipboard-test` deliberately uses SDL's offscreen driver.
   TASK-28's `--sidebar-test` uses the production sidebar and real SDL events to switch provisioned
   tabs by click and through an independently entered keyboard focus path, hide and reveal the
