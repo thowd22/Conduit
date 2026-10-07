@@ -361,9 +361,15 @@ pub const ExecutionContext = struct {
     }
 };
 
-/// The local execution implementation. This is deliberately the only
-/// production call to `pty.spawn` in this module; every workspace caller sees
-/// only `ExecutionContext.Ref.spawn`. Its file and command capabilities act on
+/// The SSH execution context (TASK-43, decision-8): `ssh.SshContext.create`
+/// builds an owned `ExecutionContext` of kind `.ssh` whose processes ride one
+/// OpenSSH ControlMaster connection.
+pub const ssh = @import("ssh.zig");
+
+/// The local execution implementation. With the SSH context's spawns of the
+/// local `ssh` client (`ssh.zig`), this is deliberately the only production
+/// call to `pty.spawn` in this module; every workspace caller sees only
+/// `ExecutionContext.Ref.spawn`. Its file and command capabilities act on
 /// this machine and keep no state in the context, so they are safe from any
 /// thread. `run` children inherit Conduit's process environment, like every
 /// Local child (TASK-73).
@@ -473,78 +479,88 @@ pub const LocalExecutionContext = struct {
     }
 
     fn run(_: *anyopaque, allocator: Allocator, io: std.Io, request: RunRequest) RunError!RunResult {
-        if (request.argv.len == 0) return error.InvalidRequest;
-        if (request.stdin) |bytes| {
-            if (bytes.len > RunRequest.max_stdin) return error.InvalidRequest;
-        }
-        var child = std.process.spawn(io, .{
-            .argv = request.argv,
-            .cwd = .{ .path = request.cwd },
-            .stdin = if (request.stdin != null) .pipe else .ignore,
-            .stdout = .pipe,
-            .stderr = .pipe,
-        }) catch |err| return switch (err) {
-            error.FileNotFound => error.CommandNotFound,
-            error.AccessDenied, error.PermissionDenied => error.AccessDenied,
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.SpawnFailed,
-        };
-        // Kills and reaps a child that is still running on every early return;
-        // after `wait` it does nothing.
-        defer child.kill(io);
-
-        if (request.stdin) |bytes| {
-            if (child.stdin) |stdin| {
-                // A child that exits without reading closes the pipe; its exit status, not
-                // this write, is the outcome the caller is told about.
-                stdin.writeStreamingAll(io, bytes) catch |err|
-                    log.debug("run: stdin not fully delivered: {s}", .{@errorName(err)});
-                stdin.close(io);
-                child.stdin = null;
-            }
-        }
-
-        const timeout = (std.Io.Timeout{ .duration = .{
-            .raw = .fromMilliseconds(request.timeout_ms),
-            .clock = .awake,
-        } }).toDeadline(io);
-
-        var streams_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
-        var multi_reader: std.Io.File.MultiReader = undefined;
-        multi_reader.init(allocator, io, streams_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
-        defer multi_reader.deinit();
-        const stdout_reader = multi_reader.reader(0);
-        const stderr_reader = multi_reader.reader(1);
-
-        while (multi_reader.fill(64, timeout)) |_| {
-            if (stdout_reader.buffered().len > request.max_output or
-                stderr_reader.buffered().len > request.max_output)
-            {
-                return error.OutputTooLarge;
-            }
-        } else |err| switch (err) {
-            error.EndOfStream => {},
-            error.Timeout => return error.Timeout,
-            else => return error.Unavailable,
-        }
-        multi_reader.checkAnyError() catch return error.Unavailable;
-
-        const term_status = child.wait(io) catch return error.Unavailable;
-        const stdout = multi_reader.toOwnedSlice(0) catch return error.OutOfMemory;
-        errdefer allocator.free(stdout);
-        const stderr = multi_reader.toOwnedSlice(1) catch return error.OutOfMemory;
-        return switch (term_status) {
-            .exited => |code| .{ .exit_code = code, .stdout = stdout, .stderr = stderr },
-            .signal, .stopped => |sig| .{
-                .exit_code = null,
-                .signal = @intCast(@intFromEnum(sig)),
-                .stdout = stdout,
-                .stderr = stderr,
-            },
-            .unknown => .{ .exit_code = null, .stdout = stdout, .stderr = stderr },
-        };
+        return runLocalProcess(allocator, io, request);
     }
 };
+
+/// Run one bounded command on this machine over pipes: the Local context's
+/// `run`, shared with contexts whose transport is itself a local program (the
+/// SSH context runs `ssh` through it). The child inherits Conduit's process
+/// environment (TASK-73); an empty `request.cwd` means Conduit's own working
+/// directory. Blocks until the child exits or the timeout kills it, so it is
+/// for worker threads only.
+pub fn runLocalProcess(allocator: Allocator, io: std.Io, request: RunRequest) RunError!RunResult {
+    if (request.argv.len == 0) return error.InvalidRequest;
+    if (request.stdin) |bytes| {
+        if (bytes.len > RunRequest.max_stdin) return error.InvalidRequest;
+    }
+    var child = std.process.spawn(io, .{
+        .argv = request.argv,
+        .cwd = if (request.cwd.len == 0) .inherit else .{ .path = request.cwd },
+        .stdin = if (request.stdin != null) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| return switch (err) {
+        error.FileNotFound => error.CommandNotFound,
+        error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.SpawnFailed,
+    };
+    // Kills and reaps a child that is still running on every early return;
+    // after `wait` it does nothing.
+    defer child.kill(io);
+
+    if (request.stdin) |bytes| {
+        if (child.stdin) |stdin| {
+            // A child that exits without reading closes the pipe; its exit status, not
+            // this write, is the outcome the caller is told about.
+            stdin.writeStreamingAll(io, bytes) catch |err|
+                log.debug("run: stdin not fully delivered: {s}", .{@errorName(err)});
+            stdin.close(io);
+            child.stdin = null;
+        }
+    }
+
+    const timeout = (std.Io.Timeout{ .duration = .{
+        .raw = .fromMilliseconds(request.timeout_ms),
+        .clock = .awake,
+    } }).toDeadline(io);
+
+    var streams_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, streams_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    while (multi_reader.fill(64, timeout)) |_| {
+        if (stdout_reader.buffered().len > request.max_output or
+            stderr_reader.buffered().len > request.max_output)
+        {
+            return error.OutputTooLarge;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        error.Timeout => return error.Timeout,
+        else => return error.Unavailable,
+    }
+    multi_reader.checkAnyError() catch return error.Unavailable;
+
+    const term_status = child.wait(io) catch return error.Unavailable;
+    const stdout = multi_reader.toOwnedSlice(0) catch return error.OutOfMemory;
+    errdefer allocator.free(stdout);
+    const stderr = multi_reader.toOwnedSlice(1) catch return error.OutOfMemory;
+    return switch (term_status) {
+        .exited => |code| .{ .exit_code = code, .stdout = stdout, .stderr = stderr },
+        .signal, .stopped => |sig| .{
+            .exit_code = null,
+            .signal = @intCast(@intFromEnum(sig)),
+            .stdout = stdout,
+            .stderr = stderr,
+        },
+        .unknown => .{ .exit_code = null, .stdout = stdout, .stderr = stderr },
+    };
+}
 
 /// How often a polling watch re-scans its directory. The Linux watch also
 /// uses it while the directory does not exist yet.
@@ -4918,4 +4934,9 @@ test "the local context runs a bounded command and reports its exit, output and 
         .argv = &.{},
         .cwd = "/",
     }));
+}
+
+test {
+    // The SSH context's unit and sshd-container integration tests.
+    _ = ssh;
 }

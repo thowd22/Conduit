@@ -601,6 +601,74 @@ nothing else is a legal dependency.
   `run` keep no mutable context state and may run on any thread holding a `Ref`; they block on
   IO, so for a remote context they stay off the render thread, and `run` waits for its child
   and belongs on a worker everywhere. A handle belongs to the thread that created it.
+- **SSH context (TASK-43 part one, decision-8).** `workspace.ssh` (`src/ssh.zig`, inside the
+  `workspace` module) implements the SSH `ExecutionContext` (`kind() == .ssh`) as "a Local spawn
+  of the system `ssh`": no SSH library, and Conduit never handles a credential.
+  `SshContext.create(allocator, io, Options)` copies a `Target` (`destination` alias or
+  `[user@]host`, optional `port`, optional `config_file` for `-F`, extra `-o Key=Value`
+  `options`, `shell_integration = .off | .auto`) and `local_env`, prepares the control directory
+  and starts nothing; `SshContext.fromContext`/`fromRef` recover it from an owned or borrowed
+  context. `connect(size)` starts the master
+  `ssh -M -N -o ControlMaster=yes -o ControlPersist=no -o ControlPath=<dir>/m<pid>-<n>
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 … -- <destination>` through `pty.spawn` in
+  a PTY the context owns; `masterTerminal()` is a non-owning `pty.Pty` view of it for the owner to
+  present as the connection session, where OpenSSH's host-key, passphrase, password and 2FA
+  prompts appear verbatim. Conduit's lifecycle options precede `-F`, `-p` and the target options
+  on every command line (OpenSSH keeps the first value), the master never gets `-v`, and Conduit
+  never sets `StrictHostKeyChecking` or `UserKnownHostsFile`. Without `config_file` the user's
+  `~/.ssh/config` decides everything else (aliases, `ProxyJump`, identities). The state machine
+  (`State`: `disconnected`, `connecting`, `connected`, `lost`, `failed`) is advanced by the
+  owner's non-blocking `poll()`: `connected` once the master's control socket accepts a
+  connection (OpenSSH binds it only after authentication), `failed` if the master exits first,
+  `lost` if it exits or a worker finds it gone (an exec's 255 with no live socket, or
+  `checkMaster()`'s `ssh -O check`) without Conduit hanging it up, `disconnected` after
+  `disconnect()` (`ssh -O exit`, then SIGHUP). Hang-up and loss both exit 255; `sessionEnd`
+  classifies a session client's end from that plus "Conduit hung it up" and "master alive".
+  `reconnect()` starts a new master at the master terminal's last size in the same view; the
+  owner respawns sessions once `connected`. A worker that detects loss sets an atomic flag and
+  calls `Options.wake`; the owner applies it at its next `poll`.
+  - **Sessions.** `spawn` refuses with `error.Closed` unless `connected` (a client with no master
+    silently opens a second, separately authenticated connection) and runs
+    `ssh -tt -o ControlMaster=no -o ControlPath=…`. The request is read context-neutrally:
+    `argv` is the remote program (empty: the remote login shell `"${SHELL:-/bin/sh}" -l`), `cwd` a
+    remote directory (empty: the remote home; `cd` failure falls back to home), `env` the remote
+    overlay, and `size` the local PTY, whose resizes the client forwards. The local client gets
+    `Options.local_env` (Conduit's inherited environment, so `SSH_AUTH_SOCK`, `SSH_ASKPASS`,
+    `DISPLAY` and `KRB5CCNAME` reach it); `pty.SpawnRequest` gained no field. Overlay variables
+    that describe this machine (`PATH`, `HOME`, `SHELL`, `USER`, `TMPDIR`, `DISPLAY`, `XDG_*`,
+    `SSH_*`, the local shell-integration handshake) or have invalid names never cross.
+  - **Quoting.** Every value is single-quoted with `'\''` escaping into one `/bin/sh` script, and
+    the script crosses the remote login shell as `exec /bin/sh -c 'eval "$(printf %b "…")"'` with
+    every byte outside `[A-Za-z0-9 _./:=,+@-]` octal-escaped, because fish treats `\\`/`\'`
+    inside single quotes as escapes and csh-family shells cannot carry a newline in quotes. The
+    round trip is unit-tested through sh, dash, bash and zsh and was checked once in a container
+    through fish and tcsh. NUL is refused.
+  - **Exec channels.** `readFile`, `listDir`, `statPath` and `run` run
+    `ssh -T -o BatchMode=yes -o ControlMaster=no -o ControlPath=…` over pipes through
+    `workspace.runLocalProcess` (the Local `run`, now shared; an empty `RunRequest.cwd` keeps
+    Conduit's own directory), refuse with `Unavailable` unless `connected`, and use small POSIX-sh
+    helpers: `head -c <max+1>` for reads, NUL-terminated kind+name records without GNU
+    `find -printf` for listings, and GNU `stat -c` with a BSD `stat -f` fallback for metadata.
+    Helper exit codes 64 to 67 map to `NotFound`, `IsADirectory`, `AccessDenied` and
+    `NotADirectory`. `run` reports a missing remote cwd or program as `CommandNotFound`, as Local
+    does. `watch` keeps one long-lived exec channel whose remote loop fingerprints the directory
+    (`ls -lan` with full timestamps, `cksum`) every `watch_interval_s` (2 s) and streams `c`/`h`
+    lines; `watch` blocks until the loop's baseline exists, `pollChanges` reads without blocking,
+    and an ended channel reports a change and restarts at most every 2 s while connected.
+  - **Control directory.** `$XDG_RUNTIME_DIR/conduit/ssh` (from `Options.runtime_dir`), else
+    `/tmp/conduit-<uid>/ssh`. Each level Conduit names is created 0700 and `lstat`-checked: a real
+    directory, owned by the effective uid, mode exactly 0700, never a symlink. Socket names are
+    `m<pid>-<serial>` (no hostnames or users), and the path must leave room in `sun_path` for
+    OpenSSH's 17-byte temporary bind suffix.
+  - **Not yet.** Remote shell integration (`.auto` behaves as `.off`: no remote OSC 7 or prompt
+    marks) and the connection session kind, sidebar state and `--ssh-test` (part two). On macOS
+    (the same design, but its control-directory checks are not written) and Windows (no
+    ControlMaster) `create` reports `error.Unsupported`. Threads: the master PTY, `connect`, `poll`,
+    `disconnect`, `reconnect`, `masterTerminal` and destruction are owner-thread only; `spawn`,
+    the file capabilities, `run` and `checkMaster` block on a local `ssh` and belong on workers.
+    The sshd-container integration test (`test/fixtures/ssh/Dockerfile`, skipped without Docker)
+    proves one authentication for two shells, exec channels and a watch, loss detection and
+    reconnect.
 - **Spawn boundary.** `ExecutionContext` owns and destroys its erased implementation. A worker may
   borrow an `ExecutionContext.Ref` and return the PTY for owner-thread `attachChild`. For a new
   tab, `app` snapshots and owns a copy of the invoking session's current validated OSC 7 cwd before
