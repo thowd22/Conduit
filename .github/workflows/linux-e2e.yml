@@ -52,8 +52,8 @@ jobs:
             sway \
             jq \
             xclip \
-            desktop-file-utils \
-            librsvg2-bin
+            x11-utils \
+            desktop-file-utils
 
       - name: Resolve the pinned Zig version
         shell: bash
@@ -191,6 +191,12 @@ jobs:
         run: |
           xvfb-run -a --server-args="-screen 0 1280x800x24" \
             bash .github/scripts/check-x11-keyboard.sh "$ARTIFACT_ROOT/platform/x11-keyboard"
+
+      - name: X11 window icon check
+        shell: bash
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            bash .github/scripts/check-x11-window-icon.sh "$ARTIFACT_ROOT/platform/x11-window-icon"
 
       - name: Real IBus Hangul input check
         shell: bash

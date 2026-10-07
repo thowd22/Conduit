@@ -3,7 +3,7 @@
 //! **Owns** window creation, the GL context, the HiDPI scale, event translation and clipboard
 //! access (TASK-15). **Never** contains product logic, layout or workspace behaviour, and never
 //! lets an OS handle escape above this file.
-//! **May depend on** `std` and the SDL3 seam only.
+//! **May depend on** `std`, the SDL3 seam and the embedded window-icon pixels only.
 //!
 //! TASK-7 owns what is here now: a real window with a real GL context, a hidden-but-real mode
 //! (doc-2: headless is a peer of the on-screen path, never a second renderer), and the
@@ -23,6 +23,7 @@
 const std = @import("std");
 const sdl = @import("sdl");
 const builtin = @import("builtin");
+const window_icon = @import("window-icon");
 
 /// The log scope for platform failures. Every line platform logs goes through a scope and never
 /// straight to a stream.
@@ -57,6 +58,38 @@ pub fn lastError(buffer: []u8) []const u8 {
     const kept = @min(text.len, buffer.len);
     @memcpy(buffer[0..kept], text[0..kept]);
     return buffer[0..kept];
+}
+
+// ---------------------------------------------------------------------------
+// Window icon
+// ---------------------------------------------------------------------------
+
+/// The window icon's edge length in pixels. The embedded fixture is exactly this square in RGBA8.
+pub const window_icon_size: usize = 64;
+
+/// Give the window Conduit's icon, so a task switcher shows it even where no desktop entry is
+/// installed (on X11, SDL publishes it as `_NET_WM_ICON`). An icon is cosmetic: a refusal is
+/// logged and the window carries on without one.
+fn setWindowIcon(handle: *sdl.SDL_Window) void {
+    // SDL's signature takes mutable pixels, but a surface made from caller memory is only read
+    // here: `SDL_SetWindowIcon` converts and copies it, and the surface is destroyed before
+    // returning, so the embedded constant is never written.
+    const surface = sdl.SDL_CreateSurfaceFrom(
+        @as(c_int, @intCast(window_icon_size)),
+        @as(c_int, @intCast(window_icon_size)),
+        sdl.SDL_PIXELFORMAT_RGBA32,
+        @constCast(window_icon.rgba.ptr),
+        @as(c_int, @intCast(window_icon_size * 4)),
+    ) orelse {
+        var buffer: [256]u8 = undefined;
+        log.warn("window icon surface could not be created: {s}", .{lastError(&buffer)});
+        return;
+    };
+    defer sdl.SDL_DestroySurface(surface);
+    if (!sdl.SDL_SetWindowIcon(handle, surface)) {
+        var buffer: [256]u8 = undefined;
+        log.warn("SDL_SetWindowIcon failed: {s}", .{lastError(&buffer)});
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,6 +1544,7 @@ pub const Window = struct {
             return error.WindowCreationFailed;
         };
         errdefer sdl.SDL_DestroyWindow(handle);
+        setWindowIcon(handle);
 
         const context = sdl.SDL_GL_CreateContext(handle) orelse {
             var buffer: [256]u8 = undefined;
@@ -3139,6 +3173,20 @@ const TestHintSetter = struct {
         return false;
     }
 };
+
+test "the embedded window icon is a 64x64 RGBA8 image with real transparency" {
+    try testing.expectEqual(window_icon_size * window_icon_size * 4, window_icon.rgba.len);
+    var transparent = false;
+    var opaque_pixel = false;
+    var index: usize = 3;
+    while (index < window_icon.rgba.len) : (index += 4) {
+        if (window_icon.rgba[index] != 255) transparent = true;
+        if (window_icon.rgba[index] != 0) opaque_pixel = true;
+    }
+    // Neither all-clear nor all-solid: the artwork survived, and so did its alpha channel.
+    try testing.expect(transparent);
+    try testing.expect(opaque_pixel);
+}
 
 test "application metadata forwards caller-owned identity without initializing SDL" {
     const metadata: AppMetadata = .{

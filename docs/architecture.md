@@ -62,7 +62,7 @@ Conduit/
 │   └── conduit_test.zig external conduit-test executable composition root
 ├── assets/              files embedded into the binary by build.zig, with their licences
 │   ├── fonts/           bundled JetBrains Mono fallback face (OFL)
-│   ├── linux/           freedesktop desktop entry and scalable application icon
+│   ├── linux/           freedesktop desktop entry, hicolor PNG icons and the window-icon pixels
 │   ├── shell-integration/  Conduit's own bash, zsh, fish scripts (OSC 7 / OSC 133), injected per shell
 │   └── THIRD-PARTY-LICENSES/  FreeType and HarfBuzz notices
 ├── docs/                this file and reports that belong to the repo, not a task
@@ -216,6 +216,9 @@ nothing else is a legal dependency.
   and font-discovery backends own
   their narrow OS calls, as architecture invariant 10 permits. SDL3 arrives through the
   `castholm/SDL` build package plus a thin `@cImport`/extern seam Conduit owns (decision-2).
+  Every new window gets Conduit's icon through `SDL_SetWindowIcon` from an embedded 64x64 RGBA8
+  fixture (`assets/linux/io.github.thowd22.Conduit-64.rgba`), which X11 task switchers read as
+  `_NET_WM_ICON`; a refusal is logged at warn and never fails window creation.
 - **Never** contain product logic, layout or workspace behaviour; let an SDL handle escape above
   the seam; place an OS conditional in a shared module (P12, invariant 10 — the only permitted
   OS conditionals are *selecting* a backend).
@@ -1008,9 +1011,9 @@ The implemented window, rendering and capture contract is:
 - Linux desktop identity is set before window creation, and runtime logs report the selected
   backend and pixel density. `build.zig` validates and installs
   `assets/linux/io.github.thowd22.Conduit.desktop` and
-  `assets/linux/io.github.thowd22.Conduit.svg` as
+  the PNG renders under `assets/linux/icons/hicolor/` as
   `share/applications/io.github.thowd22.Conduit.desktop` and
-  `share/icons/hicolor/scalable/apps/io.github.thowd22.Conduit.svg`. A clean isolated
+  `share/icons/hicolor/<N>x<N>/apps/io.github.thowd22.Conduit.png` (16 through 512). A clean isolated
   `zig build --prefix <temporary-prefix>` staged those files with the binary, fallback font,
   shell integration and licenses, satisfying the desktop-payload criterion independently of a
   distribution package build.

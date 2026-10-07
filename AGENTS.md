@@ -241,6 +241,20 @@ asserts single delivery to the child (`KEYS_HEX1:48656c6c6f20576f726c64`, `KEYS_
 the search Input (`1/1`); it runs in the Linux gate. macOS and Windows AltGr/Option behaviour is
 unverified.
 
+Conduit ships the user-supplied application icon. `assets/linux/io.github.thowd22.Conduit-source.png`
+is the untouched original; `-master.png` is that file with its alpha cleaned (near-opaque fill
+snapped to opaque, background-removal dust below alpha 8 removed; the exact command is in
+`assets/linux/README.md`), and it generates the checked-in hicolor PNGs at 16, 22, 24, 32, 48, 64,
+128, 256 and 512. `build.zig` installs them at `share/icons/hicolor/<N>x<N>/apps/io.github.thowd22.Conduit.png`
+after checking each one's PNG signature and IHDR size; the earlier placeholder SVG and its
+scalable install are gone. The AppImage uses the 256 render as its top-level icon and `.DirIcon`,
+and `release-verify.sh` and `validate-linux-desktop.sh` check the PNG payload. `platform` embeds a
+64x64 RGBA8 fixture and gives every window that icon through `SDL_SetWindowIcon` (failures are
+non-fatal); `.github/scripts/check-x11-window-icon.sh` proves under Xvfb that the window's
+`_NET_WM_ICON` is 64x64 and matches the fixture pixel for pixel, and it runs in the Linux gate.
+Wayland has no window-icon property, so the desktop entry supplies the icon there; native macOS
+and Windows window icons are unverified.
+
 TASK-36 is complete. Command+F on macOS or Ctrl+Shift+F on Linux/Windows opens an inline semantic
 `Input`; named actions and clickable controls provide next/previous navigation plus case and regex
 toggles. Literal and regex scans are bounded and incremental across retained scrollback, with
@@ -254,7 +268,7 @@ frame was visually inspected.
 
 TASK-50 is complete. X11 runs report the X11 backend, and Weston and Sway headless sessions run
 SDL's Wayland backend over the same SDL/OpenGL path. An isolated `zig build --prefix` stages the
-binary, fallback font, shell integration, licenses, desktop entry and scalable icon at their
+binary, fallback font, shell integration, licenses, desktop entry and hicolor PNG icons at their
 standard freedesktop paths, and the installed payload passes desktop-file validation in CI. The
 hosted Linux gate supplies the external evidence: `check-sway-fractional.sh` runs Sway 1.9
 headless (GLES2 where a DRM render node exists, pixman otherwise, because hosted runners have no

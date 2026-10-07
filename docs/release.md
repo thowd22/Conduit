@@ -50,7 +50,8 @@ git push origin v0.2.0-rc.1
 
 Every package contains the `conduit` binary, the bundled JetBrains Mono
 fallback font, the bash/zsh/fish shell integration, the freedesktop desktop
-entry and scalable icon, Conduit's MIT `LICENSE` and the third-party notices
+entry and the application icon as PNGs at the hicolor sizes 16, 22, 24, 32,
+48, 64, 128, 256 and 512, Conduit's MIT `LICENSE` and the third-party notices
 `build.zig` installs under `share/licenses/conduit/` (Ghostty, SDL, zopengl,
 FreeType, HarfBuzz, Oniguruma, JetBrains Mono OFL). The development-only
 `conduit-test` driver CLI is deliberately not packaged.
@@ -83,7 +84,9 @@ FreeType, HarfBuzz, Oniguruma, JetBrains Mono OFL). The development-only
   against SHA-256 pins recorded in that script (checked against the digests
   GitHub publishes for those release assets). `AppRun` is
   `packaging/appimage/AppRun`; the desktop entry and icon come from the staged
-  prefix. The tool runs with `--appimage-extract-and-run`, so no FUSE is
+  prefix, with the 256x256 PNG copied to the AppDir root as
+  `io.github.thowd22.Conduit.png` (what the entry's `Icon=` resolves to there)
+  and linked as `.DirIcon`. The tool runs with `--appimage-extract-and-run`, so no FUSE is
   needed on the runner, and `--runtime-file` keeps the runtime pinned.
 - **Tooling on the runner:** `dpkg-deb`, `readelf`, `objdump`, `file`, `tar`,
   `gzip`, `sha256sum`, `curl` and `docker`, all present on the ubuntu-24.04
@@ -107,7 +110,8 @@ per check, continues past failures, and exits non-zero if any failed:
   inside a pristine `ubuntu:22.04` container followed by `conduit --version`.
   Without Docker the install leg prints `SKIP` and the extraction leg stands.
 - AppImage: ELF runtime with the type 2 magic, `--appimage-extract` without
-  FUSE, `AppRun`, desktop entry, icon and `.DirIcon` at the AppDir root, the
+  FUSE, `AppRun`, desktop entry (still naming `Icon=io.github.thowd22.Conduit`),
+  PNG icon and a `.DirIcon` that resolves to a PNG at the AppDir root, the
   full payload under `usr/`, the binary checks, and `AppRun --version`.
 
 Binaries run with `HOME` and the `XDG_*` directories pointed into the work

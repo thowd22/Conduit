@@ -59,7 +59,6 @@ unset DISPLAY WAYLAND_DISPLAY
 payload_files=(
   bin/conduit
   "share/applications/$app_id.desktop"
-  "share/icons/hicolor/scalable/apps/$app_id.svg"
   share/conduit/fonts/JetBrainsMono-Regular.ttf
   share/conduit/shell-integration/bash/conduit.bash
   share/conduit/shell-integration/zsh/.zshenv
@@ -75,6 +74,11 @@ payload_files=(
   share/licenses/conduit/Oniguruma-COPYING.txt
   share/licenses/conduit/JetBrainsMono-OFL-1.1.txt
 )
+# The application icon at every freedesktop hicolor size build.zig installs.
+icon_sizes=(16 22 24 32 48 64 128 256 512)
+for size in "${icon_sizes[@]}"; do
+  payload_files+=("share/icons/hicolor/${size}x${size}/apps/$app_id.png")
+done
 
 # Compare two dotted versions numerically; true when $1 <= $2.
 version_le() {
@@ -271,11 +275,14 @@ if [ -f "$appimage_path" ]; then
     root="$ai_work/squashfs-root"
     check_that "AppImage: AppRun present" "AppImage: AppRun missing" [ -x "$root/AppRun" ]
     check_that "AppImage: desktop entry at AppDir root" "AppImage: desktop entry missing at AppDir root" [ -f "$root/$app_id.desktop" ]
-    if [ -f "$root/$app_id.svg" ] && [ -e "$root/.DirIcon" ]; then
-      pass "AppImage: icon and .DirIcon present"
+    if [ -f "$root/$app_id.png" ] && [ -f "$root/.DirIcon" ] \
+      && [ "$(head -c 8 "$root/.DirIcon" | od -An -tx1 | tr -d ' \n')" = "89504e470d0a1a0a" ]; then
+      pass "AppImage: PNG icon and .DirIcon present"
     else
-      fail "AppImage: icon or .DirIcon missing"
+      fail "AppImage: PNG icon or .DirIcon missing"
     fi
+    check_that "AppImage: desktop entry names the icon" "AppImage: desktop entry Icon= does not name $app_id" \
+      grep -qx "Icon=$app_id" "$root/$app_id.desktop"
     check_payload_tree "AppImage" "$root/usr"
     check_binary "AppImage" "$root/usr/bin/conduit"
     check_version_output "AppImage (AppRun)" "$root/AppRun"

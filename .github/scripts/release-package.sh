@@ -36,7 +36,6 @@ app_id="io.github.thowd22.Conduit"
 required_payload=(
   bin/conduit
   "share/applications/$app_id.desktop"
-  "share/icons/hicolor/scalable/apps/$app_id.svg"
   share/conduit/fonts/JetBrainsMono-Regular.ttf
   share/conduit/shell-integration/bash/conduit.bash
   share/conduit/shell-integration/zsh/.zshenv
@@ -52,6 +51,11 @@ required_payload=(
   share/licenses/conduit/Oniguruma-COPYING.txt
   share/licenses/conduit/JetBrainsMono-OFL-1.1.txt
 )
+# The application icon at every freedesktop hicolor size build.zig installs.
+icon_sizes=(16 22 24 32 48 64 128 256 512)
+for size in "${icon_sizes[@]}"; do
+  required_payload+=("share/icons/hicolor/${size}x${size}/apps/$app_id.png")
+done
 
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -165,8 +169,9 @@ if [ -n "$tools" ] && [ -x "$tools/appimagetool-x86_64.AppImage" ] && [ -f "$too
   cp -a -- "$payload/." "$appdir/usr/"
   install -m 0755 -- "$repo_root/packaging/appimage/AppRun" "$appdir/AppRun"
   cp -- "$payload/share/applications/$app_id.desktop" "$appdir/$app_id.desktop"
-  cp -- "$payload/share/icons/hicolor/scalable/apps/$app_id.svg" "$appdir/$app_id.svg"
-  ln -sf -- "$app_id.svg" "$appdir/.DirIcon"
+  # The desktop entry's `Icon=$app_id` resolves to this top-level PNG inside an AppImage.
+  cp -- "$payload/share/icons/hicolor/256x256/apps/$app_id.png" "$appdir/$app_id.png"
+  ln -sf -- "$app_id.png" "$appdir/.DirIcon"
   # `--appimage-extract-and-run` lets the tool run on hosts without FUSE;
   # `--runtime-file` pins the runtime instead of downloading the latest one.
   ARCH=x86_64 "$tools/appimagetool-x86_64.AppImage" --appimage-extract-and-run \

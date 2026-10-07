@@ -212,19 +212,21 @@ fn installLinuxPayload(
         &desktop_check.step,
     );
 
-    const icon_source = b.path("assets/linux/io.github.thowd22.Conduit.svg");
-    const icon_check = b.addCheckFile(icon_source, .{ .expected_matches = &.{
-        "<svg",
-        "viewBox=\"0 0 256 256\"",
-        "</svg>",
-    } });
-    icon_check.setName("validate the Linux scalable icon framing");
-    installLinuxFileChecked(
-        b,
-        icon_source,
-        "share/icons/hicolor/scalable/apps/io.github.thowd22.Conduit.svg",
-        &icon_check.step,
-    );
+    // The application icon, rendered from the checked-in master at every
+    // freedesktop hicolor size a launcher or task switcher asks for. Each copy
+    // is checked to be a PNG whose IHDR declares exactly its directory's size,
+    // so a mis-rendered or swapped file fails the build instead of shipping.
+    for (linux_icon_sizes) |size| {
+        const source = b.path(b.fmt("assets/linux/icons/hicolor/{d}x{d}/apps/io.github.thowd22.Conduit.png", .{ size, size }));
+        const check = b.addCheckFile(source, .{ .expected_matches = &.{pngHeader(b, size)} });
+        check.setName(b.fmt("validate the Linux {d}x{d} icon", .{ size, size }));
+        installLinuxFileChecked(
+            b,
+            source,
+            b.fmt("share/icons/hicolor/{d}x{d}/apps/io.github.thowd22.Conduit.png", .{ size, size }),
+            &check.step,
+        );
+    }
 
     const payload_files = [_]struct { source: std.Build.LazyPath, destination: []const u8 }{
         .{ .source = b.path(bundled_face_asset), .destination = "share/conduit/fonts/JetBrainsMono-Regular.ttf" },
@@ -245,6 +247,25 @@ fn installLinuxPayload(
     for (payload_files) |file| {
         b.getInstallStep().dependOn(&b.addInstallFile(file.source, file.destination).step);
     }
+}
+
+/// The freedesktop hicolor sizes the Linux payload installs the application
+/// icon at. Each has a checked-in render under `assets/linux/icons/hicolor`.
+const linux_icon_sizes = [_]u32{ 16, 22, 24, 32, 48, 64, 128, 256, 512 };
+
+/// The first 24 bytes of a square `size`x`size` PNG: the signature, then the
+/// IHDR chunk's length, type, width and height (big-endian). `addCheckFile`
+/// only tests for substrings, not prefixes, but the PNG specification puts
+/// IHDR immediately after the signature, so finding this run proves both the
+/// format and the declared dimensions.
+fn pngHeader(b: *std.Build, size: u32) []const u8 {
+    var header: [24]u8 = undefined;
+    @memcpy(header[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, header[8..12], 13, .big);
+    @memcpy(header[12..16], "IHDR");
+    std.mem.writeInt(u32, header[16..20], size, .big);
+    std.mem.writeInt(u32, header[20..24], size, .big);
+    return b.allocator.dupe(u8, &header) catch @panic("OOM");
 }
 
 fn installLinuxFileChecked(
@@ -325,6 +346,21 @@ fn wireThirdPartySeams(
     if (wired[moduleIndex("platform")]) |platform| {
         platform.addImport("sdl", sdlSeam(b, target, optimize, sdl_lib));
         platform.linkLibrary(sdl_lib);
+
+        // The window icon, as raw 64x64 RGBA8 pixels handed to SDL so task
+        // switchers show it before any desktop entry is consulted. Embedded the
+        // same way as the bundled face, because `@embedFile` may not reach
+        // outside the module's package path.
+        if (!sourceExists(b, window_icon_asset)) {
+            fail("the window icon {s} is missing from the repository", .{window_icon_asset});
+        }
+        const icon_files = b.addWriteFiles();
+        _ = icon_files.addCopyFile(b.path(window_icon_asset), "window_icon.rgba");
+        platform.addAnonymousImport("window-icon", .{
+            .root_source_file = icon_files.add("window_icon.zig",
+                \\pub const rgba: []const u8 = @embedFile("window_icon.rgba");
+            ),
+        });
     }
 
     // The shell-integration scripts, embedded so a shell can be given them
@@ -441,6 +477,10 @@ fn wireFontSeams(
 
     return .{ .freetype = ft_lib, .harfbuzz = hb_lib, .seam = font_c };
 }
+
+/// The window icon's raw pixels: 64x64 RGBA8, rendered from the same master as
+/// the installed hicolor PNGs. See `src/platform.zig` for how it reaches SDL.
+const window_icon_asset = "assets/linux/io.github.thowd22.Conduit-64.rgba";
 
 /// The bundled fallback face, as the build sees it: a file in the repository
 /// that is copied and embedded rather than opened at runtime, so that a machine
