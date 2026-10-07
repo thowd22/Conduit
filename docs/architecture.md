@@ -851,7 +851,7 @@ nothing else is a legal dependency.
     gate extension, no subagents, no hooks for manual starts (session JSONL and the PTY baseline
     only until the extension is installed with consent), prompt access left to TASK-59, no
     structured stop for a TUI turn, and omp's native approvals, `rpc-ui` and ACP unused and
-    unverified. `detect` waits for an ExecutionContext probe. Unit tests use captured fixtures
+    unverified. `detect` runs `pi --version` (or `omp --version`) through `ExecutionContext.run`. Unit tests use captured fixtures
     under `src/agent/pi/testdata/`; two integration tests run the real `pi --mode rpc` with the
     extension against a loopback mock model (`testdata/mock_chat.py`) and skip when `pi` or
     `python3` is absent.
