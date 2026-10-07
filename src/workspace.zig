@@ -78,13 +78,166 @@ pub const ExecutionContextKind = enum {
     }
 };
 
-/// An owned, type-erased place in which workspace processes start.
+/// Failures of a context's file-system capability (`readFile`, `listDir`,
+/// `statPath`). The set is closed so a remote context maps its transport
+/// failures onto the same vocabulary a Local one uses.
+pub const FsError = error{
+    NotFound,
+    AccessDenied,
+    NotADirectory,
+    IsADirectory,
+    /// The file is larger than the caller's buffer.
+    TooLarge,
+    NameTooLong,
+    /// The context has no file system capability (the default vtable entry).
+    Unsupported,
+    OutOfMemory,
+    /// Any other read failure, including a lost remote connection.
+    Unavailable,
+};
+
+/// What a path names, in the terms every context can answer.
+pub const PathKind = enum { file, directory, other };
+
+/// The metadata `statPath` reports. `mtime_ns` is nanoseconds since the Unix
+/// epoch in the context's own clock; callers compare it only for equality.
+pub const PathStat = struct {
+    kind: PathKind,
+    size: u64,
+    mtime_ns: i128,
+};
+
+/// One directory entry. `name` borrows the context's iteration buffer and is
+/// valid only during the visit callback.
+pub const DirEntry = struct {
+    name: []const u8,
+    kind: PathKind,
+};
+
+/// The callback `listDir` calls once per entry, on the caller's thread.
+/// Returning `false` stops the listing early, which is how a caller bounds it.
+pub const DirVisitor = struct {
+    context: *anyopaque,
+    visit_fn: *const fn (context: *anyopaque, entry: DirEntry) bool,
+};
+
+/// One bounded, non-interactive command (`ExecutionContext.run`).
+///
+/// `argv` is passed to the program verbatim, never through a shell; `argv[0]`
+/// is resolved on the context's own `PATH`. All slices are borrowed for the
+/// call. The child's stdin is `stdin` followed by end of file, or empty.
+pub const RunRequest = struct {
+    argv: []const []const u8,
+    /// The child's working directory, in the context's own path syntax.
+    cwd: []const u8,
+    /// At most `max_stdin` bytes, so writing it up front can never block on a
+    /// child that is not reading.
+    stdin: ?[]const u8 = null,
+    /// The most bytes kept from each of stdout and stderr. A child that
+    /// writes more fails with `error.OutputTooLarge` and is killed.
+    max_output: usize = 256 * 1024,
+    /// Wall-clock bound on the whole run. On expiry the child is killed and
+    /// the call fails with `error.Timeout`.
+    timeout_ms: u32 = 10_000,
+
+    pub const max_stdin: usize = 16 * 1024;
+};
+
+/// The outcome of a command that ran to completion. `stdout` and `stderr` are
+/// owned by the allocator passed to `run`; release them with `deinit`.
+pub const RunResult = struct {
+    /// The exit status, or `null` when the child did not exit normally.
+    exit_code: ?u8,
+    /// The terminating signal, when there was one.
+    signal: ?u32 = null,
+    stdout: []u8,
+    stderr: []u8,
+
+    /// Whether the command exited with status 0.
+    pub fn succeeded(self: RunResult) bool {
+        return self.exit_code != null and self.exit_code.? == 0;
+    }
+
+    pub fn deinit(self: *RunResult, allocator: Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        self.* = undefined;
+    }
+};
+
+/// Failures of `ExecutionContext.run` that prevent a result. A command that
+/// starts and exits non-zero is a `RunResult`, not an error.
+pub const RunError = error{
+    /// `argv[0]` does not exist on the context's `PATH`.
+    CommandNotFound,
+    AccessDenied,
+    /// Empty argv, or stdin over `RunRequest.max_stdin`.
+    InvalidRequest,
+    Timeout,
+    OutputTooLarge,
+    SpawnFailed,
+    /// The context cannot run commands (the default vtable entry).
+    Unsupported,
+    OutOfMemory,
+    Unavailable,
+};
+
+/// Failures of `ExecutionContext.watch`. A path that does not exist yet is
+/// not an error: the watch reports a change once it appears.
+pub const WatchError = error{ Unsupported, OutOfMemory, Unavailable };
+
+/// An owned change flag for one directory, created by
+/// `ExecutionContext.watch`.
+///
+/// Thread ownership: the handle belongs to the thread that created it. It
+/// starts no thread and never calls back; `pollChanges` is non-blocking and
+/// only says whether anything in the directory (an entry's creation, removal,
+/// rename, content or metadata) may have changed since the previous poll. The
+/// caller then re-reads what it needs through the context, so no file content
+/// ever crosses threads. False positives are allowed; a missed change is not.
+pub const WatchHandle = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        poll_changes: *const fn (*anyopaque) bool,
+        destroy: *const fn (*anyopaque) void,
+    };
+
+    /// Whether the directory may have changed since the last poll.
+    pub fn pollChanges(self: WatchHandle) bool {
+        return self.vtable.poll_changes(self.ptr);
+    }
+
+    /// Release the watch and everything it holds.
+    pub fn deinit(self: *WatchHandle) void {
+        self.vtable.destroy(self.ptr);
+        self.* = undefined;
+    }
+};
+
+/// An owned, type-erased place in which workspace processes start and
+/// workspace files are read.
 ///
 /// `initOwned` transfers ownership of `ptr`; its vtable must release that
 /// implementation in `destroy`. This public seam lets tests and future SSH or
 /// WSL contexts participate without exposing local process APIs to callers.
 /// Do not copy an owning value: transfer it into one workspace and call
 /// `deinit` exactly once.
+///
+/// Every capability takes paths in the context's own syntax (`/`-separated
+/// for Local, SSH and WSL alike) and borrows `std.Io` from the caller. Local
+/// inherits this machine; remote contexts supply their own implementations of
+/// the same entries (TASK-43, TASK-47), and an entry a context does not
+/// implement defaults to `error.Unsupported`.
+///
+/// Threads: `spawn`, `readFile`, `listDir`, `statPath` and `run` keep no
+/// mutable state in the context and may be called from any thread holding a
+/// `Ref`. They block on IO for as long as the operation takes (a remote
+/// context waits on its connection), so the render/UI thread must not call
+/// them for a remote context; `run` additionally waits for the child, up to
+/// its timeout, and so belongs on a worker thread everywhere. A `WatchHandle`
+/// belongs to the thread that created it.
 pub const ExecutionContext = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -92,29 +245,71 @@ pub const ExecutionContext = struct {
     pub const SpawnFn = *const fn (*anyopaque, pty.SpawnRequest) pty.Error!pty.Pty;
     pub const KindFn = *const fn (*const anyopaque) ExecutionContextKind;
     pub const DestroyFn = *const fn (*anyopaque) void;
+    /// Read the whole file at `path` into `buffer` and return the filled
+    /// prefix. A file longer than `buffer` is `error.TooLarge`, so
+    /// `buffer.len` is the read bound.
+    pub const ReadFileFn = *const fn (*anyopaque, std.Io, []const u8, []u8) FsError![]u8;
+    /// Call the visitor once per entry of the directory at `path`, excluding
+    /// `.` and `..`, in no particular order.
+    pub const ListDirFn = *const fn (*anyopaque, std.Io, []const u8, DirVisitor) FsError!void;
+    /// Describe `path`, following symbolic links.
+    pub const StatPathFn = *const fn (*anyopaque, std.Io, []const u8) FsError!PathStat;
+    /// Start an owned change watch on the directory at `path`.
+    pub const WatchFn = *const fn (*anyopaque, Allocator, std.Io, []const u8) WatchError!WatchHandle;
+    /// Run one bounded command to completion; output is owned by the allocator.
+    pub const RunFn = *const fn (*anyopaque, Allocator, std.Io, RunRequest) RunError!RunResult;
 
     pub const VTable = struct {
         spawn: SpawnFn,
         kind: KindFn,
         destroy: DestroyFn,
+        read_file: ReadFileFn = unsupportedReadFile,
+        list_dir: ListDirFn = unsupportedListDir,
+        stat_path: StatPathFn = unsupportedStatPath,
+        watch: WatchFn = unsupportedWatch,
+        run: RunFn = unsupportedRun,
     };
 
-    /// A non-owning execution capability. It may start work and inspect the
-    /// context kind, but cannot destroy the implementation. The owning
-    /// `ExecutionContext` must outlive every borrowed reference.
+    /// A non-owning execution capability. It may start work, read files and
+    /// inspect the context kind, but cannot destroy the implementation. The
+    /// owning `ExecutionContext` must outlive every borrowed reference.
     pub const Ref = struct {
         ptr: *anyopaque,
-        spawn_fn: SpawnFn,
-        kind_fn: KindFn,
+        vtable: *const VTable,
 
         /// Spawn through the borrowed concrete context.
         pub fn spawn(self: Ref, request: pty.SpawnRequest) pty.Error!pty.Pty {
-            return self.spawn_fn(self.ptr, request);
+            return self.vtable.spawn(self.ptr, request);
         }
 
         /// Identify the borrowed concrete environment.
         pub fn kind(self: Ref) ExecutionContextKind {
-            return self.kind_fn(self.ptr);
+            return self.vtable.kind(self.ptr);
+        }
+
+        /// See `ReadFileFn`.
+        pub fn readFile(self: Ref, io: std.Io, path: []const u8, buffer: []u8) FsError![]u8 {
+            return self.vtable.read_file(self.ptr, io, path, buffer);
+        }
+
+        /// See `ListDirFn`.
+        pub fn listDir(self: Ref, io: std.Io, path: []const u8, visitor: DirVisitor) FsError!void {
+            return self.vtable.list_dir(self.ptr, io, path, visitor);
+        }
+
+        /// See `StatPathFn`.
+        pub fn statPath(self: Ref, io: std.Io, path: []const u8) FsError!PathStat {
+            return self.vtable.stat_path(self.ptr, io, path);
+        }
+
+        /// See `WatchFn` and `WatchHandle`.
+        pub fn watch(self: Ref, allocator: Allocator, io: std.Io, path: []const u8) WatchError!WatchHandle {
+            return self.vtable.watch(self.ptr, allocator, io, path);
+        }
+
+        /// See `RunFn` and `RunRequest`.
+        pub fn run(self: Ref, allocator: Allocator, io: std.Io, request: RunRequest) RunError!RunResult {
+            return self.vtable.run(self.ptr, allocator, io, request);
         }
     };
 
@@ -129,13 +324,9 @@ pub const ExecutionContext = struct {
         return LocalExecutionContext.create(allocator);
     }
 
-    /// Borrow a spawn-capable handle without transferring destruction rights.
+    /// Borrow a capability handle without transferring destruction rights.
     pub fn borrow(self: *const ExecutionContext) Ref {
-        return .{
-            .ptr = self.ptr,
-            .spawn_fn = self.vtable.spawn,
-            .kind_fn = self.vtable.kind,
-        };
+        return .{ .ptr = self.ptr, .vtable = self.vtable };
     }
 
     /// Identify the environment without exposing its concrete state.
@@ -148,11 +339,34 @@ pub const ExecutionContext = struct {
         self.vtable.destroy(self.ptr);
         self.* = undefined;
     }
+
+    fn unsupportedReadFile(_: *anyopaque, _: std.Io, _: []const u8, _: []u8) FsError![]u8 {
+        return error.Unsupported;
+    }
+
+    fn unsupportedListDir(_: *anyopaque, _: std.Io, _: []const u8, _: DirVisitor) FsError!void {
+        return error.Unsupported;
+    }
+
+    fn unsupportedStatPath(_: *anyopaque, _: std.Io, _: []const u8) FsError!PathStat {
+        return error.Unsupported;
+    }
+
+    fn unsupportedWatch(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8) WatchError!WatchHandle {
+        return error.Unsupported;
+    }
+
+    fn unsupportedRun(_: *anyopaque, _: Allocator, _: std.Io, _: RunRequest) RunError!RunResult {
+        return error.Unsupported;
+    }
 };
 
 /// The local execution implementation. This is deliberately the only
 /// production call to `pty.spawn` in this module; every workspace caller sees
-/// only `ExecutionContext.Ref.spawn`.
+/// only `ExecutionContext.Ref.spawn`. Its file and command capabilities act on
+/// this machine and keep no state in the context, so they are safe from any
+/// thread. `run` children inherit Conduit's process environment, like every
+/// Local child (TASK-73).
 pub const LocalExecutionContext = struct {
     allocator: Allocator,
 
@@ -160,6 +374,11 @@ pub const LocalExecutionContext = struct {
         .spawn = spawn,
         .kind = kind,
         .destroy = destroy,
+        .read_file = readFile,
+        .list_dir = listDir,
+        .stat_path = statPath,
+        .watch = watch,
+        .run = run,
     };
 
     /// Allocate an owned local context implementation.
@@ -182,6 +401,302 @@ pub const LocalExecutionContext = struct {
         const self: *LocalExecutionContext = @ptrCast(@alignCast(ptr));
         const allocator = self.allocator;
         allocator.destroy(self);
+    }
+
+    fn fsError(err: anyerror) FsError {
+        return switch (err) {
+            error.FileNotFound => error.NotFound,
+            error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+            error.NotDir => error.NotADirectory,
+            error.IsDir => error.IsADirectory,
+            error.NameTooLong => error.NameTooLong,
+            error.OutOfMemory, error.SystemResources => error.OutOfMemory,
+            else => error.Unavailable,
+        };
+    }
+
+    fn pathKind(file_kind: std.Io.File.Kind) PathKind {
+        return switch (file_kind) {
+            .file => .file,
+            .directory => .directory,
+            else => .other,
+        };
+    }
+
+    fn readFile(_: *anyopaque, io: std.Io, path: []const u8, buffer: []u8) FsError![]u8 {
+        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| return fsError(err);
+        defer file.close(io);
+        const stat = file.stat(io) catch |err| return fsError(err);
+        if (stat.kind == .directory) return error.IsADirectory;
+        if (stat.size > buffer.len) return error.TooLarge;
+
+        var reader = file.reader(io, &.{});
+        const n = reader.interface.readSliceShort(buffer) catch return error.Unavailable;
+        if (n == buffer.len) {
+            // The file may have grown since `stat`; one more byte decides.
+            var probe: [1]u8 = undefined;
+            const extra = reader.interface.readSliceShort(&probe) catch return error.Unavailable;
+            if (extra != 0) return error.TooLarge;
+        }
+        return buffer[0..n];
+    }
+
+    fn listDir(_: *anyopaque, io: std.Io, path: []const u8, visitor: DirVisitor) FsError!void {
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| return fsError(err);
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (iterator.next(io) catch |err| return fsError(err)) |entry| {
+            var entry_kind = pathKind(entry.kind);
+            if (entry.kind == .sym_link or entry.kind == .unknown) {
+                // Follow the link so a symlinked task file still counts as a file; a
+                // dangling link is simply not a file.
+                entry_kind = if (dir.statFile(io, entry.name, .{})) |target|
+                    pathKind(target.kind)
+                else |_|
+                    .other;
+            }
+            if (!visitor.visit_fn(visitor.context, .{ .name = entry.name, .kind = entry_kind })) return;
+        }
+    }
+
+    fn statPath(_: *anyopaque, io: std.Io, path: []const u8) FsError!PathStat {
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| return fsError(err);
+        return .{
+            .kind = pathKind(stat.kind),
+            .size = stat.size,
+            .mtime_ns = stat.mtime.nanoseconds,
+        };
+    }
+
+    fn watch(_: *anyopaque, allocator: Allocator, io: std.Io, path: []const u8) WatchError!WatchHandle {
+        return LocalWatch.create(allocator, io, path);
+    }
+
+    fn run(_: *anyopaque, allocator: Allocator, io: std.Io, request: RunRequest) RunError!RunResult {
+        if (request.argv.len == 0) return error.InvalidRequest;
+        if (request.stdin) |bytes| {
+            if (bytes.len > RunRequest.max_stdin) return error.InvalidRequest;
+        }
+        var child = std.process.spawn(io, .{
+            .argv = request.argv,
+            .cwd = .{ .path = request.cwd },
+            .stdin = if (request.stdin != null) .pipe else .ignore,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        }) catch |err| return switch (err) {
+            error.FileNotFound => error.CommandNotFound,
+            error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.SpawnFailed,
+        };
+        // Kills and reaps a child that is still running on every early return;
+        // after `wait` it does nothing.
+        defer child.kill(io);
+
+        if (request.stdin) |bytes| {
+            if (child.stdin) |stdin| {
+                // A child that exits without reading closes the pipe; its exit status, not
+                // this write, is the outcome the caller is told about.
+                stdin.writeStreamingAll(io, bytes) catch |err|
+                    log.debug("run: stdin not fully delivered: {s}", .{@errorName(err)});
+                stdin.close(io);
+                child.stdin = null;
+            }
+        }
+
+        const timeout = (std.Io.Timeout{ .duration = .{
+            .raw = .fromMilliseconds(request.timeout_ms),
+            .clock = .awake,
+        } }).toDeadline(io);
+
+        var streams_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+        var multi_reader: std.Io.File.MultiReader = undefined;
+        multi_reader.init(allocator, io, streams_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+        defer multi_reader.deinit();
+        const stdout_reader = multi_reader.reader(0);
+        const stderr_reader = multi_reader.reader(1);
+
+        while (multi_reader.fill(64, timeout)) |_| {
+            if (stdout_reader.buffered().len > request.max_output or
+                stderr_reader.buffered().len > request.max_output)
+            {
+                return error.OutputTooLarge;
+            }
+        } else |err| switch (err) {
+            error.EndOfStream => {},
+            error.Timeout => return error.Timeout,
+            else => return error.Unavailable,
+        }
+        multi_reader.checkAnyError() catch return error.Unavailable;
+
+        const term_status = child.wait(io) catch return error.Unavailable;
+        const stdout = multi_reader.toOwnedSlice(0) catch return error.OutOfMemory;
+        errdefer allocator.free(stdout);
+        const stderr = multi_reader.toOwnedSlice(1) catch return error.OutOfMemory;
+        return switch (term_status) {
+            .exited => |code| .{ .exit_code = code, .stdout = stdout, .stderr = stderr },
+            .signal, .stopped => |sig| .{
+                .exit_code = null,
+                .signal = @intCast(@intFromEnum(sig)),
+                .stdout = stdout,
+                .stderr = stderr,
+            },
+            .unknown => .{ .exit_code = null, .stdout = stdout, .stderr = stderr },
+        };
+    }
+};
+
+/// How often a polling watch re-scans its directory. The Linux watch also
+/// uses it while the directory does not exist yet.
+pub const watch_poll_interval_ms: i64 = 1000;
+/// The most entries a polling watch fingerprints, so a scan stays bounded.
+pub const watch_max_entries: usize = 4096;
+
+/// The Local `WatchHandle`: inotify on the directory on Linux, drained without
+/// a thread from a non-blocking descriptor at `pollChanges`; elsewhere, and on
+/// Linux while the directory does not exist, a rate-limited fingerprint of the
+/// directory's entries (name, kind, size, mtime). The design follows
+/// `config.Watcher` (TASK-37) minus its thread and wake callback, because the
+/// owner polls.
+const LocalWatch = struct {
+    allocator: Allocator,
+    io: std.Io,
+    /// Owned, NUL-terminated copy of the watched directory path.
+    path: [:0]u8,
+    /// Linux inotify descriptor, or -1 when inotify is unavailable.
+    inotify_fd: i32 = -1,
+    /// Whether the inotify watch on `path` is established.
+    watching: bool = false,
+    fingerprint: u64 = 0,
+    last_scan_ms: i64 = 0,
+
+    const handle_vtable: WatchHandle.VTable = .{
+        .poll_changes = pollChanges,
+        .destroy = destroy,
+    };
+
+    fn create(allocator: Allocator, io: std.Io, path: []const u8) WatchError!WatchHandle {
+        const self = try allocator.create(LocalWatch);
+        errdefer allocator.destroy(self);
+        const owned = try allocator.dupeZ(u8, path);
+        self.* = .{ .allocator = allocator, .io = io, .path = owned };
+        if (comptime builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            const rc = linux.inotify_init1(linux.IN.CLOEXEC | linux.IN.NONBLOCK);
+            if (linux.errno(rc) == .SUCCESS) {
+                self.inotify_fd = @intCast(rc);
+                _ = self.addWatch();
+            } else {
+                log.warn("inotify is unavailable; polling a watched directory every {d} ms", .{watch_poll_interval_ms});
+            }
+        }
+        if (!self.watching) {
+            self.fingerprint = self.scan();
+            self.last_scan_ms = nowMs(io);
+        }
+        return .{ .ptr = self, .vtable = &handle_vtable };
+    }
+
+    fn destroy(ptr: *anyopaque) void {
+        const self: *LocalWatch = @ptrCast(@alignCast(ptr));
+        if (comptime builtin.os.tag == .linux) {
+            if (self.inotify_fd >= 0) _ = std.os.linux.close(self.inotify_fd);
+        }
+        const allocator = self.allocator;
+        allocator.free(self.path);
+        allocator.destroy(self);
+    }
+
+    fn nowMs(io: std.Io) i64 {
+        return std.Io.Clock.awake.now(io).toMilliseconds();
+    }
+
+    /// Establish the inotify watch. Linux only; returns whether it now holds.
+    fn addWatch(self: *LocalWatch) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        if (self.inotify_fd < 0) return false;
+        const linux = std.os.linux;
+        const mask: u32 = linux.IN.CLOSE_WRITE | linux.IN.MOVED_TO | linux.IN.MOVED_FROM |
+            linux.IN.CREATE | linux.IN.DELETE | linux.IN.ATTRIB | linux.IN.MODIFY |
+            linux.IN.DELETE_SELF | linux.IN.MOVE_SELF | linux.IN.ONLYDIR;
+        const rc = linux.inotify_add_watch(self.inotify_fd, self.path.ptr, mask);
+        self.watching = linux.errno(rc) == .SUCCESS;
+        return self.watching;
+    }
+
+    fn pollChanges(ptr: *anyopaque) bool {
+        const self: *LocalWatch = @ptrCast(@alignCast(ptr));
+        if (self.watching) {
+            const changed = self.drainInotify();
+            if (self.watching) return changed;
+            // The directory itself went away or was replaced. Re-watch it now if
+            // it is back, otherwise fall back to rate-limited fingerprinting until
+            // it reappears; either way this poll is a change.
+            if (!self.addWatch()) {
+                self.fingerprint = self.scan();
+                self.last_scan_ms = nowMs(self.io);
+            }
+            return true;
+        }
+        // The directory appeared since the last poll: everything in it is new.
+        if (self.addWatch()) return true;
+
+        const now = nowMs(self.io);
+        if (now - self.last_scan_ms < watch_poll_interval_ms) return false;
+        self.last_scan_ms = now;
+        const fingerprint = self.scan();
+        if (fingerprint == self.fingerprint) return false;
+        self.fingerprint = fingerprint;
+        return true;
+    }
+
+    /// Read every queued inotify event. Any event, an overflowed queue, or the
+    /// directory itself going away is a change.
+    fn drainInotify(self: *LocalWatch) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        const linux = std.os.linux;
+        var changed = false;
+        var buffer: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
+        while (true) {
+            const rc = linux.read(self.inotify_fd, &buffer, buffer.len);
+            if (linux.errno(rc) != .SUCCESS or rc == 0) return changed;
+            var offset: usize = 0;
+            while (offset + @sizeOf(linux.inotify_event) <= rc) {
+                const event: *const linux.inotify_event = @ptrCast(@alignCast(&buffer[offset]));
+                const span = @sizeOf(linux.inotify_event) + event.len;
+                if (offset + span > rc) break;
+                if (event.mask & (linux.IN.IGNORED | linux.IN.DELETE_SELF | linux.IN.MOVE_SELF) != 0) {
+                    self.watching = false;
+                }
+                changed = true;
+                offset += span;
+            }
+        }
+    }
+
+    /// An order-independent fingerprint of the directory: whether it exists,
+    /// and each entry's name, kind, size and mtime.
+    fn scan(self: *LocalWatch) u64 {
+        const io = self.io;
+        var dir = std.Io.Dir.cwd().openDir(io, self.path, .{ .iterate = true }) catch return 0;
+        defer dir.close(io);
+        var sum: u64 = 1;
+        var count: usize = 0;
+        var iterator = dir.iterate();
+        while (iterator.next(io) catch null) |entry| {
+            if (count == watch_max_entries) break;
+            count += 1;
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(entry.name);
+            if (dir.statFile(io, entry.name, .{})) |stat| {
+                hasher.update(std.mem.asBytes(&stat.size));
+                const mtime: i128 = stat.mtime.nanoseconds;
+                hasher.update(std.mem.asBytes(&mtime));
+                hasher.update(&.{@intFromEnum(stat.kind)});
+            } else |_| {}
+            sum +%= hasher.final();
+        }
+        return sum;
     }
 };
 
@@ -4227,4 +4742,180 @@ test "a real 4 MiB PTY flood is fully consumed within the per-wake budget in bou
     }
     try testing.expectEqual(@as(usize, 4194304), total);
     try testing.expect(!workspace.needsPump());
+}
+
+fn contextTmpPath(tmp: *std.testing.TmpDir, buffer: []u8, name: []const u8) ![]const u8 {
+    if (name.len == 0) return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path[0..], name });
+}
+
+test "a context without file or command capabilities reports them unsupported" {
+    const testing = std.testing;
+    var audit: FakeAudit = .{};
+    var owner = try FakeContext.create(testing.allocator, &audit, .ssh);
+    defer owner.deinit();
+    const borrowed = owner.borrow();
+    var buffer: [8]u8 = undefined;
+
+    try testing.expectError(error.Unsupported, borrowed.readFile(testing.io, "/x", &buffer));
+    try testing.expectError(error.Unsupported, borrowed.statPath(testing.io, "/x"));
+    try testing.expectError(error.Unsupported, borrowed.watch(testing.allocator, testing.io, "/x"));
+    try testing.expectError(error.Unsupported, borrowed.run(testing.allocator, testing.io, .{
+        .argv = &.{"true"},
+        .cwd = "/",
+    }));
+}
+
+test "the local context reads bounded files, lists and stats directories" {
+    const testing = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "small.md", .data = "hello" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "large.md", .data = "0123456789" });
+    try tmp.dir.createDir(testing.io, "nested", .default_dir);
+
+    var context = try ExecutionContext.local(testing.allocator);
+    defer context.deinit();
+    const local_ref = context.borrow();
+    var path_buffer: [256]u8 = undefined;
+
+    var buffer: [8]u8 = undefined;
+    const small = try local_ref.readFile(testing.io, try contextTmpPath(&tmp, &path_buffer, "small.md"), &buffer);
+    try testing.expectEqualStrings("hello", small);
+    try testing.expectError(error.TooLarge, local_ref.readFile(testing.io, try contextTmpPath(&tmp, &path_buffer, "large.md"), &buffer));
+    try testing.expectError(error.NotFound, local_ref.readFile(testing.io, try contextTmpPath(&tmp, &path_buffer, "absent.md"), &buffer));
+    try testing.expectError(error.IsADirectory, local_ref.readFile(testing.io, try contextTmpPath(&tmp, &path_buffer, "nested"), &buffer));
+
+    // Exactly the buffer size is not too large.
+    var exact: [10]u8 = undefined;
+    try testing.expectEqualStrings("0123456789", try local_ref.readFile(testing.io, try contextTmpPath(&tmp, &path_buffer, "large.md"), &exact));
+
+    const stat = try local_ref.statPath(testing.io, try contextTmpPath(&tmp, &path_buffer, "small.md"));
+    try testing.expectEqual(PathKind.file, stat.kind);
+    try testing.expectEqual(@as(u64, 5), stat.size);
+    try testing.expectEqual(PathKind.directory, (try local_ref.statPath(testing.io, try contextTmpPath(&tmp, &path_buffer, "nested"))).kind);
+    try testing.expectError(error.NotFound, local_ref.statPath(testing.io, try contextTmpPath(&tmp, &path_buffer, "absent")));
+
+    const Collect = struct {
+        files: usize = 0,
+        dirs: usize = 0,
+        visits: usize = 0,
+        stop_after: usize = std.math.maxInt(usize),
+
+        fn visit(ptr: *anyopaque, entry: DirEntry) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.visits += 1;
+            switch (entry.kind) {
+                .file => self.files += 1,
+                .directory => self.dirs += 1,
+                .other => {},
+            }
+            return self.visits < self.stop_after;
+        }
+    };
+    var all: Collect = .{};
+    try local_ref.listDir(testing.io, try contextTmpPath(&tmp, &path_buffer, ""), .{ .context = &all, .visit_fn = Collect.visit });
+    try testing.expectEqual(@as(usize, 2), all.files);
+    try testing.expectEqual(@as(usize, 1), all.dirs);
+
+    // Returning false stops the listing: the caller's bound.
+    var bounded: Collect = .{ .stop_after = 1 };
+    try local_ref.listDir(testing.io, try contextTmpPath(&tmp, &path_buffer, ""), .{ .context = &bounded, .visit_fn = Collect.visit });
+    try testing.expectEqual(@as(usize, 1), bounded.visits);
+
+    try testing.expectError(error.NotFound, local_ref.listDir(testing.io, try contextTmpPath(&tmp, &path_buffer, "absent"), .{ .context = &all, .visit_fn = Collect.visit }));
+    try testing.expectError(error.NotADirectory, local_ref.listDir(testing.io, try contextTmpPath(&tmp, &path_buffer, "small.md"), .{ .context = &all, .visit_fn = Collect.visit }));
+}
+
+test "a local watch flags creation, modification, removal and a late directory without a thread" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var context = try ExecutionContext.local(testing.allocator);
+    defer context.deinit();
+    var path_buffer: [256]u8 = undefined;
+
+    var handle = try context.borrow().watch(testing.allocator, testing.io, try contextTmpPath(&tmp, &path_buffer, ""));
+    defer handle.deinit();
+    try testing.expect(!handle.pollChanges());
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.md", .data = "one" });
+    try testing.expect(handle.pollChanges());
+    // A poll consumes what it reported.
+    try testing.expect(!handle.pollChanges());
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.md", .data = "two two" });
+    try testing.expect(handle.pollChanges());
+    try tmp.dir.deleteFile(testing.io, "a.md");
+    try testing.expect(handle.pollChanges());
+    try testing.expect(!handle.pollChanges());
+
+    // A directory that does not exist yet is watched from the moment it appears.
+    var late = try context.borrow().watch(testing.allocator, testing.io, try contextTmpPath(&tmp, &path_buffer, "late"));
+    defer late.deinit();
+    try testing.expect(!late.pollChanges());
+    try tmp.dir.createDir(testing.io, "late", .default_dir);
+    try testing.expect(late.pollChanges());
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "late/b.md", .data = "x" });
+    try testing.expect(late.pollChanges());
+}
+
+test "the local context runs a bounded command and reports its exit, output and timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var context = try ExecutionContext.local(testing.allocator);
+    defer context.deinit();
+    const local_ref = context.borrow();
+
+    var ok = try local_ref.run(testing.allocator, testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "echo ok" },
+        .cwd = "/",
+        .timeout_ms = 5000,
+    });
+    defer ok.deinit(testing.allocator);
+    try testing.expect(ok.succeeded());
+    try testing.expectEqualStrings("ok\n", ok.stdout);
+    try testing.expectEqualStrings("", ok.stderr);
+
+    var failed = try local_ref.run(testing.allocator, testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "printf 'bad thing' >&2; exit 3" },
+        .cwd = "/",
+    });
+    defer failed.deinit(testing.allocator);
+    try testing.expect(!failed.succeeded());
+    try testing.expectEqual(@as(?u8, 3), failed.exit_code);
+    try testing.expectEqualStrings("bad thing", failed.stderr);
+
+    var piped = try local_ref.run(testing.allocator, testing.io, .{
+        .argv = &.{"cat"},
+        .cwd = "/",
+        .stdin = "through stdin",
+    });
+    defer piped.deinit(testing.allocator);
+    try testing.expectEqualStrings("through stdin", piped.stdout);
+
+    var cwd = try local_ref.run(testing.allocator, testing.io, .{ .argv = &.{"pwd"}, .cwd = "/tmp" });
+    defer cwd.deinit(testing.allocator);
+    try testing.expectEqualStrings("/tmp\n", cwd.stdout);
+
+    try testing.expectError(error.Timeout, local_ref.run(testing.allocator, testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "sleep 5" },
+        .cwd = "/",
+        .timeout_ms = 100,
+    }));
+    try testing.expectError(error.OutputTooLarge, local_ref.run(testing.allocator, testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "head -c 100000 /dev/zero" },
+        .cwd = "/",
+        .max_output = 1024,
+    }));
+    try testing.expectError(error.CommandNotFound, local_ref.run(testing.allocator, testing.io, .{
+        .argv = &.{"conduit-no-such-command-62"},
+        .cwd = "/",
+    }));
+    try testing.expectError(error.InvalidRequest, local_ref.run(testing.allocator, testing.io, .{
+        .argv = &.{},
+        .cwd = "/",
+    }));
 }
