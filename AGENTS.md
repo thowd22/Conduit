@@ -203,7 +203,10 @@ the IBus engine-readiness flake fixed in the following commit. `v0.1.3`
 (https://github.com/thowd22/Conduit/releases/tag/v0.1.3) carries TASK-72: the ReleaseSafe terminal
 engine, bounded draining and frame pacing; `seq 1 200000` takes 0.12 s in that binary. `v0.1.4`
 (https://github.com/thowd22/Conduit/releases/tag/v0.1.4) carries TASK-73: Local children inherit
-the desktop environment. `zig build
+the desktop environment. `v0.1.7` (https://github.com/thowd22/Conduit/releases/tag/v0.1.7) carries
+TASK-74 (sidebar Palette hint and version, content-sized palette) and TASK-75 (PTY wakeup fix);
+`v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
+the `less` wheel test ordering and the IBus bridge race that the following commits fixed. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
 re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
 the log sink or SDL start, and an unstamped build prints `conduit 0.0.0-dev`.
