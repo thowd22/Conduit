@@ -4773,6 +4773,12 @@ const App = struct {
             }
             job.child = null;
             if (model.sessionById(target_id)) |target| if (target.child() != null) {
+                // The grid may have changed while the worker was spawning; the
+                // child must draw for the grid it has now, not the one it was
+                // requested with.
+                if (job.spawn) |request| target.syncChildSize(request.size) catch |err| {
+                    log.warn("could not tell the new child its window size: {s}", .{@errorName(err)});
+                };
                 const grid = target.terminal().gridSize();
                 log.info("child started, window {d}x{d} cells", .{ grid.cols, grid.rows });
             };
@@ -15691,6 +15697,8 @@ const ConfigWait = union(enum) {
     no_element: []const u8,
     active_text: []const u8,
     cell_height_above: u32,
+    /// No asynchronous face load is in flight.
+    fonts_idle,
     /// The committed theme's palette is this one.
     theme: theme.Palette,
 };
@@ -15705,6 +15713,7 @@ fn configWaitMet(self: *App, condition: ConfigWait) !bool {
             break :found self.activeLive().terminal().visibleTextContains(text);
         },
         .cell_height_above => |height| self.font_load == null and self.fonts.metrics().cell.height_px > height,
+        .fonts_idle => self.font_load == null,
         .theme => |palette| self.theme_palette.eql(palette),
     };
 }
@@ -15826,6 +15835,10 @@ fn configTest(self: *App, io: Io, out: *Writer) !u8 {
     try Dir.cwd().deleteFile(io, path);
     configCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_delete + 1 }) and
         self.configErrorText() == null and self.scratchpad_percent_small == 50, "deleting the file returned to the documented defaults with no error", .{});
+    // The deletion also dropped `font.size`, so a face load is in flight. Let it
+    // settle before spawning the editor: a grid that changes under a starting
+    // child is a separate concern from whether the editor opens the file.
+    configCheck(out, &failures, try waitForConfig(self, io, out, .fonts_idle), "the default face finished loading after the deletion", .{});
 
     // Keyboard path: the shipped Ctrl+, creates the file and opens it in an editor tab.
     const tabs_before_keyboard = self.activeWorkspace().tabCount();

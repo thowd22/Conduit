@@ -149,6 +149,21 @@ pub const Session = struct {
         self.child_output_quiescent = false;
     }
 
+    /// Tell an attached child the grid it is actually drawn in when that differs
+    /// from `spawned`, the size its PTY was created with.
+    ///
+    /// A spawn is asynchronous, so the grid may change while the worker is still
+    /// starting the child (a font reload, a window or divider resize). Without
+    /// this the child keeps drawing for the old size until the next resize. When
+    /// the sizes agree nothing is sent, so callers that pin exact resize counts
+    /// see no extra traffic.
+    pub fn syncChildSize(self: *Session, spawned: pty.WindowSize) pty.Error!void {
+        const child_pty = self.child_handle orelse return;
+        const current = pty.WindowSize.init(self.terminal_ptr.gridSize().rows, self.terminal_ptr.gridSize().cols);
+        if (current.rows == spawned.rows and current.cols == spawned.cols) return;
+        try child_pty.resize(current);
+    }
+
     /// Which owner this terminal was created for.
     pub fn kind(self: *const Session) Kind {
         return self.kind_value;
@@ -368,6 +383,8 @@ const ResponsePty = struct {
     /// this end before returning zero: the read thread finishing between the owner's two looks.
     late_end: ?pty.ChildState = null,
     late_output: []const u8 = "",
+    /// The most recent window size the session told this child about.
+    resized: ?pty.WindowSize = null,
 
     const vtable: pty.Pty.VTable = .{
         .write = write,
@@ -402,7 +419,10 @@ const ResponsePty = struct {
         return count;
     }
 
-    fn resize(_: *anyopaque, _: pty.WindowSize) pty.Error!void {}
+    fn resize(ptr: *anyopaque, size: pty.WindowSize) pty.Error!void {
+        const self: *ResponsePty = @ptrCast(@alignCast(ptr));
+        self.resized = size;
+    }
 
     fn kill(_: *anyopaque, _: pty.Signal) pty.Error!void {}
 
@@ -650,6 +670,38 @@ test "a session exposes OSC 133 prompt state and retained rows" {
     live.terminal().feed("\x1b]133;A\x07$ \x1b]133;B\x07");
     _ = live.terminal().takeEvents();
     try testing.expect(live.cursorIsAtPrompt());
+}
+
+test "a child attached after the terminal was resized is told the current size" {
+    const testing = std.testing;
+    // The PTY was created with the grid known when the spawn was requested; the
+    // grid changed while the worker was still spawning (a font reload, a window
+    // or sidebar resize). The child must learn the grid it is actually drawn in,
+    // or it draws for a size the terminal no longer has until the next resize.
+    var fake: ResponsePty = .{};
+    var live = try Session.init(testing.io, testing.allocator, .human_terminal, .{ .cols = 20, .rows = 3 });
+    defer live.deinit() catch |err| std.debug.panic("session cleanup failed: {s}", .{@errorName(err)});
+    try live.resize(.{ .cols = 56, .rows = 18 });
+    try live.attachChild(fake.asPty());
+    try testing.expect(fake.resized == null);
+
+    try live.syncChildSize(pty.WindowSize.init(3, 20));
+
+    try testing.expect(fake.resized != null);
+    try testing.expectEqual(@as(u16, 18), fake.resized.?.rows);
+    try testing.expectEqual(@as(u16, 56), fake.resized.?.cols);
+}
+
+test "a child spawned at the current size is not resized again on attach" {
+    const testing = std.testing;
+    var fake: ResponsePty = .{};
+    var live = try Session.init(testing.io, testing.allocator, .human_terminal, .{ .cols = 20, .rows = 3 });
+    defer live.deinit() catch |err| std.debug.panic("session cleanup failed: {s}", .{@errorName(err)});
+    try live.attachChild(fake.asPty());
+
+    try live.syncChildSize(pty.WindowSize.init(3, 20));
+
+    try testing.expect(fake.resized == null);
 }
 
 test "a session retains its explicit owner kind" {
