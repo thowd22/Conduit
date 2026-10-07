@@ -826,6 +826,35 @@ nothing else is a legal dependency.
     anomalyco/opencode `dev` source (a697115, v1.18.35) on 2026-10-07 and is unverified against
     a live opencode; the fixtures in `test/fixtures/agent/opencode/` are hand-written, and the
     live test skips when `opencode` is not installed.
+  - `pi.zig` (TASK-55): `PiAdapter` for Pi 0.73.1 and, as `Variant.omp`, the omp fork. Pi has no
+    hooks and no permission prompts, so the adapter speaks one of two channels (`Mode`). `tui`:
+    Conduit's dependency-free extension `pi/conduit.js` (embedded as `extension_source`; the owner
+    writes it to `<sink>/conduit.js` through the ExecutionContext before the spawn) is loaded
+    with `pi -e` and appends versioned, token-tagged JSON lines to `$CONDUIT_AGENT_SINK/events.jsonl`;
+    with `CONDUIT_AGENT_GATE` it holds bash/write/edit on Pi's own confirm dialog and also accepts
+    a `yes`/`no` file at `<sink>/decisions/<id>`, published by rename, whichever answers first
+    (`resolved_elsewhere` when the human answered in Pi). `rpc`: `pi --mode rpc` for headless
+    agents; the confirm arrives as `extension_ui_request` and is answered with
+    `extension_ui_response`, input is `prompt`/`steer`, stop is `abort`. All IO goes through an
+    owner-supplied `Transport` (non-blocking `read`, plus `write` for RPC or `decide` for the
+    decision file), so the adapter makes no OS calls and a remote context can carry it. Mapping:
+    `agent_start` → working, `agent_end` → done/errored/idle by `stopReason`, user and assistant
+    `message_end` → message, `tool_execution_start` → tool_use plus file_reference for a `path`,
+    confirm → permission_request with decisions `yes`/`no`, RPC `select`/`input`/`editor` →
+    waiting_input, retry exhaustion → errored, `get_state.isStreaming` → working/idle. Lines are
+    bounded (1 MiB default; an over-long line keeps only its `type`, so an oversized `agent_end`
+    still ends the turn), and a full queue resumes mid-line on the next poll. `SessionReader`
+    parses Pi's session JSONL (v3 header, `message`/`compaction`/`branch_summary`/`custom_message`
+    entries) incrementally into transcript events and refuses unknown versions;
+    `sessionDirName` gives Pi's `--<cwd>--` directory name and `recognizeCommand` classifies a
+    foreground `pi`/`omp`. Gaps versus Claude Code and Codex: no permission prompts without the
+    gate extension, no subagents, no hooks for manual starts (session JSONL and the PTY baseline
+    only until the extension is installed with consent), prompt access left to TASK-59, no
+    structured stop for a TUI turn, and omp's native approvals, `rpc-ui` and ACP unused and
+    unverified. `detect` waits for an ExecutionContext probe. Unit tests use captured fixtures
+    under `src/agent/pi/testdata/`; two integration tests run the real `pi --mode rpc` with the
+    extension against a loopback mock model (`testdata/mock_chat.py`) and skip when `pi` or
+    `python3` is absent.
 
 ### `backlog`
 
