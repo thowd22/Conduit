@@ -58,7 +58,8 @@
 //! Version gating (decision-7, rule 4): the app-server is labelled
 //! experimental and already differs between 0.160.1 and 0.161.0. The adapter
 //! accepts `tested_min` ≤ version < `tested_end` — the version comes from
-//! `Options.cli_version` (the owner's `codex --version` probe) and is
+//! `detect` (`codex --version` run through the workspace's ExecutionContext)
+//! or `Options.cli_version`, and is
 //! confirmed from the `initialize` response's `userAgent` — and otherwise
 //! refuses with `error.Protocol` and reports heuristic-only capabilities, so
 //! the agent degrades to the PTY baseline instead of guessing.
@@ -157,6 +158,33 @@ pub const tested_min: Version = .{ .major = 0, .minor = 160, .patch = 0 };
 /// daemon runs 0.161.0 and every name used here is in the stable surface, but
 /// its shapes were not re-recorded; anything newer is refused until verified.
 pub const tested_end: Version = .{ .major = 0, .minor = 162, .patch = 0 };
+
+/// Bounds on the `codex --version` probe.
+const detect_max_output: usize = 4096;
+const detect_timeout_ms: u32 = 5000;
+/// The longest first line of `codex --version` output that is parsed.
+const max_version_line_bytes: usize = 256;
+
+/// The version in `codex --version` output (`codex-cli 0.160.1`): the last
+/// word of the first line, a bare `N.N.N` with an optional `v`/`name/`
+/// prefix and pre-release suffix. Anything else is null.
+pub fn parseVersionOutput(stdout: []const u8) ?Version {
+    var lines = std.mem.tokenizeAny(u8, stdout, "\r\n");
+    const line = std.mem.trim(u8, lines.next() orelse return null, " \t");
+    if (line.len > max_version_line_bytes) return null;
+    var words = std.mem.tokenizeAny(u8, line, " \t");
+    var last: ?[]const u8 = null;
+    while (words.next()) |word| last = word;
+    var word = last orelse return null;
+    if (std.mem.lastIndexOfScalar(u8, word, '/')) |slash| word = word[slash + 1 ..];
+    if (word.len > 1 and word[0] == 'v') word = word[1..];
+    if (word.len == 0 or !std.ascii.isDigit(word[0])) return null;
+    for (word) |c| switch (c) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '.', '-', '+' => {},
+        else => return null,
+    };
+    return Version.find(word);
+}
 
 /// Whether the adapter speaks to this app-server version.
 pub fn versionSupported(version: Version) bool {
@@ -859,8 +887,10 @@ pub const Options = struct {
     mode: Mode = .daemon,
     /// The agent's working directory in its ExecutionContext. Copied.
     cwd: []const u8,
-    /// The output of `codex --version` from the owner's probe, if it ran one.
-    /// Outside the tested range the adapter degrades to heuristics.
+    /// The output of `codex --version`, when the owner already has it.
+    /// Optional: `detect` runs the same probe through the ExecutionContext and
+    /// sets the gate itself. Outside the tested range the adapter degrades to
+    /// heuristics.
     cli_version: ?[]const u8 = null,
     /// Sent as `clientInfo`; borrowed for the adapter's lifetime.
     client_name: []const u8 = "conduit",
@@ -1041,9 +1071,7 @@ pub const CodexAdapter = struct {
 
     /// The adapter's capabilities when it speaks to a supported app-server.
     pub const structured_capabilities: adapter_mod.Capabilities = .{
-        // TODO(TASK-54): detect once ExecutionContext can run `codex --version`
-        // remotely; until then the owner passes the probe in `cli_version`.
-        .detect = false,
+        .detect = true,
         .launch = true,
         .attach = true,
         .poll = true,
@@ -1058,7 +1086,7 @@ pub const CodexAdapter = struct {
     /// What is left outside the tested version range: launch the TUI into a
     /// PTY and rely on the heuristic baseline. `attach` stays callable so it
     /// can report `error.Protocol` rather than a silent `Unsupported`.
-    pub const gated_capabilities: adapter_mod.Capabilities = .{ .launch = true, .attach = true };
+    pub const gated_capabilities: adapter_mod.Capabilities = .{ .detect = true, .launch = true, .attach = true };
 
     pub fn init(allocator: Allocator, io: std.Io, options: Options) InitError!CodexAdapter {
         const cwd = try allocator.dupe(u8, options.cwd);
@@ -1101,6 +1129,7 @@ pub const CodexAdapter = struct {
     const vtable: adapter_mod.Adapter.VTable = .{
         .harness = harnessFn,
         .capabilities = capabilitiesFn,
+        .detect = detectFn,
         .launch = launchFn,
         .attach = attachFn,
         .poll = pollFn,
@@ -1148,6 +1177,46 @@ pub const CodexAdapter = struct {
     /// is `codex app-server --listen stdio://`, which the owner must start
     /// with pipes or a socketpair rather than a PTY, since the protocol is
     /// line-framed JSON and a terminal's line discipline would alter it.
+    // Detect -------------------------------------------------------------------
+
+    /// Run `codex --version` through the workspace's ExecutionContext, so
+    /// remote workspaces probe their own install. A missing command (or exit
+    /// 127 from a shell-wrapped context) is "not installed". The version also
+    /// sets the gate: outside the tested range the adapter drops to
+    /// heuristic-only capabilities, and output that names no version is
+    /// refused with `error.Protocol` and gates the adapter too, rather than
+    /// guessing.
+    fn detectFn(ptr: *anyopaque, request: adapter_mod.DetectRequest) adapter_mod.Error!?[]const u8 {
+        const self = cast(ptr);
+        var result = request.context.run(self.allocator, self.io, .{
+            .argv = &.{ "codex", "--version" },
+            .cwd = if (self.cwd.len != 0) self.cwd else "/",
+            .max_output = detect_max_output,
+            .timeout_ms = detect_timeout_ms,
+        }) catch |err| switch (err) {
+            error.CommandNotFound => return null,
+            error.Unsupported => return error.Unsupported,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unavailable => return error.Disconnected,
+            error.AccessDenied, error.InvalidRequest, error.Timeout, error.OutputTooLarge, error.SpawnFailed => {
+                log.debug("version probe failed: {s}", .{@errorName(err)});
+                return error.Protocol;
+            },
+        };
+        defer result.deinit(self.allocator);
+        if (result.exit_code) |code| if (code == 127) return null;
+        if (!result.succeeded()) return error.Protocol;
+        const version = parseVersionOutput(result.stdout) orelse {
+            self.gated = true;
+            log.debug("codex --version named no version; heuristics only", .{});
+            return error.Protocol;
+        };
+        self.gated = !versionSupported(version);
+        if (self.gated) log.debug("codex version outside the tested range; heuristics only", .{});
+        return std.fmt.bufPrint(request.version_buffer, "{d}.{d}.{d}", .{ version.major, version.minor, version.patch }) catch
+            error.NoSpaceLeft;
+    }
+
     fn launchFn(_: *anyopaque, allocator: Allocator, request: adapter_mod.LaunchRequest) adapter_mod.Error!adapter_mod.LaunchSpec {
         var argv: std.ArrayList([]const u8) = .empty;
         if (request.headless) {
@@ -2194,6 +2263,7 @@ const testing = std.testing;
 const test_log = std.log.scoped(.agent_codex_test);
 const registry_mod = @import("registry.zig");
 const session = @import("session");
+const workspace = @import("workspace");
 
 /// A scripted in-memory byte stream. Reads return what the test fed, at most
 /// `max_read` bytes at a time; writes are captured, and `responder` (when
@@ -3144,7 +3214,7 @@ test "launch describes the TUI or the headless app-server" {
     defer codex.deinit();
     const a = codex.adapter();
     try testing.expectEqual(Harness.codex, a.harness());
-    try testing.expect(!a.capabilities().detect);
+    try testing.expect(a.capabilities().detect);
     try testing.expect(!a.capabilities().read_prompt);
     var prompt: [8]u8 = undefined;
     try testing.expectError(error.Unsupported, a.readPrompt(&prompt));
@@ -3675,4 +3745,130 @@ test "with a live codex daemon, a hand-started TUI is found and its approval ans
     try testing.expect(answered);
     try testing.expect(resolved);
     try testing.expectEqual(State.done, reg.get(agent_id).?.state);
+}
+
+/// An ExecutionContext whose `run` returns one scripted outcome and records
+/// the request.
+const ScriptedRunContext = struct {
+    outcome: union(enum) {
+        result: struct { exit_code: ?u8, stdout: []const u8 = "" },
+        fail: workspace.RunError,
+    },
+    argv: [4][]const u8 = undefined,
+    argc: usize = 0,
+    cwd: []const u8 = "",
+    max_output: usize = 0,
+    timeout_ms: u32 = 0,
+
+    const vtable: workspace.ExecutionContext.VTable = .{
+        .spawn = spawn,
+        .kind = kind,
+        .destroy = destroy,
+        .run = run,
+    };
+
+    fn ref(self: *ScriptedRunContext) workspace.ExecutionContext.Ref {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    // `agent` does not import `pty`; the spawn entry's types come from the
+    // vtable's own function type.
+    const spawn_fn = @typeInfo(@typeInfo(workspace.ExecutionContext.SpawnFn).pointer.child).@"fn";
+
+    fn spawn(_: *anyopaque, _: spawn_fn.params[1].type.?) spawn_fn.return_type.? {
+        return error.SystemError;
+    }
+
+    fn kind(_: *const anyopaque) workspace.ExecutionContextKind {
+        return .ssh;
+    }
+
+    fn destroy(_: *anyopaque) void {}
+
+    fn run(ptr: *anyopaque, allocator: Allocator, _: std.Io, request: workspace.RunRequest) workspace.RunError!workspace.RunResult {
+        const self: *ScriptedRunContext = @ptrCast(@alignCast(ptr));
+        // Only string literals and adapter-owned strings that outlive the
+        // test's reads are recorded.
+        self.argc = @min(request.argv.len, self.argv.len);
+        @memcpy(self.argv[0..self.argc], request.argv[0..self.argc]);
+        self.cwd = request.cwd;
+        self.max_output = request.max_output;
+        self.timeout_ms = request.timeout_ms;
+        switch (self.outcome) {
+            .fail => |err| return err,
+            .result => |r| {
+                const stdout = try allocator.dupe(u8, r.stdout);
+                errdefer allocator.free(stdout);
+                return .{ .exit_code = r.exit_code, .stdout = stdout, .stderr = try allocator.dupe(u8, "") };
+            },
+        }
+    }
+};
+
+test "detect runs codex --version through the context and sets the gate" {
+    var stream: MemoryStream = .{ .allocator = testing.allocator };
+    defer stream.deinit();
+    var line = LineTransport.init(testing.allocator, stream.stream(), 1024);
+    defer line.deinit();
+    var codex = try CodexAdapter.init(testing.allocator, testing.io, .{ .transport = line.transport(), .cwd = "/work/proj" });
+    defer codex.deinit();
+    const a = codex.adapter();
+    try testing.expect(a.capabilities().detect);
+    var version: [32]u8 = undefined;
+
+    var installed: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "codex-cli 0.160.1\n" } } };
+    try testing.expectEqualStrings("0.160.1", (try a.detect(.{ .context = installed.ref(), .version_buffer = &version })).?);
+    try testing.expectEqual(@as(usize, 2), installed.argc);
+    try testing.expectEqualStrings("codex", installed.argv[0]);
+    try testing.expectEqualStrings("--version", installed.argv[1]);
+    try testing.expectEqualStrings("/work/proj", installed.cwd);
+    try testing.expectEqual(detect_max_output, installed.max_output);
+    try testing.expectEqual(detect_timeout_ms, installed.timeout_ms);
+    try testing.expect(!codex.gated);
+    try testing.expect(a.capabilities().structured_status);
+
+    // Not installed: the command is missing, or a shell said so.
+    var missing: ScriptedRunContext = .{ .outcome = .{ .fail = error.CommandNotFound } };
+    try testing.expect((try a.detect(.{ .context = missing.ref(), .version_buffer = &version })) == null);
+    var shell_missing: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 127 } } };
+    try testing.expect((try a.detect(.{ .context = shell_missing.ref(), .version_buffer = &version })) == null);
+
+    // Probe failures are reported, not guessed.
+    var failing: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 1, .stdout = "codex-cli 0.160.1\n" } } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = failing.ref(), .version_buffer = &version }));
+    var slow: ScriptedRunContext = .{ .outcome = .{ .fail = error.Timeout } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = slow.ref(), .version_buffer = &version }));
+    var no_run: ScriptedRunContext = .{ .outcome = .{ .fail = error.Unsupported } };
+    try testing.expectError(error.Unsupported, a.detect(.{ .context = no_run.ref(), .version_buffer = &version }));
+    var tight: [4]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, a.detect(.{ .context = installed.ref(), .version_buffer = &tight }));
+    try testing.expect(!codex.gated);
+
+    // A newer codex than tested: installed, but heuristics only.
+    var newer: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "codex-cli 0.170.2\n" } } };
+    try testing.expectEqualStrings("0.170.2", (try a.detect(.{ .context = newer.ref(), .version_buffer = &version })).?);
+    try testing.expect(codex.gated);
+    try testing.expect(!a.capabilities().structured_status);
+    try testing.expect(a.capabilities().detect);
+    try testing.expectError(error.Protocol, a.attach(.{ .session = .first, .token = .fromBytes(@splat(1)) }));
+
+    // Junk output names no version: refused, and the adapter stays gated.
+    var junk: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "codex-cli 0.160.1;rm -rf /\n" } } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = junk.ref(), .version_buffer = &version }));
+    try testing.expect(codex.gated);
+
+    // A supported probe lifts the gate again.
+    try testing.expectEqualStrings("0.160.1", (try a.detect(.{ .context = installed.ref(), .version_buffer = &version })).?);
+    try testing.expect(!codex.gated);
+}
+
+test "codex --version output parses strictly" {
+    try testing.expectEqual(Version{ .major = 0, .minor = 160, .patch = 1 }, parseVersionOutput("codex-cli 0.160.1\n").?);
+    try testing.expectEqual(Version{ .major = 0, .minor = 161, .patch = 0 }, parseVersionOutput("  codex-cli v0.161.0-alpha.2\r\nextra\n").?);
+    try testing.expectEqual(Version{ .major = 1, .minor = 2, .patch = 3 }, parseVersionOutput("codex/1.2.3").?);
+    try testing.expect(parseVersionOutput("") == null);
+    try testing.expect(parseVersionOutput("codex-cli\n") == null);
+    try testing.expect(parseVersionOutput("codex-cli 0.160\n") == null);
+    try testing.expect(parseVersionOutput("codex-cli 0.160.1;x\n") == null);
+    try testing.expect(parseVersionOutput("codex-cli " ++ "9" ** 300 ++ "\n") == null);
 }
