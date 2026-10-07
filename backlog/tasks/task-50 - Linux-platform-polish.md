@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 00:39'
+updated_date: '2026-10-07 03:59'
 labels:
   - platform
   - linux
@@ -69,6 +69,8 @@ Approved CI evidence is now checked in: the Linux workflow explicitly installs i
 2026-10-07 the installed icon is now the user-supplied artwork: source PNG kept untouched, alpha-cleaned master generates hicolor 16-512 PNGs installed and packaged (deb, tar.gz, AppImage .DirIcon); desktop-file validation and the PNG payload checks run in CI; the window icon is set via SDL_SetWindowIcon and check-x11-window-icon.sh proves _NET_WM_ICON matches the 64x64 fixture. Local gate 531/538 tests, 17 headless checks, e2e 6/6, window-icon and keyboard X11 checks all green.
 
 2026-10-07 second IBus flake on a hosted run (release 37552145736, 1 of 6 executions of the hardened script): the child received gksrmf once, so the keys reached the terminal before ibus-engine-hangul (spawned lazily on first focus-in) was answering. check-ibus-hangul.sh now waits for the engine process (pgrep -f, the comm name is truncated) and probes with 'g' until ime.preedit exists, erasing a passed-through probe with Backspace, bounded to five attempts; container 5/5 with one probe each.
+
+2026-10-07 third IBus flake mode (gate 37554433896 on 6c49246): every probe arrived as ASCII with the engine process already running. Cause: ibus-daemon --xim starts ibus-x11 asynchronously while SDL opens its XIM once at window creation, so a Conduit launched before the bridge registered never attaches to an input method. check-ibus-hangul.sh now waits for xprop -root XIM_SERVERS to contain @server=ibus (recorded as xim-servers.txt) before launching; container 5/5 with one probe each.
 <!-- SECTION:NOTES:END -->
 
 ## Comments

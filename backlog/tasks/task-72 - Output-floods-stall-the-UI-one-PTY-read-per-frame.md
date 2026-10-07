@@ -1,11 +1,11 @@
 ---
 id: TASK-72
 title: 'Output floods stall the UI: one PTY read per frame'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-07 02:11'
-updated_date: '2026-10-07 03:55'
+updated_date: '2026-10-07 04:12'
 labels:
   - performance
   - terminal
@@ -25,10 +25,10 @@ Inside Conduit, 'seq 1 200000' (1.3 MB) takes about 20 s with the ReleaseSafe bu
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Draining child output is bounded by bytes and time per wake rather than by one read, and output keeps flowing while frames are coalesced to roughly display rate
-- [ ] #2 A deterministic test proves a multi-megabyte flood is consumed in bounded frames or bounded time without reaching into app state
-- [ ] #3 'seq 1 200000' and 'yes | head -200000' complete inside a ReleaseSafe Conduit within a few seconds on the dev box, and the driver keeps answering during the flood
-- [ ] #4 Idle behaviour is unchanged: an untouched window draws no frames and the loop still blocks in SDL
+- [x] #1 Draining child output is bounded by bytes and time per wake rather than by one read, and output keeps flowing while frames are coalesced to roughly display rate
+- [x] #2 A deterministic test proves a multi-megabyte flood is consumed in bounded frames or bounded time without reaching into app state
+- [x] #3 'seq 1 200000' and 'yes | head -200000' complete inside a ReleaseSafe Conduit within a few seconds on the dev box, and the driver keeps answering during the flood
+- [x] #4 Idle behaviour is unchanged: an untouched window draws no frames and the loop still blocks in SDL
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -48,4 +48,12 @@ Inside Conduit, 'seq 1 200000' (1.3 MB) takes about 20 s with the ReleaseSafe bu
 2026-10-07 slice 1 (Opus agent, main.zig/workspace.zig/e2e): App.run now drains child output in bounded 16 KiB pump passes under workspace.DrainBudget.per_wake (4 MiB or 8 ms) before deciding to draw; a pure FramePacer coalesces frames to one per max(16 ms, last frame cost) while output keeps arriving and draws an owed frame as soon as output pauses or the loop exits; the driver is polled every iteration; idle --self-test still draws one frame. New unit tests: DrainBudget edges, 5.2 MiB fake-PTY flood in exactly 2 wakes, real-PTY 4 MiB flood under 10 s, exhaustive FramePacer decisions, an 8 MiB simulated flood with bounded frames; new scripted E2E scenario output-flood (4 MB CR flood, runtime-built marker). Results: a 40 MB CR flood fell from 12.7 s to 1.4 s (ReleaseSafe) and 18.6 s to 4.1 s (Debug), but seq 1 200000 stays at 14.6 s and yes | head -200000 at 12-13 s in ReleaseSafe because each LF costs ~75 us inside Terminal.feed (empty lines 2.6 s per 64 KiB; CR-only and soft-wrapped text are fast; scrollback limit irrelevant). Debug is also dominated by Ghostty's slow_runtime_safety PageList.verifyIntegrity on every scroll. AC3 stays open; slice 2 targets the LF cost in term.zig.
 
 2026-10-07 slice 2 root cause (Opus agent, term.zig): Conduit adds no per-linefeed work; build.zig called b.dependency("ghostty", .{}) without target/optimize, so ghostty-vt was built in Ghostty's default Debug mode with slow_runtime_safety on inside every Conduit build, including the shipped v0.1.0-v0.1.2 binaries. Each scroll then ran Screen.assertIntegrity and the PageList/Page integrity checks: ~79 us per LF in ReleaseSafe Conduit, ~1.5 ms in Debug. Unit benchmark of a 200,000-line feed: 15.8 s -> 0.098 s (ReleaseSafe engine). Fix applied by the coordinator in build.zig: ghosttyDependencyOptions passes Conduit's target and optimize to both ghostty dependency calls, with the engine built at least ReleaseSafe even for a Debug Conduit (Debug keeps Conduit's own checks; only Ghostty's internal integrity asserts are given up). term.zig gained a comptime engine_integrity_checks probe via @FieldType(PageList, "pause_integrity_checks"), a test that fails any optimised build linking a slow-checked engine, and a 200,000-line feed test bounded at 5 s. Real app after the fix: Debug Conduit seq 1 200000 REAL 0.484 s (was >260 s), yes | head -200000 REAL 0.333 s (was >245 s); the agent measured ReleaseSafe 0.124 s and 0.106 s (were 14.6 s and 13.0 s).
+
+2026-10-07 hosted and release evidence: gate 37565999811 (drain/pacing slice) and 37569321582 green; release run 37569118654 published v0.1.3 from c6bca1d. Published binary measured through conduit-test under Xvfb: seq 1 200000 REAL 0.126 s, yes | head -200000 REAL 0.121 s (were 14.6 s and 13.0 s); Codex running inside the fixed build answers the driver in ~22 ms during and after a 50,000-line local command (was 0.6-1.3 s). --self-test idle frame count unchanged (one frame in 1000 ms), loop still blocks in SDL when nothing is pending.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Output floods no longer stall the UI. Two causes were fixed: the event loop drained one PTY read per frame (now bounded 16 KiB passes under a 4 MiB / 8 ms per-wake budget with FramePacer coalescing frames to display rate while output flows), and build.zig built the ghostty-vt engine in Ghostty's default Debug mode with slow_runtime_safety on inside every Conduit build (now built at least ReleaseSafe with Conduit's target/optimize passed through). seq 1 200000 went from 14.6 s to 0.12 s in the released binary and from over 260 s to 0.48 s in Debug. Verified by DrainBudget/FramePacer/flood unit tests, a term test that fails any optimised build linking a slow-checked engine, a 200,000-line feed bound, the output-flood E2E scenario, hosted gates, and timings of the published v0.1.3 binary.
+<!-- SECTION:FINAL_SUMMARY:END -->
