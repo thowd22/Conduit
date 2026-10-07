@@ -1,11 +1,11 @@
 ---
 id: TASK-73
 title: Child shells inherit only a curated environment
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-07 04:41'
-updated_date: '2026-10-07 04:50'
+updated_date: '2026-10-07 04:58'
 labels:
   - terminal
   - workspace
@@ -25,9 +25,9 @@ Conduit builds every child's environment from scratch (COLORTERM, HOME, LANG, PA
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A Local execution context starts children with the Conduit process's environment, with Conduit's own terminal identity variables (TERM, COLORTERM, TERM_PROGRAM) set on top and nothing else removed except variables that would leak the test driver or isolated-run configuration
-- [ ] #2 A deterministic check proves a shell inside Conduit sees the launching session's DISPLAY or WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS and SSH_AUTH_SOCK when the launcher had them, and that conduit-test's isolated HOME/XDG overrides still apply to the app itself
-- [ ] #3 Remote contexts remain explicit: the curated environment is kept only where a context cannot forward the local one, and the architecture guide records the rule
+- [x] #1 A Local execution context starts children with the Conduit process's environment, with Conduit's own terminal identity variables (TERM, COLORTERM, TERM_PROGRAM) set on top and nothing else removed except variables that would leak the test driver or isolated-run configuration
+- [x] #2 A deterministic check proves a shell inside Conduit sees the launching session's DISPLAY or WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS and SSH_AUTH_SOCK when the launcher had them, and that conduit-test's isolated HOME/XDG overrides still apply to the app itself
+- [x] #3 Remote contexts remain explicit: the curated environment is kept only where a context cannot forward the local one, and the architecture guide records the rule
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -43,4 +43,12 @@ Conduit builds every child's environment from scratch (COLORTERM, HOME, LANG, PA
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-10-07 implemented by an Opus agent: EnvSource can enumerate the process environment; ChildSpec.build/buildIn/buildInteractive take the workspace ExecutionContextKind and baseEnvironment switches on it with no default branch (.local inherits, .ssh/.wsl start curated); TERM/COLORTERM/TERM_PROGRAM set on top with PATH/HOME/LANG fallbacks; values held in std.process.Environ.Map so overrides replace rather than duplicate. Exclusions (ChildSpec.inherited_exclusions): CONDUIT_TEST_RUN, CONDUIT_TEST_ROOT (conduit-test addressing), CONDUIT_LOG_FILE (this run's truncated log), the four shell-integration handshake variables of an enclosing Conduit, and TERM_PROGRAM_VERSION. Driver endpoint/artifact dir travel only as flags; the launcher's isolated HOME/XDG/TMPDIR still reach children. Unit tests cover inheritance (probe, DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, SSH_AUTH_SOCK, LC_TIME), override uniqueness, exclusions, fallbacks, the scratchpad shell, the curated ssh/wsl path and a lookup-only source. Eighth E2E scenario child-environment (runner sets probe/agent-socket/driver variables for launch only) passes; real-driver probe showed PROBE_hello, DISP_:99, isolated HOME and DRV_unset. Agent gate: zig build test 544/552 (8 skips), e2e 8/8, self/driver/tabs/panes/scratchpad/workspaces/links/clipboard checks green.
+
+2026-10-07 coordinator gate: zig build test 544/552 (8 skips), all seventeen headless checks, e2e 8/8 including child-environment; hosted release run for v0.1.4 (1b0ff54) passed the full Linux gate and published; the released binary, launched through conduit-test with CONDUIT_PROBE_VAR=released, printed PROBE_released and DISP_:99 in its child shell while keeping the isolated HOME. Remote rule recorded in docs/architecture.md (workspace/app) and AGENTS.md.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Local children now inherit Conduit's process environment with the terminal identity set on top and only test-driver addressing, this run's log file, an enclosing Conduit's shell-integration handshake and TERM_PROGRAM_VERSION removed, so desktop session variables and user exports reach shells and the programs they run; SSH and WSL contexts keep the curated set, and the rule 'Local inherits; remote contexts supply their own' is documented. Verified by unit tests, the child-environment E2E scenario through conduit-test, the full Linux gate, and a probe of the published v0.1.4 binary.
+<!-- SECTION:FINAL_SUMMARY:END -->
