@@ -1260,6 +1260,9 @@ const SshWatch = struct {
     }
 
     fn start(self: *SshWatch) bool {
+        // The watch channel reads the child's pipe through the POSIX `sys` calls; SSH workspaces
+        // are Linux-only (`supported`), and this keeps the rest of the module compiling elsewhere.
+        if (comptime !supported) return false;
         self.last_start_ms = nowMs(self.io);
         self.ready = false;
         if (self.context.state() != .connected) return false;
@@ -1294,6 +1297,7 @@ const SshWatch = struct {
 
     /// Block until the current channel reports its baseline, or fail.
     fn awaitReady(self: *SshWatch) bool {
+        if (comptime !supported) return false;
         const deadline = nowMs(self.io) + watch_ready_timeout_ms;
         while (true) {
             const outcome = self.drain();
@@ -1310,6 +1314,7 @@ const SshWatch = struct {
 
     /// Take everything the channel has delivered without blocking.
     fn drain(self: *SshWatch) Drained {
+        if (comptime !supported) return .ended;
         const child = self.child orelse return .ended;
         var changed = false;
         var buffer: [256]u8 = undefined;

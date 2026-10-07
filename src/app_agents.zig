@@ -1918,7 +1918,10 @@ test "a fake agent's launch writes its files and its events become glyph states 
     var read_buffer: [8]u8 = undefined;
     try testing.expectEqualStrings("x", try Dir.cwd().readFile(testing.io, files[0].path, &read_buffer));
     const sink_stat = try Dir.cwd().statFile(testing.io, runner.sink_dir, .{});
-    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(sink_stat.permissions.toMode() & 0o777)));
+    // Windows has no mode bits: `private_dir` is the default directory permission there.
+    if (builtin.os.tag != .windows) {
+        try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(sink_stat.permissions.toMode() & 0o777)));
+    }
 
     const outside = [_]agent.LaunchSpec.File{.{ .path = "/tmp/elsewhere.js", .bytes = "x" }};
     try testing.expectError(error.UnsafeFile, runner.writeLaunchFile(outside[0]));
