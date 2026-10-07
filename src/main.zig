@@ -21826,6 +21826,7 @@ const inheriting_env = test_env{ .vars = &.{
     .{ "COLORTERM", "24bit" },
     .{ "TERM_PROGRAM", "vscode" },
     .{ "TERM_PROGRAM_VERSION", "1.2.3" },
+    .{ "CONDUIT_AGENT_TOKEN", "0123456789abcdef0123456789abcdef" },
     .{ "CONDUIT_TEST_RUN", "run-1" },
     .{ "CONDUIT_TEST_ROOT", "/private/root" },
     .{ "CONDUIT_LOG_FILE", "/private/outer.log" },

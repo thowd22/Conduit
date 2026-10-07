@@ -68,8 +68,9 @@ fn eqlHyphenated(comptime tag: []const u8, text: []const u8) bool {
 test "every harness parses back from the spellings Conduit writes" {
     const testing = std.testing;
 
-    // The catalogue is the three harnesses named in CONDUIT.md, and no more.
-    try testing.expectEqual(@as(usize, 3), Harness.all.len);
+    // The catalogue is the three harnesses named in CONDUIT.md plus OpenCode
+    // (TASK-78), and no more.
+    try testing.expectEqual(@as(usize, 4), Harness.all.len);
 
     for (Harness.all) |harness| {
         const tag = @tagName(harness);
