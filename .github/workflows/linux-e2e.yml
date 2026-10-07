@@ -53,7 +53,10 @@ jobs:
             jq \
             xclip \
             x11-utils \
-            desktop-file-utils
+            desktop-file-utils \
+            fonts-noto-color-emoji \
+            fonts-noto-cjk \
+            fonts-dejavu-core
 
       - name: Resolve the pinned Zig version
         shell: bash

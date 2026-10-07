@@ -288,6 +288,37 @@ const child_environment_steps = [_]Step{
 };
 
 /// All scenarios in deterministic execution and report order.
+// TASK-39: one screen of every glyph category the font stack resolves beyond
+// the primary face. A Starship-style prompt (Powerline arrows and rounded caps
+// over coloured segments, a Nerd Font branch icon), box drawing with light,
+// heavy and double strokes, block elements, braille, a CJK word through the
+// system fallback, Claude Code's U+273B, a supplementary-plane Nerd Font icon,
+// programming ligatures and colour emoji. Every byte is printed by the child,
+// so the screenshot shows what the renderer drew for each category.
+const font_coverage_marker = "FONT_COVERAGE_READY";
+
+const font_coverage_command =
+    "stty -echo; printf '\x1b[2J\x1b[H'; " ++
+    "printf '\x1b[30;44m \u{F126} main \x1b[34;42m\u{E0B0}\x1b[30;42m ~/src/conduit \x1b[32;45m\u{E0B0}" ++
+    "\x1b[30;45m 3.2s \x1b[35;49m\u{E0B0}\x1b[0m \x1b[33m\u{E0B6}\x1b[30;43m zig \x1b[33;49m\u{E0B4}\x1b[0m\\n'; " ++
+    "printf '\x1b[32m\u{276F}\x1b[0m cargo build => ok != err -> done\\n\\n'; " ++
+    "printf '\u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{252C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256E} " ++
+    "\u{2554}\u{2550}\u{2550}\u{2566}\u{2550}\u{2550}\u{2557} \u{250F}\u{2501}\u{2501}\u{2513}\\n'; " ++
+    "printf '\u{2502} \u{4E2D}\u{6587} \u{2502} \u{273B} \u{F0068}  \u{2502} \u{2551}\u{2588}\u{2588}\u{2551}\u{2592}\u{2592}\u{2551} " ++
+    "\u{2503}\u{2580}\u{2584}\u{2503}\\n'; " ++
+    "printf '\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256F} " ++
+    "\u{255A}\u{2550}\u{2550}\u{2569}\u{2550}\u{2550}\u{255D} \u{2517}\u{2501}\u{2501}\u{251B}\\n\\n'; " ++
+    "printf 'braille \u{28FF}\u{2847}\u{283F}\u{28B8}\u{28C0}\u{281B}\u{28E4}\u{2836}  emoji \u{1F600} \u{1F680} \u{1F40D}\\n'; " ++
+    "printf 'FONT_%s\\n' COVERAGE_READY; " ++
+    "while :; do sleep 60; done";
+
+const font_coverage_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = font_coverage_marker } },
+    .{ .wait_terminal_text = .{ .contains = "\u{4E2D}\u{6587}" } },
+    .inspect,
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -334,6 +365,11 @@ pub const all = [_]Scenario{
         .name = "sidebar-palette",
         .command = deterministic_shell,
         .steps = &sidebar_palette_steps,
+    },
+    .{
+        .name = "font-coverage",
+        .command = font_coverage_command,
+        .steps = &font_coverage_steps,
     },
 };
 
