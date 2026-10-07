@@ -1912,6 +1912,7 @@ const ConPty = struct {
     fn watchThread(self: *ConPty) void {
         var handles = [2]win.HANDLE{ self.child, self.stop };
         if (win.waitOn(&handles, null) != 0) return;
+        log.warn("DIAG watcher: child ended, closing the pseudoconsole", .{});
         self.closeConsole();
     }
 
@@ -1963,7 +1964,9 @@ const ConPty = struct {
             if (!self.waitForRoom()) return;
 
             var count: u32 = 0;
-            switch (self.readOnce(buffer, overlapped, &count, child_ended)) {
+            const diag_outcome = self.readOnce(buffer, overlapped, &count, child_ended);
+            log.warn("DIAG read: {s} {d} bytes {f}", .{ @tagName(diag_outcome), count, std.zig.fmtString(buffer[0..@min(count, 200)]) });
+            switch (diag_outcome) {
                 .bytes => self.enqueue(buffer[0..count]),
                 .child_ended => child_ended = true,
                 .hung_up, .stopping => return,
@@ -1990,7 +1993,9 @@ const ConPty = struct {
             // which is the only place either kind of completion puts it.
             return self.finishRead(overlapped, count, .bytes);
         }
-        switch (win.lastError()) {
+        const diag_err = win.lastError();
+        if (diag_err != .IO_PENDING) log.warn("DIAG ReadFile: {s}", .{@tagName(diag_err)});
+        switch (diag_err) {
             // The read is in flight; the wait below is what completes it.
             .IO_PENDING => {},
             // The pseudoconsole hung up: this terminal will never produce bytes again.
@@ -2028,13 +2033,20 @@ const ConPty = struct {
                 // Cancellation is a normal ending, not a failure: the read delivered nothing and
                 // nobody will ask about it again.
                 .OPERATION_ABORTED => return outcome,
+                // The pseudoconsole hung up while the read was in flight.
+                .BROKEN_PIPE, .HANDLE_EOF => return if (outcome == .stopping) .stopping else .hung_up,
                 else => |err| log.err("cannot collect a read from the terminal: {s}", .{@tagName(err)}),
             }
             return .hung_up;
         }
-        if (outcome != .bytes) return outcome;
-        // A pipe read that completes with nothing is the far end hanging up.
-        if (transferred == 0) return .hung_up;
+        // A read that completed before the cancellation reached it still moved bytes, and they are
+        // the child's: keep them. A stop is still a stop, and a child that ended is still signalled,
+        // so the next wait reports it again.
+        if (outcome == .stopping) return outcome;
+        if (transferred == 0) {
+            // A pipe read that completes with nothing is the far end hanging up.
+            return if (outcome == .bytes) .hung_up else outcome;
+        }
         count.* = transferred;
         return .bytes;
     }
@@ -2972,7 +2984,7 @@ const win = struct {
         // pipe, a file, a CI log) is handed those handles instead of the pseudoconsole's and
         // writes past the terminal entirely. Null handles with the flag set make the child take
         // its standard handles from the console it is attached to, which is the pseudoconsole.
-        startup.startup_info.dwFlags = startf_usestdhandles;
+        startup.startup_info.dwFlags = if (diag_use_std_handles) startf_usestdhandles else 0;
         startup.startup_info.hStdInput = null;
         startup.startup_info.hStdOutput = null;
         startup.startup_info.hStdError = null;
@@ -3841,6 +3853,60 @@ fn windowsRequest(argv: []const []const u8) SpawnRequest {
     };
 }
 
+var diag_use_std_handles = true;
+
+fn diagReader(handle: win.HANDLE, out: *std.ArrayList(u8)) void {
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        var got: win.DWORD = 0;
+        if (win.ReadFile(handle, &buffer, buffer.len, &got, null) == .FALSE) {
+            log.warn("DIAG sync read ended: {s}", .{@tagName(win.lastError())});
+            return;
+        }
+        if (got == 0) {
+            log.warn("DIAG sync read: zero bytes", .{});
+            return;
+        }
+        out.appendSlice(std.heap.page_allocator, buffer[0..got]) catch return;
+    }
+}
+
+fn diagRun(gpa: Allocator, use_std_handles: bool, named_output: bool) !void {
+    diag_use_std_handles = use_std_handles;
+    defer diag_use_std_handles = true;
+    var prepared = try WindowsRequest.init(gpa, windowsRequest(&.{ "cmd.exe", "/Q", "/C", "echo diag-hello& exit 42" }));
+    defer prepared.deinit(gpa);
+    var input = try win.createInputPipe();
+    defer input.close();
+    var output: WindowsPipe = .{};
+    if (named_output) {
+        output = try win.createOutputPipe();
+    } else if (win.CreatePipe(&output.conduit, &output.conpty, null, 0) == .FALSE) return error.SystemError;
+    defer output.close();
+    const console = try win.createPseudoConsole(WindowSize.init(24, 80), input.conpty, output.conpty);
+    var child = try win.createProcess(gpa, prepared, console);
+    defer child.close();
+    var collected: std.ArrayList(u8) = .empty;
+    defer collected.deinit(std.heap.page_allocator);
+    var thread: ?std.Thread = null;
+    if (!named_output) thread = try std.Thread.spawn(.{}, diagReader, .{ output.conduit, &collected });
+    var handles = [1]win.HANDLE{child.handle};
+    const waited = win.waitOn(&handles, 5000);
+    var code: u32 = 0;
+    _ = win.getExitCodeProcess(child.handle, &code);
+    log.warn("DIAG std_handles={} named={} wait={d} exit=0x{X}", .{ use_std_handles, named_output, waited, code });
+    win.closePseudoConsole(console);
+    if (thread) |t| t.join();
+    log.warn("DIAG output: {f}", .{std.zig.fmtString(collected.items[0..@min(collected.items.len, 600)])});
+}
+
+test "DIAG conpty variations" {
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    diagRun(gpa, true, false) catch |err| log.warn("DIAG run failed: {s}", .{@errorName(err)});
+    diagRun(gpa, false, false) catch |err| log.warn("DIAG run failed: {s}", .{@errorName(err)});
+}
+
 test "a request the Windows backend could not run is refused before anything is created" {
     if (!has_conpty_backend) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -3912,6 +3978,7 @@ test "a Windows terminal runs what the owner writes, through the pseudoconsole" 
     try writeAll(pty, "set conduit=marker\recho conduit-pty-%conduit%\r");
     const output = try readUntil(gpa, pty, "conduit-pty-marker");
     defer gpa.free(output);
+    log.warn("DIAG round trip: {f}", .{std.zig.fmtString(output[0..@min(output.len, 1500)])});
 
     // Both halves of the round trip: the terminal's echo of what the owner wrote, which still
     // carries the unexpanded variable, and the line the shell printed in answer.
