@@ -205,7 +205,8 @@ engine, bounded draining and frame pacing; `seq 1 200000` takes 0.12 s in that b
 (https://github.com/thowd22/Conduit/releases/tag/v0.1.4) carries TASK-73: Local children inherit
 the desktop environment. `v0.1.7` (https://github.com/thowd22/Conduit/releases/tag/v0.1.7) carries
 TASK-74 (sidebar Palette hint and version, content-sized palette) and TASK-75 (PTY wakeup fix);
-`v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
+`v0.1.8` (https://github.com/thowd22/Conduit/releases/tag/v0.1.8) carries M4: TASK-37, 38, 39, 40 and
+41. `v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
 the `less` wheel test ordering and the IBus bridge race that the following commits fixed. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
 re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
@@ -449,6 +450,41 @@ palette. The deterministic Linux `--settings-test` drives all of this through re
 file readback, and its 640x360 frame was inspected. The thirteenth scripted scenario,
 `settings-view`, opens the view by keyboard and through `sidebar.palette`, then clicks a bool row.
 macOS and Windows are unverified.
+
+TASK-42 is complete: decision-8 chooses the system OpenSSH client, spawned through `pty.spawn`,
+with one ControlMaster per SSH workspace on Linux and macOS (tabs, panes, the scratchpad, editor
+tabs and agent TUIs run `ssh -tt -o ControlMaster=no` over it; file reads, listings, watches and
+command runs use `ssh -T -o BatchMode=yes` exec channels), one `ssh.exe` per session with the
+Windows ssh-agent on Windows (WSL transport and libssh2/WinCNG are recorded as later opt-in
+upgrades), OpenSSH's own host-key, passphrase, password and 2FA prompts shown verbatim in a
+connection session that Conduit never parses, stores or logs, explicit user-driven reconnect, and
+remote shell integration installed into a content-addressed cache. `spikes/ssh-controlmaster`
+proved one authentication, two independent resizable shells and two exec channels on one master
+against a local sshd container; `ControlMaster=no` silently opens a direct connection without a
+live master, so every exec uses BatchMode and sessions spawn only while connected. TASK-43
+implements it.
+
+TASK-52 is complete. `agent` now holds the harness-neutral core under `src/agent/`, re-exported
+from `agent.zig`. `State` (idle, working, waiting_input, waiting_permission, done, errored) has a
+`canTransition` table and a `Source` that is either structured or heuristic. `Event` is a typed
+union of message, tool_use, file_reference, permission_request (with the harness's own decision
+list), permission_resolved (including resolved_elsewhere), status_change, subagent, notification
+and exited; its payload text is untrusted and never acted on. Events cross from adapter IO
+threads to the owner thread through the bounded, mutex-guarded `EventQueue`, which deep-copies
+each event into a fixed slot and refuses rather than grows when full. `Adapter` is a type-erased
+vtable (detect, launch, attach, poll, sendInput, respondPermission, readPrompt, updatePrompt,
+stop) whose every method is gated by `Capabilities` and returns `error.Unsupported` when
+unavailable. `launch` only describes the process (argv plus extra env including
+`CONDUIT_AGENT_TOKEN`, which `ChildSpec` now strips from nested children); the workspace spawns it
+through its ExecutionContext into an `agent_terminal` session. `Registry` keeps agents per
+workspace under monotonic, never-reused `AgentId`s. Owned agents must use agent sessions, observed
+(hand-started) agents live in a human terminal the human keeps, and the scratchpad is refused for
+both. Pending permissions are tracked by id, heuristic status is ignored once a structured event
+arrives, and an exit freezes the record. `Heuristics` maps PTY facts (output, title, BEL, OSC
+9/777, OSC 133, human input, quiet, child exit) to heuristic events. The scripted `FakeAdapter`
+drives the unit tests through every transition. `Harness` now includes `opencode`, and
+`src/agent/{claude_code,codex,pi,opencode}.zig` are stubs for TASK-53/54/55/78; nothing in the app
+is wired to the registry yet.
 
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading

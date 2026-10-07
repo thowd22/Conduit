@@ -1380,6 +1380,9 @@ const ChildSpec = struct {
         "CONDUIT_ZSH_ZDOTDIR",
         "CONDUIT_SHELL_INTEGRATION_XDG_DIR",
         "TERM_PROGRAM_VERSION",
+        // An enclosing Conduit's agent correlation token (TASK-52) must not reach a
+        // nested child, or a harness started inside it would report to the wrong agent.
+        "CONDUIT_AGENT_TOKEN",
     };
 
     /// A child's environment while it is being built: the key-replacing map

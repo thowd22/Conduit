@@ -1306,7 +1306,7 @@ inside the same event loop, so the main thread is that render/UI thread.
 | Settings file watch | `config.Watcher`, own thread | the thread only sets an atomic `changed` flag and posts an SDL wake; `app` reads, validates and applies the file on the main thread in `poll` |
 | Font discovery and file loading | `font`, off-thread | discovered faces handed to the main thread **(d)** |
 | Agent harness IO | `agent` adapters, off-thread | events handed over through a defined queue **(d)** |
-| SSH transport | `workspace`'s ExecutionContext, off-thread | [undecided](#9-undecided): TASK-42, TASK-43 |
+| SSH transport | `workspace`'s ExecutionContext, off-thread | decision-8: the system OpenSSH client in Conduit-owned PTYs and pipes, one ControlMaster per SSH workspace on Linux/macOS; TASK-43 implements it |
 | Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)** |
 
 **(d)** = derived by applying the AGENTS.md rule "the render/UI thread never blocks on IO" to a
@@ -1532,9 +1532,6 @@ decision record and this file is updated in the same change.
 
 | Question | Owner |
 |---|---|
-| SSH transport and multiplexing: how do tabs, panes and the scratchpad share one connection? | TASK-42, TASK-43 |
-| What integration surfaces do Claude Code, Codex and Pi actually expose — state, prompts, permission prompts, events? | TASK-51 |
-| What do harness adapters do when a harness offers no structured surface? | TASK-51 |
 | Which queue primitive and thread decomposition each boundary uses | this document sets the rule only; each boundary documents its own choice |
 | Config file format and the hot-reload mechanism | TASK-37 |
 | How workspace state is persisted and restored | TASK-65 |

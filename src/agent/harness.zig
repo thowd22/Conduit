@@ -19,13 +19,14 @@ pub const Harness = enum {
     claude_code,
     codex,
     pi,
+    opencode,
 
-    /// The error a spelling that is none of the three harnesses produces.
+    /// The error a spelling that is none of the shipped harnesses produces.
     pub const Error = error{UnknownHarness};
 
     /// Every harness Conduit ships, in the order the product catalogue lists
     /// them.
-    pub const all = [_]Harness{ .claude_code, .codex, .pi };
+    pub const all = [_]Harness{ .claude_code, .codex, .pi, .opencode };
 
     /// The name shown in the agent view and stored with the agent's state.
     pub fn displayName(self: Harness) []const u8 {
@@ -33,6 +34,7 @@ pub const Harness = enum {
             .claude_code => "Claude Code",
             .codex => "Codex",
             .pi => "Pi",
+            .opencode => "OpenCode",
         };
     }
 

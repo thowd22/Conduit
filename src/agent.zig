@@ -86,6 +86,14 @@ pub const Observation = heuristics.Observation;
 
 pub const FakeAdapter = @import("agent/fake.zig").FakeAdapter;
 
+/// The harness adapters. Each lives in its own file so the adapter tasks
+/// (TASK-53, 54, 55, 78) can land independently; a file that is still a stub
+/// exports nothing beyond its tests.
+pub const claude_code = @import("agent/claude_code.zig");
+pub const codex = @import("agent/codex.zig");
+pub const pi = @import("agent/pi.zig");
+pub const opencode = @import("agent/opencode.zig");
+
 test {
     _ = @import("agent/harness.zig");
     _ = state;
@@ -94,4 +102,8 @@ test {
     _ = registry;
     _ = heuristics;
     _ = @import("agent/fake.zig");
+    _ = claude_code;
+    _ = codex;
+    _ = pi;
+    _ = opencode;
 }

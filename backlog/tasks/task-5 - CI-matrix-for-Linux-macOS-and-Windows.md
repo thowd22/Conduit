@@ -1,11 +1,11 @@
 ---
 id: TASK-5
 title: 'CI matrix for Linux, macOS and Windows'
-status: To Do
+status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-06 22:34'
+updated_date: '2026-10-07 20:12'
 labels:
   - infra
   - ci
@@ -31,6 +31,15 @@ GitHub Actions workflow that installs the pinned Zig version and runs build and 
 - [x] #2 Zig version in CI comes from one pinned source of truth
 - [x] #3 A failing unit test fails the workflow
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Reproduce the Windows and macOS build failures locally by cross-compiling (zig build -Dtarget=x86_64-windows-gnu / -Dtarget=aarch64-macos / x86_64-macos) and from the latest ci.yml run logs.
+2. Fix build.zig/dependency options and OS-conditional backend code (platform, pty ConPTY, font discovery) so zig build and the unit-test binaries compile for all three targets; tests that are Linux-only skip on other OSes rather than fail.
+3. Make ci.yml cache the Zig toolchain and global cache, run zig build and zig build test on ubuntu/macos/windows, and not be cancelled by every push (concurrency per ref, matrix completes).
+4. Trigger with workflow_dispatch, iterate until all three legs are green; record the run id.
+<!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
