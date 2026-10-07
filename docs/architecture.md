@@ -797,6 +797,35 @@ nothing else is a legal dependency.
     `status_change`, `notification` and `exited` events. Pure; the caller supplies timestamps.
   - `fake.zig`: `FakeAdapter`, a scripted implementation of every method used by the unit tests
     and available to later fake-adapter E2E scenarios.
+  - `opencode.zig` (TASK-78): `OpenCodeAdapter`, OpenCode's structured side channel through the
+    HTTP server its TUI starts when given `--port`. `launch` describes
+    `opencode --port P --hostname 127.0.0.1 [--prompt …]` (or `opencode serve …` headless) with
+    `CONDUIT_AGENT_TOKEN`, `OPENCODE_SERVER_USERNAME=opencode` and the token as
+    `OPENCODE_SERVER_PASSWORD`, so the loopback server needs basic auth only the child's
+    environment knows. A minimal HTTP/1.1 client (`writeRequest`, `parseHead`, an incremental
+    chunked/length `BodyDecoder`) and an incremental, bounded `SseParser` read `GET /event`;
+    `poll` never blocks longer than `Options.poll_wait_ns`. Mapping: `session.status`
+    busy/retry → `working`, idle and `session.idle` → `done` (cancelling pending permissions);
+    `session.error` → `errored` plus a notification, except `MessageAbortedError` → `idle`;
+    `permission.asked` (and v1 `permission.updated`) → `permission_request` with OpenCode's
+    `once`/`always`/`reject`; `permission.replied` → `permission_resolved`, `allowed`/`rejected`
+    when Conduit answered and `resolved_elsewhere` when the TUI did; `question.asked` →
+    `waiting_input` plus a notification; finished text parts, tool parts (with `filePath` as a
+    file reference) and file parts → transcript events, each part once; child sessions
+    (`session.created` with `parentID`) → `subagent`. `respondPermission` posts
+    `{"reply":…}` to `/permission/:id/reply`, falling back to the deprecated
+    `/session/:sid/permissions/:id` `{"response":…}`; `sendInput` uses `prompt_async`
+    (creating a session on a headless server), `stop` uses `abort`, and `attach` with a harness
+    session id replays `GET /session/:id/message`. Every request carries `?directory=` for the
+    agent's cwd. Structured capabilities are reported only while the event stream is live; an
+    unreachable server leaves the PTY baseline and is retried with backoff. Gaps: `detect`
+    is unsupported until the ExecutionContext can run a probe; the channel is Local-only (SSH and
+    WSL get the plain TUI, TASK-61); an `opencode` started by hand without `--port` has no
+    external server; prompts are files, so read/update prompt are unsupported; events over
+    1 MiB are dropped. The protocol was read from opencode.ai/docs/server and the
+    anomalyco/opencode `dev` source (a697115, v1.18.35) on 2026-10-07 and is unverified against
+    a live opencode; the fixtures in `test/fixtures/agent/opencode/` are hand-written, and the
+    live test skips when `opencode` is not installed.
 
 ### `backlog`
 
