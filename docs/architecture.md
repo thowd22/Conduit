@@ -405,6 +405,31 @@ nothing else is a legal dependency.
   terminal keeps rendering and running beneath the surface. API for TASK-58/59:
   `runner.view.active`/`log`/`rows`, `Runner.answerPermission`, `Runtime.runnerForAgent`, and the
   `agent.view` action.
+- **Agent manager (TASK-58).** In `main.zig`, `agents.open` (Ctrl+Shift+G / Cmd+Shift+G, an app
+  default like the notifications chord; palette "Agents") opens a modal `Surface`
+  `agents.dialog` that owns every key press like the settings view and every pointer gesture
+  like the notification list. Each frame it relists `Runtime.registry` (bounded to 64 agents,
+  12 visible rows, scrolling with the highlight) sorted by `app_agents.sortManagerRows`
+  (workspace sidebar order, then tab order, then id) and registers one `InteractiveText`
+  `agents.row.<agent id>` per agent, labelled by `app_agents.formatManagerRow` (glyph, display
+  name, workspace › tab, task slot, `managerStateWord`, age of `Runtime.lastActivity`), plus
+  controls `agents.row.<id>.stop` / `.restart` / `.message`, `agents.new` / `agents.back`, a
+  `agents.heading`, `agents.status` and `agents.hint`. Every control dispatches the semantic
+  `agents.activate`, which parses its origin id. The highlight follows an agent id, never a
+  position. Focus closes the manager and calls `focusSession`; stop hangs up an owned agent's PTY
+  (`hangUpAgent`, shared with `agent.stop`); restart is `Runtime.relaunchRequest` +
+  `replaceRunner` (a new runner and agent id bound to the same session, the old ones forgotten)
+  and `startAgentChildIn(..., respawn = true)`, whose `Load` replaces the ended child through
+  `Workspace.respawnRequest`/`replaceSessionChild` (a spawn that never started uses
+  `spawnRequest` instead); `pollAgents` skips a spawning runner's session so the old child's exit
+  is not charged to the new agent. Message opens an inline `Input` `agents.input` under the row
+  and queues the text with `Runner.sendMessage` into the same request ring as permission answers,
+  so the worker stays the adapter's one caller (`sendInput` gets the text as typed; refused with a
+  status when the record lacks the `send_input` capability). New is an in-manager chooser:
+  `agents.new.harness.<n>` (from `launchChoices`), `agents.new.workspace.<n>` (sidebar order) and
+  a prompt `Input` with `agents.new.launch`, which activates the workspace and runs
+  `launchAgent`, `agent.launch`'s own path. TASK-64 fills `ManagerColumns.task` for the task
+  column.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
@@ -423,7 +448,8 @@ nothing else is a legal dependency.
   editor tabs), TASK-36 (bounded literal and regex search UI); M4 — TASK-40 (font settings,
   commands and family picker), TASK-41 (settings view and keybinding editor); TASK-76 (git branch
   rows and the secondary small face), TASK-77 (sidebar workspace gap); M6 — TASK-56 (agent runtime,
-  sidebar glyphs and notifications), TASK-57 (the structured agent view).
+  sidebar glyphs and notifications), TASK-57 (the structured agent view), TASK-58 (the agent
+  manager).
 
 ### `platform`
 
@@ -1114,6 +1140,7 @@ nothing else is a legal dependency.
     and available to later fake-adapter E2E scenarios. With `resolve_on_answer` (TASK-57) it
     answers each `respondPermission` with a `permission_resolved` on its next poll (rejected for
     a `reject` decision, allowed otherwise), as a real harness reports an answer's outcome.
+    `input()` returns what `sendInput` recorded, which TASK-58's manager checks read.
   - `opencode.zig` (TASK-78): `OpenCodeAdapter`, OpenCode's structured side channel through the
     HTTP server its TUI starts when given `--port`. `launch` describes
     `opencode --port P --hostname 127.0.0.1 [--prompt …]` (or `opencode serve …` headless) with
@@ -1815,7 +1842,7 @@ inside the same event loop, so the main thread is that render/UI thread.
 | Clipboard read/write | `platform.clipboard` | IO; must not block the main thread **(d)** |
 | Settings file watch | `config.Watcher`, own thread | the thread only sets an atomic `changed` flag and posts an SDL wake; `app` reads, validates and applies the file on the main thread in `poll` |
 | Font discovery and file loading | `font`, off-thread | discovered faces handed to the main thread **(d)** |
-| Agent harness IO | `agent` adapters, one IO worker per launched agent (`app_agents.Runner`) | the worker alone calls its adapter's `attach`/`poll` and pushes into that agent's `EventQueue`; the spawn worker runs `Runner.prepare` before the poll worker exists; `App.pollAgents` drains on the main thread and wakes the loop through the driver wake |
+| Agent harness IO | `agent` adapters, one IO worker per launched agent (`app_agents.Runner`) | the worker alone calls its adapter's `attach`/`poll`/`respondPermission`/`sendInput` (the last two from a mutex-guarded request ring the owner fills) and pushes into that agent's `EventQueue`; the spawn worker runs `Runner.prepare` before the poll worker exists; `App.pollAgents` drains on the main thread and wakes the loop through the driver wake |
 | Harness detection, OS notifications | `app_agents`, short-lived workers | detection borrows the workspace context (joined before the workspace goes) and publishes versions behind an atomic `done`; an OS notification worker owns copies of its text and only runs `platform.notify` |
 | SSH transport | `workspace`'s ExecutionContext, off-thread | decision-8: the system OpenSSH client in Conduit-owned PTYs and pipes, one ControlMaster per SSH workspace on Linux/macOS; the master PTY and `connect`/`poll`/`hangUp`/`reconnect` stay on the main thread, sessions spawn on the presentation's spawn workers, the one-shot `HostProbe` worker borrows the context's `run` and publishes the remote host name behind an atomic flag, and a worker that finds the master gone sets the context's flag and posts an SDL wake |
 | Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)**; a context `WatchHandle` has no thread and is polled by the `Project` owner |
@@ -1951,14 +1978,15 @@ Which level proves what, by concern:
 
 Rules that apply to all levels:
 
-- The twenty-five verified Linux headless app checks are `--grid-test`, `--self-test`,
+- The twenty-six verified Linux headless app checks are `--grid-test`, `--self-test`,
   `--scroll-test`, `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`,
   `--sidebar-test`, `--tabs-test`, `--panes-test`, `--palette-test`, `--scratchpad-test`,
   `--workspaces-test`, `--links-test`, `--search-test`, `--menu-test`, `--config-test`,
   `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`,
-  `--agent-view-test`, `--ssh-test` and `--driver-test`; the scripted `zig build e2e` runner has
-  sixteen scenarios, the latest being `font-coverage`, `theme-picker`, `font-picker`,
-  `settings-view`, `sidebar-branch`, `agent-notifications` and `agent-view`. Real-window checks use
+  `--agent-view-test`, `--agent-manager-test`, `--ssh-test` and `--driver-test`; the scripted
+  `zig build e2e` runner has seventeen scenarios, the latest being `font-coverage`,
+  `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch`, `agent-notifications`,
+  `agent-view` and `agent-manager`. Real-window checks use
   Xvfb locally; `--clipboard-test` deliberately uses SDL's offscreen driver.
   TASK-28's `--sidebar-test` uses the production sidebar and real SDL events to switch provisioned
   tabs by click and through an independently entered keyboard focus path, hide and reveal the

@@ -551,6 +551,34 @@ const agent_view_steps = [_]Step{
     .{ .wait_terminal_text = .{ .contains = "FAKE-STEP 2" } },
 };
 
+// TASK-58: the same fake agent, launched from the palette, then the agent
+// manager opened by its chord from the first tab. Agent 1's row is clicked,
+// which closes the manager and shows the agent's own tab again.
+const agent_manager_row_id = "agents.row.1";
+
+const agent_manager_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "Agent: launch" },
+    .{ .key = "ENTER" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "palette.argument", .state = "exists", .equals = true } },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.idle", .state = "exists", .equals = true } },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-AGENT-READY" } },
+    .{ .click = "workspace.1.tab.1" },
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+g" },
+    .{ .wait_element = .{ .id = "agents.dialog", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = agent_manager_row_id, .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .click = agent_manager_row_id },
+    .{ .wait_element = .{ .id = "agents.dialog", .state = "exists", .equals = false } },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-AGENT-READY" } },
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -635,12 +663,41 @@ pub const all = [_]Scenario{
         .command = deterministic_shell,
         .steps = &agent_view_steps,
     },
+    .{
+        .name = "agent-manager",
+        .launch_env = &agent_notifications_env,
+        .command = deterministic_shell,
+        .steps = &agent_manager_steps,
+    },
 };
+
+test "the agent manager scenario opens the manager by chord and focuses by a click" {
+    const scenario = all[16];
+    try std.testing.expectEqualStrings("agent-manager", scenario.name);
+    try std.testing.expectEqual(@as(usize, 17), all.len);
+    try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
+    var chord = false;
+    var clicked = false;
+    var closed = false;
+    for (scenario.steps) |step| switch (step) {
+        .key => |key| if (std.mem.eql(u8, key, "CTRL+SHIFT+g")) {
+            chord = true;
+        },
+        .click => |id| if (std.mem.eql(u8, id, agent_manager_row_id)) {
+            clicked = true;
+        },
+        .wait_element => |wait| if (std.mem.eql(u8, wait.id, "agents.dialog") and !wait.equals) {
+            closed = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(chord and clicked and closed);
+}
 
 test "the agent view scenario opens the view by chord and answers by a click" {
     const scenario = all[15];
     try std.testing.expectEqualStrings("agent-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 16), all.len);
+    try std.testing.expectEqual(@as(usize, 17), all.len);
     var chords: usize = 0;
     var clicked = false;
     var outcome = false;
@@ -898,7 +955,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 16), all.len);
+    try std.testing.expectEqual(@as(usize, 17), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;

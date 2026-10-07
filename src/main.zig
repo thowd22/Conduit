@@ -345,6 +345,10 @@ pub const Run = struct {
     /// keyboard and mouse. Runs in `--agent-test`'s environment (the flag
     /// sets `agent_test` too) with the view script instead of TASK-56's.
     agent_view_test: bool = false,
+    /// Exercise TASK-58: the agent manager across two workspaces, by chord,
+    /// palette, keyboard and mouse. Runs in `--agent-test`'s environment
+    /// (the flag sets `agent_test` too) with TASK-56's fake script.
+    agent_manager_test: bool = false,
     /// The private directory `--agent-test` keeps its agent sinks and its
     /// background-tab trigger in. Not a command-line flag: `runApp` sets it.
     agent_test_dir: ?[]const u8 = null,
@@ -611,6 +615,9 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
         } else if (std.mem.eql(u8, arg, "--agent-view-test")) {
             run.agent_test = true;
             run.agent_view_test = true;
+        } else if (std.mem.eql(u8, arg, "--agent-manager-test")) {
+            run.agent_test = true;
+            run.agent_manager_test = true;
         } else if (std.mem.eql(u8, arg, "--ssh-test")) {
             run.ssh_test = true;
         } else if (std.mem.eql(u8, arg, "--font-test")) {
@@ -1984,6 +1991,23 @@ const remote_show_connection_action = "remote.show-connection";
 const agent_view_action = "agent.view";
 const agent_view_answer_action = "agent.view.answer";
 const agent_view_open_ref_action = "agent.view.open-ref";
+/// TASK-58: the agent manager, and the semantic action its rows and
+/// controls dispatch.
+const agents_open_action = "agents.open";
+const agents_activate_action = "agents.activate";
+/// The most agents the manager lists; more are left out of the list.
+const manager_capacity: usize = 64;
+/// The most rows the manager shows at once; the list scrolls.
+const manager_visible_capacity: usize = 12;
+const manager_id_capacity: usize = 48;
+const manager_label_capacity: usize = 384;
+/// A row, its three controls, and the heading, chooser, input, status and
+/// hint elements.
+const manager_element_capacity: usize = manager_visible_capacity * 4 + 12;
+const manager_hint = "Enter focus  s stop  r restart  m message  n new  Esc close";
+/// What the manager is doing: listing agents, typing a message to the
+/// highlighted one, or one step of the new-agent flow.
+const ManagerMode = enum { browse, message, new_harness, new_workspace, new_prompt };
 /// The most agent-view elements one frame registers: the surfaces, visible
 /// rows and their controls of every pane that shows a view.
 const agent_view_element_capacity: usize = 384;
@@ -2051,7 +2075,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 76;
+const action_capacity_base: usize = 78;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 const settings_open_action = "settings.open";
@@ -2172,10 +2196,10 @@ const search_candidate_budget: usize = 32;
 // one per tab row.
 const semantic_element_capacity: usize = sidebar_element_capacity + terminal_link_capacity +
     search_highlight_capacity + 13 + settings_visible_capacity + 4 + sidebar_element_capacity +
-    agent_view_element_capacity;
+    agent_view_element_capacity + manager_element_capacity;
 /// Copied Run descriptors per frame: the preedit's three, a few chrome
 /// rows, and up to four per agent-view row (TASK-57).
-const semantic_run_capacity: usize = 6 + 4 * agent_view_element_capacity;
+const semantic_run_capacity: usize = 6 + 4 * agent_view_element_capacity + 8;
 
 /// The vertical gap, in logical pixels, above every workspace after the first
 /// in the sidebar (TASK-77). It is scaled by the window scale where it is
@@ -3662,6 +3686,7 @@ fn buildConfiguredBindings(
     // it.
     try overrides.append(allocator, .{ .chord = notificationsChord(profile), .action = notifications_open_action });
     try overrides.append(allocator, .{ .chord = agentViewChord(profile), .action = agent_view_action });
+    try overrides.append(allocator, .{ .chord = agentsManagerChord(profile), .action = agents_open_action });
     for (loaded.keybinds.items) |keybind| {
         const chord = inputmod.parseChord(keybind.chord) catch |err| {
             loaded.addDiagnostic(keybind.line, "{s}", .{chordErrorMessage(err)});
@@ -3719,6 +3744,14 @@ fn agentSinkRoot(io: Io, env: EnvSource, options: Options, buffer: []u8) ?[]cons
 /// Ctrl+Shift+N on Linux and Windows, Cmd+Shift+N on macOS: the notification
 /// list (TASK-56). Free in both shipped default tables.
 /// TASK-57's view toggle, an app default beside the list chord.
+/// TASK-58's agent manager: Command+Shift+G on macOS, Ctrl+Shift+G elsewhere.
+fn agentsManagerChord(profile: inputmod.PlatformProfile) inputmod.Chord {
+    return switch (profile) {
+        .macos => .{ .key = .{ .character = 'g' }, .modifiers = .{ .shift = true, .super = true } },
+        .linux_windows => .{ .key = .{ .character = 'g' }, .modifiers = .{ .ctrl = true, .shift = true } },
+    };
+}
+
 fn agentViewChord(profile: inputmod.PlatformProfile) inputmod.Chord {
     return switch (profile) {
         .macos => .{ .key = .{ .character = 'a' }, .modifiers = .{ .shift = true, .super = true } },
@@ -4221,6 +4254,9 @@ const App = struct {
     settings_mode: SettingsMode = .browse,
     /// The inline value editor. Owned; its text is copied out on commit.
     settings_input: ui.Input,
+    /// The agent manager's message and initial-prompt field (TASK-58). Owned;
+    /// its text is copied out when sent.
+    manager_input: ui.Input,
     /// The chord a conflicting capture is waiting to take, while `.conflict`.
     settings_pending_chord: ?inputmod.Chord = null,
     /// A rejected value or chord, shown as `settings.error` until the next edit.
@@ -4398,6 +4434,32 @@ const App = struct {
     notifications_pointer_owned: bool = false,
     notification_row_ids: [notification_visible_rows][palette_semantic_capacity]u8 = undefined,
     notification_row_labels: [notification_visible_rows][notification_row_label_capacity]u8 = undefined,
+    /// The agent manager modal (TASK-58). Main thread. The list is rebuilt
+    /// from the registry every frame; the highlight follows an agent id so a
+    /// re-sort never moves it to another agent.
+    manager_visible: bool = false,
+    manager_pointer_owned: bool = false,
+    manager_mode: ManagerMode = .browse,
+    manager_selected: ?agent.AgentId = null,
+    /// The highlighted row's position, kept for when its agent goes.
+    manager_selected_index: usize = 0,
+    manager_scroll: usize = 0,
+    manager_order: [manager_capacity]agent.AgentId = undefined,
+    manager_count: usize = 0,
+    manager_ids: [2][manager_visible_capacity][4][manager_id_capacity]u8 = undefined,
+    manager_generation: usize = 0,
+    manager_labels: [manager_visible_capacity][manager_label_capacity]u8 = undefined,
+    manager_status_storage: [palette_label_capacity]u8 = undefined,
+    manager_status_len: usize = 0,
+    /// The new-agent flow: the harnesses offered, the highlighted choice,
+    /// and what was chosen so far.
+    manager_harness: [agent.Harness.all.len + 1]app_agents.Choice = undefined,
+    manager_harness_labels: [agent.Harness.all.len + 1][96]u8 = undefined,
+    manager_harness_label_lens: [agent.Harness.all.len + 1]usize = undefined,
+    manager_harness_count: usize = 0,
+    manager_choice_selected: usize = 0,
+    manager_new_choice: ?app_agents.Choice = null,
+    manager_new_workspace: ?workspace.WorkspaceKey = null,
     /// TASK-57: element ids and their targets for the agent views of the
     /// last two frames (ids must outlive one frame for focus reconciliation).
     agent_view_index: usize = 0,
@@ -5215,6 +5277,18 @@ const App = struct {
             .handler = agentViewOpenRefAction,
             .palette = null,
         });
+        // TASK-58: the manager over every workspace's agents.
+        try actions.register(.{
+            .name = agents_open_action,
+            .label = "Agents",
+            .handler = agentsOpenAction,
+        });
+        try actions.register(.{
+            .name = agents_activate_action,
+            .label = "Activate agent manager element",
+            .handler = agentsActivateAction,
+            .palette = null,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -5242,6 +5316,8 @@ const App = struct {
         errdefer search_query.deinit();
         var settings_input = try ui.Input.init(allocator, config.max_string_bytes, "");
         errdefer settings_input.deinit();
+        var manager_input = try ui.Input.init(allocator, app_agents.Runner.max_message_bytes, "");
+        errdefer manager_input.deinit();
 
         var spec: ChildSpec = .{ .allocator = allocator, .argv = &.{}, .env = &.{} };
         errdefer spec.deinit();
@@ -5357,6 +5433,7 @@ const App = struct {
             .palette_argument = palette_argument,
             .search_query = search_query,
             .settings_input = settings_input,
+            .manager_input = manager_input,
             .right_click = config.Layer.resolve(config.RightClick, config.RightClick.built_in, loaded_config.settings.right_click, options.run.right_click),
             .session_right_click = options.run.right_click,
             .session_font_family = session_font_family,
@@ -6316,6 +6393,7 @@ const App = struct {
         if (self.rename_input) |*field| field.deinit();
         self.search_query.deinit();
         self.settings_input.deinit();
+        self.manager_input.deinit();
         self.palette_argument.deinit();
         self.palette_query.deinit();
         self.palette_model.deinit();
@@ -7130,7 +7208,7 @@ const App = struct {
     /// opens over another modal surface or while a gesture is in flight.
     fn openContextMenu(self: *App, col: u32, row: u32, link_id: ?[]const u8) !void {
         if (self.contextMenuVisible() or self.notificationsVisible() or self.paletteVisible() or self.settingsVisible() or self.closeModalActive() or
-            self.rename_tab_id != null or self.search_visible or self.scratchpadVisible() or
+            self.managerVisible() or self.rename_tab_id != null or self.search_visible or self.scratchpadVisible() or
             self.ui_pointer_owned or self.sidebar_dragging or self.dragged_divider_id != null or
             self.dragged_tab_id != null) return;
         var menu: ContextMenu = .{
@@ -7527,10 +7605,31 @@ const App = struct {
     fn startAgentChild(self: *App, session_id: session.SessionId, cwd: []u8, runner: *app_agents.Runner) void {
         const presentation = self.activePresentation();
         const model = self.workspace_registry.byKey(presentation.key) orelse unreachable;
-        var request = model.spawnRequest(session_id, .{
+        self.startAgentChildIn(presentation, model, session_id, cwd, runner, false);
+    }
+
+    /// `startAgentChild` for any workspace's presentation. With `respawn`
+    /// the session's ended child is replaced under the same id, as a
+    /// TASK-58 restart needs; otherwise the session is still starting.
+    /// Takes `cwd`.
+    fn startAgentChildIn(
+        self: *App,
+        presentation: *WorkspacePresentation,
+        model: *workspace.Workspace,
+        session_id: session.SessionId,
+        cwd: []u8,
+        runner: *app_agents.Runner,
+        respawn: bool,
+    ) void {
+        const process: workspace.ProcessSpec = .{
             .argv = &agent_placeholder_argv,
             .env = self.agent_spec.env,
-        }) catch |err| {
+        };
+        const prepared: anyerror!pty.SpawnRequest = if (respawn)
+            model.respawnRequest(session_id, process, cwd)
+        else
+            model.spawnRequest(session_id, process);
+        var request = prepared catch |err| {
             log.warn("could not prepare the agent's child: {s}", .{@errorName(err)});
             self.allocator.free(cwd);
             self.agents.spawnFinished(runner, false);
@@ -7550,6 +7649,7 @@ const App = struct {
             .spawn_cwd = cwd,
             .spawn_session_id = session_id,
             .workspace_key = presentation.key,
+            .respawn = respawn,
             .execution_context = model.contextRef(),
             .agent_runner = runner,
         };
@@ -7572,15 +7672,7 @@ const App = struct {
         switch (record.ownership) {
             // Conduit ends an agent it launched by hanging up its PTY child;
             // the exit then arrives like any other and settles the glyph.
-            .owned => {
-                const model = self.workspace_registry.byKey(key) orelse return;
-                const live = model.sessionById(id) orelse return;
-                const child = live.child() orelse return;
-                child.kill(.hangup) catch |err| switch (err) {
-                    error.Closed => {},
-                    else => log.warn("could not stop the agent: {s}", .{@errorName(err)}),
-                };
-            },
+            .owned => self.hangUpAgent(record),
             // A human's own process is never ended: stop only observing it.
             .observed => self.agents.sessionClosed(key, id),
         }
@@ -7627,6 +7719,9 @@ const App = struct {
                     continue :sweep;
                 };
                 if (record.hasExited()) continue;
+                // A restart's runner is spawning into a session whose old
+                // child already ended; that exit is not the new agent's.
+                if (self.agents.runnerForAgent(record.id)) |runner| if (runner.spawning) continue;
                 const child = present.child() orelse continue;
                 switch (child.state()) {
                     .running => {},
@@ -8510,7 +8605,7 @@ const App = struct {
 
     fn openNotifications(self: *App) !void {
         if (self.notificationsVisible() or self.contextMenuVisible() or self.paletteVisible() or self.settingsVisible() or
-            self.closeModalActive() or self.rename_tab_id != null or self.ui_pointer_owned or self.sidebar_dragging or
+            self.managerVisible() or self.closeModalActive() or self.rename_tab_id != null or self.ui_pointer_owned or self.sidebar_dragging or
             self.dragged_divider_id != null or self.dragged_tab_id != null) return;
         if (self.search_visible) try self.closeSearch();
         self.composition.cancel();
@@ -8635,6 +8730,875 @@ const App = struct {
         if (origin.value.len > id_storage.len) return;
         @memcpy(id_storage[0..origin.value.len], origin.value);
         try self.activateNotificationRow(id_storage[0..origin.value.len]);
+    }
+
+    // The agent manager (TASK-58) -------------------------------------------
+
+    fn managerVisible(self: *const App) bool {
+        return self.manager_visible;
+    }
+
+    /// The position of a workspace in the sidebar, or null once it is gone.
+    fn workspaceRank(self: *const App, key: workspace.WorkspaceKey) ?usize {
+        var index: usize = 0;
+        while (index < self.workspace_registry.count()) : (index += 1) {
+            if (self.workspace_registry.keyAt(index) == key) return index;
+        }
+        return null;
+    }
+
+    /// Relist the registry's agents in manager order: workspaces as the
+    /// sidebar lists them, then their tab order, then id. Never the
+    /// scratchpad: the registry refuses to bind an agent there.
+    fn rebuildManagerOrder(self: *App) void {
+        var keys: [manager_capacity]app_agents.ManagerSortKey = undefined;
+        var count: usize = 0;
+        for (self.agents.registry.all()) |*record| {
+            if (count == manager_capacity) break;
+            const rank = self.workspaceRank(record.workspace) orelse continue;
+            const model = self.workspace_registry.byKey(record.workspace) orelse continue;
+            const location = model.paneForSession(record.session);
+            const tab_rank: usize = if (location) |found| model.tabIndex(found.tab_id) orelse std.math.maxInt(usize) else std.math.maxInt(usize);
+            keys[count] = .{ .workspace_rank = rank, .tab_rank = tab_rank, .id = record.id };
+            count += 1;
+        }
+        app_agents.sortManagerRows(keys[0..count]);
+        for (keys[0..count], 0..) |key, index| self.manager_order[index] = key.id;
+        self.manager_count = count;
+        if (count == 0) {
+            self.manager_selected = null;
+            return;
+        }
+        if (self.manager_selected) |id| {
+            if (self.managerIndexOf(id) != null) return;
+        }
+        // The highlighted agent went (its tab closed): keep the position.
+        self.manager_selected = self.manager_order[@min(self.manager_selected_index, count - 1)];
+    }
+
+    fn managerIndexOf(self: *const App, id: agent.AgentId) ?usize {
+        for (self.manager_order[0..self.manager_count], 0..) |candidate, index| {
+            if (candidate == id) return index;
+        }
+        return null;
+    }
+
+    fn managerListRows(self: *const App) usize {
+        return switch (self.manager_mode) {
+            .browse, .message => @max(self.manager_count, 1),
+            .new_harness => @max(self.manager_harness_count, 1),
+            .new_workspace => @max(self.workspace_registry.count(), 1),
+            .new_prompt => 1,
+        };
+    }
+
+    fn managerBounds(self: *const App) ?ui.Rect {
+        if (!self.manager_visible) return null;
+        const canvas = self.ui_canvas.bounds();
+        if (canvas.width < 30 or canvas.height < 8) return null;
+        const width = @min(canvas.width - 2, @as(u32, 96));
+        const list: u32 = @intCast(@min(self.managerListRows(), manager_visible_capacity));
+        const extra: u32 = if (self.manager_mode == .message) 1 else 0;
+        // Two borders, the heading, the status line and the hint.
+        const height = @min(list + extra + 5, canvas.height - 2);
+        return .{
+            .x = (canvas.width - width) / 2,
+            .y = (canvas.height - height) / 2,
+            .width = width,
+            .height = height,
+        };
+    }
+
+    /// Scroll so the highlighted row shows in `list_rows` rows.
+    fn managerKeepVisible(self: *App, selected: usize, total: usize, list_rows: usize) void {
+        if (list_rows == 0) return;
+        if (selected < self.manager_scroll) self.manager_scroll = selected;
+        if (selected >= self.manager_scroll + list_rows) self.manager_scroll = selected + 1 - list_rows;
+        const last_start = total -| list_rows;
+        if (self.manager_scroll > last_start) self.manager_scroll = last_start;
+    }
+
+    fn managerStatus(self: *const App) []const u8 {
+        return self.manager_status_storage[0..self.manager_status_len];
+    }
+
+    fn setManagerStatus(self: *App, comptime format: []const u8, args: anytype) void {
+        var writer: std.Io.Writer = .fixed(&self.manager_status_storage);
+        writer.print(format, args) catch {
+            // A status cut by the fixed buffer is still its start.
+        };
+        var len = writer.end;
+        while (len != 0 and !std.unicode.utf8ValidateSlice(self.manager_status_storage[0..len])) len -= 1;
+        self.manager_status_len = len;
+    }
+
+    /// The id of one manager element, in this frame's storage. Ids alternate
+    /// storage per frame so the tree never sees an id's bytes change.
+    fn managerId(self: *App, slot: usize, part: usize, comptime format: []const u8, args: anytype) ![]const u8 {
+        const generation = self.manager_generation % 2;
+        return std.fmt.bufPrint(&self.manager_ids[generation][slot][part], format, args);
+    }
+
+    fn addManagerControl(self: *App, parent: ui.Id, id_text: []const u8, label: []const u8, x: u32, y: u32) !void {
+        const id: ui.Id = .{ .value = id_text };
+        try self.ui_tree.addInteractiveText(.{
+            .id = id,
+            .parent = parent,
+            .role = "button",
+            .label = label,
+            .action = agents_activate_action,
+            .bounds = .{ .x = x, .y = y, .width = @intCast(label.len), .height = 1 },
+        }, .{
+            .id = id,
+            .label = label,
+            .action = agents_activate_action,
+            .normal = .{ .foreground = .muted },
+            .hovered = .{ .foreground = .strong, .underline = .accent },
+            .focused = .{ .foreground = .on_accent, .background = .accent },
+        });
+    }
+
+    fn addManagerChoiceRow(self: *App, parent: ui.Id, id_text: []const u8, label: []const u8, selected: bool, x: u32, y: u32, width: u32) !void {
+        const id: ui.Id = .{ .value = id_text };
+        try self.ui_tree.addInteractiveText(.{
+            .id = id,
+            .parent = parent,
+            .role = "option",
+            .label = label,
+            .selected = selected,
+            .action = agents_activate_action,
+            .bounds = .{ .x = x, .y = y, .width = width, .height = 1 },
+        }, .{
+            .id = id,
+            .label = label,
+            .action = agents_activate_action,
+            .normal = if (selected) .{ .foreground = .strong, .background = .selection } else .{ .foreground = .foreground },
+            .hovered = if (selected)
+                .{ .foreground = .strong, .background = .selection, .underline = .accent }
+            else
+                .{ .foreground = .strong, .underline = .accent },
+            .focused = .{ .foreground = .on_accent, .background = .accent },
+        });
+    }
+
+    fn addManagerText(self: *App, parent: ui.Id, id_text: []const u8, role: []const u8, text: []const u8, style: ui.TextStyle, bounds: ui.Rect) !void {
+        const runs = [_]ui.Run{.{ .text = text, .style = style }};
+        try self.ui_tree.addText(.{
+            .id = .{ .value = id_text },
+            .parent = parent,
+            .role = role,
+            .label = text,
+            .bounds = bounds,
+        }, .{ .runs = &runs });
+    }
+
+    fn addManagerInput(self: *App, parent: ui.Id, label: []const u8, bounds: ui.Rect) !void {
+        try self.ui_tree.addInput(.{
+            .id = .{ .value = "agents.input" },
+            .parent = parent,
+            .role = "input",
+            .label = label,
+            .action = agents_activate_action,
+            .bounds = bounds,
+        }, &self.manager_input, .{
+            .text = .{ .foreground = .strong, .background = .field },
+            .selection_background = .selection,
+            .cursor_background = .accent,
+            .cursor_foreground = .background,
+        });
+        try self.composePalettePreedit(parent, bounds, &self.manager_input);
+    }
+
+    /// The manager is a `Surface` panel: a heading, one `InteractiveText` row
+    /// per agent with its stop, restart and message controls, an inline
+    /// message `Input` under the highlighted row while one is typed, the
+    /// new-agent chooser steps, a status line and a key hint. Rows are
+    /// rebuilt from the registry every frame, so states and ages are live.
+    fn composeManager(self: *App) !void {
+        const bounds = self.managerBounds() orelse return;
+        self.rebuildManagerOrder();
+        self.manager_generation +%= 1;
+        const dialog_id: ui.Id = .{ .value = "agents.dialog" };
+        try self.ui_tree.addSurface(.{
+            .id = dialog_id,
+            .role = "dialog",
+            .label = "Agents",
+            .bounds = bounds,
+        }, .{
+            .rect = bounds,
+            .erase_underlay = true,
+            .fill = .background,
+            .border = .double,
+            .border_style = .{ .foreground = .border, .background = .background },
+            .title = " Agents ",
+            .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
+        });
+        const inner_x = bounds.x + 2;
+        const inner_width = bounds.width - 4;
+        const heading_y = bounds.y + 1;
+        const list_top = bounds.y + 2;
+        const list_end = bounds.y + bounds.height - 3;
+        const muted: ui.TextStyle = .{ .foreground = .muted };
+
+        const heading = switch (self.manager_mode) {
+            .browse, .message => "  harness  workspace › tab  task  state  last",
+            .new_harness => "New agent: harness",
+            .new_workspace => "New agent: workspace",
+            .new_prompt => "New agent: initial prompt (Enter for none)",
+        };
+        const control = if (self.manager_mode == .browse) "new" else "back";
+        const control_width: u32 = @intCast(control.len);
+        try self.addManagerText(dialog_id, "agents.heading", "heading", heading, muted, .{ .x = inner_x, .y = heading_y, .width = inner_width -| (control_width + 1), .height = 1 });
+        if (self.manager_mode != .message) {
+            try self.addManagerControl(dialog_id, if (self.manager_mode == .browse) "agents.new" else "agents.back", control, inner_x + inner_width - control_width, heading_y);
+        }
+
+        const available: usize = if (list_end > list_top) list_end - list_top else 0;
+        switch (self.manager_mode) {
+            .browse, .message => try self.composeManagerAgents(dialog_id, inner_x, inner_width, list_top, available),
+            .new_harness => {
+                const count = self.manager_harness_count;
+                if (count == 0) {
+                    try self.addManagerText(dialog_id, "agents.empty", "status", "No coding agent found here", muted, .{ .x = inner_x, .y = list_top, .width = inner_width, .height = 1 });
+                }
+                self.managerKeepVisible(self.manager_choice_selected, count, available);
+                const end = @min(count, self.manager_scroll + available);
+                for (self.manager_scroll..end, 0..) |index, slot| {
+                    const id_text = try self.managerId(slot, 0, "agents.new.harness.{d}", .{index});
+                    try self.addManagerChoiceRow(dialog_id, id_text, self.manager_harness_labels[index][0..self.manager_harness_label_lens[index]], index == self.manager_choice_selected, inner_x, list_top + @as(u32, @intCast(slot)), inner_width);
+                }
+            },
+            .new_workspace => {
+                const count = self.workspace_registry.count();
+                self.managerKeepVisible(self.manager_choice_selected, count, available);
+                const end = @min(count, self.manager_scroll + available);
+                for (self.manager_scroll..end, 0..) |index, slot| {
+                    const model = self.workspace_registry.at(index) orelse continue;
+                    const id_text = try self.managerId(slot, 0, "agents.new.workspace.{d}", .{index});
+                    try self.addManagerChoiceRow(dialog_id, id_text, model.name(), index == self.manager_choice_selected, inner_x, list_top + @as(u32, @intCast(slot)), inner_width);
+                }
+            },
+            .new_prompt => {
+                const launch = "launch";
+                const field_width: u32 = inner_width -| @as(u32, launch.len + 1);
+                if (field_width != 0) try self.addManagerInput(dialog_id, "Initial prompt", .{ .x = inner_x, .y = list_top, .width = field_width, .height = 1 });
+                try self.addManagerControl(dialog_id, "agents.new.launch", launch, inner_x + inner_width - @as(u32, launch.len), list_top);
+            },
+        }
+
+        const status_bounds: ui.Rect = .{ .x = inner_x, .y = bounds.y + bounds.height - 3, .width = inner_width, .height = 1 };
+        if (self.manager_status_len != 0) {
+            try self.addManagerText(dialog_id, "agents.status", "status", self.managerStatus(), .{ .foreground = .attention }, status_bounds);
+        }
+        const hint = switch (self.manager_mode) {
+            .browse => manager_hint,
+            .message => "Enter send  Esc cancel",
+            .new_harness, .new_workspace => "Enter choose  Esc back",
+            .new_prompt => "Enter launch  Esc back",
+        };
+        try self.addManagerText(dialog_id, "agents.hint", "status", hint, muted, .{ .x = inner_x, .y = bounds.y + bounds.height - 2, .width = inner_width, .height = 1 });
+    }
+
+    fn composeManagerAgents(self: *App, dialog_id: ui.Id, inner_x: u32, inner_width: u32, list_top: u32, available: usize) !void {
+        const muted: ui.TextStyle = .{ .foreground = .muted };
+        if (self.manager_count == 0) {
+            try self.addManagerText(dialog_id, "agents.empty", "status", "No agents  n new", muted, .{ .x = inner_x, .y = list_top, .width = inner_width, .height = 1 });
+            return;
+        }
+        const extra: usize = if (self.manager_mode == .message) 1 else 0;
+        const list_rows = available -| extra;
+        const selected_index = if (self.manager_selected) |id| self.managerIndexOf(id) orelse 0 else 0;
+        self.manager_selected_index = selected_index;
+        self.managerKeepVisible(selected_index, self.manager_count, list_rows);
+        const end = @min(self.manager_count, self.manager_scroll + list_rows);
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        // `stop restart message`, right-aligned.
+        const controls_width: u32 = 20;
+        const label_width = inner_width -| (controls_width + 1);
+        var y = list_top;
+        for (self.manager_scroll..end, 0..) |index, slot| {
+            const id = self.manager_order[index];
+            const record = self.agents.registry.get(id) orelse continue;
+            const is_selected = index == selected_index;
+            const raw_id = @intFromEnum(id);
+            const workspace_name = if (self.workspace_registry.byKey(record.workspace)) |model| model.name() else "?";
+            var age_buffer: [16]u8 = undefined;
+            const label = app_agents.formatManagerRow(&self.manager_labels[slot], .{
+                .glyph = app_agents.stateGlyph(record.state),
+                .harness = self.agents.displayName(record),
+                .workspace = workspace_name,
+                .tab = self.sessionTabName(record.workspace, record.session) orelse "(closed)",
+                .task = null,
+                .state = app_agents.managerStateWord(record),
+                .age = formatAge(&age_buffer, self.agents.lastActivity(id) orelse now, now),
+            });
+            const row_text = try self.managerId(slot, 0, "agents.row.{d}", .{raw_id});
+            const row_id: ui.Id = .{ .value = row_text };
+            const attention = record.state == .waiting_permission or record.state == .waiting_input or record.state == .errored;
+            try self.ui_tree.addInteractiveText(.{
+                .id = row_id,
+                .parent = dialog_id,
+                .role = "agent",
+                .label = label,
+                .selected = is_selected,
+                .action = agents_activate_action,
+                .bounds = .{ .x = inner_x, .y = y, .width = label_width, .height = 1 },
+            }, .{
+                .id = row_id,
+                .label = label,
+                .action = agents_activate_action,
+                .normal = if (is_selected)
+                    .{ .foreground = .strong, .background = .selection }
+                else if (record.hasExited())
+                    .{ .foreground = .muted }
+                else if (attention)
+                    .{ .foreground = .attention }
+                else
+                    .{ .foreground = .foreground },
+                .hovered = if (is_selected)
+                    .{ .foreground = .strong, .background = .selection, .underline = .accent }
+                else
+                    .{ .foreground = .strong, .underline = .accent },
+                .focused = .{ .foreground = .on_accent, .background = .accent },
+            });
+            const controls_x = inner_x + inner_width - controls_width;
+            if (!record.hasExited()) {
+                try self.addManagerControl(dialog_id, try self.managerId(slot, 1, "agents.row.{d}.stop", .{raw_id}), "stop", controls_x, y);
+            }
+            if (self.agents.restartable(id)) {
+                try self.addManagerControl(dialog_id, try self.managerId(slot, 2, "agents.row.{d}.restart", .{raw_id}), "restart", controls_x + 5, y);
+            }
+            if (!record.hasExited()) {
+                try self.addManagerControl(dialog_id, try self.managerId(slot, 3, "agents.row.{d}.message", .{raw_id}), "message", controls_x + 13, y);
+            }
+            y += 1;
+            if (is_selected and self.manager_mode == .message) {
+                const send = "send";
+                const prefix = "› ";
+                try self.addManagerText(dialog_id, "agents.input.prompt", "status", prefix, muted, .{ .x = inner_x, .y = y, .width = 2, .height = 1 });
+                const field_width: u32 = inner_width -| @as(u32, send.len + 3);
+                if (field_width != 0) try self.addManagerInput(dialog_id, "Message", .{ .x = inner_x + 2, .y = y, .width = field_width, .height = 1 });
+                try self.addManagerControl(dialog_id, "agents.send", send, inner_x + inner_width - @as(u32, send.len), y);
+                y += 1;
+            }
+        }
+    }
+
+    fn openManager(self: *App) !void {
+        if (self.managerVisible() or self.notificationsVisible() or self.contextMenuVisible() or self.paletteVisible() or
+            self.settingsVisible() or self.closeModalActive() or self.rename_tab_id != null or self.ui_pointer_owned or
+            self.sidebar_dragging or self.dragged_divider_id != null or self.dragged_tab_id != null) return;
+        const canvas = self.ui_canvas.bounds();
+        if (canvas.width < 30 or canvas.height < 8) return;
+        if (self.search_visible) try self.closeSearch();
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        try self.window.stopTextInput();
+        self.manager_visible = true;
+        self.manager_mode = .browse;
+        self.manager_scroll = 0;
+        self.manager_status_len = 0;
+        clearPaletteInput(&self.manager_input);
+        // Open on the agent a notification or `agent.focus` chose last, or
+        // the presented session's agent.
+        self.manager_selected = self.agents.selected_agent orelse
+            if (self.agents.agentForSession(self.activePresentation().key, self.presentedSessionId())) |record| record.id else null;
+        self.manager_selected_index = 0;
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    fn closeManager(self: *App) !void {
+        if (!self.managerVisible()) return;
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        self.manager_visible = false;
+        self.manager_mode = .browse;
+        self.manager_status_len = 0;
+        clearPaletteInput(&self.manager_input);
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    /// Back to the agent list from a message or a chooser step.
+    fn managerBack(self: *App) !void {
+        self.composition.cancel();
+        self.manager_mode = .browse;
+        self.manager_scroll = 0;
+        clearPaletteInput(&self.manager_input);
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+        try self.syncTextInput();
+    }
+
+    fn managerFocusInput(self: *App) !void {
+        clearPaletteInput(&self.manager_input);
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        if (self.ui_tree.focus(.{ .value = "agents.input" })) try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    const ManagerMove = enum { previous, next, first, last };
+
+    fn moveManagerSelection(self: *App, move: ManagerMove) !void {
+        self.manager_status_len = 0;
+        switch (self.manager_mode) {
+            .browse => {
+                self.rebuildManagerOrder();
+                const count = self.manager_count;
+                if (count == 0) return self.refreshActiveUi();
+                const current = if (self.manager_selected) |id| self.managerIndexOf(id) orelse 0 else 0;
+                const target = movedIndex(current, count, move);
+                self.manager_selected = self.manager_order[target];
+                self.manager_selected_index = target;
+            },
+            .new_harness, .new_workspace => {
+                const count = if (self.manager_mode == .new_harness) self.manager_harness_count else self.workspace_registry.count();
+                if (count == 0) return self.refreshActiveUi();
+                self.manager_choice_selected = movedIndex(@min(self.manager_choice_selected, count - 1), count, move);
+            },
+            .message, .new_prompt => return,
+        }
+        try self.refreshActiveUi();
+    }
+
+    fn movedIndex(current: usize, count: usize, move: ManagerMove) usize {
+        return switch (move) {
+            .first => 0,
+            .last => count - 1,
+            .next => (current + 1) % count,
+            .previous => (current + count - 1) % count,
+        };
+    }
+
+    fn selectedManagerAgent(self: *App) ?agent.AgentId {
+        self.rebuildManagerOrder();
+        return self.manager_selected;
+    }
+
+    /// Focus: close the manager and show the agent's workspace, tab and pane
+    /// (its structured view, when that is what the tab presents).
+    fn managerFocus(self: *App, id: agent.AgentId) !void {
+        const record = self.agents.registry.get(id) orelse return;
+        const key = record.workspace;
+        const session_id = record.session;
+        try self.closeManager();
+        try self.focusSession(key, session_id);
+        self.agents.selected_agent = id;
+    }
+
+    /// Hang up an owned agent's PTY; the exit arrives like any other and
+    /// settles its state. A human's own process is never ended.
+    fn hangUpAgent(self: *App, record: *const agent.Agent) void {
+        const model = self.workspace_registry.byKey(record.workspace) orelse return;
+        const live = model.sessionById(record.session) orelse return;
+        const child = live.child() orelse return;
+        child.kill(.hangup) catch |err| switch (err) {
+            error.Closed => {},
+            else => log.warn("could not stop the agent: {s}", .{@errorName(err)}),
+        };
+    }
+
+    fn managerStop(self: *App, id: agent.AgentId) !void {
+        self.manager_selected = id;
+        const record = self.agents.registry.get(id) orelse return;
+        const name = self.agents.displayName(record);
+        if (record.ownership == .observed) {
+            self.setManagerStatus("{s} runs in your terminal: stop it there", .{name});
+        } else if (record.hasExited()) {
+            self.setManagerStatus("{s} has exited", .{name});
+        } else {
+            self.hangUpAgent(record);
+            self.setManagerStatus("stopping {s}", .{name});
+        }
+        try self.refreshActiveUi();
+    }
+
+    /// Restart an exited (or failed) owned agent in its own tab: the same
+    /// harness, cwd and initial prompt under a new agent id, its row
+    /// replacing the old one.
+    fn managerRestart(self: *App, id: agent.AgentId) !void {
+        self.manager_selected = id;
+        const record = self.agents.registry.get(id) orelse return;
+        const name = self.agents.displayName(record);
+        if (!self.agents.restartable(id)) {
+            self.setManagerStatus("{s}: only an exited agent Conduit started can restart", .{name});
+            return self.refreshActiveUi();
+        }
+        const key = record.workspace;
+        const session_id = record.session;
+        const model = self.workspace_registry.byKey(key) orelse return;
+        const presentation = self.presentationByKey(key) orelse return;
+        const live = model.sessionById(session_id) orelse return;
+        if (live.child()) |child| if (child.state() == .running) {
+            self.setManagerStatus("{s} is still running: stop it first", .{name});
+            return self.refreshActiveUi();
+        };
+        if (presentation.load != null or presentation.closing) {
+            self.setManagerStatus("restart deferred: a start is in progress", .{});
+            return self.refreshActiveUi();
+        }
+        var request = self.agents.relaunchRequest(id) orelse return;
+        request.probe_env = self.agent_spec.env;
+        request.home = self.home_dir;
+        request.claude_config_dir = self.claude_config_dir;
+        request.codex_home = self.codex_home;
+        const runner = self.agents.replaceRunner(id, request, .{
+            .workspace = key,
+            .session = session_id,
+            .session_kind = .agent_terminal,
+            .scratchpad = model.scratchpadId(),
+        }) catch |err| {
+            self.setManagerStatus("{s} did not restart: {s}", .{ name, @errorName(err) });
+            return self.refreshActiveUi();
+        };
+        const cwd = self.allocator.dupe(u8, runner.cwd) catch {
+            self.agents.spawnFinished(runner, false);
+            self.setManagerStatus("out of memory", .{});
+            return self.refreshActiveUi();
+        };
+        self.manager_selected = runner.agent_id;
+        self.startAgentChildIn(presentation, model, session_id, cwd, runner, live.child() != null);
+        self.rebuildAgentChoices();
+        self.setManagerStatus("restarted {s}", .{name});
+        try self.refreshActiveUi();
+    }
+
+    fn managerMessage(self: *App, id: agent.AgentId) !void {
+        self.manager_selected = id;
+        const record = self.agents.registry.get(id) orelse return;
+        const name = self.agents.displayName(record);
+        if (record.hasExited()) {
+            self.setManagerStatus("{s} has exited", .{name});
+            return self.refreshActiveUi();
+        }
+        if (!record.capabilities.send_input) {
+            self.setManagerStatus("message unsupported: {s} takes input only in its terminal", .{name});
+            return self.refreshActiveUi();
+        }
+        self.manager_status_len = 0;
+        self.manager_mode = .message;
+        try self.managerFocusInput();
+    }
+
+    /// Send the typed message to the highlighted agent through its runner's
+    /// worker queue, then return to the list.
+    fn sendManagerMessage(self: *App) !void {
+        const id = self.manager_selected orelse return self.managerBack();
+        const text = self.manager_input.text();
+        if (text.len == 0) return self.managerBack();
+        const record = self.agents.registry.get(id) orelse return self.managerBack();
+        const name = self.agents.displayName(record);
+        const runner = self.agents.runnerForAgent(id) orelse {
+            self.setManagerStatus("{s} takes no messages", .{name});
+            return self.managerBack();
+        };
+        if (runner.sendMessage(text)) {
+            self.setManagerStatus("sent to {s}", .{name});
+        } else |err| switch (err) {
+            error.QueueFull => self.setManagerStatus("{s} is busy: try again", .{name}),
+            error.MessageTooLong => self.setManagerStatus("message too long", .{}),
+        }
+        try self.managerBack();
+    }
+
+    /// The new-agent flow's first step: the harnesses `agent.launch` offers.
+    fn managerNew(self: *App) !void {
+        self.ensureAgentDetection();
+        const key = self.workspace_registry.activeKey() orelse return;
+        const choices = self.agents.launchChoices(key);
+        self.setAgentLaunchChoices();
+        var count: usize = 0;
+        for (choices) |choice| {
+            if (count == self.manager_harness.len) break;
+            const parsed = app_agents.Choice.parse(choice.value) orelse continue;
+            self.manager_harness[count] = parsed;
+            const len = @min(choice.label.len, self.manager_harness_labels[count].len);
+            @memcpy(self.manager_harness_labels[count][0..len], choice.label[0..len]);
+            self.manager_harness_label_lens[count] = len;
+            count += 1;
+        }
+        self.manager_harness_count = count;
+        if (count == 0) {
+            self.setManagerStatus("no coding agent found here", .{});
+            return self.refreshActiveUi();
+        }
+        self.manager_status_len = 0;
+        self.manager_mode = .new_harness;
+        self.manager_choice_selected = 0;
+        self.manager_scroll = 0;
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+    }
+
+    fn managerPickHarness(self: *App, index: usize) !void {
+        if (index >= self.manager_harness_count) return;
+        self.manager_new_choice = self.manager_harness[index];
+        self.manager_mode = .new_workspace;
+        self.manager_scroll = 0;
+        const active = self.workspace_registry.activeKey();
+        self.manager_choice_selected = 0;
+        if (active) |key| self.manager_choice_selected = self.workspaceRank(key) orelse 0;
+        try self.refreshActiveUi();
+    }
+
+    fn managerPickWorkspace(self: *App, index: usize) !void {
+        const key = self.workspace_registry.keyAt(index) orelse return;
+        self.manager_new_workspace = key;
+        self.manager_mode = .new_prompt;
+        try self.managerFocusInput();
+    }
+
+    /// Launch the chosen harness into a new tab of the chosen workspace,
+    /// through `agent.launch`'s own path, and highlight its new row.
+    fn launchFromManager(self: *App) !void {
+        const choice = self.manager_new_choice orelse return self.managerBack();
+        const key = self.manager_new_workspace orelse return self.managerBack();
+        if (choice == .fake and !self.agents.fake_enabled) return self.managerBack();
+        if (self.workspace_registry.activeKey() != key) {
+            if (!try self.activateWorkspaceKey(key, false)) {
+                self.setManagerStatus("launch deferred: the workspace could not be shown", .{});
+                return self.managerBack();
+            }
+        }
+        const typed = self.manager_input.text();
+        const prompt: ?[]const u8 = if (typed.len == 0) null else typed;
+        const before = self.agents.registry.next_ordinal;
+        try self.launchAgent(choice, prompt);
+        self.manager_new_choice = null;
+        self.manager_new_workspace = null;
+        if (self.agents.registry.next_ordinal != before) {
+            const id = agent.AgentId.fromOrdinal(before);
+            self.manager_selected = id;
+            if (self.agents.registry.get(id)) |record| self.setManagerStatus("launched {s}", .{self.agents.displayName(record)});
+        } else if (self.workspace_status) |status| {
+            self.setManagerStatus("{s}", .{status});
+        }
+        try self.managerBack();
+    }
+
+    /// Every key while the manager is open. A press is the manager's (no
+    /// binding and no terminal beneath sees it); a release or repeat only
+    /// settles the binding state a press before it opened left behind.
+    fn onManagerKey(self: *App, key: platform.KeyEvent) !void {
+        var scratch: inputmod.TextScratch = .{};
+        const translated = translateAppKey(&self.composition, &scratch, key);
+        if (key.action != .press) {
+            _ = inputmod.resolve(&self.binding_state, key, translated, self.bindings);
+            return;
+        }
+        const identity = uiKeyIdentity(key) orelse return;
+        const plain = !key.mods.ctrl and !key.mods.alt and !key.mods.super;
+        switch (self.manager_mode) {
+            .message, .new_prompt => {
+                if (plain) switch (key.key) {
+                    .enter => {
+                        _ = self.ui_key_state.claim(identity, .none);
+                        if (self.manager_mode == .message) try self.sendManagerMessage() else try self.launchFromManager();
+                        return;
+                    },
+                    .escape => {
+                        _ = self.ui_key_state.claim(identity, .none);
+                        return self.managerBack();
+                    },
+                    .tab, .up, .down => {
+                        _ = self.ui_key_state.claim(identity, .none);
+                        return;
+                    },
+                    else => {},
+                };
+                if (try self.routeFocusedUiKey(key, translated)) return;
+                _ = self.ui_key_state.claim(identity, .none);
+            },
+            .new_harness, .new_workspace => {
+                _ = self.ui_key_state.claim(identity, .none);
+                if (!plain) return;
+                switch (key.key) {
+                    .escape => try self.managerBack(),
+                    .up => try self.moveManagerSelection(.previous),
+                    .down => try self.moveManagerSelection(.next),
+                    .tab => try self.moveManagerSelection(if (key.mods.shift) .previous else .next),
+                    .home => try self.moveManagerSelection(.first),
+                    .end => try self.moveManagerSelection(.last),
+                    .enter => if (self.manager_mode == .new_harness)
+                        try self.managerPickHarness(self.manager_choice_selected)
+                    else
+                        try self.managerPickWorkspace(self.manager_choice_selected),
+                    else => {},
+                }
+            },
+            .browse => {
+                _ = self.ui_key_state.claim(identity, .none);
+                if (!plain) return;
+                switch (key.key) {
+                    .escape => try self.closeManager(),
+                    .up => try self.moveManagerSelection(.previous),
+                    .down => try self.moveManagerSelection(.next),
+                    .tab => try self.moveManagerSelection(if (key.mods.shift) .previous else .next),
+                    .home => try self.moveManagerSelection(.first),
+                    .end => try self.moveManagerSelection(.last),
+                    .enter => if (self.selectedManagerAgent()) |id| try self.managerFocus(id),
+                    else => {
+                        if (key.mods.shift) return;
+                        const codepoint = if (key.unshifted_codepoint != 0) key.unshifted_codepoint else key.codepoint;
+                        switch (codepoint) {
+                            'n' => try self.managerNew(),
+                            's', 'r', 'm' => {
+                                const id = self.selectedManagerAgent() orelse return;
+                                switch (codepoint) {
+                                    's' => try self.managerStop(id),
+                                    'r' => try self.managerRestart(id),
+                                    else => {
+                                        try self.managerMessage(id);
+                                        // SDL echoes `m` as text next; the new
+                                        // field must not start with it.
+                                        if (self.manager_mode == .message) self.key_text_echo.recordKeyText(key, "m");
+                                    },
+                                }
+                            },
+                            else => {},
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    /// What a manager element id names.
+    const ManagerTarget = union(enum) {
+        row: agent.AgentId,
+        stop: agent.AgentId,
+        restart: agent.AgentId,
+        message: agent.AgentId,
+        new,
+        back,
+        send,
+        launch,
+        harness: usize,
+        workspace: usize,
+    };
+
+    fn managerTarget(id: []const u8) ?ManagerTarget {
+        if (std.mem.eql(u8, id, "agents.new")) return .new;
+        if (std.mem.eql(u8, id, "agents.back")) return .back;
+        if (std.mem.eql(u8, id, "agents.send")) return .send;
+        if (std.mem.eql(u8, id, "agents.new.launch")) return .launch;
+        if (paletteSemanticIndex(id, "agents.new.harness.")) |index| return .{ .harness = index };
+        if (paletteSemanticIndex(id, "agents.new.workspace.")) |index| return .{ .workspace = index };
+        const prefix = "agents.row.";
+        if (!std.mem.startsWith(u8, id, prefix)) return null;
+        const rest = id[prefix.len..];
+        const dot = std.mem.indexOfScalar(u8, rest, '.');
+        const raw = std.fmt.parseUnsigned(u64, rest[0 .. dot orelse rest.len], 10) catch return null;
+        if (raw == 0) return null;
+        const agent_id: agent.AgentId = @enumFromInt(raw);
+        const part = if (dot) |at| rest[at + 1 ..] else return .{ .row = agent_id };
+        if (std.mem.eql(u8, part, "stop")) return .{ .stop = agent_id };
+        if (std.mem.eql(u8, part, "restart")) return .{ .restart = agent_id };
+        if (std.mem.eql(u8, part, "message")) return .{ .message = agent_id };
+        return null;
+    }
+
+    /// A click on (or the semantic activation of) one manager element.
+    fn activateManagerElement(self: *App, id: []const u8) !void {
+        if (!self.managerVisible()) return;
+        const target = managerTarget(id) orelse return;
+        // A click anywhere but the field being typed in ends the typing.
+        const typing = self.manager_mode == .message or self.manager_mode == .new_prompt;
+        switch (target) {
+            .send => if (self.manager_mode == .message) return self.sendManagerMessage(),
+            .launch => if (self.manager_mode == .new_prompt) return self.launchFromManager(),
+            .back => return self.managerBack(),
+            .harness => |index| if (self.manager_mode == .new_harness) return self.managerPickHarness(index),
+            .workspace => |index| if (self.manager_mode == .new_workspace) return self.managerPickWorkspace(index),
+            else => {},
+        }
+        if (typing) try self.managerBack();
+        switch (target) {
+            .row => |agent_id| try self.managerFocus(agent_id),
+            .stop => |agent_id| try self.managerStop(agent_id),
+            .restart => |agent_id| try self.managerRestart(agent_id),
+            .message => |agent_id| try self.managerMessage(agent_id),
+            .new => try self.managerNew(),
+            else => {},
+        }
+    }
+
+    /// The manager is modal like the palette: pointer gestures inside it
+    /// highlight and activate its rows and controls, a press outside closes
+    /// it, and every gesture is owned through release.
+    fn handleManagerUiEvent(self: *App, event: platform.Event) !bool {
+        const tree = self.activeUiTree();
+        switch (event) {
+            .mouse_motion => |motion| {
+                const point = devicePointerPoint(motion.x, motion.y, self.window.state.scale);
+                const before = uiInteractionState(tree);
+                tree.pointerMoved(point);
+                if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                return true;
+            },
+            .mouse_button => |button| {
+                const point = devicePointerPoint(button.x, button.y, self.window.state.scale);
+                switch (button.action) {
+                    .press => {
+                        self.manager_pointer_owned = true;
+                        const bounds = self.managerBounds();
+                        if (bounds == null or !self.pointInCellRect(point, bounds.?)) {
+                            try self.closeManager();
+                            return true;
+                        }
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        tree.pointerPressed(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        return true;
+                    },
+                    .repeat => return true,
+                    .release => {
+                        if (!self.manager_pointer_owned) return true;
+                        self.manager_pointer_owned = false;
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        const activation = tree.pointerReleased(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        const requested = activation orelse return true;
+                        if (std.mem.eql(u8, requested.id.value, "agents.input")) return true;
+                        var id_storage: [manager_id_capacity]u8 = undefined;
+                        if (requested.id.value.len > id_storage.len) return true;
+                        @memcpy(id_storage[0..requested.id.value.len], requested.id.value);
+                        try self.activateManagerElement(id_storage[0..requested.id.value.len]);
+                        return true;
+                    },
+                }
+            },
+            .wheel => return true,
+            .key => return false,
+            // Text and composition reach only the inline field; with no field
+            // they are swallowed rather than typed into the terminal beneath.
+            .text_input, .text_editing, .candidates => return !(self.manager_mode == .message or self.manager_mode == .new_prompt),
+            else => return false,
+        }
+    }
+
+    fn agentsOpenAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        try self.openManager();
+    }
+
+    fn agentsActivateAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const origin = invocation.origin orelse return;
+        var id_storage: [manager_id_capacity]u8 = undefined;
+        if (origin.value.len > id_storage.len) return;
+        @memcpy(id_storage[0..origin.value.len], origin.value);
+        try self.activateManagerElement(id_storage[0..origin.value.len]);
     }
 
     fn paletteBounds(self: *const App) ?ui.Rect {
@@ -10175,7 +11139,7 @@ const App = struct {
         try self.composeSearchBar();
 
         const text = self.composition.preedit();
-        if (!self.paletteVisible() and !self.settingsVisible() and !self.search_visible and self.presentedAgentView() == null and
+        if (!self.paletteVisible() and !self.settingsVisible() and !self.managerVisible() and !self.search_visible and self.presentedAgentView() == null and
             text.len != 0 and std.unicode.utf8ValidateSlice(text))
         {
             if (self.presentedLive().terminal().cursor().position) |cursor| {
@@ -10255,6 +11219,7 @@ const App = struct {
         if (self.settingsVisible()) try self.composeSettings();
         if (self.contextMenuVisible()) try self.composeContextMenu();
         if (self.notificationsVisible()) try self.composeNotifications();
+        if (self.managerVisible()) try self.composeManager();
         if (self.closeModalActive()) {
             const modal_width = @min(canvas_bounds.width, @as(u32, 42));
             const modal_height = @min(canvas_bounds.height, @as(u32, 7));
@@ -10852,6 +11817,11 @@ const App = struct {
         if (self.settingsVisible()) {
             const terminal_owned = if (uiKeyIdentity(key)) |identity| self.terminal_key_state.indexOf(identity) != null else false;
             if (key.action == .press or !terminal_owned) return self.onSettingsKey(key);
+        }
+        // The agent manager owns every key press the same way (TASK-58).
+        if (self.managerVisible()) {
+            const terminal_owned = if (uiKeyIdentity(key)) |identity| self.terminal_key_state.indexOf(identity) != null else false;
+            if (key.action == .press or !terminal_owned) return self.onManagerKey(key);
         }
         if (try self.routeSearchKey(key)) return;
         if (!self.paletteVisible() and self.scratchpad_escape_owned and key.key == .escape) {
@@ -13513,7 +14483,7 @@ const App = struct {
     }
 
     fn openSettings(self: *App) !void {
-        if (self.settingsVisible() or self.paletteVisible() or self.contextMenuVisible() or
+        if (self.settingsVisible() or self.paletteVisible() or self.contextMenuVisible() or self.managerVisible() or
             self.closeModalActive() or self.rename_tab_id != null or self.sidebar_dragging or
             self.dragged_divider_id != null or self.dragged_tab_id != null) return;
         const canvas = self.ui_canvas.bounds();
@@ -13951,7 +14921,7 @@ const App = struct {
     }
 
     fn openPalette(self: *App) !void {
-        if (self.paletteVisible() or self.settingsVisible() or self.notificationsVisible() or self.closeModalActive() or self.rename_tab_id != null or
+        if (self.paletteVisible() or self.settingsVisible() or self.notificationsVisible() or self.managerVisible() or self.closeModalActive() or self.rename_tab_id != null or
             self.ui_key_state.len != 0 or self.terminal_key_state.len != 0 or
             self.ui_pointer_owned or self.scratchpad_ui_pointer_owned or
             self.scratchpad_terminal_pointer_owned or self.terminal_pointer_presses != 0 or
@@ -15473,7 +16443,7 @@ const App = struct {
             try self.refreshActiveUi();
             return;
         }
-        if (self.paletteVisible() or self.settingsVisible() or self.search_visible) return;
+        if (self.paletteVisible() or self.settingsVisible() or self.managerVisible() or self.search_visible) return;
         // A view is not a terminal: text typed over it reaches nobody.
         if (self.presentedAgentView() != null) return;
         self.presentedLive().terminal().userInput();
@@ -15811,8 +16781,17 @@ const App = struct {
             },
             else => {},
         };
+        if (!self.managerVisible() and self.manager_pointer_owned) switch (event) {
+            .mouse_motion => return true,
+            .mouse_button => |button| {
+                if (button.action == .release) self.manager_pointer_owned = false;
+                return true;
+            },
+            else => {},
+        };
         if (self.contextMenuVisible()) return self.handleContextMenuUiEvent(event);
         if (self.notificationsVisible()) return self.handleNotificationsUiEvent(event);
+        if (self.managerVisible()) return self.handleManagerUiEvent(event);
         if (self.paletteVisible()) return self.handlePaletteUiEvent(event);
         if (self.settingsVisible()) return self.handleSettingsUiEvent(event);
         if (self.search_visible) return self.handleSearchUiEvent(event);
@@ -17891,7 +18870,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 77 and
+    failures += reportCheck(out, registered_actions.len == 79 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -17968,7 +18947,9 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[73].name, agent_view_action) and
         std.mem.eql(u8, registered_actions[74].name, agent_view_answer_action) and
         std.mem.eql(u8, registered_actions[75].name, agent_view_open_ref_action) and
-        std.mem.eql(u8, registered_actions[76].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[76].name, agents_open_action) and
+        std.mem.eql(u8, registered_actions[77].name, agents_activate_action) and
+        std.mem.eql(u8, registered_actions[78].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -21673,6 +22654,11 @@ const AgentWait = union(enum) {
     label: struct { id: []const u8, text: []const u8 },
     /// Some element whose id starts with `prefix` and whose label contains `text`.
     role_label: struct { prefix: []const u8, text: []const u8 },
+    /// The fake adapter of `agent` recorded `text` through `sendInput`
+    /// (TASK-58).
+    fake_input: struct { agent: agent.AgentId, text: []const u8 },
+    /// The session's child is a running process (a restart's new child).
+    child_running: struct { key: workspace.WorkspaceKey, session: session.SessionId },
 };
 
 const AgentOsTrace = struct {
@@ -21699,6 +22685,17 @@ fn agentWaitMet(self: *App, trace: *const AgentOsTrace, condition: AgentWait) bo
         .active_workspace => |key| self.workspace_registry.activeKey() == key,
         .label => |want| if (self.ui_tree.byId(.{ .value = want.id })) |element| std.mem.indexOf(u8, element.label, want.text) != null else false,
         .role_label => |want| viewElement(self, want.prefix, want.text) != null,
+        .fake_input => |want| fake: {
+            const runner = self.agents.runnerForAgent(want.agent) orelse break :fake false;
+            if (runner.backend != .fake) break :fake false;
+            break :fake std.mem.indexOf(u8, runner.backend.fake.input(), want.text) != null;
+        },
+        .child_running => |want| running: {
+            const model = self.workspace_registry.byKey(want.key) orelse break :running false;
+            const live = model.sessionById(want.session) orelse break :running false;
+            const child = live.child() orelse break :running false;
+            break :running child.state() == .running;
+        },
     };
 }
 
@@ -21930,6 +22927,224 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     try writePngOffThread(self.allocator, io, screenshot_path, screenshot_pixels, self.size);
     out.print("agent-test: screenshot {s}\n", .{screenshot_path}) catch {};
     out.print("agent-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
+// --agent-manager-test (TASK-58) -----------------------------------------------
+
+fn managerCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("agent-manager-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+fn agentsManagerChordKey(self: *App, io: Io, out: *Writer) !bool {
+    const mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .shift = true, .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    return postKey(self, io, out, 'g', mods);
+}
+
+/// The id of agent `id`'s manager row (or one of its controls).
+fn managerRowId(buffer: []u8, id: agent.AgentId, control: ?[]const u8) []const u8 {
+    if (control) |name| return std.fmt.bufPrint(buffer, "agents.row.{d}.{s}", .{ @intFromEnum(id), name }) catch "";
+    return std.fmt.bufPrint(buffer, "agents.row.{d}", .{@intFromEnum(id)}) catch "";
+}
+
+fn managerRowSelected(self: *App, id: agent.AgentId) bool {
+    var buffer: [manager_id_capacity]u8 = undefined;
+    const element = self.ui_tree.byId(.{ .value = managerRowId(&buffer, id, null) }) orelse return false;
+    return element.state.selected;
+}
+
+fn managerRowY(self: *App, id: agent.AgentId) ?i32 {
+    var buffer: [manager_id_capacity]u8 = undefined;
+    const element = self.ui_tree.byId(.{ .value = managerRowId(&buffer, id, null) }) orelse return null;
+    return element.bounds.y;
+}
+
+/// The agent of the presented session, once it is registered.
+fn presentedAgentId(self: *App) ?agent.AgentId {
+    const record = self.agents.agentForSession(self.activePresentation().key, self.presentedSessionId()) orelse return null;
+    return record.id;
+}
+
+/// Exercise TASK-58 through real PTYs and SDL events: two workspaces with a
+/// fake agent each, the manager by chord and by palette, live rows, focus by
+/// Enter and by click, a message by keyboard, stop, restart and a new agent
+/// spawned by mouse through the chooser rows, modal isolation and Escape.
+fn agentManagerTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    var os_trace: AgentOsTrace = .{};
+    self.focus_override = true;
+    defer self.focus_override = null;
+
+    try self.drawFrame();
+    const first_key = self.workspace_registry.activeKey() orelse return 1;
+    const first_model = self.activeWorkspace();
+    const first_tab = first_model.activeTabId() orelse return 1;
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "AGENT-TEST-READY" }), "the first tab's real PTY peer became ready", .{});
+
+    // Agent one in workspace 1, stepped to working.
+    managerCheck(out, &failures, try launchFakeAgentByMouse(self, io, out) and
+        try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-AGENT-READY" }), "the first fake agent launched in workspace 1", .{});
+    const first_agent = presentedAgentId(self) orelse return 1;
+    const first_agent_tab = first_model.activeTabId() orelse return 1;
+    _ = try agentTypeLine(self, io, out, "one");
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.working" }), "the first agent is working", .{});
+
+    // A second workspace with agent two, idle.
+    _ = try runPaletteCommandByKeyboard(self, io, out, "Create workspace");
+    _ = try agentTypeLine(self, io, out, "/tmp");
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.2" }) and
+        self.workspace_registry.activeKey() != first_key, "a second workspace is active", .{});
+    const second_key = self.workspace_registry.activeKey() orelse return 1;
+    const second_model = self.activeWorkspace();
+    // Its first tab is a plain shell, started on a worker; output it
+    // computes proves it runs.
+    _ = try waitForAgent(self, io, out, &os_trace, .{ .child_running = .{ .key = second_key, .session = self.activePresentation().active_session_id } });
+    _ = try agentTypeLine(self, io, out, "printf 'W2-%s\\n' READY");
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "W2-READY" }), "workspace 2's first tab's shell is running", .{});
+    managerCheck(out, &failures, try launchFakeAgentByMouse(self, io, out) and
+        try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-AGENT-READY" }), "the second fake agent launched in workspace 2", .{});
+    const second_agent = presentedAgentId(self) orelse return 1;
+    const second_agent_tab = second_model.activeTabId() orelse return 1;
+    const second_session = second_model.focusedPaneSessionId(second_agent_tab) orelse return 1;
+
+    // The manager by chord: both agents, workspace 1 first, live state.
+    var row_buffer: [manager_id_capacity]u8 = undefined;
+    var control_buffer: [manager_id_capacity]u8 = undefined;
+    _ = try agentsManagerChordKey(self, io, out);
+    const opened = try waitForAgent(self, io, out, &os_trace, .{ .element = "agents.dialog" });
+    const first_row = managerRowId(&row_buffer, first_agent, null);
+    managerCheck(out, &failures, opened and try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = first_row, .text = "Fake agent" } }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = first_row, .text = "working" } }), "the chord opened the manager with agent one working", .{});
+    var first_label_buffer: [tab_name_capacity + 8]u8 = undefined;
+    const first_location = std.fmt.bufPrint(&first_label_buffer, "{s} › ", .{first_model.name()}) catch "";
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = first_row, .text = first_location } }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = first_row, .text = "  –  " } }), "agent one's row names its workspace and tab and leaves the task slot empty", .{});
+    const second_row = managerRowId(&control_buffer, second_agent, null);
+    var second_label_buffer: [tab_name_capacity + 8]u8 = undefined;
+    const second_location = std.fmt.bufPrint(&second_label_buffer, "{s} › ", .{second_model.name()}) catch "";
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = second_row, .text = "idle" } }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = second_row, .text = second_location } }), "agent two's row is idle in workspace 2", .{});
+    const first_y = managerRowY(self, first_agent);
+    const second_y = managerRowY(self, second_agent);
+    managerCheck(out, &failures, first_y != null and second_y != null and first_y.? < second_y.?, "rows follow sidebar order: workspace 1's agent first", .{});
+    var scratch_listed = false;
+    for (self.manager_order[0..self.manager_count]) |id| {
+        const record = self.agents.registry.get(id) orelse continue;
+        const model = self.workspace_registry.byKey(record.workspace) orelse continue;
+        if (record.session == model.scratchpadId()) scratch_listed = true;
+    }
+    managerCheck(out, &failures, self.manager_count == 2 and !scratch_listed, "the manager lists two agents and never a scratchpad", .{});
+    managerCheck(out, &failures, managerRowSelected(self, second_agent), "the presented agent is highlighted on open", .{});
+
+    // A transition while the manager is open: agent two's process takes a
+    // step (the fake's script counts the bytes its shell appends).
+    const second_runner = self.agents.runnerForAgent(second_agent) orelse return 1;
+    var steps_buffer: [path_capacity]u8 = undefined;
+    const steps_path = try std.fmt.bufPrint(&steps_buffer, "{s}/steps", .{second_runner.sink_dir});
+    try Dir.cwd().writeFile(io, .{ .sub_path = steps_path, .data = "x" });
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = second_row, .text = "working" } }), "agent two's row changed to working while the manager was open", .{});
+
+    // Modal isolation: an unused key and a bound chord do nothing beneath.
+    const presented = second_model.sessionById(self.presentedSessionId()) orelse return 1;
+    const sent_before = presented.pendingResponseBytes();
+    const routes_before = self.terminal_key_route_count;
+    const tabs_before = second_model.tabCount();
+    _ = try postKey(self, io, out, 'x', .{});
+    _ = try postKey(self, io, out, 't', switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    });
+    managerCheck(out, &failures, self.managerVisible() and presented.pendingResponseBytes() == sent_before and
+        self.terminal_key_route_count == routes_before and second_model.tabCount() == tabs_before, "an unused key and the new-tab chord stayed inside the manager", .{});
+
+    // Keyboard highlight: Home, End.
+    _ = try postNamedKey(self, io, out, .home, .{});
+    managerCheck(out, &failures, managerRowSelected(self, first_agent), "Home highlighted agent one", .{});
+    _ = try postNamedKey(self, io, out, .end, .{});
+    managerCheck(out, &failures, managerRowSelected(self, second_agent), "End highlighted agent two", .{});
+
+    // A message by keyboard, without leaving the manager.
+    _ = try postKey(self, io, out, 'm', .{});
+    const field = self.ui_tree.byId(.{ .value = "agents.input" });
+    managerCheck(out, &failures, field != null and field.?.state.focused, "m opened the focused message field under agent two", .{});
+    _ = try agentTypeLine(self, io, out, "hello agent");
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .fake_input = .{ .agent = second_agent, .text = "hello agent" } }) and
+        self.managerVisible() and self.ui_tree.byId(.{ .value = "agents.input" }) == null and
+        try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = "agents.status", .text = "sent to Fake agent" } }), "Enter sent the message through the worker to the adapter and the manager stayed open", .{});
+
+    // Stop by key: the row shows exited and offers restart.
+    _ = try postKey(self, io, out, 's', .{});
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = second_row, .text = "exited" } }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = managerRowId(&row_buffer, second_agent, "restart") }), "s stopped agent two: its row shows exited and a restart control", .{});
+
+    // Restart by key: a new agent id bound to the same tab replaces the row.
+    _ = try postKey(self, io, out, 'r', .{});
+    const restarted = second_model.paneForSession(second_session) != null and self.agents.registry.findBySession(second_key, second_session) != null;
+    const third_agent = self.agents.registry.findBySession(second_key, second_session) orelse second_agent;
+    const third_row = managerRowId(&row_buffer, third_agent, null);
+    managerCheck(out, &failures, restarted and third_agent != second_agent and
+        try waitForAgent(self, io, out, &os_trace, .{ .element_absent = second_row }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = third_row, .text = "idle" } }) and
+        second_model.paneForSession(second_session).?.tab_id == second_agent_tab, "r restarted agent two as agent {d} in the same tab", .{@intFromEnum(third_agent)});
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .child_running = .{ .key = second_key, .session = second_session } }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-AGENT-READY" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = third_row, .text = second_location } }), "the restarted agent's new process is running in workspace 2", .{});
+
+    // Focus by Enter: agent one's workspace and tab.
+    _ = try postNamedKey(self, io, out, .home, .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .active_workspace = first_key }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .active_tab = first_agent_tab }) and !self.managerVisible(), "Enter focused agent one: workspace 1 and its tab", .{});
+
+    // The manager from the palette by mouse; a click on agent three's row.
+    managerCheck(out, &failures, try clickPaletteCommand(self, io, out, agents_open_action, null) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "agents.dialog" }), "the palette opened the manager by mouse", .{});
+    _ = try clickTabsElement(self, io, out, third_row);
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .active_workspace = second_key }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .active_tab = second_agent_tab }) and !self.managerVisible(), "a click on agent {d}'s row focused workspace 2 and its tab", .{@intFromEnum(third_agent)});
+
+    // A new agent by mouse: new, the fake's row, workspace 1, launch.
+    _ = try agentsManagerChordKey(self, io, out);
+    _ = try waitForAgent(self, io, out, &os_trace, .{ .element = "agents.dialog" });
+    _ = try clickTabsElement(self, io, out, "agents.new");
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = "agents.new.harness.0", .text = app_agents.fake_choice_label } }), "new listed the fake harness first", .{});
+    _ = try clickTabsElement(self, io, out, "agents.new.harness.0");
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = "agents.new.workspace.0", .text = first_model.name() } }) and
+        self.ui_tree.byId(.{ .value = "agents.new.workspace.1" }) != null, "the workspace step lists both open workspaces", .{});
+    _ = try clickTabsElement(self, io, out, "agents.new.workspace.0");
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "agents.input" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "agents.new.launch" }), "the prompt step shows its field and launch control", .{});
+    const tabs_in_first = first_model.tabCount();
+    const before_ordinal = self.agents.registry.next_ordinal;
+    _ = try clickTabsElement(self, io, out, "agents.new.launch");
+    const fourth_agent = agent.AgentId.fromOrdinal(before_ordinal);
+    const fourth_row = managerRowId(&row_buffer, fourth_agent, null);
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = fourth_row, .text = first_location } }) and
+        first_model.tabCount() == tabs_in_first + 1 and self.workspace_registry.activeKey() == first_key and self.managerVisible() and
+        managerRowSelected(self, fourth_agent), "launch spawned agent {d} into a new tab of workspace 1 and its row appeared highlighted", .{@intFromEnum(fourth_agent)});
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-AGENT-READY" }), "the new agent's real process is running", .{});
+    managerCheck(out, &failures, self.manager_count == 3, "three agents are listed", .{});
+
+    try self.drawFrame();
+    const screenshot_pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(screenshot_pixels);
+
+    // Escape closes; the first tab is still where it was.
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element_absent = "agents.dialog" }) and
+        first_model.tab(first_tab) != null, "Escape closed the manager", .{});
+
+    var screenshot_path_buffer: [path_capacity]u8 = undefined;
+    var id_buffer: [path_capacity]u8 = undefined;
+    const screenshot_path = try std.fmt.bufPrint(&screenshot_path_buffer, "{s}{c}agent-manager-test-{s}.png", .{ fallback_log_dir, std.fs.path.sep, try generateRunId(io, &id_buffer) });
+    try writePngOffThread(self.allocator, io, screenshot_path, screenshot_pixels, self.size);
+    out.print("agent-manager-test: screenshot {s}\n", .{screenshot_path}) catch {};
+    out.print("agent-manager-test: {d} failure(s)\n", .{failures}) catch {};
     out.flush() catch {};
     return if (failures == 0) 0 else 1;
 }
@@ -24450,6 +25665,9 @@ const usage =
     \\  --agent-view-test                  drive the fake agent's structured view: rows,
     \\                                    scrolling, permission answers by keyboard and
     \\                                    mouse, a file reference, copy and search
+    \\  --agent-manager-test               drive the agent manager over two workspaces:
+    \\                                    live rows, focus, message, stop, restart and
+    \\                                    a new agent by keyboard and mouse, then exit
     \\  --ssh-test                         drive SSH workspaces against a throwaway sshd
     \\                                    container: connect, prompts, remote panes and
     \\                                    scratchpad, loss and reconnect, then exit
@@ -24777,6 +25995,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try gitTest(app, init.io, out);
     } else if (options.run.agent_view_test) {
         check_status = try agentViewTest(app, init.io, out);
+    } else if (options.run.agent_manager_test) {
+        check_status = try agentManagerTest(app, init.io, out);
     } else if (options.run.agent_test) {
         check_status = try agentTest(app, init.io, out);
     } else if (options.run.ssh_test) {
@@ -25273,6 +26493,15 @@ test "--agent-test owns a fixed real-child viewport and its own deterministic ch
     // The sink root sits in the check's private directory.
     var buffer: [path_capacity]u8 = undefined;
     try std.testing.expectEqualStrings("/tmp/conduit-agent-test-x/agents", agentSinkRoot(std.testing.io, env.source(), options, &buffer).?);
+}
+
+test "--agent-manager-test runs in --agent-test's environment" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--agent-manager-test" }, env.source());
+    try std.testing.expect(parsed.run.agent_test and parsed.run.agent_manager_test and !parsed.run.agent_view_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--agent-manager-test") != null);
+    const options = optionsForRun(parsed);
+    try std.testing.expect(options.run.hidden and wantsChild(options) and usesDeterministicScratchpad(options));
 }
 
 test "agent sinks are per-run private state under XDG_STATE_HOME or HOME" {

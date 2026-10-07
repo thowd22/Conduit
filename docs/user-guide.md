@@ -214,6 +214,28 @@ back. The view keeps the agent's most recent 4,096 events (4 MiB of text); older
 with a note at the top. Transcript text is display only: nothing in it can open a file or answer a
 request without your click or key.
 
+## Agent manager
+
+Ctrl+Shift+G (Cmd+Shift+G), or **Agents** in the palette, opens one list of every agent in every
+workspace: Conduit's own launches and harnesses it noticed you start in a terminal. The
+scratchpad never appears. Each row reads `<glyph> <harness>  <workspace> › <tab>  <task>  <state>
+<last activity>`, ordered like the sidebar (workspace, then tab); states and ages update live while
+the list is open. The task column shows `–` until backlog tasks are linked to agents.
+
+| Key | Click | Does |
+|---|---|---|
+| Up/Down, Tab, Home/End | — | move the highlight |
+| Enter | the row | close the list and show the agent's workspace and tab (its agent view if that tab shows one) |
+| s | `stop` | hang up an agent Conduit started; one you started yourself is stopped in its own terminal |
+| r | `restart` | start an exited or failed agent again in the same tab: same harness, directory and initial prompt, as a new agent |
+| m | `message` | type a message in the field under the row; Enter or `send` sends it, Escape cancels |
+| n | `new` | choose a harness, then a workspace, then an optional initial prompt; Enter or `launch` starts it in a new tab of that workspace |
+| Escape | outside the list | close it (in a step, Escape or `back` returns to the list) |
+
+A message goes to the harness's structured channel without leaving the list. A harness that has
+none (Claude Code today) says `message unsupported` in the status line; type into its tab instead.
+Keys and text over the list never reach the terminal beneath it.
+
 ## Settings view
 
 Ctrl+Shift+, (Cmd+Shift+,) or the palette's **Settings** opens a dialog listing every setting,
@@ -350,6 +372,7 @@ command except the fixed ones at the end can be rebound or unbound with `keybind
 | Font: Reset Size | `font.size.reset` | Ctrl+0 |
 | Open terminal search (fixed) | `search.open` | Ctrl+Shift+F |
 | Agent: toggle view | `agent.view` | Ctrl+Shift+A |
+| Agents | `agents.open` | Ctrl+Shift+G |
 
 ### macOS
 
@@ -386,6 +409,7 @@ macOS chords are the shipped defaults for macOS builds; they have not been run o
 | Font: Reset Size | `font.size.reset` | Cmd+0 |
 | Open terminal search (fixed) | `search.open` | Cmd+F |
 | Agent: toggle view | `agent.view` | Cmd+Shift+A |
+| Agents | `agents.open` | Cmd+Shift+G |
 
 ### Commands with no default chord
 
@@ -415,4 +439,5 @@ These belong to the surface that has focus and are not rebindable yet. All platf
 | Sidebar (once focused) | Tab/Shift+Tab move; Up/Down between workspaces; Enter activates |
 | Scratchpad (shown) | Escape hides it |
 | Agent view | Up/Down, PageUp/PageDown, Home/End scroll; Tab/Shift+Tab move between references and choices; Left/Right between a request's choices; Enter opens or answers; Shift+arrows select; Escape clears |
+| Agent manager | Up/Down, Tab/Shift+Tab, Home/End move; Enter focuses; s stop; r restart; m message; n new; Escape closes or goes back |
 | Any text field | Left/Right/Home/End (Shift extends the selection), Backspace, Delete; Ctrl+A / Ctrl+C / Ctrl+V (Cmd on macOS) select all, copy, paste |
