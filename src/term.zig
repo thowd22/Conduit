@@ -8828,8 +8828,14 @@ test "a real full-screen program gets the wheel as cursor keys, and the view doe
 
     const AltScreen = struct {
         terminal: *const Terminal,
+        // The mode switch and the first drawn line can arrive in separate
+        // reads, so an alternate screen alone does not mean the program has
+        // drawn yet: the first row must hold text too.
         fn holds(self: @This()) bool {
-            return self.terminal.isAlternateScreen();
+            if (!self.terminal.isAlternateScreen()) return false;
+            var scratch: [64]u8 = undefined;
+            const first = readRow(self.terminal, 0, &scratch) catch return false;
+            return std.mem.trim(u8, first, " ").len != 0;
         }
     };
     try waitFor(gpa, pager, &terminal, AltScreen{ .terminal = &terminal }, AltScreen.holds);

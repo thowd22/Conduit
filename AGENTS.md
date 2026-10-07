@@ -311,7 +311,9 @@ pty test fails on the single-pipe design. `session.drainChildOutput` now observe
 before taking bytes so an end published between the two observations cannot strand the final
 queue (fake-backend test). The faster wakeups exposed that the tmux integration test typed F1
 within tmux's 1 ms `assume-paste-time`, which treats the key as pasted text and skips bindings;
-the test's tmux config sets it to 0.
+the test's tmux config sets it to 0, and the `less` wheel test now waits for the pager's first
+row to be drawn rather than only for the alternate screen, because the mode switch can now arrive
+in its own read ahead of the content.
 
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
