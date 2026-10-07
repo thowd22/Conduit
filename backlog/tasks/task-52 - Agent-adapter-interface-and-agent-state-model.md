@@ -1,9 +1,11 @@
 ---
 id: TASK-52
 title: Agent adapter interface and agent state model
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-03 21:39'
+updated_date: '2026-10-07 19:57'
 labels:
   - agents
   - architecture
@@ -28,3 +30,12 @@ Define the harness-neutral AgentAdapter interface (detect installation, launch i
 - [ ] #3 Agent events are a typed stream (message, tool use, file reference, permission request, status change)
 - [ ] #4 Agent-owned sessions are separated from human sessions in the model
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Define agent.Adapter (type-erased vtable: detect, launch, attach, events, sendInput, respondPermission, prompt read/update, stop; each capability optional with explicit unsupported) and the typed Event stream and Agent state machine (idle, working, waiting_input, waiting_permission, done, errored) per decision-7, with a status source (structured vs heuristic).
+2. agent.Registry keyed by workspace key holding Agent records under monotonic ids, each bound to an agent-kind session id; the scratchpad can never be an agent target.
+3. PTY-baseline heuristics module shape (OSC 0/2, BEL, OSC 9/777, OSC 133, activity, exit) as the harness-neutral fallback contract.
+4. Fake adapter driving every interface method in unit tests; registry state-transition tests; docs.
+<!-- SECTION:PLAN:END -->

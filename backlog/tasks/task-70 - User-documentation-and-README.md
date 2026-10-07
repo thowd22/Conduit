@@ -1,9 +1,11 @@
 ---
 id: TASK-70
 title: User documentation and README
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-03 21:39'
+updated_date: '2026-10-07 19:57'
 labels:
   - docs
 milestone: m-8
@@ -25,3 +27,11 @@ README with screenshots and install instructions, plus docs for configuration, k
 - [ ] #2 Configuration and keybinding reference is complete
 - [ ] #3 Agent setup is documented for Claude Code, Codex and Pi
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. README: what Conduit is, screenshots from the deterministic checks, install (release assets: tar.gz, deb, AppImage) and build-from-source.
+2. docs/config.md completeness pass plus a keybinding reference generated from the default binding tables; themes, fonts, scratchpad, palette, settings view.
+3. Agent setup per harness (Claude Code, Codex, Pi, OpenCode) from doc-3/decision-7, marked as the current state; test driver and MCP usage for agents.
+<!-- SECTION:PLAN:END -->
