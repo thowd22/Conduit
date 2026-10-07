@@ -301,8 +301,14 @@ pub const Run = struct {
     /// scratchpad sizes, a malformed line's visible error, hot reload and the
     /// open-config action, through real SDL events, then exit.
     config_test: bool = false,
+    /// Exercise the theme engine: a bundled scheme and a user Ghostty-format
+    /// file from the settings, the palette theme picker's live preview by
+    /// keyboard and hover, Escape reverting it and a mouse choice saved to the
+    /// settings file, through real SDL events, then exit.
+    theme_test: bool = false,
     /// The settings file to load and watch instead of the platform location.
-    /// Not a command-line flag: `runApp` sets it for `--config-test`, which
+    /// Not a command-line flag: `runApp` sets it for `--config-test` and
+    /// `--theme-test`, which
     /// writes into a private directory. Null means the platform location for
     /// an ordinary run and no file at all for every other built-in check, so
     /// a user's settings never change what a check measures.
@@ -347,37 +353,12 @@ pub const Run = struct {
     no_shell_integration: bool = false,
 };
 
-/// The palette a run draws with. Slot order is `theme.Role`'s, which is the
-/// ANSI order a terminal's colours are specified in: the eight normal colours,
-/// then the eight bright ones, then the four roles that are not one of the 16.
-///
-/// TASK-38 replaces this with the theme engine and a file format. Until then a
-/// run has exactly one palette, and saying so here is better than having the
-/// renderer invent one.
-pub const default_palette: theme.Palette = .{
-    .colors = .{
-        .{ .r = 0x1a, .g = 0x1c, .b = 0x24 }, // black
-        .{ .r = 0xcc, .g = 0x55, .b = 0x55 }, // red
-        .{ .r = 0x7f, .g = 0xb8, .b = 0x74 }, // green
-        .{ .r = 0xd6, .g = 0xb0, .b = 0x55 }, // yellow
-        .{ .r = 0x61, .g = 0x7f, .b = 0xd4 }, // blue
-        .{ .r = 0xb4, .g = 0x7a, .b = 0xd0 }, // magenta
-        .{ .r = 0x56, .g = 0xb6, .b = 0xc2 }, // cyan
-        .{ .r = 0xc8, .g = 0xc8, .b = 0xd2 }, // white
-        .{ .r = 0x4a, .g = 0x4f, .b = 0x5c }, // bright_black
-        .{ .r = 0xe0, .g = 0x6c, .b = 0x6c }, // bright_red
-        .{ .r = 0x9a, .g = 0xd0, .b = 0x8c }, // bright_green
-        .{ .r = 0xec, .g = 0xc8, .b = 0x6a }, // bright_yellow
-        .{ .r = 0x7c, .g = 0x9c, .b = 0xe8 }, // bright_blue
-        .{ .r = 0xd0, .g = 0x92, .b = 0xe4 }, // bright_magenta
-        .{ .r = 0x6c, .g = 0xcc, .b = 0xd6 }, // bright_cyan
-        .{ .r = 0xf0, .g = 0xf0, .b = 0xf6 }, // bright_white
-        .{ .r = 0x16, .g = 0x1a, .b = 0x22 }, // background
-        .{ .r = 0xd8, .g = 0xd8, .b = 0xe0 }, // foreground
-        .{ .r = 0x2c, .g = 0x3a, .b = 0x4d }, // selection
-        .{ .r = 0x7c, .g = 0x9c, .b = 0xe8 }, // accent
-    },
-};
+/// The palette a run draws with until the `theme` setting is resolved, and
+/// whenever it names nothing: `conduit-dark`, derived by `theme.derive`. That
+/// is exactly the palette Conduit drew with before themes existed (the theme
+/// unit tests pin it slot for slot), so built-in checks that never load a
+/// settings file see the same colours as before.
+pub const default_palette: theme.Palette = theme.derive(theme.conduit_dark);
 
 /// A palette colour as a surface colour.
 ///
@@ -403,7 +384,7 @@ pub fn gridColors(palette: theme.Palette) render.Colors {
         .ansi = ansi,
         .foreground = surfaceColor(palette.get(.foreground)),
         .background = surfaceColor(palette.get(.background)),
-        .cursor = surfaceColor(palette.get(.foreground)),
+        .cursor = surfaceColor(palette.get(.cursor)),
         .selection = surfaceColor(palette.get(.selection)),
     };
 }
@@ -423,7 +404,8 @@ fn optionsForRun(options: Options) Options {
         !options.run.sidebar_test and !options.run.tabs_test and !options.run.panes_test and
         !options.run.scratchpad_test and !options.run.palette_test and
         !options.run.workspaces_test and !options.run.links_test and
-        !options.run.search_test and !options.run.menu_test and !options.run.config_test) return options;
+        !options.run.search_test and !options.run.menu_test and !options.run.config_test and
+        !options.run.theme_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -563,6 +545,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.menu_test = true;
         } else if (std.mem.eql(u8, arg, "--config-test")) {
             run.config_test = true;
+        } else if (std.mem.eql(u8, arg, "--theme-test")) {
+            run.theme_test = true;
         } else if (namesValue(arg, "--right-click")) {
             run.right_click = config.RightClick.parse(try takeValue(arg, "--right-click", args, &i)) catch
                 return error.InvalidRightClick;
@@ -1107,12 +1091,11 @@ fn onPanic(message: []const u8, first_trace_addr: ?usize) noreturn {
 // The window, the surface and the loop
 // ---------------------------------------------------------------------------
 
-/// The colour the surface is cleared to before anything is drawn.
-///
-/// This is the terminal background until `theme` owns one. A surface that has
-/// never had anything drawn into it is this colour, so a window that has just
-/// opened shows a terminal's background rather than a hole.
-pub const background: render.Rgba = .{ .r = 0x16, .g = 0x1a, .b = 0x22 };
+/// The colour the surface is cleared to before the theme is resolved: the
+/// default palette's background. A surface that has never had anything drawn
+/// into it is this colour, so a window that has just opened shows a terminal's
+/// background rather than a hole. `App.background` follows the active theme.
+pub const background: render.Rgba = surfaceColor(default_palette.get(.background));
 
 /// The window title. A window manager's task list, a screenshot's header and a
 /// log reader all name the app from here.
@@ -1459,6 +1442,8 @@ const ChildSpec = struct {
             menu_test_script
         else if (options.run.config_test)
             config_test_script
+        else if (options.run.theme_test)
+            theme_test_script
         else
             options.run.command;
         const shell: ?[]const u8 = if (command) |line| blk: {
@@ -1722,7 +1707,7 @@ fn wantsChild(options: Options) bool {
     if (options.run.clipboard_test or options.run.ime_test or options.run.tabs_test or
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
         options.run.links_test or options.run.search_test or options.run.menu_test or
-        options.run.config_test) return true;
+        options.run.config_test or options.run.theme_test) return true;
     return !options.run.no_child and !options.run.self_test and !options.run.grid_test and
         !options.run.scroll_test and !options.run.mouse_test and !options.run.ui_test and
         !options.run.sidebar_test;
@@ -1738,7 +1723,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.clipboard_test or run.ui_test or run.ime_test or run.sidebar_test or
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
-        run.config_test or run.driver_test;
+        run.config_test or run.theme_test or run.driver_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -1825,7 +1810,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 50;
+const action_capacity_base: usize = 51;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 
@@ -3009,6 +2994,200 @@ fn ensureConfigFile(io: Io, path: []const u8) !void {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Themes (TASK-38)
+// ---------------------------------------------------------------------------
+
+/// How many files of the user theme directory the catalog lists. Together
+/// with the bundled schemes this must fit the palette's per-command choice
+/// rows (`palette_action_capacity`).
+const max_user_themes: usize = 32;
+/// The longest user theme file name listed, in bytes.
+const theme_name_capacity: usize = 64;
+/// Every theme one run can offer.
+const theme_choice_capacity: usize = theme.bundled.len + max_user_themes;
+
+comptime {
+    std.debug.assert(theme_choice_capacity <= palette_action_capacity);
+}
+
+const theme_pick_action = "theme.pick";
+
+/// Whether a user theme file's name can be listed and written back as a
+/// `theme = <name>` value: one line of printable UTF-8 that the settings
+/// parser reads back unchanged and that cannot be mistaken for `auto:`.
+fn usableThemeFileName(name: []const u8) bool {
+    if (name.len == 0 or name.len > theme_name_capacity) return false;
+    if (name[0] == '.' or name[0] == ' ' or name[name.len - 1] == ' ') return false;
+    if (!std.unicode.utf8ValidateSlice(name)) return false;
+    for (name) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == '"' or byte == ',' or byte == '/' or byte == '\\') return false;
+    }
+    if (name.len >= 5 and std.ascii.eqlIgnoreCase(name[0..5], "auto:")) return false;
+    return true;
+}
+
+/// The themes a run can choose from: every bundled scheme that no user file
+/// shadows, and every usable Ghostty-format file in the user theme directory,
+/// already parsed and derived so previewing one costs no IO.
+///
+/// Heap-allocated once by `App.init` and owned by `App`; the `theme.pick`
+/// registry entry borrows `choices`, and `App.setThemeChoices` re-points it
+/// after every rebuild. Main thread only.
+const ThemeCatalog = struct {
+    const Entry = struct {
+        /// Borrowed from `theme.bundled` or `user_names`.
+        label: []const u8,
+        /// What `theme = <value>` names: a bundled id or the file name.
+        value: []const u8,
+        scheme: theme.Scheme,
+        palette: theme.Palette,
+        user: bool,
+        /// The first problem in a user file, or null.
+        problem: ?theme.Diagnostic = null,
+    };
+
+    entries: [theme_choice_capacity]Entry = undefined,
+    choices: [theme_choice_capacity]inputmod.PaletteChoice = undefined,
+    count: usize = 0,
+    user_names: [max_user_themes][theme_name_capacity]u8 = undefined,
+
+    fn entriesSlice(self: *const ThemeCatalog) []const Entry {
+        return self.entries[0..self.count];
+    }
+
+    fn choiceSlice(self: *const ThemeCatalog) []const inputmod.PaletteChoice {
+        return self.choices[0..self.count];
+    }
+
+    /// Re-read the user directory (null: none) and relist every theme, sorted
+    /// by label with `active` (a name, matched like the setting) first.
+    /// Never fails: an unreadable directory or file costs only that entry.
+    fn rebuild(self: *ThemeCatalog, io: Io, gpa: std.mem.Allocator, directory: ?[]const u8, active: []const u8) void {
+        self.count = 0;
+        if (directory) |path| self.loadUserThemes(io, gpa, path) catch |err| {
+            theme.log.warn("the user theme directory could not be listed: {s}", .{@errorName(err)});
+        };
+        const user_count = self.count;
+        bundled: for (theme.bundled) |*entry| {
+            for (self.entries[0..user_count]) |user| {
+                if (theme.sameName(user.value, entry.id) or theme.sameName(user.value, entry.label)) continue :bundled;
+            }
+            self.entries[self.count] = .{
+                .label = entry.label,
+                .value = entry.id,
+                .scheme = entry.scheme,
+                .palette = theme.derive(entry.scheme),
+                .user = false,
+            };
+            self.count += 1;
+        }
+        self.order(active);
+    }
+
+    fn loadUserThemes(self: *ThemeCatalog, io: Io, gpa: std.mem.Allocator, path: []const u8) !void {
+        var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+
+        // Collect, sort and de-duplicate first so which files are listed does
+        // not depend on the directory's iteration order.
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |name| gpa.free(name);
+            names.deinit(gpa);
+        }
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
+            if (!usableThemeFileName(entry.name)) {
+                theme.log.info("a file in the theme directory was skipped: its name cannot be a theme name", .{});
+                continue;
+            }
+            if (names.items.len >= 1024) break;
+            const owned = try gpa.dupe(u8, entry.name);
+            errdefer gpa.free(owned);
+            try names.append(gpa, owned);
+        }
+        std.mem.sort([]u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []u8, b: []u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+
+        var listed: usize = 0;
+        names: for (names.items) |name| {
+            for (self.entries[0..listed]) |previous| {
+                if (theme.sameName(previous.value, name)) continue :names;
+            }
+            if (listed == max_user_themes) {
+                theme.log.warn("more than {d} user themes; the rest are not listed", .{max_user_themes});
+                break;
+            }
+            const stored = self.user_names[listed][0..name.len];
+            @memcpy(stored, name);
+            var parsed: theme.Parsed = .{ .scheme = theme.conduit_dark };
+            const read_problem: ?[]const u8 = if (dir.readFileAlloc(io, name, gpa, .limited(theme.max_file_bytes + 1))) |bytes| read: {
+                defer gpa.free(bytes);
+                parsed = theme.parseGhostty(bytes);
+                break :read null;
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.StreamTooLong => "file is larger than 64 KiB",
+                else => "file could not be read",
+            };
+            var problem: ?theme.Diagnostic = if (read_problem) |message| .{ .line = 0, .message = message } else null;
+            if (problem == null and parsed.diagnostics().len != 0) problem = parsed.diagnostics()[0];
+            self.entries[listed] = .{
+                .label = stored,
+                .value = stored,
+                .scheme = parsed.scheme,
+                .palette = theme.derive(parsed.scheme),
+                .user = true,
+                .problem = problem,
+            };
+            listed += 1;
+            self.count = listed;
+        }
+    }
+
+    /// Sort by label, case-insensitively, then move `active` to the front.
+    fn order(self: *ThemeCatalog, active: []const u8) void {
+        std.mem.sort(Entry, self.entries[0..self.count], {}, struct {
+            fn lessThan(_: void, a: Entry, b: Entry) bool {
+                return switch (std.ascii.orderIgnoreCase(a.label, b.label)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => std.mem.order(u8, a.label, b.label) == .lt,
+                };
+            }
+        }.lessThan);
+        if (self.find(active)) |index| {
+            const chosen = self.entries[index];
+            var cursor = index;
+            while (cursor > 0) : (cursor -= 1) self.entries[cursor] = self.entries[cursor - 1];
+            self.entries[0] = chosen;
+        }
+        for (self.entries[0..self.count], 0..) |entry, index| {
+            self.choices[index] = .{ .label = entry.label, .value = entry.value };
+        }
+    }
+
+    /// The entry `name` refers to: a user file first, then a bundled id or
+    /// label, compared the way `theme.sameName` does.
+    fn find(self: *const ThemeCatalog, name: []const u8) ?usize {
+        for (self.entriesSlice(), 0..) |entry, index| {
+            if (entry.user and theme.sameName(entry.value, name)) return index;
+        }
+        for (self.entriesSlice(), 0..) |entry, index| {
+            if (!entry.user and (theme.sameName(entry.value, name) or theme.sameName(entry.label, name))) return index;
+        }
+        return null;
+    }
+};
+
 /// The built-in v0.1 editor for file references (decision-5) and `config.open`. The
 /// settings file has no editor key yet, so the "configured editor command" is this default. It is
 /// always spawned as shell-free argv `vi +<line> -- <path>`; a detected column
@@ -3278,6 +3457,27 @@ const App = struct {
     /// A font problem found after the file was applied: the face is resolved
     /// on a worker, so this arrives later than the parse diagnostics.
     font_diagnostic: ?config.Diagnostic = null,
+    /// The palette every renderer draws with right now: the committed theme,
+    /// or the theme picker's highlighted preview. Main thread.
+    palette: theme.Palette = default_palette,
+    /// The committed theme's palette, what closing the picker returns to.
+    theme_palette: theme.Palette = default_palette,
+    /// Every theme this run can offer. Owned; `theme.pick` borrows its list.
+    theme_catalog: *ThemeCatalog,
+    /// `theme.pick`'s registry index, the definition its picker step names.
+    theme_pick_index: usize,
+    /// The committed theme's name, copied out of the catalog.
+    theme_name_storage: [theme_name_capacity]u8 = undefined,
+    theme_name_len: usize = 0,
+    /// A problem with the `theme` setting or the theme file it names, shown
+    /// through `config.error` like any other settings problem.
+    theme_diagnostic: ?config.Diagnostic = null,
+    theme_diagnostic_storage: [config_error_capacity]u8 = undefined,
+    /// The picker choice being previewed, and the keyboard selection and hover
+    /// last seen, so whichever moved most recently decides the preview.
+    theme_preview_choice: usize = 0,
+    theme_seen_selected: ?usize = null,
+    theme_seen_hover: ?usize = null,
     /// The scratchpad heights in percent for the two presentations.
     scratchpad_percent_small: u8 = 50,
     scratchpad_percent_large: u8 = 90,
@@ -3464,6 +3664,14 @@ const App = struct {
             config.Config.initDefaults(allocator);
         errdefer loaded_config.deinit();
         if (config_path) |path| log.info("settings from {s}", .{path}) else log.info("no settings file for this run", .{});
+        const theme_catalog = try allocator.create(ThemeCatalog);
+        errdefer allocator.destroy(theme_catalog);
+        theme_catalog.* = .{};
+        {
+            var themes_dir_buffer: [path_capacity]u8 = undefined;
+            const themes_dir = if (config_path) |path| config.themesDirectory(&themes_dir_buffer, path) else null;
+            theme_catalog.rebuild(io, allocator, themes_dir, "");
+        }
         const session_font_family: ?[]const u8 = if (options.run.font_family.len == 0) null else options.run.font_family;
         var family_from_file = session_font_family == null and loaded_config.settings.font_family != null;
         var configured_family = configuredFamily(session_font_family, loaded_config.settings.font_family);
@@ -3892,6 +4100,13 @@ const App = struct {
             .label = "Reload config",
             .handler = configReloadAction,
         });
+        const theme_pick_index = actions.definitions().len;
+        try actions.register(.{
+            .name = theme_pick_action,
+            .label = "Theme: choose",
+            .handler = themePickAction,
+            .palette = themePickCommand(theme_catalog),
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -3991,6 +4206,8 @@ const App = struct {
             .config_current = loaded_config,
             .config_path = config_path_owned,
             .font_diagnostic = font_diagnostic,
+            .theme_catalog = theme_catalog,
+            .theme_pick_index = theme_pick_index,
             .scratchpad_percent_small = loaded_config.settings.scratchpad_size,
             .scratchpad_percent_large = loaded_config.settings.scratchpad_large_size,
             .font_points = configured_points,
@@ -4019,6 +4236,9 @@ const App = struct {
             .screenshot = options.run.screenshot,
             .driver_artifact_dir = options.run.test_artifact_dir,
         };
+        app.resolveTheme();
+        app.theme_catalog.order(app.activeThemeName());
+        app.setThemeChoices();
         app.refreshConfigError();
         try app.syncGrid();
         if (testdriver.isEnabled(options.run.test_driver_endpoint != null)) {
@@ -4137,6 +4357,7 @@ const App = struct {
         if (self.config_path) |path| self.allocator.free(path);
         self.allocator.free(self.family_owned);
         self.allocator.free(self.action_definitions);
+        self.allocator.destroy(self.theme_catalog);
         self.overlay_grid.deinit();
         for (self.workspace_presentations.items) |presentation| {
             for (presentation.pane_renderers.items) |*pane_renderer| pane_renderer.deinit();
@@ -4350,7 +4571,7 @@ const App = struct {
     }
 
     fn newPaneRenderer(self: *App, session_id: session.SessionId) !PaneRenderer {
-        var grid = try render.Grid.init(self.allocator, gridColors(default_palette));
+        var grid = try render.Grid.init(self.allocator, gridColors(self.palette));
         errdefer grid.deinit();
         try grid.attachAtlas(self.fonts.atlasPixels(), .{
             .width_px = atlas_width_px,
@@ -4809,7 +5030,7 @@ const App = struct {
             .erase_underlay = true,
             .fill = .background,
             .border = .single,
-            .border_style = .{ .foreground = .bright_blue, .background = .background },
+            .border_style = .{ .foreground = .border, .background = .background },
         });
         for (items, 0..) |item, index| {
             const id: ui.Id = .{ .value = item.id };
@@ -4830,8 +5051,8 @@ const App = struct {
                 .label = item.label,
                 .action = item.action,
                 .normal = .{ .foreground = .foreground, .background = .background },
-                .hovered = .{ .foreground = .bright_white, .underline = .accent, .background = .background },
-                .focused = .{ .foreground = .black, .background = .accent },
+                .hovered = .{ .foreground = .strong, .underline = .accent, .background = .background },
+                .focused = .{ .foreground = .on_accent, .background = .accent },
             });
         }
     }
@@ -5076,7 +5297,7 @@ const App = struct {
         const start_x = field_bounds.x + @min(prefix_cells, field_bounds.width - 1);
         const normal: ui.TextStyle = .{ .foreground = .foreground, .underline = .accent };
         const selected: ui.TextStyle = .{
-            .foreground = .bright_white,
+            .foreground = .strong,
             .background = .selection,
             .underline = .accent,
         };
@@ -5127,9 +5348,9 @@ const App = struct {
             .erase_underlay = true,
             .fill = .background,
             .border = .double,
-            .border_style = .{ .foreground = .bright_blue, .background = .background },
+            .border_style = .{ .foreground = .border, .background = .background },
             .title = " Command palette ",
-            .title_style = .{ .foreground = .bright_white, .background = .background, .face_style = .bold },
+            .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
         });
 
         const inner_x = bounds.x + 2;
@@ -5151,7 +5372,7 @@ const App = struct {
                     .action = palette_activate_action,
                     .bounds = field_bounds,
                 }, &self.palette_query, .{
-                    .text = .{ .foreground = .bright_white, .background = .black },
+                    .text = .{ .foreground = .strong, .background = .field },
                     .selection_background = .selection,
                     .cursor_background = .accent,
                     .cursor_foreground = .background,
@@ -5162,7 +5383,7 @@ const App = struct {
                 if (visible_count == 0) {
                     const runs = [_]ui.Run{.{
                         .text = "No matching commands",
-                        .style = .{ .foreground = .bright_black },
+                        .style = .{ .foreground = .muted },
                     }};
                     try self.ui_tree.addText(.{
                         .id = .{ .value = "palette.empty" },
@@ -5219,11 +5440,11 @@ const App = struct {
                         .label = label,
                         .action = palette_activate_action,
                         .normal = if (is_selected)
-                            .{ .foreground = .bright_white, .background = .selection }
+                            .{ .foreground = .strong, .background = .selection }
                         else
                             .{ .foreground = .foreground },
-                        .hovered = .{ .foreground = .bright_white, .underline = .accent },
-                        .focused = .{ .foreground = .black, .background = .accent },
+                        .hovered = .{ .foreground = .strong, .underline = .accent },
+                        .focused = .{ .foreground = .on_accent, .background = .accent },
                     });
                 }
             },
@@ -5235,7 +5456,7 @@ const App = struct {
                 };
                 const runs = [_]ui.Run{.{
                     .text = palette_argument_meta.prompt,
-                    .style = .{ .foreground = .bright_white },
+                    .style = .{ .foreground = .strong },
                 }};
                 try self.ui_tree.addText(.{
                     .id = .{ .value = "palette.prompt" },
@@ -5258,7 +5479,7 @@ const App = struct {
                     .action = palette_activate_action,
                     .bounds = field_bounds,
                 }, &self.palette_argument, .{
-                    .text = .{ .foreground = .bright_white, .background = .black },
+                    .text = .{ .foreground = .strong, .background = .field },
                     .selection_background = .selection,
                     .cursor_background = .accent,
                     .cursor_foreground = .background,
@@ -5273,7 +5494,7 @@ const App = struct {
                 };
                 const runs = [_]ui.Run{.{
                     .text = palette_argument_meta.prompt,
-                    .style = .{ .foreground = .bright_white },
+                    .style = .{ .foreground = .strong },
                 }};
                 try self.ui_tree.addText(.{
                     .id = .{ .value = "palette.prompt" },
@@ -5313,11 +5534,11 @@ const App = struct {
                         .label = choice.label,
                         .action = palette_activate_action,
                         .normal = if (is_selected)
-                            .{ .foreground = .bright_white, .background = .selection }
+                            .{ .foreground = .strong, .background = .selection }
                         else
                             .{ .foreground = .foreground },
-                        .hovered = .{ .foreground = .bright_white, .underline = .accent },
-                        .focused = .{ .foreground = .black, .background = .accent },
+                        .hovered = .{ .foreground = .strong, .underline = .accent },
+                        .focused = .{ .foreground = .on_accent, .background = .accent },
                     });
                 }
             },
@@ -5782,8 +6003,8 @@ const App = struct {
                     .normal = if (active)
                         .{ .underline = .accent, .overline = .accent }
                     else
-                        .{ .underline = .bright_yellow },
-                    .hovered = .{ .underline = .bright_white, .overline = .bright_white },
+                        .{ .underline = .attention },
+                    .hovered = .{ .underline = .strong, .overline = .strong },
                     .focused = .{ .underline = .accent, .overline = .accent },
                 });
             }
@@ -5803,9 +6024,9 @@ const App = struct {
             .rect = bounds,
             .fill = .background,
             .border = if (layout.bordered) .single else .none,
-            .border_style = .{ .foreground = .bright_blue, .background = .background },
+            .border_style = .{ .foreground = .border, .background = .background },
             .title = if (layout.bordered) " Find in scrollback " else null,
-            .title_style = .{ .foreground = .bright_white, .background = .background, .face_style = .bold },
+            .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
         });
 
         const query_bounds = layout.query;
@@ -5817,7 +6038,7 @@ const App = struct {
             .action = search_next_action,
             .bounds = query_bounds,
         }, &self.search_query, .{
-            .text = .{ .foreground = .bright_white, .background = .black },
+            .text = .{ .foreground = .strong, .background = .field },
             .selection_background = .selection,
             .cursor_background = .accent,
             .cursor_foreground = .background,
@@ -5867,7 +6088,7 @@ const App = struct {
         const status_width = detail_bounds.width -| controls_width -| @intFromBool(controls.len != 0);
         const runs = [_]ui.Run{.{
             .text = status,
-            .style = .{ .foreground = if (self.search_failure == null) .bright_black else .bright_yellow },
+            .style = .{ .foreground = if (self.search_failure == null) .muted else .attention },
         }};
         try self.ui_tree.addText(.{
             .id = .{ .value = "search.status" },
@@ -5891,9 +6112,9 @@ const App = struct {
                 .id = id,
                 .label = control.label,
                 .action = control.action,
-                .normal = .{ .foreground = .bright_black, .background = .background },
-                .hovered = .{ .foreground = .bright_white, .underline = .accent, .background = .background },
-                .focused = .{ .foreground = .black, .background = .accent },
+                .normal = .{ .foreground = .muted, .background = .background },
+                .hovered = .{ .foreground = .strong, .underline = .accent, .background = .background },
+                .focused = .{ .foreground = .on_accent, .background = .accent },
             });
             control_x += control.width + 1;
         }
@@ -5902,7 +6123,14 @@ const App = struct {
     /// Rebuild the production sidebar and input-method frame, then derive the
     /// full-canvas overlay from that one semantic tree. Every non-identity
     /// slice is borrowed only until `drawOverlay` returns in this frame.
+    /// Rebuild the semantic frame, then let the theme picker's preview follow
+    /// whatever the new frame highlights.
     fn composeUi(self: *App) !void {
+        try self.composeUiTree();
+        self.syncThemePreview();
+    }
+
+    fn composeUiTree(self: *App) !void {
         try self.ui_tree.beginFrame(self.uiGeometry());
         self.terminal_link_id_generation = (self.terminal_link_id_generation + 1) % self.terminal_link_ids.len;
         self.search_highlight_id_generation = (self.search_highlight_id_generation + 1) % self.search_highlight_ids.len;
@@ -5926,7 +6154,7 @@ const App = struct {
                 .rect = sidebar_bounds,
                 .fill = .background,
                 .border = .single,
-                .border_style = .{ .foreground = .bright_black },
+                .border_style = .{ .foreground = .muted },
             });
 
             const content_width: u32 = if (origin > 2) origin - 2 else 0;
@@ -5964,11 +6192,11 @@ const App = struct {
                         .label = model.name(),
                         .action = workspace_activate_action,
                         .normal = if (selected)
-                            .{ .foreground = .bright_blue, .background = .selection }
+                            .{ .foreground = .accent, .background = .selection }
                         else
-                            .{ .foreground = .bright_blue },
-                        .hovered = .{ .foreground = .bright_white, .underline = .accent },
-                        .focused = .{ .foreground = .bright_white, .background = .selection },
+                            .{ .foreground = .accent },
+                        .hovered = .{ .foreground = .strong, .underline = .accent },
+                        .focused = .{ .foreground = .strong, .background = .selection },
                     });
                     row += 1;
                     if (!selected) continue;
@@ -5992,7 +6220,7 @@ const App = struct {
                                         .action = tab_rename_commit_action,
                                         .bounds = .{ .x = 2, .y = row, .width = content_width - 1, .height = 1 },
                                     }, field, .{
-                                        .text = .{ .foreground = .bright_white, .background = .black },
+                                        .text = .{ .foreground = .strong, .background = .field },
                                         .selection_background = .selection,
                                         .cursor_background = .accent,
                                         .cursor_foreground = .background,
@@ -6015,11 +6243,11 @@ const App = struct {
                             .label = tab.displayLabel(),
                             .action = tab_activate_action,
                             .normal = if (tab_selected)
-                                .{ .foreground = .bright_white, .background = .selection }
+                                .{ .foreground = .strong, .background = .selection }
                             else
                                 .{ .foreground = .foreground },
-                            .hovered = .{ .foreground = .bright_white, .underline = .accent },
-                            .focused = .{ .foreground = .bright_white, .background = .selection },
+                            .hovered = .{ .foreground = .strong, .underline = .accent },
+                            .focused = .{ .foreground = .strong, .background = .selection },
                         });
                     }
                 }
@@ -6031,7 +6259,7 @@ const App = struct {
                     if (config_error) |message| {
                         const error_runs = [_]ui.Run{.{
                             .text = message,
-                            .style = .{ .foreground = .bright_red },
+                            .style = .{ .foreground = .danger },
                         }};
                         try self.ui_tree.addText(.{
                             .id = .{ .value = "config.error" },
@@ -6044,7 +6272,7 @@ const App = struct {
                     if (self.workspace_status) |status| {
                         const runs = [_]ui.Run{.{
                             .text = status,
-                            .style = .{ .foreground = .bright_yellow },
+                            .style = .{ .foreground = .attention },
                         }};
                         try self.ui_tree.addText(.{
                             .id = .{ .value = "workspace.status" },
@@ -6081,15 +6309,15 @@ const App = struct {
                         .id = hint_id,
                         .label = hint_label,
                         .action = palette_open_action,
-                        .normal = .{ .foreground = .bright_black },
-                        .hovered = .{ .foreground = .bright_white, .underline = .accent },
-                        .focused = .{ .foreground = .black, .background = .accent },
+                        .normal = .{ .foreground = .muted },
+                        .hovered = .{ .foreground = .strong, .underline = .accent },
+                        .focused = .{ .foreground = .on_accent, .background = .accent },
                     });
 
                     const version_label = "v" ++ version;
                     const version_runs = [_]ui.Run{.{
                         .text = version_label,
-                        .style = .{ .foreground = .bright_black },
+                        .style = .{ .foreground = .muted },
                     }};
                     try self.ui_tree.addText(.{
                         .id = .{ .value = "sidebar.version" },
@@ -6128,8 +6356,8 @@ const App = struct {
                     .label = "‹",
                     .action = sidebar_toggle_action,
                     .normal = .{ .foreground = .accent },
-                    .hovered = .{ .foreground = .bright_white, .background = .selection },
-                    .focused = .{ .foreground = .bright_white, .background = .selection },
+                    .hovered = .{ .foreground = .strong, .background = .selection },
+                    .focused = .{ .foreground = .strong, .background = .selection },
                 });
             }
         }
@@ -6190,7 +6418,7 @@ const App = struct {
                 .role = "presentation",
                 .label = "Pane divider",
                 .bounds = bounds,
-            }, .{ .rect = bounds, .fill = .bright_black });
+            }, .{ .rect = bounds, .fill = .muted });
             const id: ui.Id = .{ .value = semantic_id };
             try self.ui_tree.addInteractiveText(.{
                 .id = id,
@@ -6202,9 +6430,9 @@ const App = struct {
                 .id = id,
                 .label = if (divider.split == .right) "│" else "─",
                 .action = pane_resize_action,
-                .normal = .{ .foreground = .bright_black },
-                .hovered = .{ .foreground = .bright_white, .background = .selection },
-                .focused = .{ .foreground = .bright_white, .background = .selection },
+                .normal = .{ .foreground = .muted },
+                .hovered = .{ .foreground = .strong, .background = .selection },
+                .focused = .{ .foreground = .strong, .background = .selection },
             });
         }
 
@@ -6229,9 +6457,9 @@ const App = struct {
                 .erase_underlay = true,
                 .fill = null,
                 .border = .single,
-                .border_style = .{ .foreground = .bright_blue, .background = .background },
+                .border_style = .{ .foreground = .border, .background = .background },
                 .title = " Scratchpad ",
-                .title_style = .{ .foreground = .bright_white, .background = .background, .face_style = .bold },
+                .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
             });
             if (self.scratchpadInnerRect()) |inner| {
                 const terminal_id: ui.Id = .{ .value = try scratchpadSemanticId(
@@ -6277,9 +6505,9 @@ const App = struct {
                     .id = restart_id,
                     .label = "restart",
                     .action = scratchpad_restart_action,
-                    .normal = .{ .foreground = .bright_black, .background = .background },
-                    .hovered = .{ .foreground = .bright_white, .background = .selection },
-                    .focused = .{ .foreground = .black, .background = .accent },
+                    .normal = .{ .foreground = .muted, .background = .background },
+                    .hovered = .{ .foreground = .strong, .background = .selection },
+                    .focused = .{ .foreground = .on_accent, .background = .accent },
                 });
                 const hide_id: ui.Id = .{ .value = try scratchpadSemanticId(
                     &self.scratchpad_semantic_storage[3],
@@ -6302,9 +6530,9 @@ const App = struct {
                     .id = hide_id,
                     .label = "hide",
                     .action = scratchpad_hide_action,
-                    .normal = .{ .foreground = .bright_black, .background = .background },
-                    .hovered = .{ .foreground = .bright_white, .background = .selection },
-                    .focused = .{ .foreground = .black, .background = .accent },
+                    .normal = .{ .foreground = .muted, .background = .background },
+                    .hovered = .{ .foreground = .strong, .background = .selection },
+                    .focused = .{ .foreground = .on_accent, .background = .accent },
                 });
             }
         }
@@ -6326,7 +6554,7 @@ const App = struct {
                             .underline = .accent,
                         };
                         const selected: ui.TextStyle = .{
-                            .foreground = .bright_white,
+                            .foreground = .strong,
                             .background = .selection,
                             .underline = .accent,
                         };
@@ -6383,8 +6611,8 @@ const App = struct {
                 .label = "›",
                 .action = sidebar_toggle_action,
                 .normal = .{ .foreground = .accent },
-                .hovered = .{ .foreground = .bright_white, .background = .selection },
-                .focused = .{ .foreground = .bright_white, .background = .selection },
+                .hovered = .{ .foreground = .strong, .background = .selection },
+                .focused = .{ .foreground = .strong, .background = .selection },
             });
         }
         if (self.paletteVisible()) try self.composePalette();
@@ -6417,13 +6645,13 @@ const App = struct {
                     .rect = modal_bounds,
                     .fill = .background,
                     .border = .double,
-                    .border_style = .{ .foreground = .bright_yellow },
+                    .border_style = .{ .foreground = .attention },
                     .title = if (closing_workspace) " Close workspace? " else if (closing_pane) " Close pane? " else " Close tab? ",
-                    .title_style = .{ .foreground = .bright_yellow, .face_style = .bold },
+                    .title_style = .{ .foreground = .attention, .face_style = .bold },
                 });
                 const message_runs = [_]ui.Run{.{
                     .text = if (closing_workspace) "All workspace sessions will stop." else "A process is still running.",
-                    .style = .{ .foreground = .bright_white },
+                    .style = .{ .foreground = .strong },
                 }};
                 try self.ui_tree.addText(.{
                     .id = .{ .value = if (closing_workspace) "workspace-close.message" else "tab-close.message" },
@@ -6459,9 +6687,9 @@ const App = struct {
                         .id = choice_id,
                         .label = choice.label,
                         .action = choice.action,
-                        .normal = .{ .foreground = .bright_white },
-                        .hovered = .{ .foreground = .bright_yellow, .underline = .accent },
-                        .focused = .{ .foreground = .black, .background = .accent },
+                        .normal = .{ .foreground = .strong },
+                        .hovered = .{ .foreground = .attention, .underline = .accent },
+                        .focused = .{ .foreground = .on_accent, .background = .accent },
                     });
                 }
             }
@@ -7070,7 +7298,8 @@ const App = struct {
     /// asynchronous font result: the lowest line wins, file-wide first.
     fn refreshConfigError(self: *App) void {
         var best = self.config_current.firstDiagnostic();
-        if (self.font_diagnostic) |diagnostic| {
+        for ([_]?config.Diagnostic{ self.font_diagnostic, self.theme_diagnostic }) |extra| {
+            const diagnostic = extra orelse continue;
             if (best == null or diagnostic.line < best.?.line) best = diagnostic;
         }
         const diagnostic = best orelse {
@@ -7150,6 +7379,190 @@ const App = struct {
                 self.font_diagnostic.?.line = self.config_current.lines.get(.font_family);
             }
         }
+        self.reloadThemes(true);
+    }
+
+    /// The user theme directory for this run, or null when the run has no
+    /// settings file (and so no directory beside it).
+    fn themesDirectoryPath(self: *const App, buffer: []u8) ?[]const u8 {
+        const path = self.config_path orelse return null;
+        return config.themesDirectory(buffer, path);
+    }
+
+    /// The name of the committed theme: a bundled id or a user file name.
+    fn activeThemeName(self: *const App) []const u8 {
+        return self.theme_name_storage[0..self.theme_name_len];
+    }
+
+    /// The highlighted choice while the theme picker is open, else null.
+    fn themePickerSelection(self: *const App) ?usize {
+        return switch (self.palette_step) {
+            .choices => |step| if (step.definition_index == self.theme_pick_index) step.selected else null,
+            else => null,
+        };
+    }
+
+    /// Relist the themes (when `rescan`) and re-resolve the `theme` setting.
+    /// Runs at startup, on every config reload and when the desktop's
+    /// light/dark preference changes. Theme files are only re-read here: a
+    /// file edited in the themes directory applies on the next config reload.
+    fn reloadThemes(self: *App, rescan: bool) void {
+        // The picker's rows are catalog indices; relisting under an open
+        // picker would move them, so it closes (reverting any preview) first.
+        if (self.themePickerSelection() != null) self.closePalette(true) catch |err| {
+            log.warn("the theme picker could not be closed for a reload: {s}", .{@errorName(err)});
+        };
+        if (rescan) {
+            var buffer: [path_capacity]u8 = undefined;
+            self.theme_catalog.rebuild(self.io, self.allocator, self.themesDirectoryPath(&buffer), self.activeThemeName());
+        }
+        self.resolveTheme();
+        self.theme_catalog.order(self.activeThemeName());
+        self.setThemeChoices();
+    }
+
+    /// Point the `theme.pick` registry entry at the catalog's current list.
+    /// `App` owns the registry's storage, so replacing the borrowed slice in
+    /// place is the registry's own contract (borrowed for the entry's life).
+    fn setThemeChoices(self: *App) void {
+        self.action_definitions[self.theme_pick_index].palette = themePickCommand(self.theme_catalog);
+    }
+
+    fn themePickCommand(catalog: *const ThemeCatalog) inputmod.PaletteCommand {
+        return .{ .argument = .{ .choices = .{
+            .name = "theme",
+            .prompt = "Theme",
+            .values = catalog.choiceSlice(),
+        } } };
+    }
+
+    /// Resolve `theme` from the current settings and the desktop preference
+    /// and commit it. A value that names nothing is reported and the previous
+    /// theme stays, as every other rejected setting does.
+    fn resolveTheme(self: *App) void {
+        self.theme_diagnostic = null;
+        const line = self.config_current.lines.get(.theme);
+        const selection = theme.parseSelection(self.config_current.settings.theme) catch {
+            self.setThemeDiagnostic(line, "theme: expected auto:<dark>,<light>", .{});
+            return;
+        };
+        const preference: ?theme.Kind = switch (platform.systemTheme()) {
+            .light => .light,
+            .dark => .dark,
+            .unknown => null,
+        };
+        const name = selection.name(preference) orelse {
+            self.commitTheme(theme.default_id, default_palette);
+            return;
+        };
+        const index = self.theme_catalog.find(name) orelse {
+            self.setThemeDiagnostic(line, "theme: no bundled or user theme named `{s}`", .{name});
+            return;
+        };
+        self.adoptThemeEntry(index, line);
+    }
+
+    /// Commit catalog entry `index`, reporting a problem its file had.
+    fn adoptThemeEntry(self: *App, index: usize, line: u32) void {
+        const entry = &self.theme_catalog.entries[index];
+        self.theme_diagnostic = null;
+        if (entry.problem) |problem| {
+            if (problem.line == 0) {
+                self.setThemeDiagnostic(line, "theme: {s}: {s}", .{ entry.value, problem.message });
+            } else {
+                self.setThemeDiagnostic(line, "theme: {s}:{d}: {s}", .{ entry.value, problem.line, problem.message });
+            }
+        }
+        self.commitTheme(entry.value, entry.palette);
+    }
+
+    fn setThemeDiagnostic(self: *App, line: u32, comptime format: []const u8, args: anytype) void {
+        var writer: std.Io.Writer = .fixed(&self.theme_diagnostic_storage);
+        writer.print(format, args) catch {
+            // A message cut by the fixed buffer is still the message's start.
+        };
+        var len = writer.end;
+        while (len != 0 and !std.unicode.utf8ValidateSlice(self.theme_diagnostic_storage[0..len])) len -= 1;
+        self.theme_diagnostic = .{ .line = line, .message = self.theme_diagnostic_storage[0..len] };
+    }
+
+    /// Make `palette` the committed theme named `name`, and show it unless
+    /// the picker is previewing another.
+    fn commitTheme(self: *App, name: []const u8, palette: theme.Palette) void {
+        const len = @min(name.len, self.theme_name_storage.len);
+        if (!std.mem.eql(u8, name[0..len], self.activeThemeName())) theme.log.info("theme: {s}", .{name[0..len]});
+        std.mem.copyForwards(u8, self.theme_name_storage[0..len], name[0..len]);
+        self.theme_name_len = len;
+        self.theme_palette = palette;
+        if (self.themePickerSelection() == null and !palette.eql(self.palette)) self.applyPalette(palette);
+    }
+
+    /// Draw everything with `palette` from the next frame: every pane, every
+    /// workspace's scratchpad, the overlay and the cleared surface.
+    fn applyPalette(self: *App, palette: theme.Palette) void {
+        self.palette = palette;
+        const colors = gridColors(palette);
+        self.background = colors.background;
+        for (self.workspace_presentations.items) |presentation| {
+            for (presentation.pane_renderers.items) |*record| record.grid.setColors(colors);
+            presentation.scratchpad_grid.setColors(colors);
+        }
+        self.overlay_grid.setColors(colors);
+        self.needs_present = true;
+        self.invalidateUi();
+    }
+
+    /// Keep the window showing what the picker highlights: the most recently
+    /// moved-to choice, by keyboard or by hover, or the committed theme once
+    /// the picker is gone. Called after every UI composition.
+    fn syncThemePreview(self: *App) void {
+        var wanted = self.theme_palette;
+        if (self.themePickerSelection()) |selected| {
+            var hovered: ?usize = null;
+            for (self.ui_tree.elements()) |element| {
+                if (!element.state.hovered) continue;
+                hovered = paletteChoiceSemanticIndex(element.id.value, self.theme_pick_index);
+            }
+            if (self.theme_seen_selected == null or self.theme_seen_selected.? != selected) {
+                self.theme_preview_choice = selected;
+            } else if (hovered) |index| {
+                if (self.theme_seen_hover == null or self.theme_seen_hover.? != index) self.theme_preview_choice = index;
+            }
+            self.theme_seen_selected = selected;
+            self.theme_seen_hover = hovered;
+            if (self.theme_preview_choice < self.theme_catalog.count) {
+                wanted = self.theme_catalog.entries[self.theme_preview_choice].palette;
+            }
+        } else {
+            self.theme_seen_selected = null;
+            self.theme_seen_hover = null;
+        }
+        if (!wanted.eql(self.palette)) self.applyPalette(wanted);
+    }
+
+    fn themePickAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const value = argument(invocation, "theme") orelse return;
+        const index = self.theme_catalog.find(value) orelse {
+            self.setWorkspaceStatus("No such theme");
+            return;
+        };
+        // The value is borrowed from the catalog, which `order` reshuffles.
+        var name_buffer: [theme_name_capacity]u8 = undefined;
+        const entry_value = self.theme_catalog.entries[index].value;
+        const name = name_buffer[0..@min(entry_value.len, name_buffer.len)];
+        @memcpy(name, entry_value[0..name.len]);
+        self.adoptThemeEntry(index, self.config_current.lines.get(.theme));
+        self.theme_catalog.order(name);
+        self.setThemeChoices();
+        if (self.config_path) |path| {
+            config.writeDocumentValue(self.io, self.allocator, path, .theme, name) catch |err| {
+                log.warn("the chosen theme could not be saved to the config file: {s}", .{@errorName(err)});
+                self.setWorkspaceStatus("Theme applied; config file not updated");
+            };
+        }
+        self.refreshConfigError();
+        try self.refreshActiveUi();
     }
 
     fn configOpenAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
@@ -7393,7 +7806,7 @@ const App = struct {
         pane_renderer_owned = false;
         errdefer pane_renderers.items[0].deinit();
 
-        var scratchpad_grid = try render.Grid.init(self.allocator, gridColors(default_palette));
+        var scratchpad_grid = try render.Grid.init(self.allocator, gridColors(self.palette));
         var scratchpad_grid_owned = true;
         errdefer if (scratchpad_grid_owned) scratchpad_grid.deinit();
         try scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), .{
@@ -9430,7 +9843,7 @@ const App = struct {
     /// layer that carries the input method's preedit.
     fn overlayView(self: *App) render.OverlayView {
         if (self.ui_test) |fixture| return fixture.view();
-        return self.ui_canvas.view(&default_palette);
+        return self.ui_canvas.view(&self.palette);
     }
 
     /// One UI mutation invalidates both layers and schedules exactly one frame.
@@ -10851,6 +11264,12 @@ const App = struct {
                 // clipboard's, and every other key reaches the program.
                 .key => |key| try self.onKey(key),
                 .clipboard_updated => |update| log.debug("event clipboard changed, owned={}", .{update.owned}),
+                .system_theme_changed => {
+                    log.info("event system theme changed", .{});
+                    self.reloadThemes(false);
+                    self.refreshConfigError();
+                    try self.refreshActiveUi();
+                },
                 .driver_wake, .driver_barrier => unreachable,
                 // The helper returned `.unrelated`, so reaching one of its
                 // three tags would be an internal routing contradiction.
@@ -12442,7 +12861,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 51 and
+    failures += reportCheck(out, registered_actions.len == 52 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -12493,7 +12912,8 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[47].name, terminal_context_menu_action) and
         std.mem.eql(u8, registered_actions[48].name, config_open_action) and
         std.mem.eql(u8, registered_actions[49].name, config_reload_action) and
-        std.mem.eql(u8, registered_actions[50].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[50].name, theme_pick_action) and
+        std.mem.eql(u8, registered_actions[51].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -15271,6 +15691,8 @@ const ConfigWait = union(enum) {
     no_element: []const u8,
     active_text: []const u8,
     cell_height_above: u32,
+    /// The committed theme's palette is this one.
+    theme: theme.Palette,
 };
 
 fn configWaitMet(self: *App, condition: ConfigWait) !bool {
@@ -15283,6 +15705,7 @@ fn configWaitMet(self: *App, condition: ConfigWait) !bool {
             break :found self.activeLive().terminal().visibleTextContains(text);
         },
         .cell_height_above => |height| self.font_load == null and self.fonts.metrics().cell.height_px > height,
+        .theme => |palette| self.theme_palette.eql(palette),
     };
 }
 
@@ -15435,6 +15858,258 @@ fn configTest(self: *App, io: Io, out: *Writer) !u8 {
     configCheck(out, &failures, std.mem.eql(u8, reread, config.defaults_document), "opening an existing file left it untouched", .{});
 
     out.print("config-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
+/// The deterministic peer behind `--theme-test`'s terminals.
+const theme_test_script =
+    "stty -echo; " ++
+    "printf 'THEME-READY\\r\\n'; " ++
+    "while IFS= read -r line; do printf 'THEME-ECHO:%s\\r\\n' \"$line\"; done";
+
+/// The settings `--theme-test` starts with: no theme, so the default.
+const theme_test_initial = "# --theme-test settings\n";
+
+/// A partial user theme in Ghostty's format, light so every chrome fallback
+/// is exercised. The ANSI colours it leaves out come from conduit-dark.
+const theme_test_user_file =
+    "# A user theme, dropped into the themes directory\n" ++
+    "background = #f4ecd8\n" ++
+    "foreground = #2b2b2b\n" ++
+    "cursor-color = #a03030\n" ++
+    "selection-background = #d8c8a0\n" ++
+    "palette = 0=#2a2a2a\n" ++
+    "palette = 4=#2050a0\n" ++
+    "palette = 12=#3060c0\n";
+const theme_test_user_name = "Test Paper";
+
+/// A private absolute path for `--theme-test`'s settings file.
+fn themeTestPath(io: Io, env: EnvSource, buffer: []u8) ![]const u8 {
+    const base = firstEnv(env, temp_dir_vars[0..]) orelse "/tmp";
+    const root = if (base.len != 0 and base[0] == '/') base else "/tmp";
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = try generateRunId(io, &id_buffer);
+    return std.fmt.bufPrint(buffer, "{s}/conduit-theme-test-{s}/conduit/config", .{ root, id });
+}
+
+/// Remove `--theme-test`'s private directory: two levels above the file.
+fn removeThemeTestDir(io: Io, path: []const u8) void {
+    const conduit_dir = config.directoryOf(path) orelse return;
+    const root = config.directoryOf(conduit_dir) orelse return;
+    if (std.mem.indexOf(u8, root, "conduit-theme-test-") == null) return;
+    Dir.cwd().deleteTree(io, root) catch |err| {
+        log.warn("could not remove the theme-test directory: {s}", .{@errorName(err)});
+    };
+}
+
+fn themeCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("theme-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// A fresh frame, copied out of the app's reused readback buffer.
+fn themeFrame(self: *App) ![]u8 {
+    try self.drawFrame();
+    return self.allocator.dupe(u8, try self.capture());
+}
+
+/// A pixel no UI covers: the bottom-right corner of the terminal area, which
+/// is the cleared surface or a blank cell, both the terminal background.
+fn themeTerminalPixel(self: *const App, pixels: []const u8) render.Rgba {
+    return pixelAt(pixels, self.size, self.size.width - 2, self.size.height - 2);
+}
+
+fn elementPixelRect(element: *const ui.Element) render.PixelRect {
+    return .{
+        .x = @floatFromInt(element.bounds.x),
+        .y = @floatFromInt(element.bounds.y),
+        .width = @floatFromInt(element.bounds.width),
+        .height = @floatFromInt(element.bounds.height),
+    };
+}
+
+/// The foreground the overlay paints the first cell of `id` with.
+fn themeElementForeground(self: *App, id: []const u8) ?render.Rgba {
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return null;
+    const cell = self.fonts.metrics().cell;
+    // Skip leading blank cells: a centred label starts inside its bounds.
+    const label_offset: u32 = @intCast(std.mem.indexOfNone(u8, element.label, " ") orelse 0);
+    const position: render.OverlayPosition = .{
+        .col = @intCast(@as(u32, @intCast(element.bounds.x)) / cell.width_px + label_offset),
+        .row = @intCast(@as(u32, @intCast(element.bounds.y)) / cell.height_px),
+    };
+    for (self.overlayView().cells) |overlay_cell| {
+        if (overlay_cell.position.col == position.col and overlay_cell.position.row == position.row and
+            !std.mem.eql(u8, overlay_cell.text, " ")) return overlay_cell.foreground;
+    }
+    var col = position.col;
+    while (col < position.col + 16) : (col += 1) {
+        for (self.overlayView().cells) |overlay_cell| {
+            if (overlay_cell.position.col == col and overlay_cell.position.row == position.row and
+                overlay_cell.text.len != 0 and !std.mem.eql(u8, overlay_cell.text, " ")) return overlay_cell.foreground;
+        }
+    }
+    return null;
+}
+
+fn themeChoiceIndex(self: *const App, label: []const u8) ?usize {
+    for (self.theme_catalog.entriesSlice(), 0..) |entry, index| {
+        if (std.mem.eql(u8, entry.label, label)) return index;
+    }
+    return null;
+}
+
+/// Exercise TASK-38 end to end: the default theme at startup, a bundled
+/// scheme from the settings file recolouring the terminal and the chrome, a
+/// Ghostty-format file dropped into the themes directory and used, the
+/// palette theme picker's live preview by keyboard and by hover with Escape
+/// reverting it, a mouse choice saved to the settings file, an unknown name
+/// reported without losing the theme, and the `auto:` pair.
+fn themeTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    const path_copy = self.config_path orelse {
+        out.writeAll("theme-test: FAIL no settings path\n") catch {};
+        return 1;
+    };
+    var path_buffer: [path_capacity]u8 = undefined;
+    @memcpy(path_buffer[0..path_copy.len], path_copy);
+    const path = path_buffer[0..path_copy.len];
+    var themes_buffer: [path_capacity]u8 = undefined;
+    const themes_dir = config.themesDirectory(&themes_buffer, path) orelse return 1;
+
+    try self.drawFrame();
+    themeCheck(out, &failures, try waitForPanes(self, io, out, .{ .focused_text = "THEME-READY" }), "the real theme-test child became ready", .{});
+    themeCheck(out, &failures, self.palette.eql(default_palette) and std.mem.eql(u8, self.activeThemeName(), "conduit-dark") and
+        self.theme_catalog.count == theme.bundled.len, "startup drew conduit-dark and listed all {d} bundled themes", .{self.theme_catalog.count});
+    const startup = try themeFrame(self);
+    defer self.allocator.free(startup);
+    const default_background = surfaceColor(default_palette.get(.background));
+    themeCheck(out, &failures, sameColor(themeTerminalPixel(self, startup), default_background), "the terminal background is conduit-dark's", .{});
+    const hint = self.ui_tree.byId(.{ .value = "sidebar.palette" }) orelse {
+        out.writeAll("theme-test: FAIL no sidebar.palette hint\n") catch {};
+        return 1;
+    };
+    const hint_rect = elementPixelRect(hint);
+    const startup_hint = themeElementForeground(self, "sidebar.palette");
+    themeCheck(out, &failures, startup_hint != null and sameColor(startup_hint.?, surfaceColor(default_palette.get(.muted))), "the sidebar hint is drawn in conduit-dark's muted role", .{});
+
+    // A bundled scheme from the settings file, applied by the watcher.
+    const dracula = theme.derive(theme.findBundled("dracula").?.scheme);
+    const reloads_before_dracula = self.config_reload_count;
+    try writeConfigTestFile(io, path, theme_test_initial ++ "theme = dracula\n");
+    themeCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_dracula + 1 }) and
+        try waitForConfig(self, io, out, .{ .theme = dracula }) and self.palette.eql(dracula), "theme = dracula applied without a restart", .{});
+    const dracula_frame = try themeFrame(self);
+    defer self.allocator.free(dracula_frame);
+    const dracula_pixel = themeTerminalPixel(self, dracula_frame);
+    themeCheck(out, &failures, sameColor(dracula_pixel, .{ .r = 0x28, .g = 0x2a, .b = 0x36 }), "the terminal background became Dracula's #282a36 (got {d},{d},{d})", .{ dracula_pixel.r, dracula_pixel.g, dracula_pixel.b });
+    const dracula_hint = themeElementForeground(self, "sidebar.palette");
+    themeCheck(out, &failures, dracula_hint != null and sameColor(dracula_hint.?, surfaceColor(dracula.get(.muted))) and
+        !sameColor(dracula_hint.?, startup_hint orelse default_background) and
+        countDifferingPixelsInRect(startup, dracula_frame, self.size, hint_rect) > 0, "the sidebar chrome was recoloured from the theme", .{});
+    const dracula_grid = gridColors(dracula);
+    var grids_follow = true;
+    for (self.activePresentation().pane_renderers.items) |record| grids_follow = grids_follow and std.meta.eql(record.grid.colors, dracula_grid);
+    grids_follow = grids_follow and std.meta.eql(self.activePresentation().scratchpad_grid.colors, dracula_grid);
+    themeCheck(out, &failures, grids_follow, "every pane grid and the scratchpad draw with the theme's 16 ANSI colours, cursor and selection", .{});
+
+    // A Ghostty-format file dropped into the themes directory and named, in
+    // another spelling, by the setting.
+    try Dir.cwd().createDirPath(io, themes_dir);
+    var user_path_buffer: [path_capacity]u8 = undefined;
+    const user_path = try std.fmt.bufPrint(&user_path_buffer, "{s}/{s}", .{ themes_dir, theme_test_user_name });
+    try Dir.cwd().writeFile(io, .{ .sub_path = user_path, .data = theme_test_user_file });
+    const paper = theme.derive(theme.parseGhostty(theme_test_user_file).scheme);
+    const reloads_before_user = self.config_reload_count;
+    try writeConfigTestFile(io, path, theme_test_initial ++ "theme = test-paper\n");
+    themeCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_user + 1 }) and
+        try waitForConfig(self, io, out, .{ .theme = paper }), "the dropped Ghostty file applied as theme = test-paper", .{});
+    const paper_frame = try themeFrame(self);
+    defer self.allocator.free(paper_frame);
+    const paper_pixel = themeTerminalPixel(self, paper_frame);
+    themeCheck(out, &failures, sameColor(paper_pixel, .{ .r = 0xf4, .g = 0xec, .b = 0xd8 }) and
+        paper.get(.green).eql(theme.conduit_dark.ansi[2]) and paper.get(.blue).eql(theme.Color.hex(0x2050a0)), "the user file's background drew and its missing colours came from conduit-dark", .{});
+    themeCheck(out, &failures, self.theme_catalog.count == theme.bundled.len + 1 and self.theme_catalog.entries[0].user and
+        std.mem.eql(u8, self.theme_catalog.choices[0].label, theme_test_user_name) and self.configErrorText() == null, "the picker lists the user theme first, as the active one, with no error", .{});
+    const paper_hint = themeElementForeground(self, "sidebar.palette");
+    themeCheck(out, &failures, paper_hint != null and sameColor(paper_hint.?, surfaceColor(paper.get(.muted))) and
+        theme.contrast(paper.get(.strong), paper.get(.background)) >= theme.text_contrast, "the light user theme derived readable chrome", .{});
+
+    // The picker by keyboard: the highlighted theme previews live.
+    _ = try paletteChord(self, io, out);
+    _ = try postPaletteText(self, io, out, "theme");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    const pick_index = self.theme_pick_index;
+    var first_id_storage: [palette_semantic_capacity]u8 = undefined;
+    const first_id = try std.fmt.bufPrint(&first_id_storage, "palette.choice.{d}.0", .{pick_index});
+    const first_row = self.ui_tree.byId(.{ .value = first_id });
+    themeCheck(out, &failures, self.themePickerSelection() != null and first_row != null and
+        std.mem.eql(u8, first_row.?.label, theme_test_user_name) and self.palette.eql(paper), "Theme: choose opened by keyboard with the active theme highlighted", .{});
+    _ = try postNamedKey(self, io, out, .down, .{});
+    const second = self.theme_catalog.entries[1];
+    const preview_frame = try themeFrame(self);
+    defer self.allocator.free(preview_frame);
+    themeCheck(out, &failures, self.themePickerSelection() == 1 and self.palette.eql(second.palette) and
+        self.theme_palette.eql(paper) and sameColor(themeTerminalPixel(self, preview_frame), surfaceColor(second.palette.get(.background))) and
+        countDifferingPixelsInRect(paper_frame, preview_frame, self.size, hint_rect) > 0, "Down previewed '{s}' across the terminal and the chrome", .{second.label});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    const reverted_frame = try themeFrame(self);
+    defer self.allocator.free(reverted_frame);
+    themeCheck(out, &failures, !self.paletteVisible() and self.palette.eql(paper) and
+        sameColor(themeTerminalPixel(self, reverted_frame), surfaceColor(paper.get(.background))), "Escape closed the picker and reverted to the committed theme", .{});
+
+    // The picker by mouse: hover previews, a click commits and saves.
+    themeCheck(out, &failures, try clickPaletteCommand(self, io, out, theme_pick_action, null) and
+        self.themePickerSelection() != null, "the palette hint and the Theme: choose row opened the picker by mouse", .{});
+    const target_index = themeChoiceIndex(self, "Gruvbox Light") orelse {
+        out.writeAll("theme-test: FAIL Gruvbox Light is not listed\n") catch {};
+        return 1;
+    };
+    const gruvbox_light = self.theme_catalog.entries[target_index].palette;
+    var target_id_storage: [palette_semantic_capacity]u8 = undefined;
+    const target_id = try std.fmt.bufPrint(&target_id_storage, "palette.choice.{d}.{d}", .{ pick_index, target_index });
+    const target_row = self.ui_tree.byId(.{ .value = target_id });
+    if (target_row) |row| {
+        const point = elementCenter(row, self.window.state.scale);
+        _ = try postMotion(self, io, out, .{ .x = point.x, .y = point.y });
+    }
+    const hover_frame = try themeFrame(self);
+    defer self.allocator.free(hover_frame);
+    themeCheck(out, &failures, target_row != null and self.palette.eql(gruvbox_light) and self.theme_palette.eql(paper) and
+        sameColor(themeTerminalPixel(self, hover_frame), surfaceColor(gruvbox_light.get(.background))), "hovering Gruvbox Light previewed it live", .{});
+    const reloads_before_pick = self.config_reload_count;
+    themeCheck(out, &failures, try clickTabsElement(self, io, out, target_id) and !self.paletteVisible() and
+        self.palette.eql(gruvbox_light) and self.theme_palette.eql(gruvbox_light) and
+        std.mem.eql(u8, self.activeThemeName(), "gruvbox-light"), "clicking Gruvbox Light committed it", .{});
+    themeCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_pick + 1 }) and
+        self.palette.eql(gruvbox_light) and self.configErrorText() == null, "the saved file reloaded to the same theme", .{});
+    var file_buffer: [4096]u8 = undefined;
+    const saved = Dir.cwd().readFile(io, path, &file_buffer) catch "";
+    themeCheck(out, &failures, std.mem.eql(u8, saved, theme_test_initial ++ "theme = gruvbox-light\n"), "the settings file now reads theme = gruvbox-light with its comment kept", .{});
+    const picked_frame = try themeFrame(self);
+    defer self.allocator.free(picked_frame);
+    themeCheck(out, &failures, sameColor(themeTerminalPixel(self, picked_frame), surfaceColor(gruvbox_light.get(.background))) and
+        countDifferingPixelsInRect(reverted_frame, picked_frame, self.size, hint_rect) > 0, "the frame changed to Gruvbox Light", .{});
+
+    // An unknown name is a visible error and the theme stays.
+    const reloads_before_unknown = self.config_reload_count;
+    try writeConfigTestFile(io, path, theme_test_initial ++ "theme = no-such-theme\n");
+    themeCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_unknown + 1 }) and
+        try waitForConfig(self, io, out, .{ .element = "config.error" }), "an unknown theme showed config.error", .{});
+    const error_element = self.ui_tree.byId(.{ .value = "config.error" });
+    themeCheck(out, &failures, error_element != null and std.mem.startsWith(u8, error_element.?.label, "config:2: theme: no bundled or user theme named") and
+        self.palette.eql(gruvbox_light), "config.error names the line and the theme stayed: '{s}'", .{if (error_element) |element| element.label else ""});
+
+    // `auto:` follows the desktop preference, dark when it is unknown.
+    const reloads_before_auto = self.config_reload_count;
+    try writeConfigTestFile(io, path, theme_test_initial ++ "theme = auto:dracula,solarized-light\n");
+    const prefers_light = platform.systemTheme() == .light;
+    const auto_expected = if (prefers_light) theme.derive(theme.findBundled("solarized-light").?.scheme) else dracula;
+    themeCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_auto + 1 }) and
+        try waitForConfig(self, io, out, .{ .theme = auto_expected }) and self.configErrorText() == null, "auto:dracula,solarized-light resolved to the {s} theme", .{if (prefers_light) "light" else "dark"});
+
+    out.print("theme-test: {d} failure(s)\n", .{failures}) catch {};
     out.flush() catch {};
     return if (failures == 0) 0 else 1;
 }
@@ -16679,6 +17354,9 @@ const usage =
     \\  --config-test                      drive the settings file: configured keys and
     \\                                    sizes, a visible error, hot reload and the
     \\                                    open-config action through SDL, then exit
+    \\  --theme-test                       drive themes: bundled and user Ghostty files,
+    \\                                    the palette picker's live preview, revert
+    \\                                    and a saved choice through SDL, then exit
     \\  --right-click=<menu|paste>         what a right click over a terminal does when
     \\                                    the program has not captured the mouse
     \\                                    (default: menu)
@@ -16823,6 +17501,11 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         try writeConfigTestFile(init.io, options.run.config_path.?, config_test_initial);
     }
     defer if (options.run.config_test) removeConfigTestDir(init.io, options.run.config_path.?);
+    if (options.run.theme_test) {
+        options.run.config_path = try themeTestPath(init.io, env, &config_path_buffer);
+        try writeConfigTestFile(init.io, options.run.config_path.?, theme_test_initial);
+    }
+    defer if (options.run.theme_test) removeThemeTestDir(init.io, options.run.config_path.?);
     try platform.setAppMetadata(.{
         .name = app_name,
         .version = version,
@@ -16852,7 +17535,7 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.ime_test or options.run.sidebar_test or options.run.tabs_test or options.run.panes_test or
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
-                options.run.config_test or options.run.driver_test) return err;
+                options.run.config_test or options.run.theme_test or options.run.driver_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
                 "no usable display ({s}): there is no window to draw in. Set DISPLAY, or run under xvfb-run",
@@ -16960,6 +17643,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try menuTest(app, init.io, out);
     } else if (options.run.config_test) {
         check_status = try configTest(app, init.io, out);
+    } else if (options.run.theme_test) {
+        check_status = try themeTest(app, init.io, out);
     } else {
         try app.run(init.io, runDeadline(init.io, options.run.run_ms));
     }
@@ -17366,6 +18051,74 @@ test "--menu-test owns a fixed real-child terminal viewport" {
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(menu_test_script, spec.argv[2]);
+}
+
+test "--theme-test owns a fixed real-child viewport and its own deterministic child" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--theme-test" }, env.source());
+    const resolved = optionsForRun(parsed);
+    try std.testing.expect(parsed.run.theme_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--theme-test") != null);
+    try std.testing.expectEqual(ui_test_width, resolved.run.width);
+    try std.testing.expect(resolved.run.hidden);
+    try std.testing.expect(wantsChild(resolved));
+    try std.testing.expect(sidebarEnabled(resolved));
+    try std.testing.expect(usesDeterministicScratchpad(resolved));
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
+    defer spec.deinit();
+    try std.testing.expectEqualStrings(theme_test_script, spec.argv[2]);
+    var buffer: [path_capacity]u8 = undefined;
+    // Like every built-in check, it never reads the user's settings.
+    try std.testing.expectEqual(@as(?[]const u8, null), configPathFor(resolved, env.source(), &buffer));
+}
+
+test "a user theme file name must read back as a theme value" {
+    try std.testing.expect(usableThemeFileName("Test Paper"));
+    try std.testing.expect(usableThemeFileName("Rosé Pine Custom"));
+    try std.testing.expect(!usableThemeFileName(""));
+    try std.testing.expect(!usableThemeFileName(".hidden"));
+    try std.testing.expect(!usableThemeFileName(" padded"));
+    try std.testing.expect(!usableThemeFileName("a\"b"));
+    try std.testing.expect(!usableThemeFileName("dark,light"));
+    try std.testing.expect(!usableThemeFileName("Auto:x"));
+    try std.testing.expect(!usableThemeFileName("tab\there"));
+    try std.testing.expect(!usableThemeFileName("\xff\xfe"));
+    try std.testing.expect(!usableThemeFileName("x" ** (theme_name_capacity + 1)));
+}
+
+test "the theme catalog lists user files first by precedence and puts the active theme first" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "Dracula", .data = "background = #000001\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "Mine", .data = "background = #102030\nbogus = 1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".hidden", .data = "background = #ffffff\n" });
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    const catalog = try std.testing.allocator.create(ThemeCatalog);
+    defer std.testing.allocator.destroy(catalog);
+    catalog.* = .{};
+    catalog.rebuild(std.testing.io, std.testing.allocator, path, "mine");
+    // The user's Dracula shadows the bundled one; .hidden is not listed.
+    try std.testing.expectEqual(theme.bundled.len + 1, catalog.count);
+    try std.testing.expectEqualStrings("Mine", catalog.choiceSlice()[0].value);
+    try std.testing.expect(catalog.entries[0].problem != null);
+    try std.testing.expectEqual(@as(u32, 2), catalog.entries[0].problem.?.line);
+    const dracula = catalog.find("dracula").?;
+    try std.testing.expect(catalog.entries[dracula].user);
+    try std.testing.expect(catalog.entries[dracula].scheme.background.eql(theme.Color.hex(0x000001)));
+    // Bundled names still resolve by id or label, in any spelling.
+    const tokyo = catalog.find("TokyoNight").?;
+    try std.testing.expectEqualStrings("tokyo-night", catalog.entries[tokyo].value);
+    try std.testing.expect(catalog.find("no such theme") == null);
+    // The rest are sorted by label.
+    for (catalog.choiceSlice()[2..], 1..) |choice, index| {
+        try std.testing.expect(std.ascii.orderIgnoreCase(catalog.choiceSlice()[index].label, choice.label) != .gt);
+    }
+    // Without a directory, only the bundled themes, with the default first when active.
+    catalog.rebuild(std.testing.io, std.testing.allocator, null, "conduit-dark");
+    try std.testing.expectEqual(theme.bundled.len, catalog.count);
+    try std.testing.expectEqualStrings("conduit-dark", catalog.choiceSlice()[0].value);
 }
 
 test "--config-test owns a fixed real-child viewport and the settings path follows the run" {
@@ -18335,6 +19088,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
         "--search-test",
         "--menu-test",
         "--config-test",
+        "--theme-test",
         "--no-child",
     }, env);
     try testing.expectEqualStrings("echo hi", options.run.command.?);
@@ -18355,6 +19109,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
     try testing.expect(options.run.search_test);
     try testing.expect(options.run.menu_test);
     try testing.expect(options.run.config_test);
+    try testing.expect(options.run.theme_test);
     try testing.expect(options.run.no_child);
 
     // The defaults are the ones a plain run uses: an interactive shell, no
@@ -18378,6 +19133,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
     try testing.expect(!plain.run.search_test);
     try testing.expect(!plain.run.menu_test);
     try testing.expect(!plain.run.config_test);
+    try testing.expect(!plain.run.theme_test);
     try testing.expect(plain.run.config_path == null);
     try testing.expect(!plain.run.no_child);
     try testing.expect(wantsChild(plain));

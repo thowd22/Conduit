@@ -185,6 +185,23 @@ fn copyClipboardText(alloc: Allocator, text: []const u8) ClipboardError![]u8 {
     return alloc.dupe(u8, text);
 }
 
+/// The desktop's light/dark preference, as far as the platform reports it.
+pub const SystemTheme = enum { unknown, light, dark };
+
+/// The desktop's current light/dark preference. `unknown` when the platform does not report one
+/// (X11 without a desktop portal, for example) or before a window exists.
+pub fn systemTheme() SystemTheme {
+    return systemThemeFrom(sdl.SDL_GetSystemTheme());
+}
+
+fn systemThemeFrom(raw: sdl.SDL_SystemTheme) SystemTheme {
+    return switch (raw) {
+        sdl.SDL_SYSTEM_THEME_LIGHT => .light,
+        sdl.SDL_SYSTEM_THEME_DARK => .dark,
+        else => .unknown,
+    };
+}
+
 /// The name of the video driver SDL is running on (`x11`, `wayland`, `offscreen`, ...), or null
 /// before a window exists. Which clipboard a run reaches depends on it: `offscreen` and `dummy`
 /// keep SDL's process-local clipboard, the display drivers reach the display's.
@@ -848,6 +865,8 @@ pub const Event = union(enum) {
     driver_wake,
     /// Every previously posted synthetic input event has passed through SDL's FIFO queue.
     driver_barrier: u32,
+    /// The desktop's light/dark preference changed; `systemTheme` reads the new one.
+    system_theme_changed,
     /// The native clipboard changed. `owned` distinguishes a change made by
     /// this process from one made by another application without exposing SDL.
     clipboard_updated: struct { owned: bool },
@@ -1337,6 +1356,8 @@ fn translateWithDriverEvents(
         return .{ .clipboard_updated = .{ .owned = raw.clipboard.owner } };
     }
     if (kind == @as(SdlEventType, @intCast(sdl.SDL_EVENT_QUIT))) return .quit;
+    // Like quit, the system theme belongs to the application, not to one window.
+    if (kind == @as(SdlEventType, @intCast(sdl.SDL_EVENT_SYSTEM_THEME_CHANGED))) return .system_theme_changed;
     if (isInputEvent(kind)) return translateInput(raw, window_id);
     if (!isWindowEvent(kind)) return null;
     if (raw.window.windowID != window_id) return null;
@@ -3643,6 +3664,18 @@ test "clipboard updates are translated without an SDL type escaping" {
 
     const event = translate(raw, 7, state, state) orelse return error.TestUnexpectedResult;
     try testing.expect(event.clipboard_updated.owned);
+}
+
+test "a system theme change is an application event and the preference maps to three values" {
+    const state = State.init(.{ .width = 800, .height = 600 }, Scale.fromPlatform(1.0));
+    var raw: sdl.SDL_Event = std.mem.zeroes(sdl.SDL_Event);
+    raw.common.type = @intCast(sdl.SDL_EVENT_SYSTEM_THEME_CHANGED);
+    const event = translate(raw, 7, state, state) orelse return error.TestUnexpectedResult;
+    try testing.expect(event == .system_theme_changed);
+
+    try testing.expectEqual(SystemTheme.light, systemThemeFrom(sdl.SDL_SYSTEM_THEME_LIGHT));
+    try testing.expectEqual(SystemTheme.dark, systemThemeFrom(sdl.SDL_SYSTEM_THEME_DARK));
+    try testing.expectEqual(SystemTheme.unknown, systemThemeFrom(sdl.SDL_SYSTEM_THEME_UNKNOWN));
 }
 
 /// A keyboard event of Conduit's choosing, as SDL would deliver it.

@@ -3569,7 +3569,7 @@ fn testPalette() theme.Palette {
         color.* = .{
             .r = @intCast(index * 7),
             .g = @intCast(index * 9),
-            .b = @intCast(index * 11),
+            .b = @truncate(index * 11),
         };
     }
     return palette;
