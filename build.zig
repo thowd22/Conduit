@@ -30,6 +30,8 @@ const modules = [_]ModuleSpec{
     .{ .name = "config", .source_file = "src/config.zig", .deps = &.{} },
     .{ .name = "font", .source_file = "src/font.zig", .deps = &.{} },
     .{ .name = "link", .source_file = "src/link.zig", .deps = &.{} },
+    // TASK-65: the persisted workspace layout, its file and the restore plan.
+    .{ .name = "state", .source_file = "src/state.zig", .deps = &.{} },
     // The stamped release version (`-Dversion=`), re-exported from the
     // generated `build_options` module so TASK-69.1's packages can prove it.
     .{ .name = "version", .source_file = "src/version.zig", .deps = &.{} },
@@ -47,7 +49,7 @@ const modules = [_]ModuleSpec{
     // A session owns a PTY and terminal state; a workspace owns sessions.
     .{ .name = "session", .source_file = "src/session.zig", .deps = &.{ "config", "pty", "term", "theme" } },
     .{ .name = "workspace", .source_file = "src/workspace.zig", .deps = &.{
-        "config", "input", "pty", "render", "session", "term", "theme", "ui",
+        "config", "input", "pty", "render", "session", "state", "term", "theme", "ui",
     } },
 
     // Feature layers over the workspace, and the automation that drives them.
@@ -66,9 +68,9 @@ const modules = [_]ModuleSpec{
 
     // The composition root. Its root file is the executable entry point.
     .{ .name = "app", .source_file = "src/main.zig", .deps = &.{
-        "agent", "backlog", "config",   "control", "font",       "input",
-        "link",  "palette", "platform", "pty",     "render",     "session",
-        "term",  "theme",   "ui",       "version", "testdriver", "workspace",
+        "agent",   "backlog",  "config",  "control",    "font",      "input", "link",
+        "palette", "platform", "pty",     "render",     "session",   "state", "term",
+        "theme",   "ui",       "version", "testdriver", "workspace",
     } },
 };
 
