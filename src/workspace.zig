@@ -5049,6 +5049,225 @@ test "a real 4 MiB PTY flood is fully consumed within the per-wake budget in bou
     try testing.expect(!workspace.needsPump());
 }
 
+/// Counts the bytes live through an allocator and their high-water mark, so a
+/// test can bound what a workload kept rather than infer it. Atomic because a
+/// PTY read thread may allocate through the same allocator.
+const PeakCountingAllocator = struct {
+    child: Allocator,
+    live: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(self: *PeakCountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn grew(self: *PeakCountingAllocator, bytes: usize) void {
+        const now = self.live.fetchAdd(bytes, .monotonic) + bytes;
+        var seen = self.peak.load(.monotonic);
+        while (now > seen) seen = self.peak.cmpxchgWeak(seen, now, .monotonic, .monotonic) orelse return;
+    }
+
+    fn changed(self: *PeakCountingAllocator, old_len: usize, new_len: usize) void {
+        if (new_len > old_len) self.grew(new_len - old_len) else _ = self.live.fetchSub(old_len - new_len, .monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PeakCountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.grew(len);
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PeakCountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.changed(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PeakCountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.changed(memory.len, new_len);
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PeakCountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+        _ = self.live.fetchSub(memory.len, .monotonic);
+    }
+};
+
+/// The process's resident set in bytes, from `/proc/self/status`; zero when
+/// unreadable. Linux only: the engine maps its scrollback pages directly, so
+/// only the resident set sees them.
+fn residentBytes(io: std.Io) usize {
+    if (builtin.os.tag != .linux) return 0;
+    var buffer: [8192]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(io, "/proc/self/status", &buffer) catch return 0;
+    const start = std.mem.indexOf(u8, text, "VmRSS:") orelse return 0;
+    var fields = std.mem.tokenizeAny(u8, text[start + "VmRSS:".len ..], " \t\n");
+    const kib = std.fmt.parseInt(usize, fields.next() orelse return 0, 10) catch return 0;
+    return kib * 1024;
+}
+
+/// Records the titles a child sets, which is how the flood test's child
+/// acknowledges each line it read: an OSC 0 travels through the same output
+/// stream as the flood, so an acknowledgement can only arrive by being parsed.
+const TitleLog = struct {
+    acked: usize = 0,
+    out_of_order: usize = 0,
+    flood_done: bool = false,
+    sentinels_before_done: usize = 0,
+    sent: *const usize,
+
+    fn sink(self: *TitleLog) EventSink {
+        return .{ .ptr = self, .on_events = record };
+    }
+
+    fn record(ptr: *anyopaque, _: session.SessionId, events: []const term.Event) void {
+        const self: *TitleLog = @ptrCast(@alignCast(ptr));
+        for (events) |event| switch (event) {
+            .title => |title| {
+                if (std.mem.eql(u8, title, "FLOOD-DONE")) {
+                    self.flood_done = true;
+                    self.sentinels_before_done = self.sent.*;
+                    continue;
+                }
+                if (!std.mem.startsWith(u8, title, "ACK-S")) continue;
+                const number = std.fmt.parseInt(usize, title["ACK-S".len..], 10) catch {
+                    self.out_of_order += 1;
+                    continue;
+                };
+                // Sentinels are numbered from one, and each must be the next.
+                if (number != self.acked + 1) self.out_of_order += 1;
+                self.acked = number;
+            },
+            else => {},
+        };
+    }
+};
+
+test "a 64 MiB flood drops no typed input and keeps memory bounded" {
+    // TASK-67 AC3. A real child floods 64 MiB of scrolling lines while the
+    // owner types a numbered sentinel line every 100 ms; the child answers
+    // each line it reads with a title carrying the number. Every sentinel must
+    // come back exactly once and in order, and the allocator's live bytes and
+    // the resident set must stay under fixed caps: the PTY ring, the read
+    // buffer and the scrollback are all bounded, so nothing may grow with the
+    // volume of output.
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const testing = std.testing;
+    const io = testing.io;
+    var counting: PeakCountingAllocator = .{ .child = testing.allocator };
+    const gpa = counting.allocator();
+    const rss_before = residentBytes(io);
+
+    const size = try term.GridSize.init(80, 24);
+    var workspace = try Workspace.initLocal(io, gpa, "input-flood", "/tmp", size);
+    defer workspace.deinit() catch |err| std.debug.panic("workspace cleanup failed: {s}", .{@errorName(err)});
+    const id = try workspace.createSession(.human_terminal, size);
+    const flood_bytes = 64 * 1024 * 1024;
+    const script = std.fmt.comptimePrint(
+        "stty -echo; " ++
+            "( yes 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde | head -c {d}; " ++
+            "printf '\\033]0;FLOOD-DONE\\007' ) & " ++
+            "while IFS= read -r line; do printf '\\033]0;ACK-%s\\007' \"$line\"; [ \"$line\" = S{d} ] && break; done; wait",
+        .{ flood_bytes, sentinel_count },
+    );
+    const request = try workspace.spawnRequest(id, .{
+        .argv = &.{ "/bin/sh", "-c", script },
+        .env = &.{ "PATH=/usr/bin:/bin", "TERM=xterm-256color", "LC_ALL=C" },
+    });
+    try workspace.attachChild(id, try workspace.contextRef().spawn(request));
+
+    var sent: usize = 0;
+    var titles: TitleLog = .{ .sent = &sent };
+    var io_buffer: [64 * 1024]u8 = undefined;
+    var response_buffer: [term.response_capacity]u8 = undefined;
+    const budget = DrainBudget.per_wake;
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const deadline = started + 120 * std.time.ns_per_s;
+    var next_sentinel = started;
+    var drained: usize = 0;
+    var rss_peak = rss_before;
+    var pending: [16]u8 = undefined;
+    var pending_len: usize = 0;
+    var pending_off: usize = 0;
+
+    while (std.Io.Clock.awake.now(io).nanoseconds < deadline) {
+        const live = workspace.sessionById(id) orelse return error.SessionNotFound;
+        const child = live.child().?;
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+
+        // Type the next sentinel on schedule, finishing any short write first:
+        // a key the PTY did not take yet is retried, never dropped.
+        if (pending_off == pending_len and sent < sentinel_count and now >= next_sentinel) {
+            sent += 1;
+            pending_len = (try std.fmt.bufPrint(&pending, "S{d}\n", .{sent})).len;
+            pending_off = 0;
+            next_sentinel += 100 * std.time.ns_per_ms;
+        }
+        if (pending_off < pending_len) pending_off += try child.write(pending[pending_off..pending_len]);
+
+        if (child.state() == .exited and !workspace.needsPump()) break;
+        if (!workspace.needsPump()) {
+            _ = child.waitReadable(10);
+            continue;
+        }
+        const wake_started = std.Io.Clock.awake.now(io).nanoseconds;
+        var wake_total: usize = 0;
+        while (true) {
+            const result = workspace.pump(&io_buffer, &response_buffer, titles.sink());
+            if (result.first_error) |err| return err;
+            wake_total += result.bytes_drained;
+            const elapsed: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds - wake_started);
+            if (!budget.allowsAnotherPass(result.bytes_drained, wake_total, elapsed)) break;
+        }
+        drained += wake_total;
+        rss_peak = @max(rss_peak, residentBytes(io));
+    }
+
+    try testing.expect(titles.flood_done);
+    try testing.expectEqual(sentinel_count, sent);
+    // Every typed line came back, once each, in the order it was typed.
+    try testing.expectEqual(@as(usize, 0), titles.out_of_order);
+    try testing.expectEqual(sentinel_count, titles.acked);
+    // At least the first sentinel was typed while the flood was still running.
+    try testing.expect(titles.sentinels_before_done >= 1);
+    try testing.expect(drained >= flood_bytes);
+
+    // Memory: the scrollback stays at its line limit, the allocator's
+    // high-water mark is a small fixed cost per session, and the resident set
+    // grew by far less than the volume that went through.
+    const live = workspace.sessionById(id) orelse return error.SessionNotFound;
+    try testing.expect(live.terminalConst().viewport().history_rows <= term.ScrollConfig.default_scrollback_lines);
+    try testing.expect(counting.peak.load(.monotonic) <= max_flood_heap_bytes);
+    if (builtin.os.tag == .linux) {
+        try testing.expect(rss_before != 0);
+        try testing.expect(rss_peak - rss_before <= max_flood_rss_growth_bytes);
+    }
+}
+
+/// Lines the flood test types: one every 100 ms, so two seconds of typing.
+const sentinel_count: usize = 20;
+/// The flood test's cap on the allocator's high-water mark. The workspace,
+/// its session, terminal state, response queue and 64 KiB PTY ring peaked at
+/// 116 KiB on Linux (TASK-67); the cap leaves room for another platform's
+/// allocator, not for anything that grows with output volume.
+const max_flood_heap_bytes: usize = 1024 * 1024;
+/// The flood test's cap on resident-set growth. The engine maps scrollback
+/// pages itself, and a full 80-column, 10,000-line history plus the child's
+/// share measured 8.4 MiB of growth on Linux; 64 MiB of output must not come
+/// close to this.
+const max_flood_rss_growth_bytes: usize = 32 * 1024 * 1024;
+
 fn contextTmpPath(tmp: *std.testing.TmpDir, buffer: []u8, name: []const u8) ![]const u8 {
     if (name.len == 0) return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
     return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path[0..], name });

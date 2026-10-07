@@ -208,15 +208,27 @@ const context_menu_steps = [_]Step{
 // at run time, so the echoed command line (which contains `FLOOD_$((1+1))_DONE`)
 // cannot satisfy the wait: only the shell finishing the flood and then running
 // `echo` can.
+//
+// TASK-67: a second command is typed through the real key path straight after
+// the first, while the flood is still running. The shell is busy, so the line
+// waits in the terminal's input queue and runs once the flood ends; its marker
+// appearing proves input typed during a flood is neither dropped nor reordered.
+// Whether or not the flood is still running when the keys land, the outcome is
+// the same, which keeps the scenario deterministic.
 const output_flood_marker = "FLOOD_2_DONE";
 const output_flood_command =
     "yes 0123456789abcdef | tr '\\n' '\\r' | head -c 4000000; echo; echo FLOOD_$((1+1))_DONE";
+const output_flood_typed_marker = "TYPED_DURING_FLOOD_5";
+const output_flood_typed_command = "echo TYPED_DURING_FLOOD_$((2+3))";
 
 const output_flood_steps = [_]Step{
     .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
     .{ .type_text = output_flood_command },
     .{ .key = "ENTER" },
+    .{ .type_text = output_flood_typed_command },
+    .{ .key = "ENTER" },
     .{ .wait_terminal_text = .{ .contains = output_flood_marker, .timeout_ms = 20_000 } },
+    .{ .wait_terminal_text = .{ .contains = output_flood_typed_marker, .timeout_ms = 10_000 } },
     .inspect,
     .screenshot,
 };
@@ -875,10 +887,20 @@ test "output flood scenario waits for a marker the typed command cannot echo" {
         else => return error.TestUnexpectedResult,
     }
     switch (scenario.steps[3]) {
+        .type_text => |text| try std.testing.expectEqualStrings(output_flood_typed_command, text),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (scenario.steps[5]) {
         .wait_terminal_text => |wait| {
             try std.testing.expectEqualStrings(output_flood_marker, wait.contains);
             try std.testing.expect(wait.timeout_ms <= 20_000);
         },
+        else => return error.TestUnexpectedResult,
+    }
+    // The typed-ahead line's marker only exists once the shell expands it.
+    try std.testing.expect(std.mem.indexOf(u8, output_flood_typed_command, output_flood_typed_marker) == null);
+    switch (scenario.steps[6]) {
+        .wait_terminal_text => |wait| try std.testing.expectEqualStrings(output_flood_typed_marker, wait.contains),
         else => return error.TestUnexpectedResult,
     }
 }
