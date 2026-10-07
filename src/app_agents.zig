@@ -89,6 +89,68 @@ pub fn mostUrgent(states: []const State) ?State {
     return best;
 }
 
+// The agent manager (TASK-58) ------------------------------------------------------
+
+/// The word the manager shows for an agent's state: `exited` once its
+/// process ended, otherwise the state's label.
+pub fn managerStateWord(record: *const agent.Agent) []const u8 {
+    if (record.hasExited()) return "exited";
+    return record.state.label();
+}
+
+/// What one manager row shows. Every text is borrowed display data.
+pub const ManagerColumns = struct {
+    glyph: []const u8,
+    harness: []const u8,
+    workspace: []const u8,
+    tab: []const u8,
+    /// The backlog task the agent works on. TASK-64 fills it; until then it
+    /// is null and the column shows `–`.
+    task: ?[]const u8 = null,
+    state: []const u8,
+    age: []const u8,
+};
+
+/// `<glyph> <harness>  <workspace> › <tab>  <task>  <state>  <age>`, cut at
+/// the last whole character that fits `buffer`.
+pub fn formatManagerRow(buffer: []u8, columns: ManagerColumns) []const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    writer.print("{s} {s}  {s} › {s}  {s}  {s}  {s}", .{
+        columns.glyph,
+        columns.harness,
+        columns.workspace,
+        columns.tab,
+        columns.task orelse "–",
+        columns.state,
+        columns.age,
+    }) catch {
+        // A row cut by the fixed buffer still starts with its glyph and name.
+    };
+    var len = writer.end;
+    while (len != 0 and !std.unicode.utf8ValidateSlice(buffer[0..len])) len -= 1;
+    return buffer[0..len];
+}
+
+/// Where a manager row sorts: its workspace in sidebar order, then its tab
+/// in that workspace's tab order (agents whose session is in no tab last),
+/// then its agent id.
+pub const ManagerSortKey = struct {
+    workspace_rank: usize,
+    tab_rank: usize,
+    id: AgentId,
+
+    fn lessThan(_: void, a: ManagerSortKey, b: ManagerSortKey) bool {
+        if (a.workspace_rank != b.workspace_rank) return a.workspace_rank < b.workspace_rank;
+        if (a.tab_rank != b.tab_rank) return a.tab_rank < b.tab_rank;
+        return @intFromEnum(a.id) < @intFromEnum(b.id);
+    }
+};
+
+/// Sort manager rows in place into the order the manager lists them.
+pub fn sortManagerRows(keys: []ManagerSortKey) void {
+    std.sort.pdq(ManagerSortKey, keys, {}, ManagerSortKey.lessThan);
+}
+
 // Notifications -------------------------------------------------------------------
 
 /// What a notification is about; each kind has its own `notifications.*`
@@ -603,7 +665,7 @@ pub const Runner = struct {
     view: agent_view.View,
     /// The fake's release schedule (checks only).
     fake_step_ends: []const usize = &fake_step_ends,
-    /// Answers waiting for the worker, the adapter's one caller.
+    /// Answers and messages waiting for the worker, the adapter's one caller.
     requests_mutex: Io.Mutex = .init,
     requests: [request_capacity]Answer = undefined,
     request_head: usize = 0,
@@ -612,17 +674,26 @@ pub const Runner = struct {
     /// The longest request or decision id an answer carries; stored events
     /// refuse longer ones, so no logged request has one.
     pub const max_answer_id_bytes = 256;
+    /// The longest message the agent manager sends in one request (TASK-58).
+    pub const max_message_bytes = 1024;
     pub const request_capacity = 8;
 
-    /// One permission answer on its way to the adapter.
+    /// One request on its way to the adapter: a permission answer
+    /// (`respondPermission`) or a message (`sendInput`).
     pub const Answer = struct {
+        kind: RequestKind = .permission,
         request: [max_answer_id_bytes]u8 = undefined,
         request_len: usize = 0,
         decision: [max_answer_id_bytes]u8 = undefined,
         decision_len: usize = 0,
+        message: [max_message_bytes]u8 = undefined,
+        message_len: usize = 0,
+
+        pub const RequestKind = enum { permission, send_input };
     };
 
     pub const AnswerError = error{ QueueFull, IdTooLong };
+    pub const MessageError = error{ QueueFull, MessageTooLong };
 
     /// Queue the human's answer to permission request `request_id` for the
     /// worker to send. Owner thread; called only from an explicit gesture.
@@ -632,6 +703,7 @@ pub const Runner = struct {
         defer self.requests_mutex.unlock(self.io);
         if (self.request_len == request_capacity) return error.QueueFull;
         const slot = &self.requests[(self.request_head + self.request_len) % request_capacity];
+        slot.kind = .permission;
         @memcpy(slot.request[0..request_id.len], request_id);
         slot.request_len = request_id.len;
         @memcpy(slot.decision[0..decision_id.len], decision_id);
@@ -639,7 +711,25 @@ pub const Runner = struct {
         self.request_len += 1;
     }
 
-    /// Send every queued answer. Worker thread (or a test driving
+    /// Queue a message the human typed for the worker to hand to the
+    /// adapter's `sendInput` (TASK-58). The text is sent as typed: a
+    /// structured channel takes it as one turn, so no line ending is added.
+    /// Owner thread; called only from an explicit gesture. The caller checks
+    /// the agent's `send_input` capability; an adapter that refuses anyway
+    /// is logged at debug by the worker.
+    pub fn sendMessage(self: *Runner, text: []const u8) MessageError!void {
+        if (text.len > max_message_bytes) return error.MessageTooLong;
+        self.requests_mutex.lockUncancelable(self.io);
+        defer self.requests_mutex.unlock(self.io);
+        if (self.request_len == request_capacity) return error.QueueFull;
+        const slot = &self.requests[(self.request_head + self.request_len) % request_capacity];
+        slot.kind = .send_input;
+        @memcpy(slot.message[0..text.len], text);
+        slot.message_len = text.len;
+        self.request_len += 1;
+    }
+
+    /// Send every queued request. Worker thread (or a test driving
     /// `pollOnce`); the adapter is called outside the lock.
     fn serviceAnswers(self: *Runner) void {
         while (true) {
@@ -652,9 +742,14 @@ pub const Runner = struct {
                 self.request_head = (self.request_head + 1) % request_capacity;
                 self.request_len -= 1;
             }
-            self.adapter().respondPermission(answer.request[0..answer.request_len], answer.decision[0..answer.decision_len]) catch |err| {
-                log.debug("a permission answer was not delivered: {s}", .{@errorName(err)});
-            };
+            switch (answer.kind) {
+                .permission => self.adapter().respondPermission(answer.request[0..answer.request_len], answer.decision[0..answer.decision_len]) catch |err| {
+                    log.debug("a permission answer was not delivered: {s}", .{@errorName(err)});
+                },
+                .send_input => self.adapter().sendInput(answer.message[0..answer.message_len]) catch |err| {
+                    log.debug("a message was not delivered: {s}", .{@errorName(err)});
+                },
+            }
         }
     }
 
@@ -927,6 +1022,9 @@ const Track = struct {
     id: AgentId,
     heuristics: agent.Heuristics = .{},
     last_tick_ns: i96 = 0,
+    /// `Io.Clock.awake` nanoseconds of the agent's latest output or event,
+    /// for the manager's "last activity" column (TASK-58).
+    last_activity_ns: i96 = 0,
 };
 
 /// A terminal fact the app reports for one session (see `agent.Observation`).
@@ -1253,7 +1351,7 @@ pub const Runtime = struct {
             .token = runner.token,
             .capabilities = runner.adapter().capabilities(),
         });
-        self.tracks.append(self.allocator, .{ .id = id }) catch |err| {
+        self.tracks.append(self.allocator, .{ .id = id, .last_activity_ns = Io.Clock.awake.now(self.io).nanoseconds }) catch |err| {
             // The id was issued just above, so it is known to the registry.
             self.registry.remove(id) catch |remove_err| log.debug("an agent was not unregistered: {s}", .{@errorName(remove_err)});
             return err;
@@ -1389,7 +1487,10 @@ pub const Runtime = struct {
         const agent_id = self.registry.findBySession(key, id) orelse return;
         const track_record = self.trackFor(agent_id) orelse return;
         switch (observation) {
-            .output, .title, .command_started => track_record.last_tick_ns = now_ns,
+            .output, .title, .command_started => {
+                track_record.last_tick_ns = now_ns;
+                track_record.last_activity_ns = now_ns;
+            },
             else => {},
         }
         const batch = track_record.heuristics.observe(observation);
@@ -1475,6 +1576,62 @@ pub const Runtime = struct {
         return record.harness.displayName();
     }
 
+    /// When an agent last produced output or an event, as
+    /// `Io.Clock.awake` nanoseconds (TASK-58's "last activity" column).
+    pub fn lastActivity(self: *Runtime, id: AgentId) ?i96 {
+        const track_record = self.trackFor(id) orelse return null;
+        return track_record.last_activity_ns;
+    }
+
+    /// Whether `id` may be restarted from the agent manager: Conduit launched
+    /// it, its process has ended or it errored, and no spawn is in flight.
+    pub fn restartable(self: *const Runtime, id: AgentId) bool {
+        const record = self.registry.get(id) orelse return false;
+        if (record.ownership != .owned) return false;
+        if (!record.hasExited() and record.state != .errored) return false;
+        const runner = self.runnerForAgent(id) orelse return false;
+        return !runner.spawning;
+    }
+
+    /// The launch an agent was started with, to start it again (TASK-58):
+    /// the same harness, workspace, session, cwd and initial prompt. Borrows
+    /// the agent's runner; the caller adds the app-level fields (probe
+    /// environment, home and config directories) before `replaceRunner`.
+    pub fn relaunchRequest(self: *const Runtime, id: AgentId) ?LaunchRequest {
+        const runner = self.runnerForAgent(id) orelse return null;
+        return .{
+            .choice = runner.choice,
+            .workspace = runner.workspace,
+            .session = runner.session,
+            .context_kind = runner.context_kind,
+            .cwd = runner.cwd,
+            .prompt = runner.prompt,
+        };
+    }
+
+    pub const ReplaceError = LaunchError || @typeInfo(@typeInfo(@TypeOf(agent.Registry.create)).@"fn".return_type.?).error_union.error_set || error{NotRestartable};
+
+    /// Restart agent `old` in its own session under a new agent id: a fresh
+    /// runner for `request` (from `relaunchRequest`), the old runner and
+    /// record forgotten, and the new one registered against `binding`. The
+    /// caller then spawns the runner's child into the same session. On error
+    /// before the old agent is forgotten nothing changes.
+    pub fn replaceRunner(self: *Runtime, old: AgentId, request: LaunchRequest, binding: agent.Binding) ReplaceError!*Runner {
+        if (!self.restartable(old)) return error.NotRestartable;
+        const previous = self.runnerForAgent(old) orelse return error.NotRestartable;
+        // The request borrows `previous`; the new runner copies it first.
+        const runner = try self.createRunner(request);
+        const was_selected = self.selected_agent == old;
+        self.forgetAgent(old);
+        self.removeRunner(previous);
+        _ = self.register(runner, binding) catch |err| {
+            self.removeRunner(runner);
+            return err;
+        };
+        if (was_selected) self.selected_agent = runner.agent_id;
+        return runner;
+    }
+
     fn raiseAgent(self: *Runtime, record: *const agent.Agent, kind: Kind, body: []const u8) ?*Entry {
         if (!allowed(self.settings, kind, record.harness)) return null;
         var title_buffer: [entry_title_capacity]u8 = undefined;
@@ -1545,6 +1702,7 @@ pub const Runtime = struct {
             while (true) {
                 const n = runner.queue.drain(self.drained);
                 if (n == 0) break;
+                if (self.trackFor(id)) |track_record| track_record.last_activity_ns = now_ns;
                 for (self.drained[0..n]) |*stored| self.applyAndAnnounce(id, stored.event, &batch_entry);
             }
         }
@@ -1586,6 +1744,9 @@ pub const Runtime = struct {
     /// An agent's PTY child ended with `status`.
     pub fn childExited(self: *Runtime, key: WorkspaceKey, id: SessionId, status: agent.ExitStatus, now_ns: i96) void {
         self.observe(key, id, .{ .child_exited = status }, now_ns);
+        if (self.registry.findBySession(key, id)) |agent_id| {
+            if (self.trackFor(agent_id)) |track_record| track_record.last_activity_ns = now_ns;
+        }
         // The structured channel may have ignored the heuristic claim; the
         // exit is a fact either way.
         if (self.registry.findBySession(key, id)) |agent_id| {
@@ -1844,4 +2005,87 @@ test "the view log fills from drained events and an answer reaches the adapter t
     while (index < Runner.request_capacity) : (index += 1) try runner.answerPermission("r", "d");
     try testing.expectError(error.QueueFull, runner.answerPermission("r", "d"));
     try testing.expectError(error.IdTooLong, runner.answerPermission("r" ** (Runner.max_answer_id_bytes + 1), "d"));
+}
+
+test "manager rows show glyph, names, an empty task slot, the state and the age" {
+    var buffer: [128]u8 = undefined;
+    const row = formatManagerRow(&buffer, .{
+        .glyph = stateGlyph(.working),
+        .harness = "Codex",
+        .workspace = "work",
+        .tab = "Codex",
+        .state = State.working.label(),
+        .age = "12s",
+    });
+    try testing.expectEqualStrings("▸ Codex  work › Codex  –  working  12s", row);
+    const tasked = formatManagerRow(&buffer, .{ .glyph = "·", .harness = "Pi", .workspace = "w", .tab = "t", .task = "TASK-7", .state = "idle", .age = "3m" });
+    try testing.expectEqualStrings("· Pi  w › t  TASK-7  idle  3m", tasked);
+    // A narrow buffer never splits the separator or the glyph.
+    var small: [10]u8 = undefined;
+    const cut = formatManagerRow(&small, .{ .glyph = "▸", .harness = "Codex", .workspace = "w", .tab = "t", .state = "idle", .age = "now" });
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try testing.expect(std.mem.startsWith(u8, cut, "▸ Codex"));
+}
+
+test "manager rows sort by workspace, then tab, then id" {
+    var keys = [_]ManagerSortKey{
+        .{ .workspace_rank = 1, .tab_rank = 0, .id = AgentId.fromOrdinal(0) },
+        .{ .workspace_rank = 0, .tab_rank = 2, .id = AgentId.fromOrdinal(1) },
+        .{ .workspace_rank = 0, .tab_rank = 1, .id = AgentId.fromOrdinal(4) },
+        .{ .workspace_rank = 0, .tab_rank = 1, .id = AgentId.fromOrdinal(2) },
+        .{ .workspace_rank = 0, .tab_rank = std.math.maxInt(usize), .id = AgentId.fromOrdinal(3) },
+    };
+    sortManagerRows(&keys);
+    const expected = [_]u64{ 2, 4, 1, 3, 0 };
+    for (keys, expected) |key, ordinal| try testing.expectEqual(ordinal, key.id.ordinal());
+}
+
+test "a message reaches the adapter through the worker's queue, and a restart replaces the agent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPath(testing.io, &root_buffer);
+    var sink_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const sink_root = try std.fmt.bufPrint(&sink_buffer, "{s}/agents", .{root_buffer[0..tmp_path_len]});
+
+    var runtime = try Runtime.init(testing.allocator, testing.io, .{ .sink_root = sink_root, .fake_enabled = true });
+    defer runtime.deinit();
+    const key = WorkspaceKey.fromOrdinal(0);
+    const session_id = SessionId.fromOrdinal(1);
+    const binding: agent.Binding = .{ .workspace = key, .session = session_id, .session_kind = .agent_terminal, .scratchpad = .first };
+    const runner = try runtime.createRunner(.{ .choice = .fake, .workspace = key, .session = session_id, .context_kind = .local, .cwd = "/w", .prompt = "go" });
+    _ = try runner.prepare(&.{"PATH=/bin"});
+    const id = try runtime.register(runner, binding);
+    try testing.expect(runtime.lastActivity(id) != null);
+
+    // Both request kinds share the bounded queue and keep their order.
+    try runner.answerPermission("fake-1", "allow");
+    try runner.sendMessage("please continue");
+    runner.pollOnce();
+    try testing.expectEqualStrings("please continue", runner.backend.fake.input());
+    try testing.expectEqualStrings("fake-1", runner.backend.fake.permissionAnswer().request);
+    try testing.expectError(error.MessageTooLong, runner.sendMessage("m" ** (Runner.max_message_bytes + 1)));
+    var index: usize = 0;
+    while (index < Runner.request_capacity) : (index += 1) try runner.sendMessage("x");
+    try testing.expectError(error.QueueFull, runner.sendMessage("x"));
+
+    // A running agent is not restartable; an exited one is, under a new id
+    // bound to the same session with the same launch.
+    try testing.expect(!runtime.restartable(id));
+    runtime.childExited(key, session_id, .{ .code = 0 }, 5);
+    try testing.expectEqualStrings("exited", managerStateWord(runtime.registry.get(id).?));
+    try testing.expect(runtime.restartable(id));
+    runtime.selected_agent = id;
+    const request = runtime.relaunchRequest(id).?;
+    try testing.expectEqualStrings("go", request.prompt.?);
+    const replacement = try runtime.replaceRunner(id, request, binding);
+    const new_id = replacement.agent_id.?;
+    try testing.expect(new_id != id);
+    try testing.expect(runtime.registry.get(id) == null);
+    try testing.expectEqual(new_id, runtime.registry.findBySession(key, session_id).?);
+    try testing.expectEqual(@as(?AgentId, new_id), runtime.selected_agent);
+    try testing.expectEqualStrings("/w", replacement.cwd);
+    try testing.expectEqualStrings("go", replacement.prompt.?);
+    try testing.expectEqual(@as(usize, 1), runtime.runners.items.len);
+    try testing.expectError(error.NotRestartable, runtime.replaceRunner(new_id, runtime.relaunchRequest(new_id).?, binding));
 }
