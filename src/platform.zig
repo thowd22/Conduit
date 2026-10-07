@@ -356,6 +356,88 @@ fn validateOpenUrl(url: []const u8) OpenUrlError!void {
     }
 }
 
+// Desktop notifications (TASK-56) -------------------------------------------------------------
+
+/// The most bytes of a notification title or body handed to the desktop. The caller has already
+/// cleaned and bounded the text; these limits only refuse something that was not.
+pub const max_notify_title_bytes: usize = 256;
+pub const max_notify_body_bytes: usize = 1024;
+/// How long one Linux notification may take before its helper is killed.
+pub const notify_timeout_ms: u32 = 5000;
+
+/// Why an OS notification was not shown.
+pub const NotifyError = Allocator.Error || error{
+    /// This platform has no notification backend yet (macOS and Windows, until TASK-48 and
+    /// TASK-49 give them one).
+    Unsupported,
+    /// The helper (`notify-send` on Linux) is not installed.
+    Unavailable,
+    /// Text over its bound, not valid UTF-8, or with a control character.
+    InvalidText,
+    /// The helper ran and failed, or did not finish within `notify_timeout_ms`.
+    Failed,
+};
+
+/// Show one desktop notification with `title` and `body`.
+///
+/// Blocks until the helper finishes or `notify_timeout_ms` passes, so it is for worker threads
+/// only, never the render thread. Linux runs `notify-send --app-name=Conduit -- <title> <body>`
+/// as argv (no shell), so notification text can never become a command; macOS and Windows
+/// return `error.Unsupported` for now. Neither text is logged.
+pub fn notify(allocator: Allocator, io: std.Io, title: []const u8, body: []const u8) NotifyError!void {
+    try validateNotifyText(title, max_notify_title_bytes);
+    try validateNotifyText(body, max_notify_body_bytes);
+    switch (builtin.os.tag) {
+        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => return notifyFreedesktop(allocator, io, title, body),
+        else => return error.Unsupported,
+    }
+}
+
+fn validateNotifyText(text: []const u8, limit: usize) NotifyError!void {
+    if (text.len > limit or !std.unicode.utf8ValidateSlice(text)) return error.InvalidText;
+    for (text) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return error.InvalidText;
+    }
+}
+
+fn notifyFreedesktop(allocator: Allocator, io: std.Io, title: []const u8, body: []const u8) NotifyError!void {
+    // An OSC 9 notification has no title; the desktop needs a summary line.
+    const summary = if (title.len == 0) "Conduit" else title;
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "notify-send", "--app-name=Conduit", "--", summary, body },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch |err| return switch (err) {
+        error.FileNotFound => error.Unavailable,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Failed,
+    };
+    // Kills and reaps a helper still running on any early return; after `wait` it does nothing.
+    defer child.kill(io);
+    const deadline = (std.Io.Timeout{ .duration = .{
+        .raw = .fromMilliseconds(notify_timeout_ms),
+        .clock = .awake,
+    } }).toDeadline(io);
+    var streams_buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, streams_buffer.toStreams(), &.{child.stdout.?});
+    defer multi_reader.deinit();
+    // notify-send prints nothing unless asked to; reading to the end of its stdout is how the
+    // wait is bounded without blocking in `wait` on a helper stuck on D-Bus.
+    while (multi_reader.fill(1, deadline)) |_| {
+        multi_reader.reader(0).tossBuffered();
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return error.Failed,
+    }
+    const status = child.wait(io) catch return error.Failed;
+    switch (status) {
+        .exited => |code| if (code != 0) return error.Failed,
+        else => return error.Failed,
+    }
+}
+
 /// Why a window could not be created, changed or driven.
 ///
 /// Every value here is the operating system, a window manager or a driver refusing something. All
@@ -1677,6 +1759,13 @@ pub const Window = struct {
             .width = @intCast(@max(width, 0)),
             .height = @intCast(@max(height, 0)),
         };
+    }
+
+    /// Whether the window has keyboard focus right now (TASK-56 raises OS notifications only
+    /// while it does not). Main thread only, like every SDL window query.
+    pub fn hasInputFocus(self: *const Window) bool {
+        const flags = sdl.SDL_GetWindowFlags(self.handle.?);
+        return flags & sdl.SDL_WINDOW_INPUT_FOCUS != 0;
     }
 
     /// Whether the window is on screen: shown and not minimised.
@@ -4209,4 +4298,11 @@ test "clipboard payloads are bounded and validated before SDL sees them" {
     defer testing.allocator.free(too_large);
     @memset(too_large, 'x');
     try testing.expectError(error.PayloadTooLarge, setClipboardText(testing.allocator, too_large));
+}
+
+test "notification text is refused when over its bound or carrying controls" {
+    try std.testing.expectError(error.InvalidText, validateNotifyText("a\x07b", 16));
+    try std.testing.expectError(error.InvalidText, validateNotifyText("\xff", 16));
+    try std.testing.expectError(error.InvalidText, validateNotifyText("x" ** 17, 16));
+    try validateNotifyText("Needs approval \xe2\x9c\x93", 32);
 }
