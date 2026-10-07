@@ -11188,7 +11188,9 @@ const App = struct {
             .notifications_pi,
             .notifications_opencode,
             => if (self.config_current.settings.notifications.get(key) orelse true) "true" else "false",
-            .keybind => "",
+            // Repeating and recorded keys have no row: the connection
+            // manager edits them (TASK-44).
+            .remote_profile, .remote_recent, .keybind => "",
         };
     }
 

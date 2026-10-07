@@ -116,6 +116,8 @@ keybind = ctrl+alt+p=palette.open
 | `notifications.codex` | `true` or `false` | `true` | Every notification from Codex agents |
 | `notifications.pi` | `true` or `false` | `true` | Every notification from Pi agents |
 | `notifications.opencode` | `true` or `false` | `true` | Every notification from OpenCode agents |
+| `remote.profile` | `<name> = <[user@]host[:port]>`, repeats | none | A saved SSH connection listed by **Remote: connect**; see [Remote connections](#remote-connections) |
+| `remote.recent` | comma-separated `[user@]host[:port]`, at most 10 | `""` | The destinations connected to most recently, newest first; written by Conduit |
 | `keybind` | see below | the shipped bindings | Applies |
 
 Command-line flags are a session layer above the file: `--font=<family>` wins over `font.family`
@@ -303,6 +305,33 @@ notifications yet. A hidden (`--hidden`, headless) run never notifies the deskto
 | `terminal` | a session without an agent sends OSC 9 or OSC 777, or rings the bell while its tab is not the one shown |
 
 The list keeps the newest 32 entries. **Notifications: clear** empties it.
+
+## Remote connections
+
+**Remote: connect** (`remote.connect`, in the palette) lists, in this order: the concrete `Host`
+aliases of `~/.ssh/config` and of the files its `Include` lines name (one level deep, at most 16
+files; key, `known_hosts` and `authorized_keys` files are never read, and `Host` patterns with `*`,
+`?` or `!` are skipped), the saved profiles, the recent destinations, and **Enter user@host…**.
+Typing filters the list fuzzily; Up and Down move, Enter or a click connects. Connecting opens an
+SSH workspace named after the alias, profile or host, at the remote home directory.
+
+```
+# One saved connection per line. A later line with the same name replaces an earlier one.
+remote.profile = build = deploy@build.example.com:2222
+remote.profile = box = dev-box
+```
+
+The grammar is `remote.profile = <name> = <destination>`. A name is at most 64 bytes, without `=`,
+`"`, `,` or control characters. A destination is `[user@]host[:port]`: letters, digits and
+`._-@:[]%+` only, never starting with `-` (it would become an `ssh` option), with an optional port
+from 1 to 65535 (`[v6]:port` for an IPv6 address). There may be at most 32 profiles. A profile
+holds a destination only: never a password, a key or any other secret. Authentication is
+OpenSSH's own, answered in the workspace's connection terminal, and every other option (user,
+port, identity, `ProxyJump`) comes from `~/.ssh/config` as it would for `ssh` itself.
+
+**Enter user@host…** asks for a destination and then offers **Save as profile**, which appends a
+`remote.profile` line named after the host. `remote.recent` is rewritten on every connection with
+that destination first; it is the file's to keep, and editing it by hand is allowed.
 
 ## Errors
 

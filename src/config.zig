@@ -218,6 +218,8 @@ pub const Key = enum {
     notifications_codex,
     notifications_pi,
     notifications_opencode,
+    remote_profile,
+    remote_recent,
     keybind,
 
     /// The key's spelling in the file, which is also its `Name`.
@@ -246,6 +248,8 @@ pub const Key = enum {
             .notifications_codex => "notifications.codex",
             .notifications_pi => "notifications.pi",
             .notifications_opencode => "notifications.opencode",
+            .remote_profile => "remote.profile",
+            .remote_recent => "remote.recent",
             .keybind => "keybind",
         };
     }
@@ -290,7 +294,138 @@ pub const Settings = struct {
     right_click: ?RightClick = null,
     /// Which agent and terminal notifications are raised (TASK-56).
     notifications: Notifications = .{},
+    /// Saved SSH connection profiles (TASK-44), in file order, one per name.
+    remote_profiles: []const Profile = &.{},
+    /// Destinations connected to most recently, newest first, at most
+    /// `max_remote_recent`.
+    remote_recent: []const []const u8 = &.{},
 };
+
+/// The most saved connection profiles one file may hold.
+pub const max_remote_profiles: usize = 32;
+/// How many recent destinations `remote.recent` keeps.
+pub const max_remote_recent: usize = 10;
+/// The longest profile name.
+pub const max_profile_name_bytes: usize = 64;
+
+/// One `remote.profile = <name> = <destination>` line (TASK-44). It holds a
+/// destination only: never a password, a key or any other secret.
+pub const Profile = struct {
+    name: []const u8,
+    /// `[user@]host[:port]`, already validated by `parseDestination`.
+    destination: []const u8,
+};
+
+/// A validated SSH destination: what `ssh` is given, and an explicit port.
+pub const Destination = struct {
+    /// `[user@]host`, a slice of the parsed text.
+    target: []const u8,
+    port: ?u16 = null,
+};
+
+pub const DestinationError = error{InvalidDestination};
+
+/// Parse `[user@]host[:port]` as typed by a person or stored in the file.
+/// Refused: empty text, a leading `-` (it would become an `ssh` option),
+/// whitespace, control bytes, and anything outside letters, digits and
+/// `._-@:[]%+`, so a destination is always one plain `ssh` argument and one
+/// comma-free item of `remote.recent`. A trailing `:<digits>` is the port
+/// (1 to 65535); a bracketed IPv6 host keeps its colons (`[::1]:22`).
+pub fn parseDestination(text: []const u8) DestinationError!Destination {
+    if (text.len == 0 or text.len > max_string_bytes or text[0] == '-') return error.InvalidDestination;
+    for (text) |byte| {
+        const allowed = std.ascii.isAlphanumeric(byte) or switch (byte) {
+            '.', '_', '-', '@', ':', '[', ']', '%', '+' => true,
+            else => false,
+        };
+        if (!allowed) return error.InvalidDestination;
+    }
+    var target = text;
+    var port: ?u16 = null;
+    if (std.mem.lastIndexOfScalar(u8, text, ':')) |colon| {
+        const bracket = std.mem.lastIndexOfScalar(u8, text, ']');
+        const single_colon = std.mem.indexOfScalar(u8, text, ':').? == colon;
+        // `host:22` and `[v6]:22` carry a port; a bare IPv6 address does not.
+        const has_port = if (bracket) |close| close + 1 == colon else single_colon;
+        if (has_port) {
+            const tail = text[colon + 1 ..];
+            if (tail.len == 0 or tail.len > 5) return error.InvalidDestination;
+            for (tail) |byte| {
+                if (!std.ascii.isDigit(byte)) return error.InvalidDestination;
+            }
+            const value = std.fmt.parseInt(u32, tail, 10) catch return error.InvalidDestination;
+            if (value == 0 or value > std.math.maxInt(u16)) return error.InvalidDestination;
+            port = @intCast(value);
+            target = text[0..colon];
+        }
+    }
+    if (target.len == 0 or target[0] == '-') return error.InvalidDestination;
+    if (std.mem.indexOfScalar(u8, target, '@')) |at| {
+        if (at == 0 or at + 1 == target.len) return error.InvalidDestination;
+        if (std.mem.indexOfScalarPos(u8, target, at + 1, '@') != null) return error.InvalidDestination;
+        if (target[at + 1] == '-') return error.InvalidDestination;
+    }
+    return .{ .target = target, .port = port };
+}
+
+/// The host part of a destination, for naming a workspace after it.
+pub fn destinationHost(destination: Destination) []const u8 {
+    const at = std.mem.indexOfScalar(u8, destination.target, '@') orelse return destination.target;
+    return destination.target[at + 1 ..];
+}
+
+/// Whether `name` can name a profile: non-empty, trimmed, at most
+/// `max_profile_name_bytes`, valid UTF-8 and free of `=`, `"`, `,` and
+/// control bytes.
+pub fn validProfileName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_profile_name_bytes) return false;
+    if (std.mem.trim(u8, name, " \t").len != name.len) return false;
+    if (hasControl(name) or std.mem.indexOfAny(u8, name, "=\",") != null) return false;
+    return std.unicode.utf8ValidateSlice(name);
+}
+
+/// Split one `remote.profile` value, `<name> = <destination>`.
+fn splitProfile(value: []const u8) ValueError!Profile {
+    const text = try parseString(value);
+    const equals = std.mem.indexOfScalar(u8, text, '=') orelse return error.ProfileShape;
+    const name = std.mem.trim(u8, text[0..equals], " \t");
+    const destination = std.mem.trim(u8, text[equals + 1 ..], " \t");
+    if (!validProfileName(name)) return error.ProfileShape;
+    _ = parseDestination(destination) catch return error.NotDestination;
+    return .{ .name = name, .destination = destination };
+}
+
+/// Split a `remote.recent` value into at most `max_remote_recent`
+/// destinations, each validated. An empty value is the empty list.
+fn splitRecent(text: []const u8, out: *[max_remote_recent][]const u8) ValueError![]const []const u8 {
+    var count: usize = 0;
+    var items = std.mem.splitScalar(u8, text, ',');
+    while (items.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t");
+        if (item.len == 0) continue;
+        _ = parseDestination(item) catch return error.NotDestination;
+        if (count == max_remote_recent) return error.TooManyRecent;
+        out[count] = item;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// The `remote.recent` value with `newest` first: `existing` follows without
+/// duplicates of it, the whole list cut to `max_remote_recent`, written
+/// comma-separated into `buffer`.
+pub fn formatRecent(buffer: []u8, newest: []const u8, existing: []const []const u8) error{NoSpaceLeft}![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    writer.writeAll(newest) catch return error.NoSpaceLeft;
+    var kept: usize = 1;
+    for (existing) |item| {
+        if (kept == max_remote_recent) break;
+        if (std.mem.eql(u8, item, newest)) continue;
+        writer.print(",{s}", .{item}) catch return error.NoSpaceLeft;
+        kept += 1;
+    }
+    return writer.buffered();
+}
 
 /// The `notifications.*` switches (TASK-56). Every one defaults to on. `enabled` gates the whole
 /// in-app list and every OS notification; `os` gates only the OS notification when the window is
@@ -453,6 +588,19 @@ pub const Config = struct {
             .notifications_pi,
             .notifications_opencode,
             => Notifications.field(key).?(&to.notifications).* = previous.settings.notifications.get(key).?,
+            .remote_profile => {
+                const list = try self.arena.allocator().alloc(Profile, from.remote_profiles.len);
+                for (list, from.remote_profiles) |*slot, profile| slot.* = .{
+                    .name = try self.dupe(profile.name),
+                    .destination = try self.dupe(profile.destination),
+                };
+                to.remote_profiles = list;
+            },
+            .remote_recent => {
+                const list = try self.arena.allocator().alloc([]const u8, from.remote_recent.len);
+                for (list, from.remote_recent) |*slot, item| slot.* = try self.dupe(item);
+                to.remote_recent = list;
+            },
             // Keybind lines are resolved against the previous binding table by `app`, which is
             // the only place that knows what a rejected chord used to do.
             .keybind => {},
@@ -497,6 +645,10 @@ const ValueError = error{
     KeybindShape,
     KeybindAction,
     KeybindArgument,
+    ProfileShape,
+    NotDestination,
+    TooManyRecent,
+    TooManyProfiles,
 };
 
 /// Parse `text` as a settings file.
@@ -598,6 +750,10 @@ fn valueMessage(key: Key, err: ValueError) []const u8 {
         error.KeybindShape => "expected `<chord>=<action>[:<argument>]`",
         error.KeybindAction => "invalid action name",
         error.KeybindArgument => "invalid argument",
+        error.ProfileShape => "expected `<name> = <user@host[:port]>`",
+        error.NotDestination => "expected `[user@]host[:port]`",
+        error.TooManyRecent => "expected at most 10 comma-separated destinations",
+        error.TooManyProfiles => "more than 32 profiles; the rest are ignored",
     };
 }
 
@@ -634,6 +790,34 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
         .notifications_pi,
         .notifications_opencode,
         => Notifications.field(key).?(&settings.notifications).* = try parseBool(value),
+        .remote_profile => {
+            const profile = try splitProfile(value);
+            const owned: Profile = .{
+                .name = try allocator.dupe(u8, profile.name),
+                .destination = try allocator.dupe(u8, profile.destination),
+            };
+            // A later line for the same name replaces the earlier one.
+            for (settings.remote_profiles, 0..) |existing, index| {
+                if (std.mem.eql(u8, existing.name, owned.name)) {
+                    const list = try allocator.dupe(Profile, settings.remote_profiles);
+                    list[index] = owned;
+                    settings.remote_profiles = list;
+                    return;
+                }
+            }
+            if (settings.remote_profiles.len >= max_remote_profiles) return error.TooManyProfiles;
+            const list = try allocator.alloc(Profile, settings.remote_profiles.len + 1);
+            @memcpy(list[0..settings.remote_profiles.len], settings.remote_profiles);
+            list[settings.remote_profiles.len] = owned;
+            settings.remote_profiles = list;
+        },
+        .remote_recent => {
+            var items: [max_remote_recent][]const u8 = undefined;
+            const parsed = try splitRecent(try parseString(value), &items);
+            const list = try allocator.alloc([]const u8, parsed.len);
+            for (list, parsed) |*slot, item| slot.* = try allocator.dupe(u8, item);
+            settings.remote_recent = list;
+        },
         .keybind => {
             const split = try splitKeybind(value);
             try result.keybinds.append(allocator, .{
@@ -906,6 +1090,11 @@ pub const defaults_document =
     "# notifications.pi = true\n" ++
     "# notifications.opencode = true\n" ++
     "\n" ++
+    "# Remote connections (Remote: connect). Saved profiles hold a destination, never a\n" ++
+    "# secret, and repeat one per line: remote.profile = <name> = <user@host[:port]>\n" ++
+    "# The last ten destinations connected to, newest first:\n" ++
+    "# remote.recent = \"\"\n" ++
+    "\n" ++
     "# Keybindings: keybind = <chord>=<action>[:<argument>], or <chord>=unbind.\n" ++
     "# Modifiers are ctrl, shift, alt and super (cmd). These lines repeat some defaults.\n" ++
     keybind_examples;
@@ -930,7 +1119,7 @@ pub const EditError = error{
 /// is written bare when that reads back unchanged, otherwise in double quotes. Only string values
 /// without control characters or double quotes are accepted, and never `keybind`, which repeats.
 pub fn setDocumentValue(gpa: Allocator, document: []const u8, key: Key, value: []const u8) EditError![]u8 {
-    if (key == .keybind) return error.InvalidValue;
+    if (key == .keybind or key == .remote_profile) return error.InvalidValue;
     if (value.len > max_string_bytes or !std.unicode.utf8ValidateSlice(value) or hasControl(value) or
         std.mem.indexOfScalar(u8, value, '"') != null) return error.InvalidValue;
     const quoted = value.len == 0 or std.mem.trim(u8, value, " \t").len != value.len;
@@ -1008,6 +1197,16 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
             },
             .mouse_right_click => {
                 _ = RightClick.parse(value) catch break :check error.NotRightClick;
+                return null;
+            },
+            .remote_profile => {
+                _ = splitProfile(value) catch |err| break :check err;
+                return null;
+            },
+            .remote_recent => {
+                if (std.mem.indexOfScalar(u8, value, '"') != null) break :check error.Unquoted;
+                var items: [max_remote_recent][]const u8 = undefined;
+                _ = splitRecent(parseString(value) catch |err| break :check err, &items) catch |err| break :check err;
                 return null;
             },
             .keybind => break :check error.KeybindShape,
@@ -1130,6 +1329,63 @@ pub fn writeDocumentValue(io: Io, gpa: Allocator, path: []const u8, key: Key, va
     };
     defer if (existing) |bytes| gpa.free(bytes);
     const edited = try setDocumentValue(gpa, existing orelse defaults_document, key, value);
+    defer gpa.free(edited);
+    try replaceDocument(io, path, edited);
+}
+
+/// `document` with the profile `name` saved as `destination`, as a new allocation the caller
+/// owns: every uncommented `remote.profile` line for that name is removed and one
+/// `remote.profile = <name> = <destination>` line is appended, so a profile is never listed
+/// twice. Every other line is kept byte for byte.
+pub fn setDocumentProfile(gpa: Allocator, document: []const u8, name: []const u8, destination: []const u8) EditError![]u8 {
+    if (!validProfileName(name)) return error.InvalidValue;
+    _ = parseDestination(destination) catch return error.InvalidValue;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    writeProfileEdit(&out.writer, document, name, destination) catch return error.OutOfMemory;
+    if (out.written().len > max_file_bytes) return error.TooLarge;
+    return out.toOwnedSlice();
+}
+
+fn writeProfileEdit(writer: *std.Io.Writer, document: []const u8, name: []const u8, destination: []const u8) std.Io.Writer.Error!void {
+    var start: usize = 0;
+    var last: u8 = '\n';
+    while (start < document.len) {
+        const newline = std.mem.indexOfScalarPos(u8, document, start, '\n');
+        var end = newline orelse document.len;
+        const next = if (newline) |index| index + 1 else document.len;
+        if (end > start and document[end - 1] == '\r') end -= 1;
+        if (!profileLineNames(document[start..end], name)) {
+            try writer.writeAll(document[start..next]);
+            last = document[next - 1];
+        }
+        start = next;
+    }
+    if (last != '\n') try writer.writeByte('\n');
+    try writer.print("remote.profile = {s} = {s}\n", .{ name, destination });
+}
+
+/// Whether `line` is an uncommented `remote.profile` line for `name`.
+fn profileLineNames(line: []const u8, name: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len == 0 or trimmed[0] == '#') return false;
+    const equals = std.mem.indexOfScalar(u8, trimmed, '=') orelse return false;
+    if (Key.fromName(std.mem.trim(u8, trimmed[0..equals], " \t")) != .remote_profile) return false;
+    const profile = splitProfile(std.mem.trim(u8, trimmed[equals + 1 ..], " \t")) catch return false;
+    return std.mem.eql(u8, profile.name, name);
+}
+
+/// Save one profile in the settings file at `path` as `setDocumentProfile` does, creating the
+/// file from `defaults_document` when it is missing, with the same write-and-rename as
+/// `writeDocumentValue`. Main thread only.
+pub fn writeDocumentProfile(io: Io, gpa: Allocator, path: []const u8, name: []const u8, destination: []const u8) !void {
+    const existing: ?[]u8 = switch (try readFile(io, gpa, path)) {
+        .missing => null,
+        .bytes => |bytes| bytes,
+        .failed => return error.Unreadable,
+    };
+    defer if (existing) |bytes| gpa.free(bytes);
+    const edited = try setDocumentProfile(gpa, existing orelse defaults_document, name, destination);
     defer gpa.free(edited);
     try replaceDocument(io, path, edited);
 }
@@ -1765,8 +2021,9 @@ test "the defaults document round-trips: uncommented, it changes nothing and rep
         try uncommented.appendSlice(testing.allocator, line);
         try uncommented.append(testing.allocator, '\n');
     }
-    // Every key appears in the document, keybind four times.
-    try testing.expectEqual(std.enums.values(Key).len - 1 + 4, settings_lines);
+    // Every key appears in the document, keybind four times; `remote.profile`
+    // repeats and is described in prose rather than as a setting line.
+    try testing.expectEqual(std.enums.values(Key).len - 2 + 4, settings_lines);
 
     var config = try parse(testing.allocator, uncommented.items, null);
     defer config.deinit();
@@ -2174,4 +2431,93 @@ test "the watcher reports a write and a rename-replace, and stops promptly" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "config", .data = "scratchpad.size = 40\n" });
     try probe.waitForWake();
     try testing.expectEqual(before + 1, probe.count.load(.acquire));
+}
+
+test "a destination is one plain ssh argument with an optional port" {
+    const plain = try parseDestination("dev-box");
+    try testing.expectEqualStrings("dev-box", plain.target);
+    try testing.expectEqual(@as(?u16, null), plain.port);
+    const full = try parseDestination("deploy@build.example.com:2222");
+    try testing.expectEqualStrings("deploy@build.example.com", full.target);
+    try testing.expectEqual(@as(?u16, 2222), full.port);
+    try testing.expectEqualStrings("build.example.com", destinationHost(full));
+    const v6 = try parseDestination("me@[::1]:22");
+    try testing.expectEqualStrings("me@[::1]", v6.target);
+    try testing.expectEqual(@as(?u16, 22), v6.port);
+    try testing.expectEqual(@as(?u16, null), (try parseDestination("::1")).port);
+
+    for ([_][]const u8{
+        "",      "-oProxyCommand=x", "user@-oX", "a b",        "host\ttab",  "a,b",
+        "x;rm",  "host:",            "host:0",   "host:65536", "host:22x",   "@host",
+        "user@", "a@b@c",            "it's",     "$(x)",       "host\nnext",
+    }) |bad| {
+        try testing.expectError(error.InvalidDestination, parseDestination(bad));
+    }
+}
+
+test "profiles repeat by name and recent destinations are a bounded list" {
+    var config = try parse(testing.allocator,
+        \\remote.profile = work = deploy@build.example.com:2222
+        \\remote.profile = box = dev-box
+        \\remote.profile = work = ops@build.example.com
+        \\remote.profile = broken
+        \\remote.profile = bad = -oProxyCommand=x
+        \\remote.recent = "dev-box, ops@a:2200"
+        \\
+    , null);
+    defer config.deinit();
+    const profiles = config.settings.remote_profiles;
+    try testing.expectEqual(@as(usize, 2), profiles.len);
+    try testing.expectEqualStrings("work", profiles[0].name);
+    try testing.expectEqualStrings("ops@build.example.com", profiles[0].destination);
+    try testing.expectEqualStrings("box", profiles[1].name);
+    try testing.expectEqual(@as(usize, 2), config.diagnostics.items.len);
+    try testing.expectEqual(@as(u32, 4), config.diagnostics.items[0].line);
+    try testing.expectEqual(@as(u32, 5), config.diagnostics.items[1].line);
+    try testing.expectEqual(@as(usize, 2), config.settings.remote_recent.len);
+    try testing.expectEqualStrings("ops@a:2200", config.settings.remote_recent[1]);
+
+    // Eleven recent destinations are refused; the previous list stands.
+    var over = try parse(testing.allocator, "remote.recent = a,b,c,d,e,f,g,h,i,j,k\n", &config);
+    defer over.deinit();
+    try testing.expectEqual(@as(usize, 1), over.diagnostics.items.len);
+    try testing.expectEqual(@as(usize, 2), over.settings.remote_recent.len);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.remote_recent, "a,b"));
+    try testing.expect(checkValue(.remote_recent, "a b") != null);
+    try testing.expect(checkValue(.remote_profile, "x = -y") != null);
+}
+
+test "the newest recent destination leads, without duplicates, ten at most" {
+    var buffer: [1024]u8 = undefined;
+    try testing.expectEqualStrings("b,a,c", try formatRecent(&buffer, "b", &.{ "a", "b", "c" }));
+    const ten = [_][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "10" };
+    try testing.expectEqualStrings("new,1,2,3,4,5,6,7,8,9", try formatRecent(&buffer, "new", &ten));
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, formatRecent(&tiny, "abc", &.{"def"}));
+
+    const document = "# keep\nremote.recent = a\n";
+    const edited = try setDocumentValue(testing.allocator, document, .remote_recent, "b,a");
+    defer testing.allocator.free(edited);
+    try testing.expectEqualStrings("# keep\nremote.recent = b,a\n", edited);
+}
+
+test "saving a profile replaces its own line, keeps the rest and never writes a second copy" {
+    const document = "# comment\nremote.profile = work = old@host\nremote.profile = box = dev-box\nfont.size = 12";
+    const once = try setDocumentProfile(testing.allocator, document, "work", "deploy@host:2222");
+    defer testing.allocator.free(once);
+    try testing.expectEqualStrings(
+        "# comment\nremote.profile = box = dev-box\nfont.size = 12\nremote.profile = work = deploy@host:2222\n",
+        once,
+    );
+    const twice = try setDocumentProfile(testing.allocator, once, "work", "deploy@host:2222");
+    defer testing.allocator.free(twice);
+    try testing.expectEqualStrings(once, twice);
+    try testing.expectError(error.InvalidValue, setDocumentProfile(testing.allocator, document, "a=b", "host"));
+    try testing.expectError(error.InvalidValue, setDocumentProfile(testing.allocator, document, "x", "-oX"));
+    try testing.expectError(error.InvalidValue, setDocumentValue(testing.allocator, document, .remote_profile, "x = y"));
+
+    var parsed = try parse(testing.allocator, twice, null);
+    defer parsed.deinit();
+    try testing.expect(!parsed.hasDiagnostics());
+    try testing.expectEqual(@as(usize, 2), parsed.settings.remote_profiles.len);
 }

@@ -214,7 +214,7 @@ fn bestFuzzyScore(query: []const u8, definition: input.ActionDefinition) ?i64 {
 /// Score an ASCII-case-insensitive subsequence. UTF-8 bytes outside ASCII are
 /// matched exactly, which keeps matching allocation-free and never splits or
 /// rewrites borrowed metadata.
-fn fuzzyScore(query: []const u8, candidate: []const u8) ?i64 {
+pub fn fuzzyScore(query: []const u8, candidate: []const u8) ?i64 {
     if (query.len == 0) return 0;
 
     var query_index: usize = 0;
