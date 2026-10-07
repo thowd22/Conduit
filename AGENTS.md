@@ -529,6 +529,83 @@ and the CLI wrappers through a scripted context, and a manual check against the 
 1.53.0 showed a CLI edit returning through `poll` as one update. There is no view or E2E scenario
 yet; that is TASK-63.
 
+TASK-53 is complete at adapter level. `agent/claude_code.zig`'s `ClaudeCodeAdapter` detects
+`claude --version` through the ExecutionContext. Its `launch` writes a per-agent sink
+(`settings.json` with command hooks for SessionStart, InstructionsLoaded, UserPromptSubmit,
+PreToolUse, PermissionRequest, PostToolUse(Failure), Notification, SubagentStart/Stop, Stop,
+StopFailure and SessionEnd, plus a POSIX `hook.sh` relay) and returns `claude --settings
+<sink>/settings.json --session-id <uuid from the agent token>` with `CONDUIT_AGENT_TOKEN`. The
+relay appends each hook input as one wrapped line to `<sink>/events.jsonl`, which `poll` tails
+into typed events. Stop maps to `done`, and an observed session's `SessionEnd` maps to `exited`. A
+PermissionRequest blocks, for at most 580 s, until `respondPermission` atomically writes
+`<sink>/decisions/<id>`; the relay then prints Claude's `hookSpecificOutput.decision.behavior`
+allow/deny reply, and answers given in Claude's own dialog resolve as `resolved_elsewhere`.
+`TranscriptReader` incrementally parses the session JSONL into messages, tool uses and file
+references. `findRunningSession` matches Claude's undocumented `<config>/sessions/<pid>.json`
+registry by pid, cwd or session id, so a `claude` started by hand in a terminal can be attached and
+followed until it exits. Real 2.1.292 field names differ from the docs (`SessionEnd.reason`,
+`StopFailure.error`), and hooks do inherit `CONDUIT_AGENT_TOKEN`. Unit tests cover every hook
+event, the transcript and the registry from fixtures recorded with 2.1.292 under
+`src/agent/claude_code/fixtures/`. Integration tests run the generated relay through a Local PTY,
+an unauthenticated real `claude -p` in an isolated HOME whose hooks reach `poll`, and a real
+interactive `claude` found in the registry, attached and seen to exit. The agent view that answers
+prompts is TASK-57/58; the sink is interim until TASK-60's endpoint, and remote contexts are
+TASK-61. An authenticated live allow/deny was not run (no credentials).
+
+TASK-54 adds the Codex adapter (`src/agent/codex.zig`). `CodexAdapter` speaks Codex's app-server
+JSON-RPC over a pluggable `Transport`: a minimal RFC 6455 WebSocket client over
+`FdStream.connectUnix` to the shared daemon's `$CODEX_HOME/app-server-control/app-server-control.sock`
+(`Mode.daemon`, joining a TUI's thread), or newline-delimited JSON over the pipes of an
+owner-spawned `codex app-server --listen stdio://` (`Mode.stdio`, a headless agent). `detect` runs
+`codex --version` through `ExecutionContext.run` and feeds the version gate (0.160.0 ≤ v <
+0.162.0, also checked against the `initialize` userAgent); outside the range capabilities drop to
+heuristics only and `attach` fails with `error.Protocol`. `attach` runs `initialize`/`initialized`
+and then resumes a known harness session id, starts a thread (stdio), or finds a hand-started TUI:
+the most recently updated loaded thread (`thread/loaded/list` ∩ `thread/list`) whose cwd is the
+agent's. `poll` maps `thread/status/changed`, turns, items and `serverRequest/resolved` to events
+with only legal state transitions; approval server requests become `permission_request`s
+carrying Codex's own `availableDecisions`, and `respondPermission` sends exactly the chosen
+decision. `sendInput` is `turn/start`/`turn/steer` and `stop` is `turn/interrupt`.
+`RolloutReader` parses rollout JSONL incrementally (approvals are never in rollouts). Unit tests
+replay an approval round trip recorded from the real 0.160.1 binary against a local mock provider
+(`test/fixtures/agent/codex/`) and drive a fake WebSocket daemon over a real Unix socket; opt-in
+runs (`CONDUIT_CODEX_MOCK_HOME`/`_CWD`, `CONDUIT_CODEX_DAEMON_HOME`/`_CWD`) answered a real stdio
+approval and a real hand-started TUI's approval on an isolated daemon. No model account was used.
+Headless stdio agents still need a piped (socketpair) spawn variant, `FdStream` should move
+behind `platform` (invariant 10), and app wiring is TASK-56/60.
+
+TASK-55 adds the Pi adapter (`src/agent/pi.zig`; omp as an unverified `Variant`). Pi has no hooks
+or permission prompts, so Conduit ships a dependency-free Pi extension (`src/agent/pi/conduit.js`,
+embedded and loaded with `pi -e`). It appends token-tagged JSON lines to
+`$CONDUIT_AGENT_SINK/events.jsonl`. With `CONDUIT_AGENT_GATE` it holds bash/write/edit on Pi's own
+confirm dialog while also accepting a `yes`/`no` decision file, and whichever answers first wins
+(`resolved_elsewhere` when the human answered in Pi). Headless agents use `pi --mode rpc`, where
+the confirm is an `extension_ui_request` answered with `extension_ui_response`. All IO goes
+through an owner-supplied `Transport`. `detect` runs `pi --version` (or `omp --version`) through
+`ExecutionContext.run`. `SessionReader` turns session JSONL v3 into transcript events. Unit tests
+use captured fixtures under `src/agent/pi/testdata/`. Two integration tests run the real `pi
+--mode rpc` with the extension against a loopback mock model, proving status, the gated confirm
+answered over RPC and through the decision file, the tool running and the session file being
+written; they skip when `pi` or `python3` is absent, so the hosted Linux gate skips them. A manual
+tmux run of the interactive TUI showed both answer paths. Still missing: `LaunchSpec` carrying the
+extension file for the owner to write, installing the extension for manual starts (consent,
+TASK-60), and registry/owner wiring.
+
+TASK-78 is implemented at adapter level and unverified live (decision-9). `agent/opencode.zig`'s
+`OpenCodeAdapter` uses the HTTP server OpenCode's TUI starts with `--port`. `detect` runs
+`opencode --version` through the context. `launch` describes `opencode --port P --hostname
+127.0.0.1 [--prompt …]` (or `opencode serve …` headless) with `CONDUIT_AGENT_TOKEN` and the token
+as the server's basic-auth password. A bounded HTTP/1.1 + SSE client reads `GET /event` and maps
+`session.status`/`session.idle`/`session.error`, `permission.asked`/`permission.replied`,
+`question.asked`, message parts and child sessions onto `agent.Event`. `respondPermission` posts
+`{"reply":"once|always|reject"}` to `/permission/:id/reply` (falling back to the deprecated
+per-session route), `sendInput` uses `prompt_async`, `stop` uses `abort`, and attach replays `GET
+/session/:id/message`. Structured capabilities are reported only while the stream is live;
+otherwise the agent stays on the PTY baseline and the adapter retries. The protocol was read from
+the docs and the opencode `dev` source (v1.18.35) on 2026-10-07; the fixtures under
+`test/fixtures/agent/opencode/` are hand-written, and a fake TCP server test covers the round
+trip. OpenCode is not installed here, so the live check skips.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
