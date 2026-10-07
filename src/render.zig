@@ -1079,6 +1079,14 @@ pub const OverlayCell = struct {
     underline: ?Rgba = null,
     strikethrough: ?Rgba = null,
     overline: ?Rgba = null,
+    /// Draw the glyph with the secondary small face (TASK-76), vertically
+    /// centred in the cell and packed at the small face's advance with the
+    /// small cells immediately before it on the same row. Fills and
+    /// decorations keep the full cell.
+    small: bool = false,
+    /// Device pixels this cell is moved down from its grid row (TASK-77).
+    /// Hit testing applies the same shift through `ui.Geometry`.
+    offset_y_px: i32 = 0,
 
     /// Whether this entry is safe to draw in a grid of `cols` by `rows`.
     ///
@@ -1091,6 +1099,53 @@ pub const OverlayCell = struct {
         return overlayTextMatchesSpan(self.text, self.span);
     }
 };
+
+/// Horizontal packing for consecutive `OverlayCell.small` cells.
+///
+/// A run starts at the first small cell's own left edge; each following cell
+/// on the same row, shift and adjacent column is placed one small advance
+/// (times its span) after the previous one. Any gap, row change or shift
+/// change starts a new run. Pure arithmetic, so it is unit tested without GL.
+pub const SmallRun = struct {
+    active: bool = false,
+    row: u32 = 0,
+    offset_y_px: i32 = 0,
+    next_col: u32 = 0,
+    next_x: f32 = 0,
+
+    /// The left edge for `cell`'s small glyph, advancing the run.
+    pub fn place(self: *SmallRun, cell: OverlayCell, normal: font.CellSize, small: font.CellSize) f32 {
+        const continues = self.active and self.row == cell.position.row and
+            self.offset_y_px == cell.offset_y_px and self.next_col == cell.position.col;
+        const x = if (continues)
+            self.next_x
+        else
+            @as(f32, @floatFromInt(@as(u64, cell.position.col) * normal.width_px));
+        self.* = .{
+            .active = true,
+            .row = cell.position.row,
+            .offset_y_px = cell.offset_y_px,
+            .next_col = cell.position.col + cell.span.cells(),
+            .next_x = x + @as(f32, @floatFromInt(small.width_px * cell.span.cells())),
+        };
+        return x;
+    }
+};
+
+test "small overlay cells pack at the small advance within a run" {
+    const normal = font.CellSize.init(10, 20);
+    const small = font.CellSize.init(6, 12);
+    var run: SmallRun = .{};
+    const fg: Rgba = .{ .r = 1, .g = 1, .b = 1 };
+    try std.testing.expectEqual(@as(f32, 30), run.place(.{ .position = .{ .col = 3, .row = 2 }, .foreground = fg, .small = true }, normal, small));
+    try std.testing.expectEqual(@as(f32, 36), run.place(.{ .position = .{ .col = 4, .row = 2 }, .foreground = fg, .small = true }, normal, small));
+    try std.testing.expectEqual(@as(f32, 42), run.place(.{ .position = .{ .col = 5, .row = 2 }, .foreground = fg, .span = .two, .text = "界", .small = true }, normal, small));
+    try std.testing.expectEqual(@as(f32, 54), run.place(.{ .position = .{ .col = 7, .row = 2 }, .foreground = fg, .small = true }, normal, small));
+    // A gap, a new row or a different shift restarts at the cell's own edge.
+    try std.testing.expectEqual(@as(f32, 90), run.place(.{ .position = .{ .col = 9, .row = 2 }, .foreground = fg, .small = true }, normal, small));
+    try std.testing.expectEqual(@as(f32, 100), run.place(.{ .position = .{ .col = 10, .row = 3 }, .foreground = fg, .small = true }, normal, small));
+    try std.testing.expectEqual(@as(f32, 110), run.place(.{ .position = .{ .col = 11, .row = 3 }, .foreground = fg, .small = true, .offset_y_px = 6 }, normal, small));
+}
 
 /// A flattened UI layer to paint above the terminal and its cursor.
 ///
@@ -1363,6 +1418,18 @@ pub const Grid = struct {
     canvas_overlay_cols: u32 = 0,
     canvas_overlay_rows: u32 = 0,
     canvas_overlay_invalidated: bool = true,
+    /// The secondary small face's coverage texture (TASK-76, decision
+    /// "Small UI text via a secondary scaled face"). Only the full-canvas
+    /// overlay samples it; zero until `attachSmallAtlas`.
+    small_atlas_texture: gl.Uint = 0,
+    small_atlas: AtlasSize = .{ .width_px = 0, .height_px = 0 },
+    /// The small atlas's `insertions + evictions` at the last upload.
+    small_atlas_epoch: u64 = 0,
+    /// Small glyphs, drawn in their own pass with `small_atlas_texture`.
+    small_glyphs: std.ArrayList(GlyphInstance) = .empty,
+    /// The small face's cell and baseline, in device pixels.
+    small_cell: font.CellSize = font.CellSize.init(1, 1),
+    small_baseline_px: u32 = 0,
     stats: GridStats = .{},
 
     /// Why a grid could not be built or drawn.
@@ -1398,6 +1465,8 @@ pub const Grid = struct {
         destroyPipeline(self.glyph_pipeline);
         if (self.atlas_texture != 0) gl.deleteTextures(1, &self.atlas_texture);
         if (self.color_texture != 0) gl.deleteTextures(1, &self.color_texture);
+        if (self.small_atlas_texture != 0) gl.deleteTextures(1, &self.small_atlas_texture);
+        self.small_glyphs.deinit(self.allocator);
         self.solids.deinit(self.allocator);
         self.glyphs.deinit(self.allocator);
         self.color_glyphs.deinit(self.allocator);
@@ -1518,8 +1587,52 @@ pub const Grid = struct {
             });
             return error.GlCallFailed;
         }
-        if (self.atlas_texture == 0) gl.genTextures(1, &self.atlas_texture);
-        gl.bindTexture(gl.TEXTURE_2D, self.atlas_texture);
+        try uploadCoverageTexture(&self.atlas_texture, pixels, size);
+        self.atlas = size;
+        // The pixels just uploaded are what the epoch means now, so the first
+        // frame only re-uploads if it rasterises something new.
+        self.atlas_epoch = 0;
+        // A new manager (a new face, size or display scale) has a new colour
+        // atlas too; the next frame that needs colour uploads all of it.
+        self.color_epoch = std.math.maxInt(u64);
+        self.redraw_all = true;
+    }
+
+    /// Attach the secondary small face the full-canvas overlay draws
+    /// `OverlayCell.small` glyphs with (TASK-76). Like `attachAtlas`, a new
+    /// small manager (font or scale change) is attached in full, and the next
+    /// overlay frame repaints.
+    pub fn attachSmallAtlas(self: *Grid, pixels: []const u8, size: AtlasSize, metrics: font.Metrics) Error!void {
+        const wanted = @as(usize, size.width_px) * @as(usize, size.height_px);
+        if (pixels.len < wanted) {
+            log.err("small glyph atlas holds {d} bytes, a {d}x{d} texture needs {d}", .{
+                pixels.len,
+                size.width_px,
+                size.height_px,
+                wanted,
+            });
+            return error.GlCallFailed;
+        }
+        try uploadCoverageTexture(&self.small_atlas_texture, pixels, size);
+        self.small_atlas = size;
+        self.small_atlas_epoch = 0;
+        self.small_cell = metrics.cell;
+        self.small_baseline_px = metrics.baseline_px;
+        self.canvas_overlay_invalidated = true;
+        // Staging room for small glyphs is reserved only once a small face
+        // exists; a grid that never draws small text holds none.
+        if (self.canvas_overlay_cols != 0 and self.canvas_overlay_rows != 0) {
+            const cells = std.math.mul(usize, self.canvas_overlay_cols, self.canvas_overlay_rows) catch return error.OutOfMemory;
+            const instances = std.math.mul(usize, cells, 4) catch return error.OutOfMemory;
+            try self.small_glyphs.ensureTotalCapacity(self.allocator, instances);
+        }
+    }
+
+    /// Create `texture` if needed and replace its contents with a one-byte
+    /// coverage mask of `size`.
+    fn uploadCoverageTexture(texture: *gl.Uint, pixels: []const u8, size: AtlasSize) GlError!void {
+        if (texture.* == 0) gl.genTextures(1, texture);
+        gl.bindTexture(gl.TEXTURE_2D, texture.*);
         // One byte per texel: the atlas is a coverage mask, so it is a single
         // channel and GL unpacks it with no row padding to account for.
         gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -1543,14 +1656,6 @@ pub const Grid = struct {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         try checkGl("glyph atlas texture");
-        self.atlas = size;
-        // The pixels just uploaded are what the epoch means now, so the first
-        // frame only re-uploads if it rasterises something new.
-        self.atlas_epoch = 0;
-        // A new manager (a new face, size or display scale) has a new colour
-        // atlas too; the next frame that needs colour uploads all of it.
-        self.color_epoch = std.math.maxInt(u64);
-        self.redraw_all = true;
     }
 
     /// Draw a frame of `terminal` into `surface`.
@@ -1851,6 +1956,7 @@ pub const Grid = struct {
         self: *Grid,
         surface: *const Surface,
         fonts: *font.Manager,
+        small_fonts: ?*font.Manager,
         view: OverlayView,
         base_changed: bool,
     ) Error!void {
@@ -1864,16 +1970,32 @@ pub const Grid = struct {
         self.solids.clearRetainingCapacity();
         self.glyphs.clearRetainingCapacity();
         self.color_glyphs.clearRetainingCapacity();
+        self.small_glyphs.clearRetainingCapacity();
+        // Consecutive small cells on one row form a run whose glyphs are
+        // packed at the small face's advance from the run's first cell, so
+        // small text reads as text rather than letter-spaced cells.
+        var run: SmallRun = .{};
+        const small_ready = small_fonts != null and self.small_atlas_texture != 0;
         for (view.cells) |cell| {
             if (!cell.validFor(view.cols, view.rows)) continue;
-            try self.addOverlayCell(fonts, cell);
+            if (cell.small and small_ready) {
+                const x = run.place(cell, self.cell, self.small_cell);
+                try self.addOverlayCellWith(fonts, cell, .{ .fonts = small_fonts.?, .x = x });
+            } else {
+                run = .{};
+                try self.addOverlayCell(fonts, cell);
+            }
         }
 
-        if (self.solids.items.len != 0 or self.glyphs.items.len != 0 or self.color_glyphs.items.len != 0) {
+        if (self.solids.items.len != 0 or self.glyphs.items.len != 0 or self.color_glyphs.items.len != 0 or
+            self.small_glyphs.items.len != 0)
+        {
             surface.bind();
             self.uploadAtlas(fonts);
+            if (small_ready) self.uploadSmallAtlas(small_fonts.?);
             try self.drawSolidPass(surface);
             try self.drawGlyphPass(surface);
+            try self.drawSmallGlyphPass(surface);
             try self.drawColorGlyphPass(surface);
         }
         self.canvas_overlay_invalidated = false;
@@ -1921,6 +2043,7 @@ pub const Grid = struct {
         const instances = std.math.mul(usize, cells, 4) catch return error.OutOfMemory;
         try self.solids.ensureTotalCapacity(self.allocator, instances);
         try self.glyphs.ensureTotalCapacity(self.allocator, instances);
+        if (self.small_atlas_texture != 0) try self.small_glyphs.ensureTotalCapacity(self.allocator, instances);
         try self.color_glyphs.ensureTotalCapacity(self.allocator, cells);
         try self.shaped.ensureTotalCapacity(self.allocator, cell_text_capacity);
     }
@@ -2125,6 +2248,17 @@ pub const Grid = struct {
 
     /// Queue one validated overlay cell without growing a retained buffer.
     fn addOverlayCell(self: *Grid, fonts: *font.Manager, cell: OverlayCell) Error!void {
+        return self.addOverlayCellWith(fonts, cell, null);
+    }
+
+    /// Where a small overlay glyph goes: the small face, and the run-packed
+    /// left edge `SmallRun.place` chose for it.
+    const SmallPlacement = struct {
+        fonts: *font.Manager,
+        x: f32,
+    };
+
+    fn addOverlayCellWith(self: *Grid, fonts: *font.Manager, cell: OverlayCell, small: ?SmallPlacement) Error!void {
         var solid_count: usize = 0;
         if (cell.background != null) solid_count += 1;
         if (cell.underline != null) solid_count += 1;
@@ -2138,11 +2272,12 @@ pub const Grid = struct {
             return;
         }
 
-        const rect = cellRect(
+        var rect = cellRect(
             @intCast(cell.position.col),
             @intCast(cell.position.row),
             self.cell,
         );
+        rect.y += @floatFromInt(cell.offset_y_px);
         const width = rect.width * @as(f32, @floatFromInt(cell.span.cells()));
         const thickness = @max(1.0, @floor(rect.height / 12.0));
 
@@ -2168,7 +2303,82 @@ pub const Grid = struct {
         }
         if (cell.text.len == 0) return;
 
+        if (small) |placement| return self.addSmallOverlayText(placement, cell, rect);
         try self.addOverlayText(fonts, cell, rect);
+    }
+
+    /// Shape and queue one grapheme with the small face, centred vertically in
+    /// the full cell `rect` and starting at the run-packed `placement.x`.
+    /// Colour glyphs are not drawn small; the cell keeps its fill.
+    fn addSmallOverlayText(self: *Grid, placement: SmallPlacement, cell: OverlayCell, rect: PixelRect) Error!void {
+        if (self.shaped.capacity < max_overlay_grapheme_bytes) return;
+        if (self.small_atlas.width_px == 0 or self.small_atlas.height_px == 0) return;
+        const small_fonts = placement.fonts;
+        small_fonts.shapeForStyle(cell.face_style, cell.text, &self.shaped) catch |err| {
+            log.debug("small overlay grapheme could not be shaped: {s}", .{@errorName(err)});
+            return;
+        };
+        if (self.shaped.items.len > self.small_glyphs.capacity - self.small_glyphs.items.len) return;
+        const top = rect.y + @floor(
+            (@as(f32, @floatFromInt(self.cell.height_px)) - @as(f32, @floatFromInt(self.small_cell.height_px))) / 2.0,
+        );
+        const small_rect: PixelRect = .{
+            .x = placement.x,
+            .y = top,
+            .width = @floatFromInt(self.small_cell.width_px),
+            .height = @floatFromInt(self.small_cell.height_px),
+        };
+        var pen_x: f32 = 0;
+        var pen_y: f32 = 0;
+        const span: u32 = if (cell.span == .two) font.face_flag_wide else 0;
+        for (self.shaped.items) |glyph| {
+            defer {
+                pen_x += glyph.x_advance_px;
+                pen_y += glyph.y_advance_px;
+            }
+            const entry = small_fonts.glyphForFace(glyph.face_index | span, glyph.glyph_index) catch |err| {
+                log.debug("small glyph {d} could not be rasterised: {s}", .{ glyph.glyph_index, @errorName(err) });
+                continue;
+            };
+            if (entry.rect.isEmpty() or entry.color) continue;
+            var placed = glyphRect(small_rect, self.small_baseline_px, entry);
+            placed.x += @round(pen_x + glyph.x_offset_px);
+            placed.y += @round(pen_y + glyph.y_offset_px);
+            self.small_glyphs.appendAssumeCapacity(.{
+                .rect = .{ placed.x, placed.y, placed.width, placed.height },
+                .uv = uvOf(entry.rect, self.small_atlas),
+                .color = cell.foreground.toFloats(),
+            });
+            self.stats.glyphs += 1;
+        }
+    }
+
+    /// Send new small-face coverage to the GPU, if any arrived.
+    fn uploadSmallAtlas(self: *Grid, small_fonts: *font.Manager) void {
+        const epoch = small_fonts.atlas.stats.insertions + small_fonts.atlas.stats.evictions;
+        if (epoch == self.small_atlas_epoch or self.small_atlas.width_px == 0) return;
+        const pixels = small_fonts.atlasPixels();
+        const wanted = @as(usize, self.small_atlas.width_px) * @as(usize, self.small_atlas.height_px);
+        if (pixels.len < wanted) {
+            log.err("small glyph atlas holds {d} bytes, the texture needs {d}", .{ pixels.len, wanted });
+            return;
+        }
+        gl.bindTexture(gl.TEXTURE_2D, self.small_atlas_texture);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.texSubImage2D(
+            gl.TEXTURE_2D,
+            0,
+            0,
+            0,
+            @intCast(self.small_atlas.width_px),
+            @intCast(self.small_atlas.height_px),
+            gl.RED,
+            gl.UNSIGNED_BYTE,
+            pixels.ptr,
+        );
+        self.small_atlas_epoch = epoch;
+        self.stats.atlas_uploads += 1;
+        self.stats.atlas_bytes += wanted;
     }
 
     /// Shape and queue one overlay grapheme through its actual face slots.
@@ -2462,6 +2672,25 @@ pub const Grid = struct {
         gl.disable(gl.BLEND);
         self.stats.draws += 1;
         try checkGl("grid glyph pass");
+    }
+
+    /// The small-face glyphs: the glyph program over the small atlas.
+    fn drawSmallGlyphPass(self: *Grid, surface: *const Surface) Error!void {
+        if (self.small_glyphs.items.len == 0 or self.small_atlas_texture == 0) return;
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.useProgram(self.glyph_pipeline.program);
+        gl.bindVertexArray(self.glyph_pipeline.vao);
+        setViewport(surface, self.glyph_pipeline);
+        self.upload(&self.glyph_pipeline, std.mem.sliceAsBytes(self.small_glyphs.items));
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, self.small_atlas_texture);
+        gl.uniform1i(self.glyph_pipeline.atlas_uniform, 0);
+        gl.uniform1i(self.glyph_pipeline.color_mode_uniform, 0);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, @intCast(self.small_glyphs.items.len));
+        gl.disable(gl.BLEND);
+        self.stats.draws += 1;
+        try checkGl("grid small glyph pass");
     }
 
     /// Draw the colour glyphs over the coverage glyphs: the same program and
@@ -3605,7 +3834,7 @@ test "full canvas overlay preparation retains storage and unchanged frames do no
     const wrong_size = OverlayView{ .cols = 11, .rows = 8 };
     try testing.expectError(
         error.CanvasOverlayNotPrepared,
-        grid.drawCanvasOverlay(&unused_surface, &unused_fonts, wrong_size, false),
+        grid.drawCanvasOverlay(&unused_surface, &unused_fonts, null, wrong_size, false),
     );
 }
 

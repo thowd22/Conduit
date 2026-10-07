@@ -362,6 +362,9 @@ pub const TextStyle = struct {
     strikethrough: ?theme.Role = null,
     /// Overline colour, or no overline.
     overline: ?theme.Role = null,
+    /// Draw glyphs with the secondary small face, vertically centred in the
+    /// cell (TASK-76). Layout, clipping and hit testing stay in whole cells.
+    small: bool = false,
 };
 
 const CellKind = enum {
@@ -377,6 +380,8 @@ const CanvasCell = struct {
     text: []const u8 = "",
     span: render.OverlaySpan = .one,
     style: TextStyle = .{},
+    /// Device-pixel downward shift of the element that painted this cell.
+    offset_y_px: i32 = 0,
 
     fn hasPaint(self: CanvasCell) bool {
         return self.text.len != 0 or self.style.background != null or
@@ -408,6 +413,9 @@ pub const Canvas = struct {
     projected: []render.OverlayCell,
     /// Entries currently initialized in `projected`.
     projected_len: usize = 0,
+    /// Device-pixel shift applied to cells painted from now on. `Tree.render`
+    /// sets it per element from `ElementRegistration.offset_px` (TASK-77).
+    paint_offset_y_px: i32 = 0,
 
     /// Allocate a canvas and projection slot for every cell in the grid.
     pub fn init(allocator: Allocator, cols: u32, rows: u32) CanvasError!Canvas {
@@ -502,6 +510,8 @@ pub const Canvas = struct {
                 .underline = resolveOptionalRole(palette, cell.style.underline),
                 .strikethrough = resolveOptionalRole(palette, cell.style.strikethrough),
                 .overline = resolveOptionalRole(palette, cell.style.overline),
+                .small = cell.style.small,
+                .offset_y_px = cell.offset_y_px,
             };
             count += 1;
         }
@@ -564,6 +574,7 @@ pub const Canvas = struct {
         self.cells[index] = .{
             .kind = .head,
             .style = .{ .background = role },
+            .offset_y_px = self.paint_offset_y_px,
         };
     }
 
@@ -598,13 +609,14 @@ pub const Canvas = struct {
             .text = cluster,
             .span = span,
             .style = resolved_style,
+            .offset_y_px = self.paint_offset_y_px,
         };
         if (span == .two) {
             var resolved_tail_style = style;
             if (resolved_tail_style.background == null) {
                 resolved_tail_style.background = kept_tail_background;
             }
-            self.cells[index + 1] = .{ .kind = .tail, .style = resolved_tail_style };
+            self.cells[index + 1] = .{ .kind = .tail, .style = resolved_tail_style, .offset_y_px = self.paint_offset_y_px };
         }
     }
 };
@@ -1489,6 +1501,18 @@ pub const Geometry = struct {
     cell_height: u32,
     /// Drawable device-pixel surface and clipping bounds.
     surface_bounds: Bounds,
+    /// Device pixels per logical pixel (the window scale). Only sub-cell
+    /// element offsets (`ElementRegistration.offset_px`) are logical.
+    pixel_scale: f32 = 1.0,
+
+    /// Convert a logical-pixel offset to whole device pixels. Non-finite or
+    /// non-positive scales count as 1 so hostile geometry cannot overflow.
+    pub fn offsetPx(self: Geometry, logical: i32) i32 {
+        const scale: f32 = if (std.math.isFinite(self.pixel_scale) and self.pixel_scale > 0) self.pixel_scale else 1.0;
+        const scaled = @round(@as(f32, @floatFromInt(logical)) * scale);
+        const limit: f32 = @floatFromInt(std.math.maxInt(i16));
+        return @intFromFloat(std.math.clamp(scaled, -limit, limit));
+    }
 
     /// Check that this mapping can produce `Point`-addressable bounds.
     pub fn validate(self: Geometry) GeometryError!void {
@@ -1505,11 +1529,18 @@ pub const Geometry = struct {
 
     /// Convert one cell rectangle to its clipped device-pixel bounds.
     pub fn boundsFor(self: Geometry, rect: Rect) GeometryError!Bounds {
+        return self.boundsForShifted(rect, 0);
+    }
+
+    /// `boundsFor`, moved down by `offset_y_px` device pixels before
+    /// clipping. This is the one place a sub-cell shift reaches geometry, so
+    /// painting, hit testing, hover, focus and the driver's bounds all agree.
+    pub fn boundsForShifted(self: Geometry, rect: Rect, offset_y_px: i32) GeometryError!Bounds {
         try self.validate();
         if (rect.isEmpty() or self.surface_bounds.isEmpty()) return Bounds.empty;
 
         const origin_x: i128 = self.surface_bounds.x;
-        const origin_y: i128 = self.surface_bounds.y;
+        const origin_y: i128 = @as(i128, self.surface_bounds.y) + offset_y_px;
         const left = origin_x + @as(i128, rect.x) * @as(i128, self.cell_width);
         const top = origin_y + @as(i128, rect.y) * @as(i128, self.cell_height);
         const right = left + @as(i128, rect.width) * @as(i128, self.cell_width);
@@ -1596,6 +1627,11 @@ pub const ElementRegistration = struct {
     action: ?[]const u8 = null,
     /// Cell bounds used for painting and pixel geometry.
     bounds: Rect,
+    /// Sub-cell downward shift in logical pixels (TASK-77). It is scaled by
+    /// `Geometry.pixel_scale` once, here at registration, and then applies to
+    /// painting and to the element's reported device-pixel `bounds`, which
+    /// hit testing, hover and the test driver read.
+    offset_px: i32 = 0,
 };
 
 /// Inert result of mouse or keyboard activation.
@@ -1636,12 +1672,14 @@ const Paint = union(Primitive) {
 
 const Node = struct {
     cell_bounds: Rect,
+    offset_y_px: i32 = 0,
     paint: Paint,
 };
 
 const PreparedElement = struct {
     element: Element,
     cell_bounds: Rect,
+    offset_y_px: i32 = 0,
 };
 
 /// Allocation-free iterator over elements with one borrowed role.
@@ -1845,7 +1883,9 @@ pub const Tree = struct {
     pub fn render(self: *Tree, canvas: *Canvas) TreeError!void {
         if (self.building or !self.ready) return error.FrameNotEnded;
         canvas.clear();
+        defer canvas.paint_offset_y_px = 0;
         for (self.nodes[0..self.element_len], 0..) |*node, index| {
+            canvas.paint_offset_y_px = node.offset_y_px;
             switch (node.paint) {
                 .text => |text| try text.draw(canvas, node.cell_bounds),
                 .interactive_text => |interactive| {
@@ -2072,7 +2112,8 @@ pub const Tree = struct {
             parent = self.semantic[parent_index].id;
         }
         if (self.element_len >= self.semantic.len) return error.ElementCapacityExceeded;
-        const pixel_bounds = try self.geometry.boundsFor(registration.bounds);
+        const offset_y_px = self.geometry.offsetPx(registration.offset_px);
+        const pixel_bounds = try self.geometry.boundsForShifted(registration.bounds, offset_y_px);
         return .{
             .element = .{
                 .id = registration.id,
@@ -2085,6 +2126,7 @@ pub const Tree = struct {
                 .primitive = primitive,
             },
             .cell_bounds = registration.bounds,
+            .offset_y_px = offset_y_px,
         };
     }
 
@@ -2092,6 +2134,7 @@ pub const Tree = struct {
         self.semantic[self.element_len] = prepared.element;
         self.nodes[self.element_len] = .{
             .cell_bounds = prepared.cell_bounds,
+            .offset_y_px = prepared.offset_y_px,
             .paint = paint,
         };
         self.element_len += 1;
@@ -2503,6 +2546,94 @@ test "tree uses reverse paint order for hit testing and focused visuals win" {
     try testing.expect(tree.byId(.{ .value = "first" }).?.state.focused);
     try testing.expectEqual(resolveRole(&palette, .black), view.cells[0].foreground);
     try testing.expectEqual(resolveRole(&palette, .accent), view.cells[0].background.?);
+}
+
+test "a sub-cell offset shifts bounds, hit testing and paint by the scaled amount" {
+    const testing = std.testing;
+    var tree = try Tree.init(testing.allocator, 3, 1);
+    defer tree.deinit();
+    var canvas = try Canvas.init(testing.allocator, 4, 3);
+    defer canvas.deinit();
+    const palette = testPalette();
+
+    var geometry = testGeometryFor(4, 3);
+    geometry.pixel_scale = 1.25;
+    try testing.expectEqual(@as(i32, 6), geometry.offsetPx(5));
+    try testing.expectEqual(@as(i32, 13), geometry.offsetPx(10));
+    var hostile = geometry;
+    hostile.pixel_scale = std.math.nan(f32);
+    try testing.expectEqual(@as(i32, 5), hostile.offsetPx(5));
+
+    try tree.beginFrame(geometry);
+    try tree.addInteractiveText(.{
+        .id = .{ .value = "upper" },
+        .role = "tab",
+        .label = "U",
+        .action = "pick.upper",
+        .bounds = .{ .x = 0, .y = 0, .width = 4, .height = 1 },
+    }, .{ .id = .{ .value = "upper" }, .label = "U", .action = "pick.upper" });
+    try tree.addInteractiveText(.{
+        .id = .{ .value = "lower" },
+        .role = "workspace",
+        .label = "L",
+        .action = "pick.lower",
+        .bounds = .{ .x = 0, .y = 1, .width = 4, .height = 1 },
+        .offset_px = 5,
+    }, .{ .id = .{ .value = "lower" }, .label = "L", .action = "pick.lower" });
+    const runs = [_]Run{.{ .text = "b", .style = .{ .foreground = .muted, .small = true } }};
+    try tree.addText(.{
+        .id = .{ .value = "lower.branch" },
+        .parent = .{ .value = "lower" },
+        .role = "branch",
+        .label = "b",
+        .bounds = .{ .x = 0, .y = 2, .width = 4, .height = 1 },
+        .offset_px = 5,
+    }, .{ .runs = &runs });
+    try tree.endFrame();
+
+    const lower = tree.byId(.{ .value = "lower" }).?;
+    try testing.expectEqual(@as(i32, 26), lower.bounds.y);
+    try testing.expectEqual(@as(u32, 20), lower.bounds.height);
+    // The 6 px above the shifted row are the gap and hit nothing; the
+    // shifted row extends 6 px further down instead.
+    try testing.expectEqualStrings("upper", tree.hitTest(.{ .x = 5, .y = 19 }).?.id.value);
+    try testing.expect(tree.hitTest(.{ .x = 5, .y = 20 }) == null);
+    try testing.expect(tree.hitTest(.{ .x = 5, .y = 25 }) == null);
+    try testing.expectEqualStrings("lower", tree.hitTest(.{ .x = 5, .y = 26 }).?.id.value);
+    try testing.expectEqualStrings("lower", tree.hitTest(.{ .x = 5, .y = 45 }).?.id.value);
+    try testing.expectEqualStrings("lower.branch", tree.hitTest(.{ .x = 5, .y = 46 }).?.id.value);
+    tree.pointerPressed(.{ .x = 5, .y = 44 });
+    const activation = tree.pointerReleased(.{ .x = 5, .y = 44 }).?;
+    try testing.expectEqualStrings("pick.lower", activation.action);
+
+    try tree.render(&canvas);
+    const view = canvas.view(&palette);
+    var saw_lower = false;
+    var saw_small = false;
+    for (view.cells) |cell| {
+        if (cell.position.row == 0) try testing.expectEqual(@as(i32, 0), cell.offset_y_px);
+        if (cell.position.row == 1 and std.mem.eql(u8, cell.text, "L")) {
+            saw_lower = true;
+            try testing.expectEqual(@as(i32, 6), cell.offset_y_px);
+            try testing.expect(!cell.small);
+        }
+        if (cell.position.row == 2 and std.mem.eql(u8, cell.text, "b")) {
+            saw_small = true;
+            try testing.expect(cell.small);
+            try testing.expectEqual(@as(i32, 6), cell.offset_y_px);
+        }
+    }
+    try testing.expect(saw_lower and saw_small);
+    try testing.expectEqual(@as(i32, 0), canvas.paint_offset_y_px);
+
+    var json: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer json.deinit();
+    try tree.writeJson(&json.writer);
+    const written = json.written();
+    const lower_at = std.mem.indexOf(u8, written, "\"id\":\"lower\"").?;
+    const lower_end = std.mem.indexOfScalarPos(u8, written, lower_at, '}').?;
+    const bounds_at = std.mem.indexOfPos(u8, written, lower_at, "\"bounds\":{\"x\":0,\"y\":26,\"width\":40,\"height\":20}").?;
+    try testing.expect(bounds_at < lower_end + 64);
 }
 
 test "mouse and keyboard activation match and release must match press" {

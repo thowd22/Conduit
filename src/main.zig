@@ -87,6 +87,13 @@ const link = @import("link");
 const palette_mod = @import("palette");
 const config = @import("config");
 const testdriver = @import("testdriver");
+/// Repository and branch resolution for the sidebar; a file of this module
+/// rather than a module of its own because only the app consumes it.
+const git = @import("git.zig");
+
+test {
+    _ = git;
+}
 /// The input module, imported under a name that does not collide with the app's
 /// `input` buffer field. A module shadowed by a local reads as "the buffer"
 /// when it means "the module", which is the kind of ambiguity that costs an
@@ -314,6 +321,9 @@ pub const Run = struct {
     /// every editor kind by keyboard and mouse with file readback, keybinding
     /// capture and conflicts, the raw-file row and modal isolation, then exit.
     settings_test: bool = false,
+    /// Exercise TASK-76's branch rows against real repositories in a private
+    /// temporary directory through real PTYs and SDL events, then exit.
+    git_test: bool = false,
     /// The settings file to load and watch instead of the platform location.
     /// Not a command-line flag: `runApp` sets it for `--config-test`,
     /// `--theme-test`, `--font-test` and `--settings-test`, which
@@ -413,7 +423,8 @@ fn optionsForRun(options: Options) Options {
         !options.run.scratchpad_test and !options.run.palette_test and
         !options.run.workspaces_test and !options.run.links_test and
         !options.run.search_test and !options.run.menu_test and !options.run.config_test and
-        !options.run.theme_test and !options.run.font_test and !options.run.settings_test) return options;
+        !options.run.theme_test and !options.run.font_test and !options.run.settings_test and
+        !options.run.git_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -557,6 +568,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.theme_test = true;
         } else if (std.mem.eql(u8, arg, "--settings-test")) {
             run.settings_test = true;
+        } else if (std.mem.eql(u8, arg, "--git-test")) {
+            run.git_test = true;
         } else if (std.mem.eql(u8, arg, "--font-test")) {
             run.font_test = true;
         } else if (namesValue(arg, "--right-click")) {
@@ -1236,6 +1249,10 @@ const Load = struct {
     io: Io,
     /// The face to build, or null when this job is only spawning a child.
     font_request: ?font.Request = null,
+    /// The secondary small face built after `font_request` (TASK-76), or
+    /// null. Its failure is not the job's failure: small text then draws at
+    /// the normal size.
+    small_font_request: ?font.Request = null,
     /// The owned settings every string of `font_request` borrows. A reload may
     /// replace the app's settings while this worker still reads them, so the
     /// job keeps its own copy.
@@ -1267,6 +1284,7 @@ const Load = struct {
     /// Zero while the worker runs, one once the values below may be read.
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     fonts: ?font.Manager = null,
+    small_fonts: ?font.Manager = null,
     child: ?pty.Pty = null,
     /// Failures as names rather than as errors: a log line outlives the error
     /// set that produced it, and the app carries on either way.
@@ -1299,6 +1317,11 @@ const Load = struct {
             const fonts = font.Manager.init(self.allocator, self.io, request);
             if (fonts) |loaded| {
                 self.fonts = loaded;
+                if (self.small_font_request) |small_request| {
+                    if (font.Manager.init(self.allocator, self.io, small_request)) |small| {
+                        self.small_fonts = small;
+                    } else |err| log.warn("the small UI face could not be loaded: {s}", .{@errorName(err)});
+                }
             } else |err| {
                 self.font_failure = @errorName(err);
             }
@@ -1317,6 +1340,43 @@ const Load = struct {
             }
         }
         self.state.store(1, .release);
+    }
+};
+
+/// The git branch shown under one session's tab (TASK-76).
+///
+/// Thread ownership: the owner (UI) thread. The only worker is `lookup`,
+/// which owns its own copy of the cwd; `App.pollGit` finishes it. `watch`
+/// belongs to the owner thread like every `WatchHandle`.
+///
+/// Refreshes are event-driven, never per frame: a new OSC 7 cwd, an OSC 133
+/// prompt start (a checkout has finished by the next prompt), a terminal
+/// reset, or the Local context's watch on the git directory reporting a
+/// change. Each refresh is at most one bounded `git.resolve` on a worker; no
+/// git process is ever started.
+const GitTrack = struct {
+    key: workspace.WorkspaceKey,
+    session_id: session.SessionId,
+    /// A refresh is owed. Set by events, consumed when a lookup starts.
+    stale: bool = true,
+    lookup: ?*git.Lookup = null,
+    /// Whether `repo` describes the session's current cwd.
+    found: bool = false,
+    repo: git.Repo = .{ .head = .{ .kind = .branch } },
+    /// A Local watch on `repo.gitDir()`, so a checkout made elsewhere (or a
+    /// `HEAD` rewritten without a new prompt) refreshes too.
+    watch: ?workspace.WatchHandle = null,
+
+    /// Join any worker and release the watch. The context the lookup borrows
+    /// must still be alive.
+    fn release(self: *GitTrack) void {
+        if (self.lookup) |job| {
+            var discarded: git.Repo = .{ .head = .{ .kind = .branch } };
+            _ = job.finish(&discarded);
+            self.lookup = null;
+        }
+        if (self.watch) |*handle| handle.deinit();
+        self.watch = null;
     }
 };
 
@@ -1466,6 +1526,8 @@ const ChildSpec = struct {
             font_test_script
         else if (options.run.settings_test)
             settings_test_script
+        else if (options.run.git_test)
+            git_test_script
         else
             options.run.command;
         const shell: ?[]const u8 = if (command) |line| blk: {
@@ -1729,7 +1791,8 @@ fn wantsChild(options: Options) bool {
     if (options.run.clipboard_test or options.run.ime_test or options.run.tabs_test or
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
         options.run.links_test or options.run.search_test or options.run.menu_test or
-        options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test) return true;
+        options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
+        options.run.git_test) return true;
     return !options.run.no_child and !options.run.self_test and !options.run.grid_test and
         !options.run.scroll_test and !options.run.mouse_test and !options.run.ui_test and
         !options.run.sidebar_test;
@@ -1745,7 +1808,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.clipboard_test or run.ui_test or run.ime_test or run.sidebar_test or
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
-        run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test;
+        run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test or run.git_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -1936,8 +1999,49 @@ const search_semantic_capacity: usize = 64;
 const search_scratch_capacity: usize = 1024 * 1024;
 const search_tick_budget: usize = 4;
 const search_candidate_budget: usize = 32;
+// The second `sidebar_element_capacity` is the TASK-76 branch rows: at most
+// one per tab row.
 const semantic_element_capacity: usize = sidebar_element_capacity + terminal_link_capacity +
-    search_highlight_capacity + 13 + settings_visible_capacity + 4;
+    search_highlight_capacity + 13 + settings_visible_capacity + 4 + sidebar_element_capacity;
+
+/// The vertical gap, in logical pixels, above every workspace after the first
+/// in the sidebar (TASK-77). It is scaled by the window scale where it is
+/// applied (`ui.Geometry.offsetPx`).
+const sidebar_workspace_gap_px: i32 = 5;
+
+/// The accumulated logical-pixel shift of the rows of the `group_index`th
+/// listed workspace (zero-based): the first workspace has no gap above it.
+fn sidebarGroupOffsetPx(group_index: u32) i32 {
+    const capped: i32 = @intCast(@min(group_index, 4096));
+    return sidebar_workspace_gap_px * capped;
+}
+
+/// The first sidebar row a group shifted down by `offset_device_px` may no
+/// longer use: a row `r` drawn `offset_device_px` lower ends at
+/// `(r + 1) * cell_height + offset`, which must not pass the top of row
+/// `list_limit`, so the limit loses the shift rounded up to whole rows.
+fn sidebarRowLimit(list_limit: u32, offset_device_px: i32, cell_height: u32) u32 {
+    if (offset_device_px <= 0 or cell_height == 0) return list_limit;
+    const offset: u32 = @intCast(offset_device_px);
+    const lost = std.math.divCeil(u32, offset, cell_height) catch return 0;
+    return list_limit -| lost;
+}
+
+test "sidebar workspace gaps accumulate and shrink the list limit by whole rows" {
+    try std.testing.expectEqual(@as(i32, 0), sidebarGroupOffsetPx(0));
+    try std.testing.expectEqual(@as(i32, 5), sidebarGroupOffsetPx(1));
+    try std.testing.expectEqual(@as(i32, 15), sidebarGroupOffsetPx(3));
+    try std.testing.expectEqual(@as(u32, 20), sidebarRowLimit(20, 0, 17));
+    try std.testing.expectEqual(@as(u32, 19), sidebarRowLimit(20, 5, 17));
+    try std.testing.expectEqual(@as(u32, 19), sidebarRowLimit(20, 17, 17));
+    try std.testing.expectEqual(@as(u32, 18), sidebarRowLimit(20, 18, 17));
+    try std.testing.expectEqual(@as(u32, 0), sidebarRowLimit(1, 40, 17));
+    try std.testing.expectEqual(@as(u32, 20), sidebarRowLimit(20, 5, 0));
+    // A row just inside the limit, shifted, still ends at the limit's top.
+    const cell: u32 = 17;
+    const limit = sidebarRowLimit(20, 6, cell);
+    try std.testing.expect((limit - 1 + 1) * cell + 6 <= 20 * cell);
+}
 const pane_ui_capacity: usize = 64;
 const tab_name_capacity: usize = 256;
 const palette_input_capacity: usize = 256;
@@ -3061,6 +3165,39 @@ const FontValues = struct {
     }
 };
 
+/// How large small UI text (TASK-76's branch rows) is relative to the
+/// configured face. At 0.6 of the point size the glyphs' x-height reads as
+/// about half the tab name's, which is what the sidebar design asks for.
+const small_text_ratio: f32 = 0.6;
+
+/// The small face's coverage atlas. A sidebar's branch names need few
+/// glyphs, so it is a quarter of the main atlas.
+const small_atlas: render.AtlasSize = .{ .width_px = 512, .height_px = 512 };
+
+/// The secondary small face's request: the same family, styles and fallback
+/// chain as `primary`, at `small_text_ratio` of its size, with smaller atlases.
+/// Null when the scaled size falls below `font.Size.min_points`, in which
+/// case small text draws at the normal size.
+fn smallFontRequest(primary: font.Request) ?font.Request {
+    var small = primary;
+    small.size = font.Size.init(primary.size.points * small_text_ratio, primary.size.scale) catch return null;
+    small.atlas_width_px = small_atlas.width_px;
+    small.atlas_height_px = small_atlas.height_px;
+    small.color_atlas_width_px = 128;
+    small.color_atlas_height_px = 128;
+    return small;
+}
+
+test "the small face request scales the size and shrinks the atlases" {
+    const primary: font.Request = .{ .family = "Mono", .size = try font.Size.init(10, 1.25) };
+    const small = smallFontRequest(primary).?;
+    try std.testing.expectEqualStrings("Mono", small.family);
+    try std.testing.expectEqual(@as(f32, 6), small.size.points);
+    try std.testing.expectEqual(@as(f32, 1.25), small.size.scale);
+    try std.testing.expectEqual(small_atlas.width_px, small.atlas_width_px);
+    try std.testing.expect(smallFontRequest(.{ .size = try font.Size.init(1.2, 1) }) == null);
+}
+
 /// The font values a parsed settings file and the `--font` session layer
 /// resolve to. Borrows from both.
 fn fontValuesFrom(session_family: ?[]const u8, settings: config.Settings) FontValues {
@@ -3662,6 +3799,12 @@ const App = struct {
     pacer: FramePacer = .{},
     /// The face the grid is rasterised from. Owned.
     fonts: font.Manager,
+    /// The secondary small face for `ui.TextStyle.small` (TASK-76), rebuilt
+    /// with `fonts`; null when it could not be built.
+    small_fonts: ?font.Manager = null,
+    /// Git branch state per session, created by the first cwd or prompt
+    /// event (TASK-76). See `GitTrack` for threads and refresh triggers.
+    git_tracks: std.ArrayList(GitTrack) = .empty,
     /// Registry-owned workspace models and their parallel, heap-stable
     /// presentation records. Both collections use the same stable keys.
     workspace_registry: workspace.WorkspaceRegistry,
@@ -3675,6 +3818,10 @@ const App = struct {
     divider_layout_count: usize = 0,
     workspace_semantic_storage: [sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
     tab_semantic_storage: [sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
+    /// Stable ids of the TASK-76 branch rows, one slot per tab slot.
+    tab_branch_semantic_storage: [sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
+    /// Frame-borrowed painted branch text, possibly ellipsized, per tab slot.
+    tab_branch_label_storage: [sidebar_element_capacity][git.max_name_bytes + 3]u8 = undefined,
     tab_rename_semantic_storage: [workspace_semantic_capacity]u8 = undefined,
     /// Backs the sidebar `Palette  <chord>` hint label until the frame is drawn.
     sidebar_palette_label_storage: [128]u8 = undefined,
@@ -4040,6 +4187,8 @@ const App = struct {
         // on a worker and is waited for once, here, before the first frame:
         // there is nothing to draw until a face exists, and a startup that is
         // not yet the loop is allowed to wait.
+        var small_fonts: ?font.Manager = null;
+        errdefer if (small_fonts) |*small| small.deinit();
         var fonts = loaded: {
             var attempt: usize = 0;
             while (true) : (attempt += 1) {
@@ -4054,6 +4203,11 @@ const App = struct {
                         try font.Size.init(font_values.points, scale),
                         env.get("HOME"),
                     ),
+                    .small_font_request = smallFontRequest(font_values.request(
+                        font_values.family,
+                        try font.Size.init(font_values.points, scale),
+                        env.get("HOME"),
+                    )),
                 };
                 try job.start();
                 job.thread.?.join();
@@ -4076,6 +4230,8 @@ const App = struct {
                     continue;
                 };
                 job.fonts = null;
+                small_fonts = job.small_fonts;
+                job.small_fonts = null;
                 allocator.destroy(job);
                 break :loaded loaded_fonts;
             }
@@ -4142,6 +4298,7 @@ const App = struct {
         var overlay_grid = try render.Grid.init(allocator, colors);
         errdefer overlay_grid.deinit();
         try overlay_grid.attachAtlas(fonts.atlasPixels(), atlas);
+        if (small_fonts) |*small| try overlay_grid.attachSmallAtlas(small.atlasPixels(), small_atlas, small.metrics());
 
         var scratchpad_grid = try render.Grid.init(allocator, colors);
         errdefer scratchpad_grid.deinit();
@@ -4597,6 +4754,7 @@ const App = struct {
             .needs_present = true,
             .scheduler = Scheduler.init(options.run.force_redraw),
             .fonts = fonts,
+            .small_fonts = small_fonts,
             .workspace_registry = workspace_registry,
             .workspace_presentations = workspace_presentations,
             .overlay_grid = overlay_grid,
@@ -4730,6 +4888,10 @@ const App = struct {
             fonts.deinit();
             job.fonts = null;
         }
+        if (job.small_fonts) |*fonts| {
+            fonts.deinit();
+            job.small_fonts = null;
+        }
         job.freeSpawnInputs();
         self.allocator.destroy(job);
     }
@@ -4788,11 +4950,14 @@ const App = struct {
             self.allocator.destroy(presentation);
         }
         self.workspace_presentations.deinit(self.allocator);
+        self.dropGitTracks(null);
+        self.git_tracks.deinit(self.allocator);
         self.workspace_registry.deinit() catch |err| {
             log.warn("could not signal a child during workspace shutdown: {s}", .{@errorName(err)});
         };
         self.allocator.free(self.pane_layouts);
         self.allocator.free(self.divider_layouts);
+        if (self.small_fonts) |*small| small.deinit();
         self.fonts.deinit();
         self.allocator.free(self.input);
         self.allocator.free(self.output);
@@ -5140,6 +5305,7 @@ const App = struct {
             .font_settings_owned = owned,
             .font_key = wanted,
             .font_request = owned.values.request(owned.values.family, size, self.home_dir),
+            .small_font_request = smallFontRequest(owned.values.request(owned.values.family, size, self.home_dir)),
         };
         job.start() catch |err| {
             log.warn("could not start the worker that re-loads the font: {s}", .{@errorName(err)});
@@ -5257,6 +5423,19 @@ const App = struct {
                 .width_px = atlas_width_px,
                 .height_px = atlas_height_px,
             }) catch |err| log.err("the new overlay face could not be uploaded: {s}", .{@errorName(err)});
+            // The small face follows the main one; without a new one the old
+            // size would be wrong, so a failed build drops it and small text
+            // draws at the normal size until the next load.
+            if (self.small_fonts) |*small| small.deinit();
+            self.small_fonts = job.small_fonts;
+            job.small_fonts = null;
+            if (self.small_fonts) |*small| {
+                self.overlay_grid.attachSmallAtlas(small.atlasPixels(), small_atlas, small.metrics()) catch |err| {
+                    log.err("the new small face could not be uploaded: {s}", .{@errorName(err)});
+                    small.deinit();
+                    self.small_fonts = null;
+                };
+            }
             log.info("now drawing with {s}, {d}x{d}px cells", .{
                 self.fonts.familyName(),
                 self.fonts.metrics().cell.width_px,
@@ -6054,6 +6233,7 @@ const App = struct {
                 .width = self.size.width,
                 .height = self.size.height,
             },
+            .pixel_scale = self.window.state.scale.factor,
         };
     }
 
@@ -6635,15 +6815,27 @@ const App = struct {
                     @as(u32, if (config_error != null) 1 else 0);
                 const list_limit = canvas_bounds.height -| (footer_rows + 1);
                 const active_key = self.workspace_registry.activeKey();
+                const geometry = self.uiGeometry();
                 var workspace_storage_index: usize = 0;
                 var tab_storage_index: usize = 0;
                 var row: u32 = 1;
                 var workspace_index: usize = 0;
-                while (row < list_limit and workspace_index < self.workspace_registry.count()) : (workspace_index += 1) {
+                // Every workspace after the first listed one sits a few
+                // logical pixels lower than the cell grid (TASK-77,
+                // decision "Sidebar workspace gap via sub-cell row
+                // offsets"); its rows must still end above the footer.
+                var group_index: u32 = 0;
+                var row_limit = list_limit;
+                var group_offset_px: i32 = 0;
+                while (row < row_limit and workspace_index < self.workspace_registry.count()) : (workspace_index += 1) {
                     const key = self.workspace_registry.keyAt(workspace_index) orelse continue;
                     const presentation = self.presentationByKey(key) orelse continue;
                     if (presentation.closing or workspace_storage_index >= self.workspace_semantic_storage.len) continue;
                     const model = self.workspace_registry.byKey(key) orelse continue;
+                    group_offset_px = sidebarGroupOffsetPx(group_index);
+                    row_limit = sidebarRowLimit(list_limit, geometry.offsetPx(group_offset_px), geometry.cell_height);
+                    if (row >= row_limit) break;
+                    group_index += 1;
                     const semantic = try workspaceSemanticId(&self.workspace_semantic_storage[workspace_storage_index], key);
                     workspace_storage_index += 1;
                     const workspace_id: ui.Id = .{ .value = semantic };
@@ -6656,6 +6848,7 @@ const App = struct {
                         .selected = selected,
                         .action = workspace_activate_action,
                         .bounds = .{ .x = 1, .y = row, .width = content_width, .height = 1 },
+                        .offset_px = group_offset_px,
                     }, .{
                         .id = workspace_id,
                         .label = model.name(),
@@ -6671,16 +6864,24 @@ const App = struct {
                     if (!selected) continue;
 
                     var tab_index: usize = 0;
-                    while (row < list_limit and tab_storage_index < self.tab_semantic_storage.len) : (row += 1) {
+                    while (row < row_limit and tab_storage_index < self.tab_semantic_storage.len) : (row += 1) {
                         const tab = model.tabAt(tab_index) orelse break;
                         tab_index += 1;
-                        const tab_semantic = try tabSemanticId(&self.tab_semantic_storage[tab_storage_index], key, tab.id());
+                        const storage_index = tab_storage_index;
+                        const tab_semantic = try tabSemanticId(&self.tab_semantic_storage[storage_index], key, tab.id());
                         tab_storage_index += 1;
                         const id: ui.Id = .{ .value = tab_semantic };
+                        var renaming = false;
+                        // The branch row's parent: the tab, or the rename
+                        // input standing in for it, so the id stays a child
+                        // of a registered element either way.
+                        var branch_parent = id;
                         if (self.rename_tab_id) |rename_id| {
                             if (rename_id == tab.id()) {
                                 if (self.rename_input) |*field| {
+                                    renaming = true;
                                     const rename_semantic = try tabRenameSemanticId(&self.tab_rename_semantic_storage, key);
+                                    branch_parent = .{ .value = rename_semantic };
                                     try self.ui_tree.addInput(.{
                                         .id = .{ .value = rename_semantic },
                                         .parent = workspace_id,
@@ -6688,36 +6889,63 @@ const App = struct {
                                         .label = "Tab name",
                                         .action = tab_rename_commit_action,
                                         .bounds = .{ .x = 2, .y = row, .width = content_width - 1, .height = 1 },
+                                        .offset_px = group_offset_px,
                                     }, field, .{
                                         .text = .{ .foreground = .strong, .background = .field },
                                         .selection_background = .selection,
                                         .cursor_background = .accent,
                                         .cursor_foreground = .background,
                                     });
-                                    continue;
                                 }
                             }
                         }
-                        const tab_selected = model.activeTabId() == tab.id();
-                        try self.ui_tree.addInteractiveText(.{
-                            .id = id,
-                            .parent = workspace_id,
-                            .role = "tab",
-                            .label = tab.displayLabel(),
-                            .selected = tab_selected,
-                            .action = tab_activate_action,
-                            .bounds = .{ .x = 2, .y = row, .width = content_width - 1, .height = 1 },
-                        }, .{
-                            .id = id,
-                            .label = tab.displayLabel(),
-                            .action = tab_activate_action,
-                            .normal = if (tab_selected)
-                                .{ .foreground = .strong, .background = .selection }
-                            else
-                                .{ .foreground = .foreground },
-                            .hovered = .{ .foreground = .strong, .underline = .accent },
-                            .focused = .{ .foreground = .strong, .background = .selection },
-                        });
+                        if (!renaming) {
+                            const tab_selected = model.activeTabId() == tab.id();
+                            try self.ui_tree.addInteractiveText(.{
+                                .id = id,
+                                .parent = workspace_id,
+                                .role = "tab",
+                                .label = tab.displayLabel(),
+                                .selected = tab_selected,
+                                .action = tab_activate_action,
+                                .bounds = .{ .x = 2, .y = row, .width = content_width - 1, .height = 1 },
+                                .offset_px = group_offset_px,
+                            }, .{
+                                .id = id,
+                                .label = tab.displayLabel(),
+                                .action = tab_activate_action,
+                                .normal = if (tab_selected)
+                                    .{ .foreground = .strong, .background = .selection }
+                                else
+                                    .{ .foreground = .foreground },
+                                .hovered = .{ .foreground = .strong, .underline = .accent },
+                                .focused = .{ .foreground = .strong, .background = .selection },
+                            });
+                        }
+
+                        // The tab's branch, when its focused session's cwd is
+                        // in a work tree (TASK-76): a second, non-interactive
+                        // row in the small muted face. A tab outside a
+                        // repository has no such row, so the list reclaims it.
+                        const session_id = model.focusedPaneSessionId(tab.id()) orelse continue;
+                        const head = self.gitHead(key, session_id) orelse continue;
+                        if (row + 1 >= row_limit or content_width < 3) continue;
+                        row += 1;
+                        const branch_semantic = try tabBranchSemanticId(&self.tab_branch_semantic_storage[storage_index], key, tab.id());
+                        // The semantic label is the whole name; the painted
+                        // run ends in an ellipsis when the row clips it.
+                        const branch_runs = [_]ui.Run{.{
+                            .text = ellipsizeToCells(&self.tab_branch_label_storage[storage_index], head.text(), content_width - 2),
+                            .style = .{ .foreground = .muted, .small = true },
+                        }};
+                        try self.ui_tree.addText(.{
+                            .id = .{ .value = branch_semantic },
+                            .parent = branch_parent,
+                            .role = "branch",
+                            .label = head.text(),
+                            .bounds = .{ .x = 3, .y = row, .width = content_width - 2, .height = 1 },
+                            .offset_px = group_offset_px,
+                        }, .{ .runs = &branch_runs });
                     }
                 }
 
@@ -7201,7 +7429,12 @@ const App = struct {
                 self.noteSearchTerminalChange(self.presentedSessionId());
                 if (self.trace) |trace| try trace.received.appendSlice(self.allocator, pass[0..got]);
             }
-            for (presented.terminal().takeEvents()) |event| self.noteTerminalEvent(presented, event);
+            const presented_key = self.activePresentation().key;
+            const presented_id = self.presentedSessionId();
+            for (presented.terminal().takeEvents()) |event| {
+                self.noteGitEvent(presented_key, presented_id, event);
+                self.noteTerminalEvent(presented, event);
+            }
             try self.flushToChild();
         }
 
@@ -7282,9 +7515,122 @@ const App = struct {
                 .bell => attention_changed = model.noteBackgroundActivity(id, true) or attention_changed,
                 else => {},
             }
+            self.noteGitEvent(event_context.key, id, event);
             self.noteTerminalEvent(live, event);
         }
         if (attention_changed) self.invalidateUi();
+    }
+
+    /// The terminal events that can change which branch a session is on:
+    /// a new cwd, a prompt start (a command such as a checkout has finished)
+    /// and a reset that forgot the cwd.
+    fn noteGitEvent(self: *App, key: workspace.WorkspaceKey, id: session.SessionId, event: term.Event) void {
+        switch (event) {
+            .working_directory, .reset => self.markGitStale(key, id),
+            .prompt => |mark| if (mark.kind == .prompt_start) self.markGitStale(key, id),
+            else => {},
+        }
+    }
+
+    /// Owe a branch refresh for one session, starting to track it if needed.
+    fn markGitStale(self: *App, key: workspace.WorkspaceKey, id: session.SessionId) void {
+        for (self.git_tracks.items) |*track| {
+            if (track.key == key and track.session_id == id) {
+                track.stale = true;
+                return;
+            }
+        }
+        self.git_tracks.append(self.allocator, .{ .key = key, .session_id = id }) catch |err| {
+            log.warn("could not track a session's git branch: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// The branch to show for one session, when its cwd is in a work tree.
+    fn gitHead(self: *const App, key: workspace.WorkspaceKey, id: session.SessionId) ?*const git.Head {
+        for (self.git_tracks.items) |*track| {
+            if (track.key == key and track.session_id == id) return if (track.found) &track.repo.head else null;
+        }
+        return null;
+    }
+
+    /// Stop tracking every session of one workspace (or of all, for null),
+    /// joining lookups that borrow its context. Called before teardown.
+    fn dropGitTracks(self: *App, key: ?workspace.WorkspaceKey) void {
+        var index: usize = 0;
+        while (index < self.git_tracks.items.len) {
+            const track = &self.git_tracks.items[index];
+            if (key != null and track.key != key.?) {
+                index += 1;
+                continue;
+            }
+            track.release();
+            _ = self.git_tracks.swapRemove(index);
+        }
+    }
+
+    /// Advance branch tracking: finish lookups, read watches, start owed
+    /// refreshes and forget sessions that are gone. Returns whether a shown
+    /// branch changed. Runs on the loop's poll, never per frame, and does no
+    /// IO itself beyond a non-blocking watch poll and, for a Local context,
+    /// creating a watch.
+    fn pollGit(self: *App) bool {
+        var changed = false;
+        var index: usize = 0;
+        while (index < self.git_tracks.items.len) {
+            const track = &self.git_tracks.items[index];
+            const model = self.workspace_registry.byKey(track.key);
+            const live = if (model) |owner| owner.sessionById(track.session_id) else null;
+            if (live == null) {
+                if (track.found) changed = true;
+                track.release();
+                _ = self.git_tracks.swapRemove(index);
+                continue;
+            }
+            index += 1;
+            const ctx = model.?.contextRef();
+            if (track.lookup) |job| {
+                if (job.finished()) {
+                    track.lookup = null;
+                    var next: git.Repo = .{ .head = .{ .kind = .branch } };
+                    const found = job.finish(&next);
+                    const same_dir = found and track.found and std.mem.eql(u8, next.gitDir(), track.repo.gitDir());
+                    if (found != track.found or (found and !next.head.eql(&track.repo.head))) changed = true;
+                    if (!same_dir) {
+                        if (track.watch) |*watch_handle| watch_handle.deinit();
+                        track.watch = null;
+                    }
+                    track.found = found;
+                    if (found) track.repo = next;
+                    // Only a Local watch is created here: a remote context's
+                    // watch may block on its connection, and the owner
+                    // thread must not. Remote branches refresh on cwd and
+                    // prompt events alone.
+                    if (found and track.watch == null and ctx.kind() == .local) {
+                        track.watch = ctx.watch(self.allocator, self.io, track.repo.gitDir()) catch |err| watch: {
+                            log.debug("the git directory cannot be watched: {s}", .{@errorName(err)});
+                            break :watch null;
+                        };
+                    }
+                }
+            }
+            if (track.watch) |watch_handle| {
+                if (watch_handle.pollChanges()) track.stale = true;
+            }
+            if (!track.stale or track.lookup != null) continue;
+            track.stale = false;
+            const cwd = live.?.workingDirectory() orelse {
+                if (track.found) changed = true;
+                track.found = false;
+                if (track.watch) |*watch_handle| watch_handle.deinit();
+                track.watch = null;
+                continue;
+            };
+            track.lookup = git.Lookup.start(self.allocator, ctx, self.io, cwd) catch |err| lookup: {
+                log.warn("could not start a git branch lookup: {s}", .{@errorName(err)});
+                break :lookup null;
+            };
+        }
+        return changed;
     }
 
     /// Say what one terminal event was, by metadata only.
@@ -8792,6 +9138,8 @@ const App = struct {
                 index += 1;
                 continue;
             }
+            // Branch lookups borrow this workspace's context.
+            self.dropGitTracks(presentation.key);
             const result = self.workspace_registry.remove(presentation.key) catch {
                 log.err("a closing workspace disappeared before teardown", .{});
                 index += 1;
@@ -11314,6 +11662,10 @@ const App = struct {
         changed = self.advanceSearch() or changed;
         changed = self.pollScratchpadLoad() or changed;
         changed = self.finalizeClosingPresentations() or changed;
+        if (self.pollGit()) {
+            self.invalidateUi();
+            changed = true;
+        }
         if (self.workspace_registry.count() == 0) return changed;
         for (self.workspace_presentations.items) |presentation| {
             const model = self.workspace_registry.byKey(presentation.key) orelse continue;
@@ -12595,8 +12947,15 @@ const App = struct {
                     .repeat => return self.closeModalActive() or self.ui_pointer_owned or self.pointInSidebar(point),
                     .release => {
                         if (!self.ui_pointer_owned) return self.closeModalActive() or self.pointInSidebar(point);
+                        // A branch row belongs to the tab above it, so a drop
+                        // on either row of a two-row tab targets that tab.
                         const drop_id: ?[]const u8 = if (tree.hitTest(point)) |target|
-                            if (std.mem.eql(u8, target.role, "tab")) target.id.value else null
+                            if (std.mem.eql(u8, target.role, "tab"))
+                                target.id.value
+                            else if (std.mem.eql(u8, target.role, "branch") and target.parent != null)
+                                target.parent.?.value
+                            else
+                                null
                         else
                             null;
                         const dragged = self.dragged_tab_id;
@@ -12720,7 +13079,8 @@ const App = struct {
             }
         }
         const overlay_before = self.overlay_grid.gridStats();
-        try self.overlay_grid.drawCanvasOverlay(&self.surface, &self.fonts, overlay, base_changed);
+        const small_fonts: ?*font.Manager = if (self.small_fonts) |*small| small else null;
+        try self.overlay_grid.drawCanvasOverlay(&self.surface, &self.fonts, small_fonts, overlay, base_changed);
         const overlay_after = self.overlay_grid.gridStats();
         if (base_changed or overlay_after.overlay_frames != overlay_before.overlay_frames or self.needs_present) {
             try self.surface.present(self.window);
@@ -15083,6 +15443,241 @@ fn sidebarTest(self: *App, io: Io, out: *Writer) !u8 {
     return if (failures == 0) 0 else 1;
 }
 
+/// The deterministic peer behind every tab in `--git-test` (TASK-76).
+///
+/// It builds two real repositories in a private temporary directory (removed
+/// when the peer exits), `main` and `trunk`, with git's user and system
+/// configuration masked so nothing of the person's setup is read, prints the
+/// first repository's commit, then acts as a minimal shell: every input line
+/// is evaluated and followed by an OSC 7 cwd and an OSC 133 prompt, exactly
+/// the signals an integrated shell sends. `$REPO` and `$OTHER` name the two
+/// repositories for typed commands.
+const git_test_script =
+    "stty -echo; " ++
+    "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=c GIT_AUTHOR_EMAIL=c@c " ++
+    "GIT_COMMITTER_NAME=c GIT_COMMITTER_EMAIL=c@c; " ++
+    "root=$(mktemp -d \"${TMPDIR:-/tmp}/conduit-git-test.XXXXXX\") || exit 1; " ++
+    "trap 'rm -rf \"$root\"' EXIT; trap 'exit 1' HUP TERM INT; " ++
+    "REPO=\"$root/repo\"; OTHER=\"$root/other\"; " ++
+    "git init -q -b main \"$REPO\" && git -C \"$REPO\" commit -q --allow-empty -m init && " ++
+    "git init -q -b trunk \"$OTHER\" && git -C \"$OTHER\" commit -q --allow-empty -m init || exit 1; " ++
+    "cd \"$REPO\"; printf 'GIT-COMMIT:%s\\r\\n' \"$(git rev-parse HEAD)\"; " ++
+    "p() { printf '\\033]7;file://localhost%s\\007\\033]133;A\\007git$ \\033]133;B\\007' \"$PWD\"; }; p; " ++
+    "while IFS= read -r line; do printf '\\033]133;C\\007'; eval \"$line\"; printf 'GIT-DONE\\r\\n'; p; done";
+
+const GitWait = union(enum) {
+    /// The element exists with exactly this label.
+    label: struct { id: []const u8, label: []const u8 },
+    /// The element is absent.
+    absent: []const u8,
+    /// The element exists.
+    element: []const u8,
+    terminal_text: []const u8,
+};
+
+fn gitWaitMet(self: *App, condition: GitWait) bool {
+    return switch (condition) {
+        .label => |wanted| if (self.ui_tree.byId(.{ .value = wanted.id })) |element|
+            std.mem.eql(u8, element.label, wanted.label)
+        else
+            false,
+        .absent => |id| self.ui_tree.byId(.{ .value = id }) == null,
+        .element => |id| self.ui_tree.byId(.{ .value = id }) != null,
+        .terminal_text => |text| self.activeLive().terminal().visibleTextContains(text),
+    };
+}
+
+/// Wait through the ordinary event/poll/draw loop, the same way
+/// `waitForTabs` does; branch lookups finish on their worker meanwhile.
+fn waitForGit(self: *App, io: Io, out: *Writer, condition: GitWait) !bool {
+    const deadline = Io.Clock.real.now(io).nanoseconds + tabs_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (gitWaitMet(self, condition)) return true;
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return false;
+        }
+        if (self.poll()) self.scheduler.invalidate();
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) return gitWaitMet(self, condition);
+    }
+}
+
+fn gitCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("git-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// Type one line into the focused terminal through SDL text input and Enter.
+fn gitTypeLine(self: *App, io: Io, out: *Writer, line: [:0]const u8) !bool {
+    return try postWorkspaceTerminalText(self, io, out, line) and try postNamedKey(self, io, out, .enter, .{});
+}
+
+/// Whether the branch row sits directly beneath its tab, one row lower,
+/// indented, and parented to it.
+fn branchBeneath(self: *App, tab_id: []const u8, branch_id: []const u8) bool {
+    const tab = self.ui_tree.byId(.{ .value = tab_id }) orelse return false;
+    const branch = self.ui_tree.byId(.{ .value = branch_id }) orelse return false;
+    const parent = branch.parent orelse return false;
+    return std.mem.eql(u8, parent.value, tab_id) and std.mem.eql(u8, branch.role, "branch") and
+        branch.primitive == .text and branch.bounds.y == tab.bounds.y + @as(i32, @intCast(tab.bounds.height)) and
+        branch.bounds.x > tab.bounds.x;
+}
+
+fn rowY(self: *App, id: []const u8) ?i32 {
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return null;
+    return element.bounds.y;
+}
+
+/// Exercise TASK-76 through real PTYs, real repositories, SDL input and the
+/// semantic tree: the branch row appears, follows checkouts, cwd changes and
+/// a watched HEAD rewrite, disappears outside a repository, shows a detached
+/// commit, and two-row tabs keep rename, reorder, resize and close.
+fn gitTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    try self.drawFrame();
+    const key = self.activePresentation().key;
+    const first_tab = self.activeWorkspace().activeTabId() orelse return 1;
+    var first_storage: [workspace_semantic_capacity]u8 = undefined;
+    const first_id = try tabSemanticId(&first_storage, key, first_tab);
+    var first_branch_storage: [workspace_semantic_capacity]u8 = undefined;
+    const first_branch = try tabBranchSemanticId(&first_branch_storage, key, first_tab);
+    const cell_height: i32 = @intCast(self.fonts.metrics().cell.height_px);
+
+    gitCheck(out, &failures, try waitForGit(self, io, out, .{ .terminal_text = "GIT-COMMIT:" }), "the peer built two real repositories", .{});
+    gitCheck(out, &failures, try waitForGit(self, io, out, .{ .label = .{ .id = first_branch, .label = "main" } }), "the tab's OSC 7 cwd inside a work tree showed branch main", .{});
+    gitCheck(out, &failures, branchBeneath(self, first_id, first_branch), "the branch is a non-interactive child row directly beneath its tab", .{});
+
+    _ = try gitTypeLine(self, io, out, "git checkout -q -b feature/x");
+    gitCheck(out, &failures, try waitForGit(self, io, out, .{ .label = .{ .id = first_branch, .label = "feature/x" } }), "a checkout typed in the tab updated the branch at the next prompt", .{});
+
+    // No prompt follows the background checkout, so only the watch on the
+    // git directory can report it.
+    _ = try gitTypeLine(self, io, out, "(sleep 0.3; git checkout -q -b watched) >/dev/null 2>&1 &");
+    gitCheck(out, &failures, try waitForGit(self, io, out, .{ .label = .{ .id = first_branch, .label = "watched" } }), "a HEAD rewritten without a prompt updated through the git-directory watch", .{});
+
+    _ = try gitTypeLine(self, io, out, "cd \"$OTHER\"");
+    gitCheck(out, &failures, try waitForGit(self, io, out, .{ .label = .{ .id = first_branch, .label = "trunk" } }), "moving the cwd to another repository showed its branch", .{});
+
+    const create_mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    _ = try postKey(self, io, out, 't', create_mods);
+    const second_tab = self.activeWorkspace().activeTabId() orelse return 1;
+    var second_storage: [workspace_semantic_capacity]u8 = undefined;
+    const second_id = try tabSemanticId(&second_storage, key, second_tab);
+    var second_branch_storage: [workspace_semantic_capacity]u8 = undefined;
+    const second_branch = try tabBranchSemanticId(&second_branch_storage, key, second_tab);
+    gitCheck(out, &failures, second_tab != first_tab and
+        try waitForGit(self, io, out, .{ .label = .{ .id = second_branch, .label = "main" } }), "a second tab in its own repository showed its own branch", .{});
+    const first_branch_y = rowY(self, first_branch) orelse -1;
+    gitCheck(out, &failures, rowY(self, second_id) == first_branch_y + cell_height, "the two-row tab pushed the next tab down by one row", .{});
+
+    gitCheck(out, &failures, try clickTabsElement(self, io, out, first_id) and
+        self.activeWorkspace().activeTabId() == first_tab, "clicking the two-row tab's name selected it", .{});
+    // A sidebar click leaves keyboard focus on the row; a terminal click
+    // returns typed lines to the shell, as a person would.
+    const terminal_point = cellPosition(self, 5, 5);
+    _ = try postButton(self, io, out, .{ .button = .left, .action = .press, .x = terminal_point.x, .y = terminal_point.y });
+    _ = try postButton(self, io, out, .{ .button = .left, .action = .release, .x = terminal_point.x, .y = terminal_point.y });
+    _ = try gitTypeLine(self, io, out, "cd /");
+    gitCheck(out, &failures, try waitForGit(self, io, out, .{ .absent = first_branch }), "a cwd outside any repository removed the branch row", .{});
+    gitCheck(out, &failures, rowY(self, second_id) == (rowY(self, first_id) orelse -1) + cell_height, "the list reclaimed the branch row", .{});
+
+    _ = try gitTypeLine(self, io, out, "cd \"$REPO\"; git checkout -q --detach");
+    const detached = try waitForGit(self, io, out, .{ .element = first_branch }) and
+        try waitForGit(self, io, out, .{ .terminal_text = "GIT-DONE" });
+    var detached_ok = false;
+    var commit_storage: [64]u8 = undefined;
+    var label_copy: [git.max_name_bytes]u8 = undefined;
+    var label_len: usize = 0;
+    if (detached) {
+        // The branch row may still say `watched` until the prompt's lookup
+        // lands; wait for a label of eight hex digits.
+        const deadline = Io.Clock.real.now(io).nanoseconds + tabs_test_budget_ms * std.time.ns_per_ms;
+        while (Io.Clock.real.now(io).nanoseconds < deadline) {
+            if (self.ui_tree.byId(.{ .value = first_branch })) |element| {
+                if (element.label.len == git.short_commit_len) {
+                    var hex = true;
+                    for (element.label) |byte| hex = hex and std.ascii.isHex(byte);
+                    if (hex) {
+                        @memcpy(label_copy[0..element.label.len], element.label);
+                        label_len = element.label.len;
+                        break;
+                    }
+                }
+            }
+            _ = try waitForGit(self, io, out, .{ .absent = "git-test.never" });
+        }
+        if (label_len != 0) {
+            const wanted = try std.fmt.bufPrint(&commit_storage, "GIT-COMMIT:{s}", .{label_copy[0..label_len]});
+            detached_ok = self.activeLive().terminal().visibleTextContains(wanted);
+        }
+    }
+    gitCheck(out, &failures, detached_ok, "a detached HEAD showed the abbreviated commit the repository reported", .{});
+
+    // Rename keeps the branch row beneath the inline input and the new name.
+    _ = try postNamedKey(self, io, out, .f2, .{});
+    var rename_storage: [workspace_semantic_capacity]u8 = undefined;
+    const rename_id = try tabRenameSemanticId(&rename_storage, key);
+    gitCheck(out, &failures, try waitForGit(self, io, out, .{ .element = rename_id }) and
+        self.ui_tree.byId(.{ .value = first_branch }) != null, "inline rename kept the branch row", .{});
+    _ = try postKey(self, io, out, 'a', .{ .ctrl = true });
+    _ = try postWorkspaceTerminalText(self, io, out, "renamed");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    // The row label carries the two-cell attention prefix; the name does not.
+    const renamed = try waitForGit(self, io, out, .{ .label = .{ .id = first_id, .label = "  renamed" } }) and
+        std.mem.eql(u8, (self.activeWorkspace().tab(first_tab) orelse return 1).name(), "renamed");
+    gitCheck(out, &failures, renamed and branchBeneath(self, first_id, first_branch), "the renamed tab kept its branch row beneath it", .{});
+
+    // A drop on the branch row targets its tab.
+    const drop_target = self.ui_tree.byId(.{ .value = first_branch });
+    const dragged = self.ui_tree.byId(.{ .value = second_id });
+    var dropped = false;
+    if (drop_target != null and dragged != null) {
+        const start = elementCenter(dragged.?, self.window.state.scale);
+        const finish = elementCenter(drop_target.?, self.window.state.scale);
+        dropped = try postButton(self, io, out, .{ .button = .left, .action = .press, .x = start.x, .y = start.y }) and
+            try postMotion(self, io, out, .{ .buttons = .{ .left = true }, .x = finish.x, .y = finish.y }) and
+            try postButton(self, io, out, .{ .button = .left, .action = .release, .x = finish.x, .y = finish.y });
+    }
+    try self.drawFrame();
+    gitCheck(out, &failures, dropped and self.activeWorkspace().tabAt(0).?.id() == second_tab and
+        branchBeneath(self, first_id, first_branch), "a pointer drag onto the branch row reordered the tabs", .{});
+    _ = try postNamedKey(self, io, out, .up, .{ .alt = true, .shift = true });
+    try self.drawFrame();
+    gitCheck(out, &failures, self.activeWorkspace().tabAt(0).?.id() == first_tab and
+        branchBeneath(self, first_id, first_branch) and
+        rowY(self, second_id) == (rowY(self, first_branch) orelse -1) + cell_height, "the keyboard moved the two-row tab back to the top", .{});
+
+    const narrow_mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .shift = true, .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    const width_before = self.sidebarOriginColumns();
+    _ = try postNamedKey(self, io, out, .left, narrow_mods);
+    try self.drawFrame();
+    const narrowed = self.ui_tree.byId(.{ .value = first_branch });
+    gitCheck(out, &failures, self.sidebarOriginColumns() < width_before and narrowed != null and
+        branchBeneath(self, first_id, first_branch) and
+        narrowed.?.bounds.x + @as(i32, @intCast(narrowed.?.bounds.width)) <= @as(i32, @intCast(@as(u32, self.sidebarOriginColumns()) * self.fonts.metrics().cell.width_px)), "a resized sidebar kept the branch row inside it", .{});
+
+    gitCheck(out, &failures, try clickTabsElement(self, io, out, second_id) and
+        self.activeWorkspace().activeTabId() == second_tab, "clicking the second tab selected it", .{});
+    _ = try postKey(self, io, out, 'w', create_mods);
+    gitCheck(out, &failures, try waitForGit(self, io, out, .{ .absent = second_id }) and
+        try waitForGit(self, io, out, .{ .absent = second_branch }) and
+        branchBeneath(self, first_id, first_branch), "closing an idle tab removed it and its branch row only", .{});
+
+    try self.drawFrame();
+    _ = try self.capture();
+    out.print("git-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
 /// The deterministic peer behind every tab in `--tabs-test`. It reports a
 /// tracked cwd of /tmp while also printing its real spawn cwd, then exposes
 /// separate activity and bell phases after two lines of real user input.
@@ -15380,6 +15975,42 @@ fn workspaceSemanticId(buffer: []u8, key: workspace.WorkspaceKey) ![]const u8 {
 
 fn tabSemanticId(buffer: []u8, key: workspace.WorkspaceKey, tab_id: workspace.TabId) ![]const u8 {
     return std.fmt.bufPrint(buffer, "workspace.{d}.tab.{d}", .{ @intFromEnum(key), @intFromEnum(tab_id) });
+}
+
+/// `text` cut to at most `cells` codepoints, the last one replaced by `…`
+/// when anything was cut. Each codepoint is counted as one cell; a wider one
+/// is still clipped safely by `ui.Text`. `text` must be valid UTF-8 no longer
+/// than `buffer.len - 3`, which `git.validName` guarantees for branch names.
+fn ellipsizeToCells(buffer: []u8, text: []const u8, cells: u32) []const u8 {
+    if (cells == 0) return "";
+    var view = (std.unicode.Utf8View.init(text) catch return text).iterator();
+    var count: u32 = 0;
+    var keep_end: usize = 0;
+    while (view.nextCodepointSlice()) |_| {
+        count += 1;
+        if (count < cells) keep_end = view.i;
+        if (count > cells) {
+            if (keep_end + 3 > buffer.len) return text;
+            @memcpy(buffer[0..keep_end], text[0..keep_end]);
+            @memcpy(buffer[keep_end .. keep_end + 3], "…");
+            return buffer[0 .. keep_end + 3];
+        }
+    }
+    return text;
+}
+
+test "branch labels are ellipsized to the row's cells" {
+    var buffer: [git.max_name_bytes + 3]u8 = undefined;
+    try std.testing.expectEqualStrings("main", ellipsizeToCells(&buffer, "main", 4));
+    try std.testing.expectEqualStrings("mai…", ellipsizeToCells(&buffer, "mainline", 4));
+    try std.testing.expectEqualStrings("fé…", ellipsizeToCells(&buffer, "féature", 3));
+    try std.testing.expectEqualStrings("", ellipsizeToCells(&buffer, "x", 0));
+    try std.testing.expectEqualStrings("…", ellipsizeToCells(&buffer, "xy", 1));
+}
+
+/// `workspace.<k>.tab.<n>.branch`: the branch row beneath one tab (TASK-76).
+fn tabBranchSemanticId(buffer: []u8, key: workspace.WorkspaceKey, tab_id: workspace.TabId) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "workspace.{d}.tab.{d}.branch", .{ @intFromEnum(key), @intFromEnum(tab_id) });
 }
 
 fn tabRenameSemanticId(buffer: []u8, key: workspace.WorkspaceKey) ![]const u8 {
@@ -16271,6 +16902,88 @@ fn workspacesTest(self: *App, io: Io, out: *Writer) !u8 {
         self.activeWorkspace().tab(second_tab_id).?.paneCount() == 2 and
         self.activeWorkspace().focusedPaneId(second_tab_id) == split_pane, "Down and Enter returned to the same focused two-pane layout", .{});
 
+    // TASK-77: the second workspace's rows sit a scaled 5 logical pixels
+    // below the cell grid; its tabs keep their ordinary spacing.
+    try self.drawFrame();
+    const geometry = self.uiGeometry();
+    const gap_px = geometry.offsetPx(sidebar_workspace_gap_px);
+    const row_px: i32 = @intCast(self.fonts.metrics().cell.height_px);
+    var gap_tab_storage: [workspace_semantic_capacity]u8 = undefined;
+    const gap_tab_id = try tabSemanticId(&gap_tab_storage, second_key, second_tab_id);
+    const first_row = self.ui_tree.byId(.{ .value = first_workspace_id });
+    const second_row = self.ui_tree.byId(.{ .value = second_workspace_id });
+    const gap_tab_row = self.ui_tree.byId(.{ .value = gap_tab_id });
+    workspacesCheck(out, &failures, gap_px > 0 and first_row != null and second_row != null and gap_tab_row != null and
+        first_row.?.bounds.y == row_px and
+        second_row.?.bounds.y == first_row.?.bounds.y + row_px + gap_px and
+        @mod(second_row.?.bounds.y, row_px) == gap_px and
+        gap_tab_row.?.bounds.y == second_row.?.bounds.y + row_px, "semantic bounds put a {d} px gap above the second workspace and none between its rows", .{gap_px});
+    // A press in the gap lands on no row.
+    const scale = self.window.state.scale.factor;
+    const gap_x = @as(f32, @floatFromInt(second_row.?.bounds.x + 2)) / scale;
+    const gap_y = @as(f32, @floatFromInt(second_row.?.bounds.y - 1)) / scale;
+    _ = try postButton(self, io, out, .{ .button = .left, .action = .press, .x = gap_x, .y = gap_y });
+    _ = try postButton(self, io, out, .{ .button = .left, .action = .release, .x = gap_x, .y = gap_y });
+    workspacesCheck(out, &failures, self.workspace_registry.activeKey().? == second_key and
+        self.ui_tree.focusedElement() == null, "a real click in the gap activated nothing", .{});
+
+    const gap_create_mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    _ = try postKey(self, io, out, 't', gap_create_mods);
+    const gap_new_tab = self.activeWorkspace().activeTabId() orelse return 1;
+    const gap_new_session = self.activePresentation().active_session_id;
+    workspacesCheck(out, &failures, try waitForWorkspaces(self, io, out, .{ .session_text = .{
+        .key = second_key,
+        .id = gap_new_session,
+        .text = "WORKSPACE-PTY-READY:",
+    } }), "the extra tab in the shifted workspace started its real PTY", .{});
+    var gap_new_storage: [workspace_semantic_capacity]u8 = undefined;
+    const gap_new_id = try tabSemanticId(&gap_new_storage, second_key, gap_new_tab);
+    try self.drawFrame();
+    const gap_new_row = self.ui_tree.byId(.{ .value = gap_new_id });
+    workspacesCheck(out, &failures, gap_new_tab != second_tab_id and gap_new_row != null and
+        gap_new_row.?.bounds.y == (self.ui_tree.byId(.{ .value = gap_tab_id }) orelse return 1).bounds.y + row_px, "a new tab in the shifted workspace kept ordinary tab spacing", .{});
+    workspacesCheck(out, &failures, try dragTabs(self, io, out, gap_new_id, gap_tab_id) and
+        self.activeWorkspace().tabAt(0).?.id() == gap_new_tab, "a real pointer drag reordered shifted tab rows", .{});
+    try self.drawFrame();
+    // The lowest device pixels of the original tab's row belong to the next
+    // grid row without the shift, so this press proves hit testing shifted.
+    const original_row = self.ui_tree.byId(.{ .value = gap_tab_id }) orelse return 1;
+    const bottom_x = @as(f32, @floatFromInt(original_row.bounds.x + 4)) / scale;
+    const bottom_y = @as(f32, @floatFromInt(original_row.bounds.y + @as(i32, @intCast(original_row.bounds.height)) - 2)) / scale;
+    _ = try postButton(self, io, out, .{ .button = .left, .action = .press, .x = bottom_x, .y = bottom_y });
+    _ = try postButton(self, io, out, .{ .button = .left, .action = .release, .x = bottom_x, .y = bottom_y });
+    workspacesCheck(out, &failures, self.activeWorkspace().activeTabId() == second_tab_id and
+        self.activePresentation().active_session_id == split_session, "a click at the bottom edge of a shifted tab selected that tab", .{});
+    // Keyboard focus walks the shifted rows like any others: the focus chord
+    // enters on the shifted workspace row, and Tab moves through its tabs.
+    _ = try postNamedKey(self, io, out, .down, sidebar_focus_mods);
+    const focused_after_entry = self.ui_tree.focusedElement();
+    workspacesCheck(out, &failures, focused_after_entry != null and std.mem.eql(u8, focused_after_entry.?.id.value, second_workspace_id), "sidebar focus entered on the shifted workspace row", .{});
+    _ = try postNamedKey(self, io, out, .tab, .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    workspacesCheck(out, &failures, self.activeWorkspace().activeTabId() == gap_new_tab, "Tab and Enter selected the first shifted tab", .{});
+    _ = try postNamedKey(self, io, out, .down, sidebar_focus_mods);
+    _ = try postNamedKey(self, io, out, .tab, .{});
+    _ = try postNamedKey(self, io, out, .tab, .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    workspacesCheck(out, &failures, self.activeWorkspace().activeTabId() == second_tab_id and
+        self.activePresentation().active_session_id == split_session, "Tab, Tab and Enter returned to the original shifted tab", .{});
+    // Close the extra tab again so the rest of the check sees the layout it
+    // built: activate it, close it, and confirm the running child's close.
+    workspacesCheck(out, &failures, try clickTabsElement(self, io, out, gap_new_id) and
+        self.activeWorkspace().activeTabId() == gap_new_tab, "clicking the shifted extra tab selected it", .{});
+    _ = try postKey(self, io, out, 'w', gap_create_mods);
+    try self.drawFrame();
+    workspacesCheck(out, &failures, try clickTabsElement(self, io, out, "tab-close.confirm") and
+        try waitForWorkspaces(self, io, out, .{ .active = second_key }) and
+        self.activeWorkspace().tab(gap_new_tab) == null and
+        self.activeWorkspace().sessionById(gap_new_session) == null and
+        self.activeWorkspace().activeTabId() == second_tab_id and
+        self.activePresentation().active_session_id == split_session, "confirming close removed the extra tab and its session and restored the two-pane tab", .{});
+
     _ = try scratchpadChord(self, io, out, true);
     workspacesCheck(out, &failures, self.activePresentation().scratchpad_presentation == .ninety and
         try waitForWorkspaces(self, io, out, .{ .scratchpad_text = .{
@@ -16310,7 +17023,10 @@ fn workspacesTest(self: *App, io: Io, out: *Writer) !u8 {
         .id = split_session,
         .text = "WORKSPACE-ECHO:closing",
     } }) and try waitForWorkspaces(self, io, out, .{ .settled = second_key }), "all terminal and scratchpad output was quiescent before teardown", .{});
-    workspacesCheck(out, &failures, second_model.registeredSessionCount() == 3 and second_model.hasAttachedChild(), "the close target still owned two terminals and one scratchpad PTY", .{});
+    // Session ids are never reused, so the TASK-77 extra tab closed above
+    // keeps its released record: four records, three of them live.
+    workspacesCheck(out, &failures, second_model.registeredSessionCount() == 4 and
+        second_model.sessionById(gap_new_session) == null and second_model.hasAttachedChild(), "the close target still owned two terminals and one scratchpad PTY", .{});
 
     _ = try clickPaletteCommand(self, io, out, workspace_close_action, null);
     workspacesCheck(out, &failures, self.pending_close_workspace == second_key, "the clickable sidebar Close workspace control opened confirmation", .{});
@@ -19405,7 +20121,7 @@ const usage =
     \\          [--grid-test] [--scroll-test] [--mouse-test] [--clipboard-test]
     \\          [--ui-test] [--ime-test] [--sidebar-test] [--tabs-test]
     \\          [--panes-test] [--scratchpad-test] [--palette-test]
-    \\          [--workspaces-test] [--links-test] [--search-test]
+    \\          [--workspaces-test] [--links-test] [--search-test] [--git-test]
     \\          [--test-driver=<endpoint>]
     \\          [--test-artifact-dir=<dir>]
     \\          [--driver-test]
@@ -19491,6 +20207,9 @@ const usage =
     \\  --settings-test                    drive the settings view: every row kind by key
     \\                                    and mouse, keybinding capture and conflicts,
     \\                                    the raw-file row and modal isolation, then exit
+    \\  --git-test                         drive the sidebar branch rows against real
+    \\                                    repositories: checkout, watch, cwd changes,
+    \\                                    detached HEAD and two-row tab behaviour, then exit
     \\  --right-click=<menu|paste>        what a right click over a terminal does when
     \\                                    the program has not captured the mouse
     \\                                    (default: menu)
@@ -19680,7 +20399,7 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
                 options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
-                options.run.driver_test) return err;
+                options.run.git_test or options.run.driver_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
                 "no usable display ({s}): there is no window to draw in. Set DISPLAY, or run under xvfb-run",
@@ -19794,6 +20513,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try fontTest(app, init.io, out);
     } else if (options.run.settings_test) {
         check_status = try settingsTest(app, init.io, out);
+    } else if (options.run.git_test) {
+        check_status = try gitTest(app, init.io, out);
     } else {
         try app.run(init.io, runDeadline(init.io, options.run.run_ms));
     }
@@ -20238,6 +20959,21 @@ test "--font-test owns a fixed real-child viewport and its own deterministic chi
     var buffer: [path_capacity]u8 = undefined;
     // Like every built-in check, it never reads the user's settings.
     try std.testing.expectEqual(@as(?[]const u8, null), configPathFor(resolved, env.source(), &buffer));
+}
+
+test "--git-test owns a fixed real-child viewport and its own deterministic child" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--git-test" }, env.source());
+    const resolved = optionsForRun(parsed);
+    try std.testing.expect(parsed.run.git_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--git-test") != null);
+    try std.testing.expectEqual(ui_test_width, resolved.run.width);
+    try std.testing.expect(resolved.run.hidden);
+    try std.testing.expect(wantsChild(resolved));
+    try std.testing.expect(usesDeterministicScratchpad(resolved));
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
+    defer spec.deinit();
+    try std.testing.expectEqualStrings(git_test_script, spec.argv[2]);
 }
 
 test "--settings-test owns a fixed real-child viewport and its own deterministic child" {

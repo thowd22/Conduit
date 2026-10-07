@@ -257,6 +257,32 @@ nothing else is a legal dependency.
   unbound, and `<chord>=<action>` is appended; the reload rebuilds the table. Pointer gestures are
   modal like the palette (an outside press closes and owns its release); text and composition reach
   only the inline field.
+- **Sidebar branch rows (TASK-76).** A tab whose focused session's OSC 7 cwd is inside a git work
+  tree occupies two rows: its unchanged name row and a non-interactive `Text` child
+  `workspace.<k>.tab.<n>.branch` (role `branch`, label = the full branch name or the 8-digit
+  short commit of a detached HEAD) indented beneath it, painted `muted` with `TextStyle.small`
+  and ellipsized to the row. A tab outside a repository has no branch row, and the list reclaims
+  it; `list_limit` counts rows, so a branch row is only added when it still fits. Hover, focus,
+  activation and rename act on the name row; a drag dropped on a branch row targets its tab.
+  `src/git.zig` (a file of the `app` module, not a module of its own) resolves the repository
+  without starting git: `git.resolve` walks up at most 32 directories through the workspace
+  `ExecutionContext.Ref.statPath`/`readFile`, follows a `gitdir:` file (linked worktrees and
+  submodules), reads `HEAD` (at most 4 KiB) and validates the name (non-empty, ≤ 128 bytes, valid
+  UTF-8, no C0/C1 control or DEL). Malformed or unreadable input is "no repository", never an
+  error. The app keeps one `GitTrack` per session (owner thread), marked stale by a new OSC 7
+  cwd, an OSC 133 prompt start or a terminal reset; `App.pollGit`, on the loop's poll and never
+  per frame, runs each refresh as one `git.Lookup` worker (the context may be remote, and remote
+  reads must not block the UI thread), and for a Local context also holds a
+  `ExecutionContext.watch` on the git directory so a `HEAD` rewritten without a new prompt
+  refreshes. Tracks for vanished sessions are dropped, and a closing workspace joins its lookups
+  before its context is released.
+- **Sidebar workspace gap (TASK-77).** Every workspace after the first listed one, and every row
+  of its group, is registered with `ElementRegistration.offset_px = 5 × group index` logical
+  pixels (`sidebar_workspace_gap_px`), so a 5-pixel gap scaled by the window scale separates one
+  workspace's last row from the next workspace row while rows within a group keep whole-cell
+  spacing. `sidebarRowLimit` lowers the list limit by the group's device-pixel shift rounded up
+  to whole rows, so no shifted row reaches the blank row above the footer, the Palette hint or the
+  version line.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
@@ -273,7 +299,8 @@ nothing else is a legal dependency.
   (scratchpad process coordination, presentation and interaction), TASK-33 (multi-workspace
   presentation, action routing and lifecycle), TASK-34 (URL/OSC 8 opening and file-reference
   editor tabs), TASK-36 (bounded literal and regex search UI); M4 — TASK-40 (font settings,
-  commands and family picker), TASK-41 (settings view and keybinding editor).
+  commands and family picker), TASK-41 (settings view and keybinding editor); TASK-76 (git branch
+  rows and the secondary small face), TASK-77 (sidebar workspace gap).
 
 ### `platform`
 
@@ -366,6 +393,14 @@ nothing else is a legal dependency.
   `font.Manager.ligatures()` is on, a repainted row is read once and each maximal run of
   same-style printable-ASCII cells containing ligature punctuation is shaped as one HarfBuzz run;
   every glyph is still placed in the cell its cluster came from, so the grid never moves.
+  TASK-76 (decision "Small UI text via a secondary scaled face"): the overlay `Grid` can attach a
+  second, smaller atlas (`attachSmallAtlas`) built by a second `font.Manager` at 0.6 of the
+  configured point size (512×512 coverage atlas). An `OverlayCell` marked `small` keeps its full
+  cell for fills and decorations, but its glyph is shaped and rasterised with that manager,
+  centred vertically in the cell and packed at the small advance with the small cells before it
+  on the same row (`SmallRun`), then drawn in a fourth instanced pass over the small texture.
+  Without a small face the cell draws at the normal size. TASK-77: `OverlayCell.offset_y_px`
+  moves a cell down by whole device pixels, the same shift `ui` applied to its element's bounds.
 - **Never** own product or layout state; it draws terminal cells or UI primitives supplied by
   callers. Never call SDL event or window functions (those are `platform`'s). Never block on IO.
 - **May depend on** `font` (glyphs), `platform` (window and context), `term` (terminal cells and
@@ -373,7 +408,7 @@ nothing else is a legal dependency.
 - **Lands** M1 — TASK-7 (FBO and present), TASK-11 (grid renderer); M2 — TASK-22 (`capture`);
   M3 — TASK-28 (terminal inset origin and full-canvas overlay geometry), TASK-30 (independent pane
   viewports and the font-metric-aware overlay compositor); M4 — TASK-39 (fallback glyphs, colour
-  glyph pass, ligature runs).
+  glyph pass, ligature runs); TASK-76 (small-face overlay pass), TASK-77 (overlay row offsets).
 
 ### `font`
 
@@ -428,8 +463,18 @@ nothing else is a legal dependency.
   theme change or a picker preview recolours every element without recomposing it. Chrome uses
   the derived roles (`strong`, `muted`, `border`, `attention`, `danger`, `on_accent`, `field`,
   `accent`, `selection`) rather than raw ANSI slots, which keeps it readable on light schemes.
+- **Small text and sub-cell offsets.** `TextStyle.small` (TASK-76) asks the renderer for the
+  secondary small face; layout, clipping and hit testing stay in whole cells. An element may be
+  registered with `ElementRegistration.offset_px`, a downward shift in logical pixels (TASK-77,
+  decision "Sidebar workspace gap via sub-cell row offsets"). `Geometry.pixel_scale` converts it
+  to whole device pixels once, at registration, in `Geometry.boundsForShifted`; the element's
+  reported `bounds` are the shifted device-pixel bounds, so hit testing, hover, press/release, the
+  test driver's `inspect` JSON and accessibility all read the same shifted geometry, and
+  `Tree.render` stamps the same shift on every canvas cell the element paints. Pixels a shift
+  uncovers belong to no element.
 - **Lands** M2 — TASK-18 (primitives), TASK-19 (tree, hit testing, hover, focus); M3 — TASK-28
-  (semantic selected state used by the first composed workspace view).
+  (semantic selected state used by the first composed workspace view); TASK-76 (small text),
+  TASK-77 (sub-cell element offsets).
 
 ### `input`
 

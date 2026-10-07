@@ -416,6 +416,54 @@ const settings_view_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-76/77: a minimal shell over a real repository in a private temporary
+// directory (removed when the child exits). Every evaluated line is followed
+// by an OSC 7 cwd and an OSC 133 prompt, the signals an integrated shell
+// sends, and git's user and system configuration are masked.
+const sidebar_branch_command =
+    "stty -echo; " ++
+    "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=c GIT_AUTHOR_EMAIL=c@c " ++
+    "GIT_COMMITTER_NAME=c GIT_COMMITTER_EMAIL=c@c; " ++
+    "root=$(mktemp -d \"${TMPDIR:-/tmp}/conduit-e2e-branch.XXXXXX\") || exit 1; " ++
+    "trap 'rm -rf \"$root\"' EXIT; trap 'exit 1' HUP TERM INT; " ++
+    "REPO=\"$root/repo\"; git init -q -b main \"$REPO\" && git -C \"$REPO\" commit -q --allow-empty -m init || exit 1; " ++
+    "cd \"$REPO\"; " ++
+    "p() { printf '\\033]7;file://localhost%s\\007\\033]133;A\\007branch$ \\033]133;B\\007' \"$PWD\"; }; p; " ++
+    "while IFS= read -r line; do printf '\\033]133;C\\007'; eval \"$line\"; p; done";
+
+const sidebar_branch_id = "workspace.1.tab.1.branch";
+
+const sidebar_branch_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "branch$ " } },
+    .{ .wait_element = .{ .id = sidebar_branch_id, .state = "exists", .equals = true } },
+    // The printed spelling needs an expansion, so echo alone cannot match.
+    .{ .type_text = "git checkout -q -b e2e/feature && printf 'ON-%s\\n' \"$(git branch --show-current)\"" },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = "ON-e2e/feature" } },
+    .{ .wait_element = .{ .id = sidebar_branch_id, .state = "exists", .equals = true } },
+    .{ .type_text = "cd /" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = sidebar_branch_id, .state = "exists", .equals = false } },
+    .{ .type_text = "cd \"$REPO\"" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = sidebar_branch_id, .state = "exists", .equals = true } },
+    // A second workspace is listed below the first's two-row tab, shifted by
+    // the TASK-77 gap; a real click on its row switches to it.
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "Create workspace" },
+    .{ .key = "ENTER" },
+    .{ .type_text = "/tmp" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "workspace.2", .state = "exists", .equals = true } },
+    .{ .click = "workspace.1" },
+    .{ .wait_element = .{ .id = sidebar_branch_id, .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .click = "workspace.2" },
+    .{ .wait_element = .{ .id = sidebar_branch_id, .state = "exists", .equals = false } },
+    .{ .wait_element = .{ .id = "workspace.2.tab.1", .state = "exists", .equals = true } },
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -483,7 +531,33 @@ pub const all = [_]Scenario{
         .command = deterministic_shell,
         .steps = &settings_view_steps,
     },
+    .{
+        .name = "sidebar-branch",
+        .command = sidebar_branch_command,
+        .steps = &sidebar_branch_steps,
+    },
 };
+
+test "sidebar branch scenario waits on the branch row appearing, leaving and returning" {
+    const scenario = all[13];
+    try std.testing.expectEqualStrings("sidebar-branch", scenario.name);
+    var appeared: usize = 0;
+    var vanished: usize = 0;
+    var clicked_second = false;
+    for (scenario.steps) |step| switch (step) {
+        .wait_element => |wait| if (std.mem.eql(u8, wait.id, sidebar_branch_id)) {
+            if (wait.equals) appeared += 1 else vanished += 1;
+        },
+        .click => |id| if (std.mem.eql(u8, id, "workspace.2")) {
+            clicked_second = true;
+        },
+        // No typed line contains the asserted output verbatim.
+        .wait_terminal_text => |wait| try std.testing.expect(std.mem.indexOf(u8, sidebar_branch_command, wait.contains) == null or
+            std.mem.eql(u8, wait.contains, "branch$ ")),
+        else => {},
+    };
+    try std.testing.expect(appeared >= 3 and vanished >= 2 and clicked_second);
+}
 
 test "scenario names and semantic selectors are stable and non-empty" {
     for (all, 0..) |scenario, index| {
@@ -684,7 +758,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 13), all.len);
+    try std.testing.expectEqual(@as(usize, 14), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;
