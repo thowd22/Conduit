@@ -88,7 +88,8 @@ jobs:
           command -v jq
           command -v xclip
           command -v desktop-file-validate
-          command -v rsvg-convert
+          command -v xprop
+          command -v file
 
       - name: Restore Zig caches
         uses: actions/cache@v4

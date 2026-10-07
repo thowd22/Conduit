@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-06 23:05'
+updated_date: '2026-10-07 00:19'
 labels:
   - platform
   - linux
@@ -65,6 +65,8 @@ Approved CI evidence is now checked in: the Linux workflow explicitly installs i
 2026-10-06 hosted evidence from GitHub Actions run 37539118525 (ubuntu-24.04, commit 2acbd93), retained in the conduit-linux-platform artifact: Sway 1.9 headless on wlroots pixman reported one active output at scale 1.25 (mode 1280x720, logical 1024x576) and Conduit logged 'window backend wayland', 'window reports 1.25 physical pixels per logical pixel', 'window geometry 640x360 logical, 800x450 pixels' with a crisp inspected frame; the real ibus-daemon with ibus-hangul composed the Dubeolsik keys sent by XTest into a semantic ime.preedit element, committed 한글 exactly once (IBUS_ASSERT:exact) and the second sentinel matched (IBUS_SECOND:exact); xclip middle-click paste proved PRIMARY_ASSERT:conduit-primary-external against an external X11 client; desktop-file validation passed on the installed payload.
 
 2026-10-06 IBus check hardening after a flaky hosted rerun (3 of 4 runs passed; the failing run's child received ggkkssrrmmff): strace in an ubuntu:24.04 container showed the app never connects to the IBus socket on X11 because SDL 3.4.16's X11 backend reaches input methods only through XIM (SDL_IME_Init is called only by the Wayland backend), so the XIM bridge (ibus-daemon --xim, XMODIFIERS=@im=ibus) is required and keeps being used. The doubled ASCII was TASK-71's key/text duplication on keys the engine forwarded back unhandled. check-ibus-hangul.sh now writes use-global-engine, preload-engines ['hangul'], engines-order and initial-input-mode hangul BEFORE starting the daemon (changing them afterwards raced the first context), waits until 'ibus engine' reports hangul for the focused context, retains terminal text on failure and strips Unix sockets from the uploaded driver root. Container: 5/5 passes, 한글 committed once each run.
+
+2026-10-07 the installed icon is now the user-supplied artwork: source PNG kept untouched, alpha-cleaned master generates hicolor 16-512 PNGs installed and packaged (deb, tar.gz, AppImage .DirIcon); desktop-file validation and the PNG payload checks run in CI; the window icon is set via SDL_SetWindowIcon and check-x11-window-icon.sh proves _NET_WM_ICON matches the 64x64 fixture. Local gate 531/538 tests, 17 headless checks, e2e 6/6, window-icon and keyboard X11 checks all green.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
