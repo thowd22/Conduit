@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-07 20:12'
+updated_date: '2026-10-07 22:33'
 labels:
   - infra
   - ci
@@ -54,4 +54,6 @@ Not verifiable here: the workflow has never run on GitHub, and nothing about the
 2026-10-05 reconciliation: reopened and AC #1 unchecked. The workflow is configured for ubuntu, macOS and Windows, but this repository has no commits and the workflow has never run; static YAML inspection is not runtime evidence for the three runners.
 
 2026-10-06 first hosted runs after the initial push: ubuntu-latest passes zig fmt/build/test; windows-latest fails in 'zig build' compiling Ghostty's C++ SIMD sources (zig-pkg/ghostty/src/simd/codepoint_width.cpp via Highway) against Zig 0.16's bundled clang headers: 'argument unused during compilation: -nostdinc++ / -fno-rtlib-defaultlib' followed by 109 errors in mmintrin.h/immintrin.h ('function-style cast to a builtin type can only take one argument'). The pinned-Zig resolution and version check worked on Windows (runs 37539118625 and 37535520847). The macOS leg had not finished before the runs were superseded; see later runs on main for its result. Windows build repair belongs with TASK-49/TASK-16; AC1 stays unchecked.
+
+2026-10-07 (merged as ead499d..a499040): build.zig defaults a Windows host to an explicit <arch>-windows-gnu target (Zig 0.16's fully native Windows target fails every C source); macOS PTY fixes (TIOCSWINSZ 0x80087467, TIOCSCTTY 0x20007461, ioctl request c_ulong, O_NONBLOCK 0x4) and DriverTransport.stop self-connect because Darwin's shutdown does not wake accept; ConPTY string/termination bugs; OS-aware test expectations (Option-as-Alt, Command rows, BASH_SILENCE_DEPRECATION_WARNING, Homebrew tmux PATH, APPDATA, path separators); ci.yml no longer cancels a started matrix, 75/40-minute timeouts, cache paths, brew tmux, per-binary diagnostics with a 240 s alarm. Evidence: ubuntu green; macOS build green and 629/643 tests with only the tmux PATH failures (fixed, unconfirmed); Windows builds and passes every module except the ConPTY runtime tests (write ACCESS_DENIED, resize hang) which are TASK-16's scope. AC1 stays open until one run is green on all three OSes.
 <!-- SECTION:NOTES:END -->

@@ -706,6 +706,19 @@ originating session's remote OSC 7 cwd, which is believed because each SSH termi
 remote host's own name, and the context's session script does the remote `cd`. After a reconnect
 the scratchpad is restored in place: same id, a fresh shell in its last remote cwd.
 
+TASK-5 is close: `ci.yml` builds and unit-tests on ubuntu, macOS and Windows runners, and a
+started matrix is never cancelled by a later push (only the newest push queues; 75-minute job and
+40-minute test timeouts; per-binary diagnostics with a 240 s alarm on a failed non-Linux leg). On
+a Windows host `build.zig` defaults to an explicit `<arch>-windows-gnu` target with the native CPU,
+because Zig 0.16's fully native Windows target fails every C source in the tree. The macOS PTY
+ioctl numbers (TIOCSWINSZ `0x80087467`, TIOCSCTTY `0x20007461`, `c_ulong` requests), `O_NONBLOCK`
+(`0x4`) and the driver transport's stop (Darwin's `shutdown` does not wake `accept`, so stop now
+connects once to its own endpoint) are fixed, OS-dependent test expectations name their platform,
+and macOS CI installs tmux. Ubuntu is green. Windows builds and passes every module except the
+ConPTY runtime tests (input write `ACCESS_DENIED`, resize hang), which TASK-16 owns. macOS last
+showed only the tmux PATH failures, since fixed but not yet confirmed green. AC1 stays open until
+one run is green on all three.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on

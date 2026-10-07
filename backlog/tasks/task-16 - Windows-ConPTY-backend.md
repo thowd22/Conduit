@@ -1,10 +1,11 @@
 ---
 id: TASK-16
 title: Windows ConPTY backend
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-05 20:33'
+updated_date: '2026-10-07 22:33'
 labels:
   - pty
   - windows
@@ -29,6 +30,14 @@ Implement the Pty interface on Windows using ConPTY (CreatePseudoConsole), inclu
 - [ ] #2 Resize is propagated to the pseudoconsole
 - [ ] #3 Child exit is detected and handles are released
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Fix the ConPTY runtime on the Windows runner: the input pipe write returns ACCESS_DENIED (open the pipe ends with the right access/overlapped flags, keep the console handle alive) and resize hangs (ResizePseudoConsole on the owner thread while the reader blocks; use overlapped reads or a dedicated reader thread with cancellation).
+2. Iterate through workflow_dispatch runs of ci.yml on a pushed branch, reading the per-binary diagnostics; cross-compile locally for x86_64-windows-gnu to keep compile errors out of the loop.
+3. Integration tests on Windows CI: spawn cmd.exe or pwsh, round-trip a command, propagate a resize, detect exit and release handles (handle-count test).
+<!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
