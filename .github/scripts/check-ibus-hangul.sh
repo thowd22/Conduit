@@ -122,9 +122,36 @@ until [[ "$(ibus engine 2>/dev/null)" == "hangul" ]]; do
   sleep 0.05
 done
 
+# The daemon spawns ibus-engine-hangul lazily on the first focus-in, and keys that arrive before
+# the engine answers pass through as ASCII (seen on a hosted run: the child received 'gksrmf').
+# Wait for the engine process, then probe with the first Dubeolsik key until a preedit appears,
+# erasing a passed-through probe with Backspace before trying again. Both loops are bounded.
+deadline=$((SECONDS + 15))
+until pgrep -f ibus-engine-hangul >/dev/null 2>&1; do
+  if (( SECONDS >= deadline )); then
+    echo "ibus-engine-hangul did not start within 15 seconds of focusing Conduit" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+probe_attempts=0
+until driver wait-for element ime.preedit exists true 2000 >/dev/null 2>&1; do
+  probe_attempts=$((probe_attempts + 1))
+  if (( probe_attempts > 5 )); then
+    echo "IBus never composed the probe key after 5 attempts" >&2
+    exit 1
+  fi
+  if (( probe_attempts > 1 )); then
+    # The previous probe passed through as ASCII; remove it from the child's line buffer.
+    xdotool key --clearmodifiers BackSpace
+  fi
+  xdotool type --clearmodifiers g
+done
+echo "probe attempts: $probe_attempts" | tee "$artifact_root/probe-attempts.txt"
+
 # XTest key events enter SDL's X11 event queue. IBus turns the Dubeolsik sequence into one UTF-8
 # commit; the PTY fixture rejects raw ASCII, duplicate commits and any other line.
-xdotool type --clearmodifiers gksrmf
+xdotool type --clearmodifiers ksrmf
 driver wait-for element ime.preedit exists true 5000
 driver inspect >"$artifact_root/preedit-semantic-tree.json"
 jq -e '.elements | any(.id == "ime.preedit" and .role == "preedit" and (.label | length > 0))' \
