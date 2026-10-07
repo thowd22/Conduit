@@ -1011,11 +1011,11 @@ test "run ids accepted from conduit-test cannot escape a scenario root" {
 }
 
 test "summary reporting is deterministic and names every scenario" {
-    const results = [_]bool{ true, false, true, true, true, true, true, true, true, true, true, true, true, true, true };
+    const results = [_]bool{ true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true };
     const summary = try renderSummary(std.testing.allocator, &results);
     defer std.testing.allocator.free(summary);
     try std.testing.expectEqualStrings(
-        "{\"passed\":14,\"failed\":1,\"scenarios\":[{\"name\":\"launch-prompt\",\"passed\":true},{\"name\":\"type-command\",\"passed\":false},{\"name\":\"select-copy\",\"passed\":true},{\"name\":\"terminal-links\",\"passed\":true},{\"name\":\"terminal-file-reference\",\"passed\":true},{\"name\":\"output-flood\",\"passed\":true},{\"name\":\"context-menu\",\"passed\":true},{\"name\":\"child-environment\",\"passed\":true},{\"name\":\"sidebar-palette\",\"passed\":true},{\"name\":\"font-coverage\",\"passed\":true},{\"name\":\"theme-picker\",\"passed\":true},{\"name\":\"font-picker\",\"passed\":true},{\"name\":\"settings-view\",\"passed\":true},{\"name\":\"sidebar-branch\",\"passed\":true},{\"name\":\"agent-notifications\",\"passed\":true}]}\n",
+        "{\"passed\":15,\"failed\":1,\"scenarios\":[{\"name\":\"launch-prompt\",\"passed\":true},{\"name\":\"type-command\",\"passed\":false},{\"name\":\"select-copy\",\"passed\":true},{\"name\":\"terminal-links\",\"passed\":true},{\"name\":\"terminal-file-reference\",\"passed\":true},{\"name\":\"output-flood\",\"passed\":true},{\"name\":\"context-menu\",\"passed\":true},{\"name\":\"child-environment\",\"passed\":true},{\"name\":\"sidebar-palette\",\"passed\":true},{\"name\":\"font-coverage\",\"passed\":true},{\"name\":\"theme-picker\",\"passed\":true},{\"name\":\"font-picker\",\"passed\":true},{\"name\":\"settings-view\",\"passed\":true},{\"name\":\"sidebar-branch\",\"passed\":true},{\"name\":\"agent-notifications\",\"passed\":true},{\"name\":\"agent-view\",\"passed\":true}]}\n",
         summary,
     );
 }

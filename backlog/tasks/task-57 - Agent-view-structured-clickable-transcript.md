@@ -1,11 +1,11 @@
 ---
 id: TASK-57
 title: 'Agent view: structured, clickable transcript'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 22:24'
+updated_date: '2026-10-07 22:58'
 labels:
   - agents
   - ui
@@ -26,11 +26,11 @@ A view that looks like terminal output but is built from structured agent events
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Agent events render as terminal-styled structured content
-- [ ] #2 File references are clickable and open at the referenced line
-- [ ] #3 Permission choices can be answered by click or keyboard and reach the harness
-- [ ] #4 Text in the view can be selected and copied
-- [ ] #5 User can switch between structured view and raw terminal for the same agent
+- [x] #1 Agent events render as terminal-styled structured content
+- [x] #2 File references are clickable and open at the referenced line
+- [x] #3 Permission choices can be answered by click or keyboard and reach the harness
+- [x] #4 Text in the view can be selected and copied
+- [x] #5 User can switch between structured view and raw terminal for the same agent
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -41,3 +41,15 @@ A view that looks like terminal output but is built from structured agent events
 3. respondPermission routed to the runner worker through a request queue; answered rows show the outcome.
 4. --agent-view-test with the fake adapter and a sixteenth e2e scenario; docs.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Agent: src/agent_view.zig View/EventLog/Rows; agent.view toggle (Ctrl+Shift+A); rows for messages (wrapped), tool uses, clickable file references opening vi +line through the context, permission decision controls answered by click or keyboard through the runner worker queue with outcome rows, subagent/notification/state lines; drag/Shift selection and copy; literal search over rows; --agent-view-test and the sixteenth scenario agent-view; --ui-test registry assertion now 77 actions. Coordinator 2026-10-07: merged as 7c53cc6; fixed two stale scenario-count assertions (15 -> 16) in e2e tests; full gate green (838/849 unit tests, 25 checks incl. --agent-view-test, 16 scenarios); screenshot inspected (messages, tool uses, reference, permission blocks, subagents).
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Structured agent view: a terminal-styled transcript built from the agent's structured events with clickable file references, inline permission decisions that reach the harness through the runner worker, selection, copy and search, toggled against the raw terminal; verified by unit tests, the deterministic --agent-view-test with the fake adapter, the agent-view scenario and the full local gate.
+<!-- SECTION:FINAL_SUMMARY:END -->

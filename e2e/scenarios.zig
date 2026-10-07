@@ -898,7 +898,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 15), all.len);
+    try std.testing.expectEqual(@as(usize, 16), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;
