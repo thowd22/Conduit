@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its seventeen Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its eighteen Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -318,6 +318,35 @@ the test's tmux config sets it to 0, and the `less` wheel test now waits for the
 row to be drawn rather than only for the alternate screen, because the mode switch can now arrive
 in its own read ahead of the content.
 
+TASK-37 is complete on Linux. `config` owns a Ghostty-style settings file (`key = value`, `#`
+comment lines, repeatable `keybind = <chord>=<action>[:<argument>]` or `<chord>=unbind`) at
+`$XDG_CONFIG_HOME/conduit/config` (else `~/.config/conduit/config`), `~/Library/Application
+Support/conduit/config` on macOS and `%APPDATA%\conduit\config` on Windows; `docs/config.md` is
+the grammar and the default for every key. Parsing is bounded (256 KiB file, 1024-byte lines, 256
+keybind lines) and never fails on input: each bad line is logged as `<path>:<line>: <message>` (key
+named, value never repeated), the rest of the file applies, and a rejected key or chord keeps its
+previous value; an unreadable file keeps every previous value and a missing one is the built-in
+layer. The first problem shows in the sidebar as the clipping `config.error` Text (role
+`config_error`, `config:<line>: <message>`) above the footer until fixed. `font.family` and
+`font.size` rebuild the face (`--font` stays the session layer); `scratchpad.size` and
+`scratchpad.large_size` set the two dock heights (default 50/90); `mouse.right_click` applies under
+`--right-click`; `font.bold`/`italic`/`bold_italic`/`ligatures`/`nerd_symbols` and `theme` are
+validated and stored for TASK-38/39/40 but have no effect yet. `input.parseChord` and
+`buildBindings` rebuild the whole binding table from the profile defaults plus the file, so every
+bound action, including both scratchpad toggles, is rebindable; the search chord and modal keys are
+not yet. A watcher thread (inotify on the parent directory on Linux, catching rename-replace saves
+and coalescing bursts after 100 ms; size/mtime/inode polling every second while the directory is
+missing and on other OSes) only flags a change and posts an SDL wake; the main thread reads and
+applies the file. Palette actions `config.open` (Ctrl+, / Cmd+,; creates the file from the
+commented defaults document, then opens `vi -- <path>` in a new tab through the workspace
+ExecutionContext) and `config.reload` exist. Built-in checks other than `--config-test` never read a
+settings file. The deterministic Linux `--config-test` proves a rebound palette chord and a
+configured scratchpad size through SDL, a malformed edit's line-numbered `config.error` with
+previous and still-valid values working, a rename-replace repair that clears it and applies new
+values including a larger font, return to defaults on deletion, and `config.open` by Ctrl+, and by
+a clicked palette row. macOS/Windows locations and the polling watcher backend are
+runtime-unverified.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -493,7 +522,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:

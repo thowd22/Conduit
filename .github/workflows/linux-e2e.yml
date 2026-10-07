@@ -158,6 +158,7 @@ jobs:
             --links-test
             --search-test
             --menu-test
+            --config-test
             --driver-test
           )
           for check in "${checks[@]}"; do

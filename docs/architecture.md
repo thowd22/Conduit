@@ -1122,6 +1122,7 @@ inside the same event loop, so the main thread is that render/UI thread.
 | FBO, shaders, glyph atlas | `render`, `font`, main thread | — |
 | PTY read side, process IO | `pty`, off-thread | bytes handed to the main thread through a defined queue **(d)** |
 | Clipboard read/write | `platform.clipboard` | IO; must not block the main thread **(d)** |
+| Settings file watch | `config.Watcher`, own thread | the thread only sets an atomic `changed` flag and posts an SDL wake; `app` reads, validates and applies the file on the main thread in `poll` |
 | Font discovery and file loading | `font`, off-thread | discovered faces handed to the main thread **(d)** |
 | Agent harness IO | `agent` adapters, off-thread | events handed over through a defined queue **(d)** |
 | SSH transport | `workspace`'s ExecutionContext, off-thread | [undecided](#9-undecided): TASK-42, TASK-43 |
