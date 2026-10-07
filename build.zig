@@ -61,11 +61,14 @@ const modules = [_]ModuleSpec{
         "input", "render", "session", "ui", "workspace",
     } },
 
+    // TASK-60: the token-scoped local control API for harnesses.
+    .{ .name = "control", .source_file = "src/control.zig", .deps = &.{"platform"} },
+
     // The composition root. Its root file is the executable entry point.
     .{ .name = "app", .source_file = "src/main.zig", .deps = &.{
-        "agent",   "backlog",  "config",  "font",       "input",     "link",
-        "palette", "platform", "pty",     "render",     "session",   "term",
-        "theme",   "ui",       "version", "testdriver", "workspace",
+        "agent", "backlog", "config",   "control", "font",       "input",
+        "link",  "palette", "platform", "pty",     "render",     "session",
+        "term",  "theme",   "ui",       "version", "testdriver", "workspace",
     } },
 };
 

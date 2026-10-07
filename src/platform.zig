@@ -3073,6 +3073,67 @@ pub const DriverClient = struct {
     }
 };
 
+/// A listening filesystem AF_UNIX socket made with the driver endpoint's rules, for a server that
+/// owns its own accept loop.
+///
+/// The TASK-60 control API serves many short-lived harness clients concurrently with reply
+/// deadlines, so it cannot reuse the single-connection, window-bound `DriverTransport`; it reuses
+/// only the endpoint discipline here. `listen` additionally refuses a parent directory that grants
+/// any group or other permission, so the endpoint always sits inside a private (0700) run
+/// directory, and leaves the socket itself 0600. A live socket is never replaced; a stale one is.
+///
+/// Threads: `listen` and `deinit` run on the owning thread; `server.accept` may block on one
+/// worker, which the owner wakes by shutting the listening socket down before `deinit`.
+///
+/// Linux and macOS only. Windows reports `error.UnsupportedPlatform` until a multi-instance
+/// protected named-pipe listener exists; nothing falls back to TCP.
+pub const LocalSocketListener = struct {
+    server: std.Io.net.Server,
+    endpoint_inode: std.Io.File.INode,
+
+    pub const ListenError = DriverTransport.StartError || error{ParentNotPrivate};
+
+    /// Listen at `endpoint`, whose parent directory must already exist and be private.
+    pub fn listen(io: std.Io, endpoint: []const u8) ListenError!LocalSocketListener {
+        if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
+        try validateDriverEndpoint(endpoint);
+        if (endpoint.len >= @sizeOf(@FieldType(std.posix.sockaddr.un, "path"))) {
+            return error.EndpointTooLong;
+        }
+        const parent = std.fs.path.dirname(endpoint) orelse return error.InvalidEndpoint;
+        const parent_stat = std.Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = false }) catch {
+            return error.EndpointSetupFailed;
+        };
+        if (parent_stat.kind != .directory) return error.EndpointSetupFailed;
+        if (parent_stat.permissions.toMode() & 0o077 != 0) return error.ParentNotPrivate;
+        try prepareDriverEndpoint(io, endpoint);
+
+        const address = std.Io.net.UnixAddress.init(endpoint) catch return error.EndpointTooLong;
+        var server = address.listen(io, .{}) catch return error.ListenerFailed;
+        errdefer server.deinit(io);
+        errdefer removeOwnedDriverEndpoint(io, endpoint, null);
+
+        std.Io.Dir.cwd().setFilePermissions(
+            io,
+            endpoint,
+            posixPermissions(0o600),
+            .{ .follow_symlinks = false },
+        ) catch return error.EndpointSetupFailed;
+        const stat = std.Io.Dir.cwd().statFile(io, endpoint, .{ .follow_symlinks = false }) catch {
+            return error.EndpointSetupFailed;
+        };
+        if (stat.kind != .unix_domain_socket) return error.EndpointSetupFailed;
+        return .{ .server = server, .endpoint_inode = stat.inode };
+    }
+
+    /// Close the listener and remove `endpoint` only if it is still the socket `listen` made.
+    pub fn deinit(self: *LocalSocketListener, io: std.Io, endpoint: []const u8) void {
+        self.server.deinit(io);
+        removeOwnedDriverEndpoint(io, endpoint, self.endpoint_inode);
+        self.* = undefined;
+    }
+};
+
 fn driverIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
