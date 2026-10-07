@@ -231,6 +231,32 @@ nothing else is a legal dependency.
   Text names the drawn family and exists only once the highlighted face has landed, which is what
   scripted checks wait on. Palette choice ids are stored per visible row, so a choice list can be
   longer than the action registry.
+- **Settings view (TASK-41).** `settings.open` (palette "Settings"; Ctrl+Shift+, on Linux/Windows,
+  Cmd+Shift+, on macOS) opens a centred modal `Surface` (`settings.dialog`, titled ` Settings `)
+  measured like the palette and clamped to the window. Its rows are rebuilt from fixed field
+  tables and the registry on each opening: dim `Text` headings (`settings.heading.<group>`) for
+  Appearance, Fonts, Keys, Scratchpad and Mouse; one `InteractiveText` per setting
+  (`settings.row.<key>`) whose label is `<key>  <value> ·`, the value being the one in effect and
+  `·` marking a value the file sets (`Config.lines`); one per palette command without an argument
+  plus `palette.open` (`settings.row.keybind.<action>`, value the live chords or `unbound`); and
+  `settings.raw`, which closes the view and dispatches `config.open`. Rows activate through the
+  palette-hidden `settings.activate` action (a click) or Enter; only rows on screen are
+  registered and the list scrolls to keep the highlight and its heading visible. Bools toggle,
+  `mouse.right_click` cycles, `theme` and `font.family` close the view and open the existing
+  `theme.pick` / `font.pick` chooser, and numbers and text open the inline `settings.input`
+  prefilled with the file spelling; Left/Right toggle, cycle or step a number by one
+  (`stepFontPoints` for the size, 10–100 for the scratchpad). A commit runs `config.checkValue`,
+  shows a refusal as `settings.error` (`<key>: <message>`, the parser's own text) and writes
+  nothing, else writes with `config.writeDocumentValue` and calls `reloadConfig` at once, so the
+  watcher's reload of the same write finds nothing left to change. The view owns every key press
+  before `inputmod.resolve` (releases only settle `BindingState` or reach the terminal that saw the
+  press), so a captured chord never runs its current action. Capture refuses a bare key that types
+  text or a bare Enter/Tab/Backspace/Escape, names a chord another command holds in
+  `settings.error` (`conflict: <label>`) and takes it on a second Enter, and writes through
+  `config.writeActionKeybinds`: the command's own lines go, each shipped chord it still holds is
+  unbound, and `<chord>=<action>` is appended; the reload rebuilds the table. Pointer gestures are
+  modal like the palette (an outside press closes and owns its release); text and composition reach
+  only the inline field.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
@@ -247,7 +273,7 @@ nothing else is a legal dependency.
   (scratchpad process coordination, presentation and interaction), TASK-33 (multi-workspace
   presentation, action routing and lifecycle), TASK-34 (URL/OSC 8 opening and file-reference
   editor tabs), TASK-36 (bounded literal and regex search UI); M4 — TASK-40 (font settings,
-  commands and family picker).
+  commands and family picker), TASK-41 (settings view and keybinding editor).
 
 ### `platform`
 
@@ -476,6 +502,14 @@ nothing else is a legal dependency.
   `font.size.reset`. The legacy terminal encoding sends `=` and `0` with Ctrl as the plain
   character and has no control code for Ctrl+-, so no common program loses input; Ctrl+Shift+-
   (Ctrl+_, a C0 control) stays the terminal's.
+- **TASK-41 keybinding editor support.** Both profiles append `settings.open` (Ctrl+Shift+, on
+  Linux/Windows, Command+Shift+, on macOS; no C0 code, plain Shift+, stays the terminal's).
+  `chordOf` turns a raw press into the `Chord` a binding would match (null for a modifier alone),
+  `findBinding` is the conflict query (the first binding with an equal chord, the one a press
+  dispatches), `chordTypesText` flags a character key without Ctrl, Alt or Super, and
+  `formatChordSpelling` writes the settings-file spelling (`ctrl+alt+super+shift+<key>`, `plus`,
+  `equal` and `space` for the characters a chord cannot hold) that `parseChord` reads back
+  unchanged; a unit test round-trips every shipped chord.
 
 ### `palette`
 
@@ -652,6 +686,14 @@ nothing else is a legal dependency.
   commands write `font.family`, `font.size`, `font.ligatures`, `font.nerd_symbols` and
   `font.fallbacks` through `writeDocumentValue`; `--font-test` is the third check that reads a
   (private) settings file.
+- **TASK-41 additions.** `checkValue` validates one typed value with the parser's own rules and
+  returns the message its file line would report (`expected 1 to 72 points`), allocation-free; a
+  quote is refused because `setDocumentValue` quotes by itself. `setActionKeybinds` returns the
+  document with every `keybind` line naming one action removed (any argument), every
+  `<chord>=unbind` line for a chord it is about to unbind removed, then those unbind lines and
+  `<chord>=<action>` appended, every other line kept byte for byte; `writeActionKeybinds` applies
+  it to the file with the same create-from-defaults, sibling write and rename (`replaceDocument`)
+  as `writeDocumentValue`. `--settings-test` is the fourth check that reads a private file.
 
 ### `theme`
 

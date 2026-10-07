@@ -21,6 +21,51 @@ context exactly like a clicked file reference. When the file does not exist yet 
 with a commented copy of every default, so it documents itself. **Reload config**
 (`config.reload`) re-reads the file on demand, for example when hot reload is unavailable.
 
+## The settings view
+
+**Settings** (`settings.open`; Ctrl+Shift+, on Linux and Windows, Cmd+Shift+, on macOS, or type
+`settings` in the command palette) opens a dialog over the window that lists every setting below,
+grouped under dim headings: Appearance, Fonts, Keys, Scratchpad and Mouse. Each row reads
+`<setting>  <value>`, the value being the one in effect. A `·` after the value means the settings
+file sets it; no mark means the built-in default (or a command-line flag) decides it. The last
+row, **Open config file**, closes the dialog and opens the file itself, as `config.open` does.
+
+- **Moving.** Up and Down (or Tab and Shift+Tab) move the highlight, skipping the headings and
+  wrapping at either end; Home and End jump to the first and last rows. The list scrolls to keep
+  the highlighted row on screen. Escape, or a click outside the dialog, closes it. While it is
+  open no key, typed text or click reaches the terminal or anything else beneath it.
+- **Editing.** Enter or a click edits a row the way its value needs:
+  - `true`/`false` settings (`font.ligatures`, `font.nerd_symbols`) flip;
+  - `mouse.right_click` switches between `menu` and `paste`;
+  - `theme` and `font.family` close the dialog and open the palette's theme or family chooser,
+    with its live preview;
+  - numbers (`font.size`, `scratchpad.size`, `scratchpad.large_size`) and text (`font.bold`,
+    `font.italic`, `font.bold_italic`, `font.fallbacks`) open a field on the row holding the
+    current value: Enter saves, Escape cancels. An empty style family means "derived from the
+    family".
+
+  Left and Right also flip a `true`/`false` row, switch `mouse.right_click`, and step a number by
+  one (the size by whole points from 6 to 72, the scratchpad by one percent from 10 to 100).
+- **Saving.** Every change is written to the settings file at once, the same way the font and
+  theme commands write theirs (creating the file from the defaults when it does not exist, and
+  leaving every other line and comment as it was), and applies immediately. A value the file
+  would reject is refused before anything is written: the dialog shows the same message a bad
+  file line would, such as `font.size: expected 1 to 72 points`, and the setting keeps its value.
+- **Keys.** The Keys group has a row for every palette command that takes no argument, plus
+  Open command palette, showing its chords (or `unbound`). Enter or a click on one waits for a
+  chord (`press a chord…`): the next key you press, with its modifiers, becomes that command's
+  only chord. Escape cancels; Backspace leaves the command unbound. A bare key that would type
+  text (a letter, or Shift and a letter) and bare Enter, Tab, Backspace or Escape are refused,
+  because they would stop reaching the terminal. If another command already has the chord, the
+  dialog says `conflict: <that command>`: Enter gives the chord to this command (the other loses
+  it), Escape keeps things as they were. The chord you press never runs its current command.
+
+  A key change rewrites only that command's `keybind` lines: its earlier lines are removed, each
+  shipped chord it still has gets a `keybind = <chord>=unbind` line, and
+  `keybind = <chord>=<command>` is appended. Taking a chord from another command needs no extra
+  line, because a later `keybind` line always replaces what its chord was bound to. Commands that
+  take an argument (`pane.split:right`, `tab.goto:3`, ...) are bound in the file directly.
+
 ## Format
 
 ```
@@ -213,14 +258,15 @@ often rebound are:
 | `scratchpad.toggle-50` | `` ctrl+` `` | `` super+` `` |
 | `scratchpad.toggle-90` | `` ctrl+shift+` `` | `` super+shift+` `` |
 | `config.open` | `ctrl+,` | `super+,` |
+| `settings.open` | `ctrl+shift+,` | `super+shift+,` |
 | `tab.new` | `ctrl+shift+t` | `super+t` |
 | `pane.split:right` / `:down` | `ctrl+shift+e` / `ctrl+shift+o` | `super+d` / `super+shift+d` |
 | `font.size.increase` | `ctrl+equal`, `ctrl+shift+equal` | `super+equal`, `super+shift+equal` |
 | `font.size.decrease` / `font.size.reset` | `ctrl+minus` / `ctrl+0` | `super+minus` / `super+0` |
 
 Not configurable yet: the search chord (Ctrl+Shift+F, Cmd+F on macOS) and the keys inside modal
-UI (palette, search field, context menu, rename and confirmation prompts) are handled by those
-surfaces directly. `search.open` itself can still be given an additional chord with `keybind`.
+UI (palette, settings view, search field, context menu, rename and confirmation prompts) are
+handled by those surfaces directly. `search.open` itself can still be given an additional chord with `keybind`.
 
 ## Errors
 
@@ -262,6 +308,13 @@ row with the cell height and the file checked after each, ligatures toggled in p
 readback, built-in symbols, fallbacks typed into the palette (an uninstalled one reported in the
 sidebar), and the family picker's keyboard preview, Escape revert, hover preview and clicked
 choice saved as `font.family`. Each command's own write is shown to reload without building the
-face a second time. `conduit-test launch` isolates `XDG_CONFIG_HOME`, so an
+face a second time. `xvfb-run -a zig build run -- --settings-test` drives the settings view the
+same way, against its own private file: it opens the view from the palette and by its chord,
+moves over the headings, flips `font.ligatures` by Enter and by a click, types a scratchpad size
+into the row's field and opens a dock of that height, steps `font.size` with Right and measures
+the cells, has `99` points refused with its message and the file unchanged, cycles
+`mouse.right_click`, captures a new palette chord and uses it, has a taken chord reported,
+kept on Escape and taken on Enter, opens the raw file from its row, and proves keys, text and
+clicks behind the dialog do nothing, reading the file back after every change. `conduit-test launch` isolates `XDG_CONFIG_HOME`, so an
 agent can write `<root>/<run>/config/conduit/config` and observe the reload through `inspect` and
 `wait-for element config.error`.
