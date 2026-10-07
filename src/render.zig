@@ -61,6 +61,15 @@
 //! Viewport clears and all three terminal passes are scissored to that pane.
 //! Layout, the one-cell gaps used as dividers, and clearing pixels vacated by a
 //! layout change remain the app compositor's responsibility.
+//!
+//! TASK-39 (font manager v2): a cell's glyph is whatever `font.Manager.resolve`
+//! finds through its fallback chain, built-in box/Powerline sprites included,
+//! and a wide cell asks for a glyph fitted to two cells. Colour glyphs (emoji)
+//! live in the manager's RGBA colour atlas, are queued in `color_glyphs` and
+//! drawn by a third instanced pass that samples an `RGBA8` texture unmodulated
+//! with premultiplied blending. With ligatures on, runs of printable ASCII that
+//! contain ligature punctuation are shaped together (`addLigatureRow`), and each
+//! resulting glyph is still drawn in the cell its cluster came from.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -933,19 +942,29 @@ const solid_fragment_source =
     \\}
 ;
 
-/// The atlas is one coverage byte per texel in an `GL_R8` texture, so the red
+/// The coverage atlas is one byte per texel in an `GL_R8` texture, so the red
 /// channel *is* the coverage, and the blend function the draw enables
 /// composites the glyph's colour over the background.
+///
+/// With `u_color_mode` set, the same program samples the colour atlas instead
+/// (TASK-39): an `RGBA8` texture of premultiplied colour glyphs such as emoji,
+/// drawn as they are rather than tinted. The instance colour only scales their
+/// opacity, and that pass blends premultiplied.
 const glyph_fragment_source =
     \\#version 330 core
     \\in vec2 v_uv;
     \\in vec4 v_color;
     \\uniform sampler2D u_atlas;
+    \\uniform int u_color_mode;
     \\out vec4 o_color;
     \\
     \\void main() {
-    \\    float coverage = texture(u_atlas, v_uv).r;
-    \\    o_color = vec4(v_color.rgb, v_color.a * coverage);
+    \\    vec4 texel = texture(u_atlas, v_uv);
+    \\    if (u_color_mode == 1) {
+    \\        o_color = texel * v_color.a;
+    \\    } else {
+    \\        o_color = vec4(v_color.rgb, v_color.a * texel.r);
+    \\    }
     \\}
 ;
 
@@ -976,6 +995,41 @@ const glyph_stride = @sizeOf(GlyphInstance);
 /// untrusted input from a running program, and the alternative is a buffer
 /// whose size the program decides.
 const cell_text_capacity = 64;
+
+/// How many cells of one ligature run are shaped at once. Longer runs are
+/// shaped in pieces of this size; a ligature straddling a piece boundary is
+/// drawn as its plain glyphs.
+const ligature_run_capacity = 256;
+
+/// Whether a cell can join a ligature run: printable ASCII other than space,
+/// one codepoint, one cell wide and visible. Wide, combined and concealed
+/// cells keep the per-cell path.
+fn ligatureCandidate(cell: term.Cell) bool {
+    if (cell.wide or cell.wide_tail or cell.grapheme.len != 0) return false;
+    if (cell.style.attributes.invisible) return false;
+    return cell.codepoint > ' ' and cell.codepoint < 0x7F;
+}
+
+/// The end of the run starting at `start`: the candidate cells after it in
+/// the same face style, or just `start` itself when it is not a candidate.
+fn ligatureRunEnd(cells: []const term.Cell, start: usize) usize {
+    if (!ligatureCandidate(cells[start])) return start + 1;
+    const style = faceStyle(cells[start].style.attributes);
+    var end = start + 1;
+    while (end < cells.len and ligatureCandidate(cells[end]) and
+        faceStyle(cells[end].style.attributes) == style) : (end += 1)
+    {}
+    return end;
+}
+
+/// Whether a run holds any of the punctuation programming ligatures are made
+/// of. A run of letters and digits is left to the cheaper per-cell path.
+fn runHasLigatureTrigger(cells: []const term.Cell) bool {
+    for (cells) |cell| {
+        if (std.mem.indexOfScalar(u8, "!#$%&*+-./:;<=>?@\\^_|~", @intCast(cell.codepoint)) != null) return true;
+    }
+    return false;
+}
 
 /// The longest UTF-8 grapheme an overlay cell accepts.
 ///
@@ -1085,6 +1139,8 @@ const Pipeline = struct {
     vbo: gl.Uint,
     viewport_uniform: gl.Int,
     atlas_uniform: gl.Int = -1,
+    /// The glyph program's switch between coverage and colour sampling.
+    color_mode_uniform: gl.Int = -1,
     /// How many bytes the instance buffer holds. It starts at nothing:
     /// `glBufferSubData` into a buffer with no store is `GL_INVALID_VALUE`, and
     /// a driver that queues that error makes every later call in the frame look
@@ -1237,8 +1293,21 @@ pub const Grid = struct {
     /// than a flag set here: a glyph evicted to make room for another one
     /// moved pixels too.
     atlas_epoch: u64 = 0,
+    /// The RGBA8 texture colour glyphs (emoji) are sampled from, created the
+    /// first time the font manager rasterises one, and its size.
+    color_texture: gl.Uint = 0,
+    color_atlas: AtlasSize = .{ .width_px = 0, .height_px = 0 },
+    /// The colour atlas's `insertions + evictions` at the last upload. Starts
+    /// at "never uploaded" so a grid attached to a manager that already holds
+    /// colour glyphs uploads them.
+    color_epoch: u64 = std.math.maxInt(u64),
     solids: std.ArrayList(SolidInstance) = .empty,
     glyphs: std.ArrayList(GlyphInstance) = .empty,
+    /// Colour glyphs, drawn in their own pass after the coverage glyphs.
+    color_glyphs: std.ArrayList(GlyphInstance) = .empty,
+    /// One row of terminal cells, read once so ligature runs can be found
+    /// before any of the row's text is queued.
+    row_cells: std.ArrayList(term.Cell) = .empty,
     ranges: std.ArrayList(RowRange) = .empty,
     shaped: std.ArrayList(font.ShapedGlyph) = .empty,
     cursor_rects: [max_cursor_rects]SolidInstance = undefined,
@@ -1328,8 +1397,11 @@ pub const Grid = struct {
         destroyPipeline(self.cursor_pipeline);
         destroyPipeline(self.glyph_pipeline);
         if (self.atlas_texture != 0) gl.deleteTextures(1, &self.atlas_texture);
+        if (self.color_texture != 0) gl.deleteTextures(1, &self.color_texture);
         self.solids.deinit(self.allocator);
         self.glyphs.deinit(self.allocator);
+        self.color_glyphs.deinit(self.allocator);
+        self.row_cells.deinit(self.allocator);
         self.ranges.deinit(self.allocator);
         self.shaped.deinit(self.allocator);
         self.* = undefined;
@@ -1475,6 +1547,9 @@ pub const Grid = struct {
         // The pixels just uploaded are what the epoch means now, so the first
         // frame only re-uploads if it rasterises something new.
         self.atlas_epoch = 0;
+        // A new manager (a new face, size or display scale) has a new colour
+        // atlas too; the next frame that needs colour uploads all of it.
+        self.color_epoch = std.math.maxInt(u64);
         self.redraw_all = true;
     }
 
@@ -1639,6 +1714,7 @@ pub const Grid = struct {
 
         self.solids.clearRetainingCapacity();
         self.glyphs.clearRetainingCapacity();
+        self.color_glyphs.clearRetainingCapacity();
 
         // A full frame starts from a clean surface; a partial one starts from
         // what the last frame left, which is the whole point of damage.
@@ -1663,11 +1739,15 @@ pub const Grid = struct {
             var row: u32 = range.first;
             while (row <= range.last) : (row += 1) {
                 self.stats.rows += 1;
+                if (fonts.ligatures()) {
+                    try self.addLigatureRow(fonts, terminal, @intCast(row));
+                    continue;
+                }
                 var col: u32 = 0;
                 while (col < self.cols) : (col += 1) {
                     self.stats.cells += 1;
                     const at = term.Position{ .col = @intCast(col), .row = @intCast(row) };
-                    try self.addCell(fonts, terminal.cell(at) orelse emptyCell(), at);
+                    try self.addCell(fonts, terminal.cell(at) orelse emptyCell(), at, true);
                 }
             }
         }
@@ -1677,6 +1757,7 @@ pub const Grid = struct {
         self.uploadAtlas(fonts);
         try self.drawSolidPass(surface);
         try self.drawGlyphPass(surface);
+        try self.drawColorGlyphPass(surface);
         if (repaint_cursor) try self.drawCursor(surface, state.shape, cursor_rect);
 
         // Where the cursor's pixels are, after this frame: drawn where the
@@ -1736,6 +1817,7 @@ pub const Grid = struct {
 
         self.solids.clearRetainingCapacity();
         self.glyphs.clearRetainingCapacity();
+        self.color_glyphs.clearRetainingCapacity();
 
         const overlay_cols = if (view.cols == 0) @as(u32, self.cols) else view.cols;
         const overlay_rows = if (view.rows == 0) @as(u32, self.rows) else view.rows;
@@ -1744,11 +1826,12 @@ pub const Grid = struct {
             try self.addOverlayCell(fonts, cell);
         }
 
-        if (self.solids.items.len == 0 and self.glyphs.items.len == 0) return;
+        if (self.solids.items.len == 0 and self.glyphs.items.len == 0 and self.color_glyphs.items.len == 0) return;
         surface.bind();
         self.uploadAtlas(fonts);
         try self.drawSolidPass(surface);
         try self.drawGlyphPass(surface);
+        try self.drawColorGlyphPass(surface);
     }
 
     /// Draw one prepared, absolute full-canvas UI layer after all pane grids.
@@ -1780,16 +1863,18 @@ pub const Grid = struct {
 
         self.solids.clearRetainingCapacity();
         self.glyphs.clearRetainingCapacity();
+        self.color_glyphs.clearRetainingCapacity();
         for (view.cells) |cell| {
             if (!cell.validFor(view.cols, view.rows)) continue;
             try self.addOverlayCell(fonts, cell);
         }
 
-        if (self.solids.items.len != 0 or self.glyphs.items.len != 0) {
+        if (self.solids.items.len != 0 or self.glyphs.items.len != 0 or self.color_glyphs.items.len != 0) {
             surface.bind();
             self.uploadAtlas(fonts);
             try self.drawSolidPass(surface);
             try self.drawGlyphPass(surface);
+            try self.drawColorGlyphPass(surface);
         }
         self.canvas_overlay_invalidated = false;
         self.stats.overlay_frames += 1;
@@ -1817,8 +1902,12 @@ pub const Grid = struct {
         // size/origin change, which is what keeps a frame from allocating.
         try self.solids.ensureTotalCapacity(self.allocator, cells * 4 + max_cursor_rects);
         try self.glyphs.ensureTotalCapacity(self.allocator, cells * 4);
+        // A colour glyph is at most one per cell (an emoji cluster shapes to
+        // one glyph), so its pass needs a cell's worth, not four.
+        try self.color_glyphs.ensureTotalCapacity(self.allocator, cells);
         try self.ranges.ensureTotalCapacity(self.allocator, size.rows);
-        try self.shaped.ensureTotalCapacity(self.allocator, cell_text_capacity);
+        try self.shaped.ensureTotalCapacity(self.allocator, @max(cell_text_capacity, ligature_run_capacity));
+        try self.row_cells.ensureTotalCapacity(self.allocator, size.cols);
         self.reserved_origin_columns = self.terminal_origin_columns;
     }
 
@@ -1832,6 +1921,7 @@ pub const Grid = struct {
         const instances = std.math.mul(usize, cells, 4) catch return error.OutOfMemory;
         try self.solids.ensureTotalCapacity(self.allocator, instances);
         try self.glyphs.ensureTotalCapacity(self.allocator, instances);
+        try self.color_glyphs.ensureTotalCapacity(self.allocator, cells);
         try self.shaped.ensureTotalCapacity(self.allocator, cell_text_capacity);
     }
 
@@ -1858,11 +1948,12 @@ pub const Grid = struct {
 
     /// Add one cell: its background rectangle, its attribute decorations and
     /// its glyphs.
-    fn addCell(self: *Grid, fonts: *font.Manager, cell: term.Cell, at: term.Position) Error!void {
-        const rect = if (self.active_viewport != null)
-            self.draw_viewport.cellRect(at.col, at.row, self.cell)
-        else
-            terminalCellRect(at.col, at.row, self.cell, self.terminal_origin_columns);
+    ///
+    /// `draw_text` is false for a cell whose text a ligature run queues
+    /// instead (`addLigatureRow`); its background and decorations still come
+    /// from here.
+    fn addCell(self: *Grid, fonts: *font.Manager, cell: term.Cell, at: term.Position, draw_text: bool) Error!void {
+        const rect = self.terminalRect(at);
         const attributes = cell.style.attributes;
         const foreground = self.colors.resolve(cell.style.fg, true);
         const background = self.colors.resolve(cell.style.bg, false);
@@ -1925,10 +2016,88 @@ pub const Grid = struct {
             try self.pushSolid(rect.x, rect.y, width, thickness, self.terminalColor(fg));
         }
 
-        if (!cell.hasText()) return;
+        if (!cell.hasText() or !draw_text) return;
+        try self.addCellText(fonts, cell, rect, faceStyle(attributes), self.inkColor(cell));
+    }
+
+    /// Where a terminal cell is on the surface.
+    fn terminalRect(self: *const Grid, at: term.Position) PixelRect {
+        return if (self.active_viewport != null)
+            self.draw_viewport.cellRect(at.col, at.row, self.cell)
+        else
+            terminalCellRect(at.col, at.row, self.cell, self.terminal_origin_columns);
+    }
+
+    /// The colour a cell's glyphs are drawn in: its foreground (or background
+    /// under `inverse`), faint and pane dimming applied.
+    fn inkColor(self: *const Grid, cell: term.Cell) Rgba {
+        const attributes = cell.style.attributes;
+        const foreground = self.colors.resolve(cell.style.fg, true);
+        const background = self.colors.resolve(cell.style.bg, false);
+        const fg = if (attributes.inverse) background else foreground;
+        var bg = if (attributes.inverse) foreground else background;
+        if (cell.selected and cell.style.bg == .default) bg = self.colors.selection;
         const ink = if (attributes.faint) faint(fg, bg) else fg;
-        const color = self.terminalColor(ink);
-        try self.addCellText(fonts, cell, rect, faceStyle(attributes), color);
+        return self.terminalColor(ink);
+    }
+
+    /// Queue one terminal row, shaping runs of ligature-prone ASCII as one
+    /// HarfBuzz run so the font's ligatures (`=>`, `!=`, `->`) form across
+    /// cells. Every glyph is still placed in the cell its cluster came from,
+    /// so the grid never moves; a font whose ligatures are a spacer plus a
+    /// glyph that overhangs to the left (JetBrains Mono, Fira Code) draws
+    /// them through its own bearings. Everything else is per cell, exactly as
+    /// with ligatures off.
+    fn addLigatureRow(self: *Grid, fonts: *font.Manager, terminal: *term.Terminal, row: u16) Error!void {
+        self.row_cells.clearRetainingCapacity();
+        var col: u16 = 0;
+        while (col < self.cols) : (col += 1) {
+            self.stats.cells += 1;
+            const at = term.Position{ .col = col, .row = row };
+            // `reserve` sized this to the grid's columns.
+            self.row_cells.appendAssumeCapacity(terminal.cell(at) orelse emptyCell());
+        }
+        const cells = self.row_cells.items;
+        var start: usize = 0;
+        while (start < cells.len) {
+            const end = ligatureRunEnd(cells, start);
+            const in_run = end - start >= 2 and runHasLigatureTrigger(cells[start..end]);
+            for (cells[start..end], start..) |cell, index| {
+                try self.addCell(fonts, cell, .{ .col = @intCast(index), .row = row }, !in_run);
+            }
+            if (in_run) try self.addLigatureRun(fonts, cells[start..end], @intCast(start), row);
+            start = end;
+        }
+    }
+
+    fn addLigatureRun(self: *Grid, fonts: *font.Manager, cells: []const term.Cell, first_col: u16, row: u16) Error!void {
+        var text: [ligature_run_capacity]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < cells.len) {
+            // A run longer than the buffer is shaped in buffer-sized pieces.
+            const count = @min(cells.len - offset, text.len);
+            for (cells[offset..][0..count], 0..) |cell, index| text[index] = @intCast(cell.codepoint);
+            const style = faceStyle(cells[offset].style.attributes);
+            fonts.shapeForStyle(style, text[0..count], &self.shaped) catch |err| {
+                log.warn("shaping a ligature run failed: {s}", .{@errorName(err)});
+                return;
+            };
+            for (self.shaped.items) |glyph| {
+                if (glyph.cluster >= count) continue;
+                const index = offset + glyph.cluster;
+                const at = term.Position{ .col = first_col + @as(u16, @intCast(index)), .row = row };
+                try self.addGlyph(
+                    fonts,
+                    .{ .face_index = glyph.face_index },
+                    glyph.glyph_index,
+                    self.terminalRect(at),
+                    glyph.x_offset_px,
+                    glyph.y_offset_px,
+                    self.inkColor(cells[index]),
+                );
+            }
+            offset += count;
+        }
     }
 
     fn terminalColor(self: *const Grid, color: Rgba) Rgba {
@@ -2027,10 +2196,11 @@ pub const Grid = struct {
 
         var pen_x: f32 = 0;
         var pen_y: f32 = 0;
+        const span: u32 = if (cell.span == .two) font.face_flag_wide else 0;
         for (self.shaped.items) |glyph| {
             try self.addGlyph(
                 fonts,
-                .{ .face_index = glyph.face_index },
+                .{ .face_index = glyph.face_index | span },
                 glyph.glyph_index,
                 rect,
                 pen_x + glyph.x_offset_px,
@@ -2053,15 +2223,17 @@ pub const Grid = struct {
         face_style: font.FaceStyle,
         color: Rgba,
     ) Error!void {
+        // A glyph in a two-cell cell may be fitted to both cells' width.
+        const span: u32 = if (cell.wide) font.face_flag_wide else 0;
         if (cell.grapheme.len == 0) {
             // The common case by a wide margin, and the one where shaping has
-            // nothing to add: one codepoint is already one cluster.
-            const index = fonts.glyphIndexForStyle(face_style, cell.codepoint);
-            if (index == 0) {
+            // nothing to add: one codepoint is already one cluster. The font
+            // manager's fallback chain picks the face, sprites included.
+            const resolved = fonts.resolve(face_style, cell.codepoint) orelse {
                 log.debug("no glyph for U+{X}; the cell keeps its background", .{cell.codepoint});
                 return;
-            }
-            try self.addGlyph(fonts, .{ .style = face_style }, index, rect, 0, 0, color);
+            };
+            try self.addGlyph(fonts, .{ .face_index = resolved.face_index | span }, resolved.glyph_index, rect, 0, 0, color);
             return;
         }
 
@@ -2080,7 +2252,7 @@ pub const Grid = struct {
         for (self.shaped.items) |glyph| {
             try self.addGlyph(
                 fonts,
-                .{ .face_index = glyph.face_index },
+                .{ .face_index = glyph.face_index | span },
                 glyph.glyph_index,
                 rect,
                 glyph.x_offset_px,
@@ -2091,9 +2263,11 @@ pub const Grid = struct {
     }
 
     const GlyphSource = union(enum) {
-        /// A simple codepoint whose glyph index came from this requested style.
+        /// A primary-face glyph index looked up for this requested style.
         style: font.FaceStyle,
-        /// A concrete loaded face chosen by HarfBuzz for a shaped run.
+        /// A concrete face, with its `font.face_flag_*` bits, chosen by the
+        /// fallback chain (`font.Manager.resolve`) or by HarfBuzz for a shaped
+        /// run.
         face_index: u32,
     };
 
@@ -2117,7 +2291,7 @@ pub const Grid = struct {
             log.err("no glyph atlas is attached, so no glyph can be drawn", .{});
             return;
         }
-        const before = fonts.atlas.stats.insertions;
+        const before = fonts.atlas.stats.insertions + fonts.color_atlas.stats.insertions;
         const entry = switch (source) {
             .style => |style| fonts.glyphForStyle(style, glyph_index),
             .face_index => |face_index| fonts.glyphForFace(face_index, glyph_index),
@@ -2127,13 +2301,27 @@ pub const Grid = struct {
             log.debug("glyph {d} could not be rasterised: {s}", .{ glyph_index, @errorName(err) });
             return;
         };
-        self.stats.rasterised += fonts.atlas.stats.insertions - before;
+        self.stats.rasterised += fonts.atlas.stats.insertions + fonts.color_atlas.stats.insertions - before;
         // A space rasterises to nothing, which is not a glyph to draw.
         if (entry.rect.isEmpty()) return;
 
         var placed = glyphRect(rect, self.baseline_px, entry);
         placed.x += @round(x_offset);
         placed.y += @round(y_offset);
+        if (entry.color) {
+            // Colour glyphs keep their own colours; only the ink's alpha
+            // reaches them, so a dimmed pane or faint text still fades them.
+            try self.color_glyphs.append(self.allocator, .{
+                .rect = .{ placed.x, placed.y, placed.width, placed.height },
+                .uv = uvOf(entry.rect, .{
+                    .width_px = fonts.color_atlas.width_px,
+                    .height_px = fonts.color_atlas.height_px,
+                }),
+                .color = color.toFloats(),
+            });
+            self.stats.glyphs += 1;
+            return;
+        }
         try self.glyphs.append(self.allocator, .{
             .rect = .{ placed.x, placed.y, placed.width, placed.height },
             .uv = uvOf(entry.rect, self.atlas),
@@ -2148,6 +2336,7 @@ pub const Grid = struct {
     /// a flag this module sets, because eviction moves pixels too and a glyph
     /// that was already in the atlas moves none.
     fn uploadAtlas(self: *Grid, fonts: *font.Manager) void {
+        self.uploadColorAtlas(fonts);
         const epoch = fonts.atlas.stats.insertions + fonts.atlas.stats.evictions;
         if (epoch == self.atlas_epoch or self.atlas.width_px == 0) return;
         const pixels = fonts.atlasPixels();
@@ -2182,6 +2371,69 @@ pub const Grid = struct {
         self.stats.atlas_bytes += wanted;
     }
 
+    /// Send new colour glyphs to the GPU, creating the RGBA texture the first
+    /// time there are any. A grid whose manager never rasterised a colour
+    /// glyph creates no texture and uploads nothing.
+    fn uploadColorAtlas(self: *Grid, fonts: *font.Manager) void {
+        const source = &fonts.color_atlas;
+        const epoch = source.stats.insertions + source.stats.evictions;
+        if (epoch == self.color_epoch) return;
+        if (epoch == 0 and self.color_texture == 0) {
+            self.color_epoch = 0;
+            return;
+        }
+        const size = AtlasSize{ .width_px = source.width_px, .height_px = source.height_px };
+        const wanted = @as(usize, size.width_px) * size.height_px * 4;
+        if (source.depth != 4 or source.pixels.len < wanted) {
+            log.err("colour atlas holds {d} bytes, the {d}x{d} texture needs {d}", .{
+                source.pixels.len,
+                size.width_px,
+                size.height_px,
+                wanted,
+            });
+            return;
+        }
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        if (self.color_texture == 0 or !std.meta.eql(size, self.color_atlas)) {
+            if (self.color_texture == 0) gl.genTextures(1, &self.color_texture);
+            gl.bindTexture(gl.TEXTURE_2D, self.color_texture);
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                gl.RGBA8,
+                @intCast(size.width_px),
+                @intCast(size.height_px),
+                0,
+                gl.RGBA,
+                gl.UNSIGNED_BYTE,
+                source.pixels.ptr,
+            );
+            // Colour glyphs are scaled to their exact pixel size on the CPU,
+            // so they are sampled texel for texel like coverage glyphs.
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            self.color_atlas = size;
+        } else {
+            gl.bindTexture(gl.TEXTURE_2D, self.color_texture);
+            gl.texSubImage2D(
+                gl.TEXTURE_2D,
+                0,
+                0,
+                0,
+                @intCast(size.width_px),
+                @intCast(size.height_px),
+                gl.RGBA,
+                gl.UNSIGNED_BYTE,
+                source.pixels.ptr,
+            );
+        }
+        self.color_epoch = epoch;
+        self.stats.atlas_uploads += 1;
+        self.stats.atlas_bytes += wanted;
+    }
+
     fn drawSolidPass(self: *Grid, surface: *const Surface) Error!void {
         if (self.solids.items.len == 0) return;
         gl.disable(gl.BLEND);
@@ -2205,10 +2457,32 @@ pub const Grid = struct {
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, self.atlas_texture);
         gl.uniform1i(self.glyph_pipeline.atlas_uniform, 0);
+        gl.uniform1i(self.glyph_pipeline.color_mode_uniform, 0);
         gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, @intCast(self.glyphs.items.len));
         gl.disable(gl.BLEND);
         self.stats.draws += 1;
         try checkGl("grid glyph pass");
+    }
+
+    /// Draw the colour glyphs over the coverage glyphs: the same program and
+    /// instance layout, sampling the RGBA atlas and blending premultiplied.
+    fn drawColorGlyphPass(self: *Grid, surface: *const Surface) Error!void {
+        if (self.color_glyphs.items.len == 0 or self.color_texture == 0) return;
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        gl.useProgram(self.glyph_pipeline.program);
+        gl.bindVertexArray(self.glyph_pipeline.vao);
+        setViewport(surface, self.glyph_pipeline);
+        self.upload(&self.glyph_pipeline, std.mem.sliceAsBytes(self.color_glyphs.items));
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, self.color_texture);
+        gl.uniform1i(self.glyph_pipeline.atlas_uniform, 0);
+        gl.uniform1i(self.glyph_pipeline.color_mode_uniform, 1);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, @intCast(self.color_glyphs.items.len));
+        gl.uniform1i(self.glyph_pipeline.color_mode_uniform, 0);
+        gl.disable(gl.BLEND);
+        self.stats.draws += 1;
+        try checkGl("grid colour glyph pass");
     }
 
     /// The cursor, painted over the cell it is on. Opaque, so it is drawn with
@@ -2433,6 +2707,7 @@ fn createGlyphPipeline() GlError!Pipeline {
         .vbo = vbo,
         .viewport_uniform = gl.getUniformLocation(program, "u_viewport"),
         .atlas_uniform = gl.getUniformLocation(program, "u_atlas"),
+        .color_mode_uniform = gl.getUniformLocation(program, "u_color_mode"),
     };
 }
 
@@ -2835,6 +3110,8 @@ test "conceal queues the background but no decorations or glyphs" {
     };
     defer grid.solids.deinit(testing.allocator);
     defer grid.glyphs.deinit(testing.allocator);
+    defer grid.color_glyphs.deinit(testing.allocator);
+    defer grid.row_cells.deinit(testing.allocator);
 
     // The font manager is never touched for a concealed cell. Passing the
     // uninitialised value makes the ordering part of the test: moving conceal
@@ -2856,7 +3133,7 @@ test "conceal queues the background but no decorations or glyphs" {
                 .overline = true,
             },
         },
-    }, .{ .col = 0, .row = 0 });
+    }, .{ .col = 0, .row = 0 }, true);
 
     try testing.expectEqual(@as(usize, 1), grid.solids.items.len);
     try testing.expectEqual(@as(usize, 0), grid.glyphs.items.len);
@@ -3046,6 +3323,8 @@ test "pane staging applies two-axis origin and inactive colour to terminal cells
     };
     defer grid.solids.deinit(testing.allocator);
     defer grid.glyphs.deinit(testing.allocator);
+    defer grid.color_glyphs.deinit(testing.allocator);
+    defer grid.row_cells.deinit(testing.allocator);
 
     var unused_fonts: font.Manager = undefined;
     const cell_background = Rgba{ .r = 240, .g = 120, .b = 8 };
@@ -3059,7 +3338,7 @@ test "pane staging applies two-axis origin and inactive colour to terminal cells
             .g = cell_background.g,
             .b = cell_background.b,
         } } },
-    }, .{ .col = 2, .row = 1 });
+    }, .{ .col = 2, .row = 1 }, true);
 
     try testing.expectEqual(@as(usize, 1), grid.solids.items.len);
     try testing.expectEqual([4]f32{ 40, 51, 8, 17 }, grid.solids.items[0].rect);
@@ -3103,6 +3382,8 @@ test "terminal origin shifts cell backgrounds and decorations together" {
     };
     defer grid.solids.deinit(testing.allocator);
     defer grid.glyphs.deinit(testing.allocator);
+    defer grid.color_glyphs.deinit(testing.allocator);
+    defer grid.row_cells.deinit(testing.allocator);
 
     var unused_fonts: font.Manager = undefined;
     try grid.addCell(&unused_fonts, .{
@@ -3117,7 +3398,7 @@ test "terminal origin shifts cell backgrounds and decorations together" {
                 .overline = true,
             },
         },
-    }, .{ .col = 1, .row = 0 });
+    }, .{ .col = 1, .row = 0 }, true);
 
     try testing.expectEqual(@as(usize, 4), grid.solids.items.len);
     for (grid.solids.items) |solid| {
@@ -3139,6 +3420,8 @@ test "changing terminal origin invalidates once and reserves the full overlay wi
     };
     defer grid.solids.deinit(testing.allocator);
     defer grid.glyphs.deinit(testing.allocator);
+    defer grid.color_glyphs.deinit(testing.allocator);
+    defer grid.row_cells.deinit(testing.allocator);
     defer grid.ranges.deinit(testing.allocator);
     defer grid.shaped.deinit(testing.allocator);
 
@@ -3286,6 +3569,8 @@ test "full canvas overlay preparation retains storage and unchanged frames do no
     };
     defer grid.solids.deinit(testing.allocator);
     defer grid.glyphs.deinit(testing.allocator);
+    defer grid.color_glyphs.deinit(testing.allocator);
+    defer grid.row_cells.deinit(testing.allocator);
     defer grid.ranges.deinit(testing.allocator);
     defer grid.shaped.deinit(testing.allocator);
 
@@ -3344,6 +3629,8 @@ test "full canvas overlay staging stays absolute for a nonzero pane origin" {
     };
     defer grid.solids.deinit(testing.allocator);
     defer grid.glyphs.deinit(testing.allocator);
+    defer grid.color_glyphs.deinit(testing.allocator);
+    defer grid.row_cells.deinit(testing.allocator);
     defer grid.ranges.deinit(testing.allocator);
     defer grid.shaped.deinit(testing.allocator);
 
@@ -3757,4 +4044,138 @@ test "a cursor that blinks or is un-hidden repaints its own row, and an idle fra
 
     frame = try state.frame(cellRect(0, 1, cell), 1, true, allocator);
     try testing.expectEqual(@as(usize, 0), frame.rows);
+}
+
+fn textCell(codepoint: u21) term.Cell {
+    return .{ .codepoint = codepoint, .grapheme = &.{}, .wide = false, .wide_tail = false };
+}
+
+/// A grid that stages glyphs without a GL context: `addCell` and `addGlyph`
+/// only need an atlas size to compute texture coordinates.
+fn stagingGrid(metrics: font.Metrics) Grid {
+    return .{
+        .allocator = std.testing.allocator,
+        .colors = .{ .ansi = @splat(.{ .r = 0, .g = 0, .b = 0 }) },
+        .solid = undefined,
+        .cursor_pipeline = undefined,
+        .glyph_pipeline = undefined,
+        .atlas = .{ .width_px = 1024, .height_px = 1024 },
+        .cell = metrics.cell,
+        .baseline_px = metrics.baseline_px,
+        .ascent_px = metrics.ascent_px,
+    };
+}
+
+fn freeStaging(grid: *Grid) void {
+    grid.solids.deinit(std.testing.allocator);
+    grid.glyphs.deinit(std.testing.allocator);
+    grid.color_glyphs.deinit(std.testing.allocator);
+    grid.shaped.deinit(std.testing.allocator);
+    grid.row_cells.deinit(std.testing.allocator);
+}
+
+test "ligature runs are maximal same-style ASCII and need a punctuation trigger" {
+    const testing = std.testing;
+    var cells = [_]term.Cell{ textCell('a'), textCell('='), textCell('>'), textCell(' '), textCell('b'), textCell('c') };
+    try testing.expectEqual(@as(usize, 3), ligatureRunEnd(&cells, 0));
+    try testing.expect(runHasLigatureTrigger(cells[0..3]));
+    try testing.expectEqual(@as(usize, 4), ligatureRunEnd(&cells, 3));
+    try testing.expectEqual(@as(usize, 6), ligatureRunEnd(&cells, 4));
+    try testing.expect(!runHasLigatureTrigger(cells[4..6]));
+
+    // A style change ends the run, and so do wide, combined and concealed cells.
+    cells[2].style.attributes.bold = true;
+    try testing.expectEqual(@as(usize, 2), ligatureRunEnd(&cells, 0));
+    var wide = textCell(0x4E2D);
+    wide.wide = true;
+    try testing.expect(!ligatureCandidate(wide));
+    var hidden = textCell('=');
+    hidden.style.attributes.invisible = true;
+    try testing.expect(!ligatureCandidate(hidden));
+    try testing.expect(!ligatureCandidate(textCell(' ')));
+}
+
+test "a ligature run draws the font's ligature, and toggling ligatures off draws the plain glyphs" {
+    const testing = std.testing;
+    var fonts = try font.Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try font.Size.init(14, 1.0),
+        .system_fallback = false,
+    });
+    defer fonts.deinit();
+    var grid = stagingGrid(fonts.metrics());
+    defer freeStaging(&grid);
+    try grid.shaped.ensureTotalCapacity(testing.allocator, ligature_run_capacity);
+
+    const cells = [_]term.Cell{ textCell('='), textCell('>') };
+    try grid.addLigatureRun(&fonts, &cells, 0, 0);
+    // JetBrains Mono draws `=>` as an empty spacer in the first cell and one
+    // glyph anchored in the second that reaches back over the first.
+    try testing.expectEqual(@as(usize, 1), grid.glyphs.items.len);
+    const second_cell_x: f32 = @floatFromInt(fonts.metrics().cell.width_px);
+    try testing.expect(grid.glyphs.items[0].rect[0] < second_cell_x);
+    try testing.expect(grid.glyphs.items[0].rect[2] > second_cell_x);
+
+    // Off: each cell's own glyph, which is what the per-cell path draws too.
+    grid.glyphs.clearRetainingCapacity();
+    fonts.setLigatures(false);
+    try grid.addLigatureRun(&fonts, &cells, 0, 0);
+    try testing.expectEqual(@as(usize, 2), grid.glyphs.items.len);
+    try testing.expect(grid.glyphs.items[1].rect[0] >= second_cell_x);
+}
+
+test "box drawing and Powerline cells are sprites that cover their cell exactly" {
+    const testing = std.testing;
+    var fonts = try font.Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try font.Size.init(14, 1.0),
+        .system_fallback = false,
+    });
+    defer fonts.deinit();
+    var grid = stagingGrid(fonts.metrics());
+    defer freeStaging(&grid);
+
+    const cell = fonts.metrics().cell;
+    for ([_]u21{ 0x2502, 0x2500, 0xE0B0, 0x2588 }, 0..) |codepoint, col| {
+        grid.glyphs.clearRetainingCapacity();
+        try grid.addCell(&fonts, textCell(codepoint), .{ .col = @intCast(col), .row = 1 }, true);
+        try testing.expectEqual(@as(usize, 1), grid.glyphs.items.len);
+        const expected = cellRect(@intCast(col), 1, cell);
+        try testing.expectEqual(
+            [4]f32{ expected.x, expected.y, expected.width, expected.height },
+            grid.glyphs.items[0].rect,
+        );
+    }
+}
+
+test "a colour emoji is queued for the colour pass and a wide fallback glyph spans its cells" {
+    const testing = std.testing;
+    var fonts = try font.Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try font.Size.init(14, 1.0),
+    });
+    defer fonts.deinit();
+    var grid = stagingGrid(fonts.metrics());
+    defer freeStaging(&grid);
+    const cell = fonts.metrics().cell;
+
+    if (fonts.resolve(.regular, 0x1F600)) |hit| if (fonts.isColor(hit.face_index)) {
+        var emoji = textCell(0x1F600);
+        emoji.wide = true;
+        try grid.addCell(&fonts, emoji, .{ .col = 0, .row = 0 }, true);
+        try testing.expectEqual(@as(usize, 1), grid.color_glyphs.items.len);
+        try testing.expectEqual(@as(usize, 0), grid.glyphs.items.len);
+        const rect = grid.color_glyphs.items[0].rect;
+        try testing.expect(rect[0] >= 0 and rect[0] + rect[2] <= @as(f32, @floatFromInt(2 * cell.width_px)));
+        try testing.expect(rect[1] >= 0 and rect[1] + rect[3] <= @as(f32, @floatFromInt(cell.height_px)));
+    };
+
+    if (fonts.resolve(.regular, 0x4E2D) != null) {
+        var ideograph = textCell(0x4E2D);
+        ideograph.wide = true;
+        grid.glyphs.clearRetainingCapacity();
+        try grid.addCell(&fonts, ideograph, .{ .col = 0, .row = 0 }, true);
+        try testing.expectEqual(@as(usize, 1), grid.glyphs.items.len);
+        try testing.expect(grid.glyphs.items[0].rect[2] > @as(f32, @floatFromInt(cell.width_px)));
+    }
 }
