@@ -1713,12 +1713,13 @@ pub fn spawnConPty(gpa: Allocator, request: SpawnRequest) Error!Pty {
 
     // The pseudoconsole reads the input pipe Conduit writes and writes the output pipe Conduit
     // reads. Only the output side is overlapped: a blocking read on it has to be something the
-    // read thread can be woken out of, and an OVERLAPPED is the only such read Windows has. A write
-    // to the input side is bounded by the terminal's own input buffer, exactly as a write to a
-    // POSIX pty master is, so it needs no completion to wait for.
-    var output = try win.createPipe(true);
+    // read thread can be woken out of, and an OVERLAPPED is the only such read Windows has, which
+    // is also why it is a named pipe (an anonymous pipe is never opened for overlapped IO). A
+    // write to the input side is bounded by the terminal's own input buffer, exactly as a write to
+    // a POSIX pty master is, so it needs no completion to wait for.
+    var output = try win.createOutputPipe();
     errdefer output.close();
-    var input = try win.createPipe(false);
+    var input = try win.createInputPipe();
     errdefer input.close();
 
     var console = try win.createPseudoConsole(request.size, output.conpty, input.conpty);
@@ -1747,6 +1748,8 @@ pub fn spawnConPty(gpa: Allocator, request: SpawnRequest) Error!Pty {
         .owner_wake = invalid_handle,
         .stop = invalid_handle,
         .reader = null,
+        .watcher = null,
+        .console_lock = .{},
         .queue = undefined,
         .stopping = .init(false),
         .end = .init(EndWord.running),
@@ -1778,13 +1781,16 @@ pub fn spawnConPty(gpa: Allocator, request: SpawnRequest) Error!Pty {
 
     pty.reader = std.Thread.spawn(.{}, ConPty.readThread, .{pty}) catch |err| {
         log.err("cannot start the read thread: {s}", .{@errorName(err)});
-        // A failed spawn must not leave a process behind, and closing a process handle does not end
-        // one: the child is ended here, and the `defer` above releases the handles afterwards.
-        if (!win.terminateProcess(pty.child, terminationCode(.kill))) {
-            log.warn("cannot end the child of a terminal that never started: {s}", .{
-                @tagName(win.lastError()),
-            });
-        }
+        pty.abandonChild();
+        return error.SpawnFailed;
+    };
+    pty.watcher = std.Thread.spawn(.{}, ConPty.watchThread, .{pty}) catch |err| {
+        log.err("cannot start the exit watcher: {s}", .{@errorName(err)});
+        pty.abandonChild();
+        pty.stopping.store(true, .release);
+        _ = win.setEvent(pty.stop);
+        if (pty.reader) |thread| thread.join();
+        pty.reader = null;
         return error.SpawnFailed;
     };
 
@@ -1805,10 +1811,13 @@ pub fn spawnConPty(gpa: Allocator, request: SpawnRequest) Error!Pty {
 /// which is what makes a second call harmless rather than a double close of a handle the OS may
 /// already have given to somebody else.
 fn releaseHandles(self: *ConPty) void {
+    // Conduit's end of the output pipe goes first. Before Windows 11 24H2 `ClosePseudoConsole`
+    // waits until the pseudoconsole has exited, and a pseudoconsole still writing its last frame
+    // into a pipe nobody reads never does; with the pipe broken that write fails at once instead.
+    win.closeHandle(self.output);
+    win.closeHandle(self.input);
     win.closePseudoConsole(self.console);
     win.closeHandle(self.child);
-    win.closeHandle(self.input);
-    win.closeHandle(self.output);
     win.closeHandle(self.read_done);
     win.closeHandle(self.space);
     win.closeHandle(self.owner_wake);
@@ -1823,8 +1832,8 @@ fn releaseHandles(self: *ConPty) void {
     self.stop = invalid_handle;
 }
 
-/// One live terminal on Windows: a pseudoconsole, a child, four events, a byte ring and a read
-/// thread.
+/// One live terminal on Windows: a pseudoconsole, a child, four events, a byte ring, a read thread
+/// and an exit watcher.
 const ConPty = struct {
     /// Bytes the read thread may hold for the owner. A full ring stops the reader, which lets the
     /// pseudoconsole's output fill and the child block — the same backpressure, from the same
@@ -1835,9 +1844,11 @@ const ConPty = struct {
     /// request is answered; long enough to cost nothing.
     const reap_interval_ms = 20;
 
-    /// How many handles a live terminal holds, apart from its read thread's own: the child, the two
-    /// pipe ends, and four events.
-    const handle_count = 7;
+    /// How long the read thread keeps reading a terminal whose child has ended without hearing
+    /// anything. Closing the pseudoconsole is what normally ends the read, by breaking the pipe
+    /// once the pseudoconsole has written its last frame; this only bounds a pseudoconsole that
+    /// is kept alive by a process Conduit did not start, so a session's end cannot be held open.
+    const final_quiet_ms = 2_000;
 
     gpa: Allocator,
     /// The end Conduit writes into the pseudoconsole.
@@ -1861,6 +1872,15 @@ const ConPty = struct {
     /// Set once, by `destroy`, to stop the read thread wherever it is waiting.
     stop: win.HANDLE,
     reader: ?std.Thread,
+    /// Waits for the child to end and then closes the pseudoconsole, which is what makes the
+    /// pseudoconsole flush its last frame and break the output pipe. It is a thread of its own
+    /// because the read thread must keep draining while the close runs: before Windows 11 24H2
+    /// `ClosePseudoConsole` waits for the pseudoconsole to exit, and Microsoft documents that it
+    /// must not be called on the thread reading the output.
+    watcher: ?std.Thread,
+    /// Guards `console` between the owner's resize and the watcher's close, so a resize never
+    /// reaches a pseudoconsole that has been closed under it.
+    console_lock: win.SrwLock,
     queue: ByteRing,
     stopping: std.atomic.Value(bool),
     /// The child's end. Written once, by the read thread, and read by everybody.
@@ -1885,6 +1905,33 @@ const ConPty = struct {
         overlapped.event = self.read_done;
         self.pump(&buffer, &overlapped);
         self.publishEnd();
+    }
+
+    /// The body of the exit watcher: once the child has ended, close the pseudoconsole so its last
+    /// frame is flushed and the output pipe breaks, which is what ends the read thread's drain.
+    fn watchThread(self: *ConPty) void {
+        var handles = [2]win.HANDLE{ self.child, self.stop };
+        if (win.waitOn(&handles, null) != 0) return;
+        self.closeConsole();
+    }
+
+    /// Close the pseudoconsole once, under the lock the owner's resize takes.
+    fn closeConsole(self: *ConPty) void {
+        win.acquireLock(&self.console_lock);
+        defer win.releaseLock(&self.console_lock);
+        win.closePseudoConsole(self.console);
+        self.console = null;
+    }
+
+    /// End the child of a terminal whose spawn failed after the child started. Closing a process
+    /// handle does not end a process, so a failed spawn ends it here and the caller's `defer`
+    /// releases the handles afterwards.
+    fn abandonChild(self: *ConPty) void {
+        if (!win.terminateProcess(self.child, terminationCode(.kill))) {
+            log.warn("cannot end the child of a terminal that never started: {s}", .{
+                @tagName(win.lastError()),
+            });
+        }
     }
 
     /// What one read of the terminal produced.
@@ -1956,7 +2003,7 @@ const ConPty = struct {
 
         var handles = [3]win.HANDLE{ self.read_done, self.stop, self.child };
         const waiting = if (child_ended) handles[0..2] else handles[0..3];
-        const outcome: ReadOutcome = switch (win.waitOn(waiting, if (child_ended) reap_interval_ms else null)) {
+        const outcome: ReadOutcome = switch (win.waitOn(waiting, if (child_ended) final_quiet_ms else null)) {
             0 => .bytes,
             1 => .stopping,
             2 => .child_ended,
@@ -2105,6 +2152,11 @@ const ConPty = struct {
     /// sees as a resize, and what it is told about as a window size change.
     fn resizeConsole(self: *ConPty, size: WindowSize) Error!void {
         if (self.finished()) return error.Closed;
+        win.acquireLock(&self.console_lock);
+        defer win.releaseLock(&self.console_lock);
+        // The watcher closes the pseudoconsole as soon as the child ends, which can be before the
+        // read thread has published that end.
+        if (self.console == null) return error.Closed;
         return win.resizePseudoConsole(self.console, size);
     }
 };
@@ -2168,6 +2220,7 @@ fn conDestroy(ptr: *anyopaque) void {
     // for the child — so joining it is a deadline rather than a hope.
     _ = win.setEvent(self.stop);
     if (self.reader) |thread| thread.join();
+    if (self.watcher) |thread| thread.join();
     releaseHandles(self);
     self.queue.destroy(self.gpa);
     self.gpa.destroy(self);
@@ -2425,7 +2478,7 @@ fn duplicateWide(gpa: Allocator, wide: []const u16) Allocator.Error![:0]u16 {
     return ownedTerminator(owned);
 }
 
-/// One anonymous pipe and its two ends.
+/// One pipe and its two ends.
 ///
 /// `conduit` is the end this backend uses and `conpty` the end `CreatePseudoConsole` is given.
 /// Closing a handle leaves `INVALID_HANDLE_VALUE` behind, so `close` on a pipe whose end has
@@ -2498,10 +2551,27 @@ const win = struct {
     const wait_failed: DWORD = 0xffffffff;
     const infinite: DWORD = 0xffffffff;
 
-    /// `PIPE_ACCESS_DUPLEX`, `FILE_FLAG_OVERLAPPED` and `HANDLE_FLAG_INHERIT`, from winbase.h.
-    const pipe_access_duplex: DWORD = 0x00000003;
+    /// `PIPE_ACCESS_INBOUND`, `FILE_FLAG_OVERLAPPED`, `FILE_FLAG_FIRST_PIPE_INSTANCE` and
+    /// `HANDLE_FLAG_INHERIT`, from winbase.h; `PIPE_REJECT_REMOTE_CLIENTS` (with the zero-valued
+    /// `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT`) from namedpipeapi.h's companion winbase.h.
+    const pipe_access_inbound: DWORD = 0x00000001;
     const file_flag_overlapped: DWORD = 0x40000000;
+    const file_flag_first_pipe_instance: DWORD = 0x00080000;
+    const pipe_reject_remote_clients: DWORD = 0x00000008;
     const handle_flag_inherit: DWORD = 0x00000001;
+
+    /// `GENERIC_WRITE`, `OPEN_EXISTING` and `FILE_ATTRIBUTE_NORMAL`, for the pseudoconsole's end of
+    /// the output pipe.
+    const generic_write: DWORD = 0x40000000;
+    const open_existing: DWORD = 3;
+    const file_attribute_normal: DWORD = 0x00000080;
+
+    /// How many bytes the output pipe buffers. A screenful of rendered VT is a few kilobytes, so
+    /// this is room for several frames before the pseudoconsole has to wait for the read thread.
+    const output_pipe_buffer: DWORD = 64 * 1024;
+
+    /// `STARTF_USESTDHANDLES`, from processthreadsapi.h.
+    const startf_usestdhandles: DWORD = 0x00000100;
 
     /// `EXTENDED_STARTUPINFO_PRESENT`, which is what tells `CreateProcessW` that the startup
     /// information is a `STARTUPINFOEXW` with an attribute list behind it, and
@@ -2595,6 +2665,37 @@ const win = struct {
 
     extern "kernel32" fn SetHandleInformation(handle: HANDLE, mask: DWORD, flags: DWORD) callconv(.winapi) BOOL;
 
+    // Declared exactly as `platform` declares them, because both modules link into one binary.
+    extern "kernel32" fn CreateNamedPipeW(
+        name: windows.LPCWSTR,
+        open_mode: DWORD,
+        pipe_mode: DWORD,
+        max_instances: DWORD,
+        out_buffer_size: DWORD,
+        in_buffer_size: DWORD,
+        default_timeout_ms: DWORD,
+        attributes: *windows.SECURITY_ATTRIBUTES,
+    ) callconv(.winapi) HANDLE;
+
+    extern "kernel32" fn CreateFileW(
+        name: windows.LPCWSTR,
+        desired_access: DWORD,
+        share_mode: DWORD,
+        attributes: ?*windows.SECURITY_ATTRIBUTES,
+        creation_disposition: DWORD,
+        flags_and_attributes: DWORD,
+        template: ?HANDLE,
+    ) callconv(.winapi) HANDLE;
+
+    // --- The lock between resize and close: synchapi.h -----------------------
+
+    /// `SRWLOCK`: one pointer, zero when unlocked, and never allocated.
+    const SrwLock = windows.SRWLOCK;
+
+    extern "kernel32" fn AcquireSRWLockExclusive(lock: *SrwLock) callconv(.winapi) void;
+
+    extern "kernel32" fn ReleaseSRWLockExclusive(lock: *SrwLock) callconv(.winapi) void;
+
     extern "kernel32" fn ReadFile(
         handle: HANDLE,
         buffer: [*]u8,
@@ -2681,8 +2782,8 @@ const win = struct {
     };
 
     /// `STARTUPINFOEXW`, from winbase.h: a `STARTUPINFOW` with the attribute list behind it. The
-    /// child is attached to the pseudoconsole by what that list carries rather than by any
-    /// `STARTUPINFOW` field, so nothing in it is set but the structure's size.
+    /// child is attached to the pseudoconsole by what that list carries; the only `STARTUPINFOW`
+    /// fields set are the size and the flag that stops redirected handles being inherited.
     const StartupInfoExW = extern struct {
         startup_info: windows.STARTUPINFOW,
         attribute_list: ?*anyopaque,
@@ -2724,21 +2825,24 @@ const win = struct {
         ClosePseudoConsole(console);
     }
 
-    /// One anonymous pipe with neither end inheritable, so nothing Conduit starts inherits a
-    /// terminal handle by accident.
-    ///
-    /// `overlapped` decides how this backend reads or writes it. The output side is overlapped,
-    /// because a blocking read on it has to be something another handle can wake, and an
-    /// `OVERLAPPED` is the only such read Windows has. The input side is not, because a write to it
-    /// is bounded by the terminal's own input buffer and needs no completion to wait for.
-    fn createPipe(overlapped: bool) Error!WindowsPipe {
+    fn acquireLock(lock: *SrwLock) void {
+        AcquireSRWLockExclusive(lock);
+    }
+
+    fn releaseLock(lock: *SrwLock) void {
+        ReleaseSRWLockExclusive(lock);
+    }
+
+    /// The input pipe: the pseudoconsole reads it and Conduit writes it, so the pseudoconsole is
+    /// given the read end and Conduit keeps the write end. Neither end is inheritable, so nothing
+    /// Conduit starts inherits a terminal handle by accident. It is not overlapped, because a write
+    /// to it is bounded by the terminal's own input buffer and needs no completion to wait for.
+    fn createInputPipe() Error!WindowsPipe {
         var pipe: WindowsPipe = .{};
         errdefer pipe.close();
-
-        var mode: DWORD = pipe_access_duplex;
-        if (overlapped) mode |= file_flag_overlapped;
-        if (CreatePipe(&pipe.conduit, &pipe.conpty, null, 0) == .FALSE) {
-            return failure("create a pipe", "CreatePipe");
+        // `CreatePipe` hands back the read end first and the write end second.
+        if (CreatePipe(&pipe.conpty, &pipe.conduit, null, 0) == .FALSE) {
+            return failure("create the terminal's input pipe", "CreatePipe");
         }
         if (SetHandleInformation(pipe.conduit, handle_flag_inherit, 0) == .FALSE or
             SetHandleInformation(pipe.conpty, handle_flag_inherit, 0) == .FALSE)
@@ -2746,6 +2850,65 @@ const win = struct {
             return failure("mark a pipe end non-inheritable", "SetHandleInformation");
         }
         return pipe;
+    }
+
+    /// Distinguishes the output pipes of one process's terminals. The name only has to be unique
+    /// for the instant between creating the pipe and opening its other end; the process id keeps
+    /// two Conduits apart and `FILE_FLAG_FIRST_PIPE_INSTANCE` refuses a name anybody else holds.
+    var output_pipe_serial: std.atomic.Value(u32) = .init(0);
+
+    /// The output pipe: the pseudoconsole writes it and Conduit reads it, through an `OVERLAPPED`
+    /// so the read thread can be woken out of a read that has not completed.
+    ///
+    /// `CreatePipe` makes anonymous pipes that cannot be read with overlapped IO (a read through
+    /// one blocks no matter what is passed), so this is a one-instance, local-only named pipe
+    /// whose server end is Conduit's overlapped, inbound read end and whose client end, opened
+    /// write-only without `FILE_FLAG_OVERLAPPED`, is the pseudoconsole's.
+    fn createOutputPipe() Error!WindowsPipe {
+        var pipe: WindowsPipe = .{};
+        errdefer pipe.close();
+
+        var attributes: windows.SECURITY_ATTRIBUTES = .{
+            .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = null,
+            .bInheritHandle = .FALSE,
+        };
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            var text: [96]u8 = undefined;
+            const name = std.fmt.bufPrint(&text, "\\\\.\\pipe\\conduit-pty-{d}-{d}-{d}", .{
+                windows.GetCurrentProcessId(),
+                output_pipe_serial.fetchAdd(1, .monotonic),
+                GetTickCount64(),
+            }) catch unreachable; // 96 bytes holds the prefix and three decimal integers.
+            var wide: [96:0]u16 = undefined;
+            const len = std.unicode.utf8ToUtf16Le(&wide, name) catch unreachable; // ASCII.
+            wide[len] = 0;
+
+            pipe.conduit = CreateNamedPipeW(
+                &wide,
+                pipe_access_inbound | file_flag_overlapped | file_flag_first_pipe_instance,
+                pipe_reject_remote_clients,
+                1,
+                0,
+                output_pipe_buffer,
+                0,
+                &attributes,
+            );
+            if (pipe.conduit != closed_handle) {
+                pipe.conpty = CreateFileW(&wide, generic_write, 0, &attributes, open_existing, file_attribute_normal, null);
+                if (pipe.conpty == closed_handle) {
+                    return failure("open the terminal's output pipe", "CreateFileW");
+                }
+                return pipe;
+            }
+            // Somebody else holds this name. Another name is one serial away; a pipe that cannot be
+            // created under any of a handful of names is a real failure.
+            const err = lastError();
+            if ((err != .ACCESS_DENIED and err != .PIPE_BUSY) or attempt >= 8) {
+                return failure("create the terminal's output pipe", "CreateNamedPipeW");
+            }
+        }
     }
 
     /// Create a pseudoconsole `size` cells big, reading `input` and writing `output`.
@@ -2805,6 +2968,14 @@ const win = struct {
         // it: this is how `CreateProcessW` knows an attribute list follows.
         startup.startup_info.cb = @sizeOf(StartupInfoExW);
         startup.attribute_list = attributes.ptr;
+        // Without this a console child of a Conduit whose own standard handles are redirected (a
+        // pipe, a file, a CI log) is handed those handles instead of the pseudoconsole's and
+        // writes past the terminal entirely. Null handles with the flag set make the child take
+        // its standard handles from the console it is attached to, which is the pseudoconsole.
+        startup.startup_info.dwFlags = startf_usestdhandles;
+        startup.startup_info.hStdInput = null;
+        startup.startup_info.hStdOutput = null;
+        startup.startup_info.hStdError = null;
 
         var info: windows.PROCESS.INFORMATION = undefined;
         const started = CreateProcessW(
@@ -3314,8 +3485,9 @@ const test_cwd = "/";
 /// what a test reads back.
 const shell_argv = [_][]const u8{ "/bin/sh", "-s" };
 
-/// How long a test waits for a terminal to say something before calling it a failure.
-const test_timeout_ms = 5_000;
+/// How long a test waits for a terminal to say something before calling it a failure. Windows gets
+/// longer: a cold Windows PowerShell on a hosted runner takes several seconds to print anything.
+const test_timeout_ms = if (builtin.os.tag == .windows) 30_000 else 5_000;
 
 /// How long one wait lasts. Short enough that a failure is reported promptly, long enough that a
 /// loaded machine does not lose a race with its own process.
@@ -3735,8 +3907,9 @@ test "a Windows terminal runs what the owner writes, through the pseudoconsole" 
     defer pty.destroy();
 
     // The marker is assembled by the shell rather than typed literally, so the only place it can
-    // appear is the shell's own output and not the line the terminal echoes back.
-    try writeAll(pty, "set conduit=marker\r\necho conduit-pty-%conduit%\r\n");
+    // appear is the shell's own output and not the line the terminal echoes back. Enter is a
+    // carriage return, which is what a terminal sends for it; a line feed is a different key.
+    try writeAll(pty, "set conduit=marker\recho conduit-pty-%conduit%\r");
     const output = try readUntil(gpa, pty, "conduit-pty-marker");
     defer gpa.free(output);
 
@@ -3753,25 +3926,49 @@ test "a resize reaches the Windows pseudoconsole and the child is told the new s
     if (!has_conpty_backend) return error.SkipZigTest;
     const gpa = testing.allocator;
 
-    // A program in the terminal asks the console how large it is, which is the only way to see the
-    // pseudoconsole's own size rather than Conduit's belief about it.
+    // A program in the terminal asks the console how large it is, once for every line it is
+    // given, which is the only way to see the pseudoconsole's own size rather than Conduit's
+    // belief about it. Enter alone types nothing, so the size can only appear as the program's
+    // own output.
     const ask = [_][]const u8{
         "powershell.exe",
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "[Console]::WindowWidth.ToString() + 'x' + [Console]::WindowHeight.ToString()",
+        "while ($null -ne [Console]::In.ReadLine()) { 'size=' + [Console]::WindowWidth + 'x' + [Console]::WindowHeight }",
     };
     const pty = try spawnConPty(gpa, windowsRequest(&ask));
     defer pty.destroy();
 
     // The size the terminal started at: 24 rows by 80 columns.
-    const at_start = try readUntil(gpa, pty, "80x24");
+    try writeAll(pty, "\r");
+    const at_start = try readUntil(gpa, pty, "size=80x24");
     defer gpa.free(at_start);
 
     try pty.resize(WindowSize.init(40, 100));
-    const after_resize = try readUntil(gpa, pty, "100x40");
-    defer gpa.free(after_resize);
+
+    // The resize and the next line reach the pseudoconsole through different pipes, so a line
+    // typed at once may be answered before the new size is in place: ask again, at a bounded
+    // pace, until the answer is the new size or the deadline passes.
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+    var buffer: [1024]u8 = undefined;
+    const deadline = testDeadline();
+    var next_ask: u64 = 0;
+    while (std.mem.indexOf(u8, seen.items, "size=100x40") == null) {
+        const now = monotonicMillis();
+        if (now >= deadline) return error.TimedOut;
+        if (now >= next_ask) {
+            try writeAll(pty, "\r");
+            next_ask = now + 500;
+        }
+        const count = pty.takeBytes(&buffer);
+        if (count != 0) {
+            try seen.appendSlice(gpa, buffer[0..count]);
+            continue;
+        }
+        _ = pty.waitReadable(timeLeft(deadline) orelse return error.TimedOut);
+    }
 }
 
 test "a Windows child that exits is reported with the code it exited with" {
@@ -3783,6 +3980,36 @@ test "a Windows child that exits is reported with the code it exited with" {
     defer pty.destroy();
 
     try testing.expectEqual(ChildState{ .exited = .{ .code = 42 } }, try waitForExit(pty));
+}
+
+test "a Windows child's last output arrives before its end is reported" {
+    // The end is published only after the pseudoconsole has been closed and its output drained,
+    // so a program's final line is never lost to the race between its exit and its last frame.
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try spawnConPty(gpa, windowsRequest(&.{ "cmd.exe", "/Q", "/C", "echo conduit-last-words& exit 7" }));
+    defer pty.destroy();
+
+    var collected: std.ArrayList(u8) = .empty;
+    defer collected.deinit(gpa);
+    var buffer: [1024]u8 = undefined;
+    const deadline = testDeadline();
+    const end = while (true) {
+        // The end is read before the ring, so bytes published ahead of it are always collected.
+        const state = pty.state();
+        const count = pty.takeBytes(&buffer);
+        if (count != 0) {
+            try collected.appendSlice(gpa, buffer[0..count]);
+            continue;
+        }
+        switch (state) {
+            .running => {},
+            .exited => break state,
+        }
+        _ = pty.waitReadable(timeLeft(deadline) orelse return error.TimedOut);
+    };
+    try testing.expectEqual(ChildState{ .exited = .{ .code = 7 } }, end);
+    try testing.expect(std.mem.indexOf(u8, collected.items, "conduit-last-words") != null);
 }
 
 test "ending a Windows child is reported, and a collected child is not ended again" {
@@ -3806,17 +4033,20 @@ test "starting and destroying a Windows terminal releases every handle it took" 
     if (!has_conpty_backend) return error.SkipZigTest;
     const gpa = testing.allocator;
 
-    // Measured, not assumed: `GetProcessHandleCount` counts what this process actually holds. The
-    // read thread's own handle is in that count while it is alive and gone once it is joined, which
-    // is why the live figure is one more than the terminal's own handles.
-    const reader_handle: u32 = 1;
+    // Measured, not assumed: `GetProcessHandleCount` counts what this process actually holds,
+    // including the handles a pseudoconsole keeps inside itself, which no Conduit field names.
+    // The first terminal is a warm-up, because the first use of these APIs loads modules and
+    // starts system threads that keep handles for the life of the process; every terminal after
+    // it must give back exactly what it took.
+    const warm_up = try spawnConPty(gpa, windowsRequest(&.{ "cmd.exe", "/Q", "/C", "exit 0" }));
+    _ = try waitForExit(warm_up);
+    warm_up.destroy();
+
     const before = try win.processHandleCount();
     for (0..5) |_| {
         const pty = try spawnConPty(gpa, windowsRequest(&.{ "cmd.exe", "/Q", "/C", "exit 0" }));
-        try testing.expectEqual(
-            before + ConPty.handle_count + reader_handle,
-            try win.processHandleCount(),
-        );
+        // A live terminal holds its child, both pipe ends, four events and two threads at least.
+        try testing.expect(try win.processHandleCount() >= before + 9);
         // The exit code is only ever reported by a wait, so this is also proof the child was
         // collected rather than left behind as a process.
         try testing.expectEqual(ChildState{ .exited = .{ .code = 0 } }, try waitForExit(pty));
