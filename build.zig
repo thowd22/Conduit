@@ -165,6 +165,7 @@ pub fn build(b: *std.Build) !void {
         .dependOn(&e2e_cmd.step);
 
     addTests(b, wired, conduit_test, e2e);
+    try addBenchmarks(b, target, optimize, wired, exe, conduit_test_exe, build_options_module);
 
     if (font_wiring) |wiring| addFontCheck(b, target, optimize, wired[moduleIndex("font")].?, wiring);
 }
@@ -1325,6 +1326,134 @@ fn addTests(
         .root_module = e2e,
     });
     test_step.dependOn(&b.addRunArtifact(e2e_tests).step);
+
+    addBenchTests(b, test_step, wired);
+}
+
+/// The optimisation the benchmarks are built with: ReleaseSafe unless
+/// `-Doptimize` or `--release` asked for a mode explicitly. A Debug Conduit
+/// is never what a budget describes, so a plain `zig build bench` does not
+/// measure one; `-Doptimize=Debug` still does when asked for by name.
+fn benchOptimize(b: *std.Build, optimize: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
+    if (b.user_input_options.contains("optimize") or b.release_mode != .off) return optimize;
+    return .ReleaseSafe;
+}
+
+/// TASK-67: `zig build bench` and `zig build bench-check`.
+///
+/// Each benchmark is its own executable so its process memory is its own; the
+/// `conduit-bench` runner (`bench/runner.zig`) runs them, echoes their JSON
+/// lines, writes `--json=<path>` and, for `bench-check`, enforces
+/// `bench/budgets.zig`. When the benchmark mode differs from the main build's,
+/// the modules, the third-party seams and the app are wired a second time at
+/// that mode, so the startup benchmark launches an optimised `conduit` rather
+/// than the installed Debug one. Nothing here joins the default install.
+fn addBenchmarks(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    wired: WiredModules,
+    exe: *std.Build.Step.Compile,
+    conduit_test_exe: *std.Build.Step.Compile,
+    build_options_module: *std.Build.Module,
+) !void {
+    const bench_optimize = benchOptimize(b, optimize);
+    var bench_wired = wired;
+    var bench_exe = exe;
+    var bench_conduit_test = conduit_test_exe;
+    if (bench_optimize != optimize) {
+        bench_wired = wireConduitModules(b, target, bench_optimize);
+        _ = try wireThirdPartySeams(b, target, bench_optimize, &bench_wired);
+        bench_wired[moduleIndex("version")].?.addImport("build_options", build_options_module);
+        const app = bench_wired[moduleIndex("app")].?;
+        app.addImport("build_options", build_options_module);
+        bench_exe = b.addExecutable(.{ .name = "conduit", .root_module = app });
+
+        const conduit_test = b.createModule(.{
+            .root_source_file = b.path("src/conduit_test.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+        });
+        conduit_test.addImport("platform", bench_wired[moduleIndex("platform")].?);
+        conduit_test.addImport("testdriver", bench_wired[moduleIndex("testdriver")].?);
+        conduit_test.addImport("build_options", build_options_module);
+        bench_conduit_test = b.addExecutable(.{ .name = "conduit-test", .root_module = conduit_test });
+    }
+
+    const zopengl = b.dependency("zopengl", .{}).module("root");
+    const programs = [_]struct { name: []const u8, imports: []const []const u8 }{
+        .{ .name = "throughput", .imports = &.{ "term", "render", "font", "platform" } },
+        .{ .name = "frame", .imports = &.{ "term", "render", "font", "platform" } },
+        .{ .name = "memory", .imports = &.{ "term", "session", "workspace" } },
+        .{ .name = "startup", .imports = &.{} },
+    };
+
+    const runner_module = b.createModule(.{
+        .root_source_file = b.path("bench/runner.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    const runner = b.addExecutable(.{ .name = "conduit-bench", .root_module = runner_module });
+
+    const bench_run = b.addRunArtifact(runner);
+    const check_run = b.addRunArtifact(runner);
+    check_run.addArg("--check");
+    for ([_]*std.Build.Step.Run{ bench_run, check_run }) |run| {
+        // The results depend on the machine and the moment, never only on the
+        // inputs, so the step is never cached.
+        run.has_side_effects = true;
+        run.addPrefixedArtifactArg("--conduit-test=", bench_conduit_test);
+        run.addPrefixedArtifactArg("--conduit=", bench_exe);
+    }
+
+    for (programs) |program| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("bench/{s}.zig", .{program.name})),
+            .target = target,
+            .optimize = bench_optimize,
+            .link_libc = true,
+        });
+        for (program.imports) |name| module.addImport(name, bench_wired[moduleIndex(name)].?);
+        module.addImport("zopengl", zopengl);
+        const program_exe = b.addExecutable(.{
+            .name = b.fmt("conduit-bench-{s}", .{program.name}),
+            .root_module = module,
+        });
+        const prefix = b.fmt("--{s}=", .{program.name});
+        bench_run.addPrefixedArtifactArg(prefix, program_exe);
+        check_run.addPrefixedArtifactArg(prefix, program_exe);
+    }
+    if (b.args) |args| {
+        bench_run.addArgs(args);
+        check_run.addArgs(args);
+    }
+
+    b.step("bench", "Run the throughput, frame, memory and startup benchmarks (ReleaseSafe)")
+        .dependOn(&bench_run.step);
+    b.step("bench-check", "Run the benchmarks and fail when a budget in bench/budgets.zig is breached")
+        .dependOn(&check_run.step);
+}
+
+/// The benchmark helpers' own unit tests join `zig build test`. They need no
+/// display: the GPU helper's test only classifies renderer strings.
+fn addBenchTests(b: *std.Build, test_step: *std.Build.Step, wired: WiredModules) void {
+    const zopengl = b.dependency("zopengl", .{}).module("root");
+    for ([_][]const u8{ "bench/common.zig", "bench/runner.zig", "bench/gpu.zig" }) |source| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = wired[moduleIndex("render")].?.resolved_target,
+            .optimize = wired[moduleIndex("render")].?.optimize,
+            .link_libc = true,
+        });
+        if (std.mem.eql(u8, source, "bench/gpu.zig")) {
+            for ([_][]const u8{ "render", "font", "platform" }) |name| module.addImport(name, wired[moduleIndex(name)].?);
+            module.addImport("zopengl", zopengl);
+        }
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+            .name = b.fmt("bench-{s}-test", .{std.fs.path.stem(source)}),
+            .root_module = module,
+        })).step);
+    }
 }
 
 /// The row of `modules` a module name occupies. Fails the build on a typo in a
