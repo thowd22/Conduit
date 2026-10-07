@@ -1,11 +1,11 @@
 ---
 id: TASK-76
 title: 'Git integration: show the current branch under each tab name'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-07 15:34'
-updated_date: '2026-10-07 20:25'
+updated_date: '2026-10-07 21:02'
 labels: []
 dependencies: []
 priority: medium
@@ -20,13 +20,13 @@ The sidebar lists tabs by name alone, so a user with several tabs in different c
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A tab whose tracked cwd is inside a git work tree shows the current branch name on the row beneath its name; a tab outside a repo shows no branch row and the list reclaims the space
-- [ ] #2 The branch text renders at roughly half the height of the tab-name text in a subdued colour, verified by an inspected screenshot at scale 1 and at a fractional scale
-- [ ] #3 The branch updates after a checkout in that tab (and after the cwd changes to another repo) without restarting Conduit, driven by the real OSC 7 cwd path, with no git subprocess started per frame
-- [ ] #4 Repository and branch resolution goes through the workspace ExecutionContext, so a remote (SSH/WSL) workspace resolves them on the remote side; nothing outside the context implementations reads a local .git
-- [ ] #5 A detached HEAD shows the abbreviated commit, and malformed .git contents never crash or hang the app
-- [ ] #6 The branch is a semantic element with a stable id (child of the tab) so the driver can inspect and wait for it; rename, reorder, close and sidebar resize behave unchanged with two-row tabs
-- [ ] #7 A deterministic Linux check or a zig build e2e scenario creates a real repo, switches branch in the tab and asserts the branch row through the real input path; the UI renderer change is recorded as a Backlog decision; AGENTS.md and docs/architecture.md are updated
+- [x] #1 A tab whose tracked cwd is inside a git work tree shows the current branch name on the row beneath its name; a tab outside a repo shows no branch row and the list reclaims the space
+- [x] #2 The branch text renders at roughly half the height of the tab-name text in a subdued colour, verified by an inspected screenshot at scale 1 and at a fractional scale
+- [x] #3 The branch updates after a checkout in that tab (and after the cwd changes to another repo) without restarting Conduit, driven by the real OSC 7 cwd path, with no git subprocess started per frame
+- [x] #4 Repository and branch resolution goes through the workspace ExecutionContext, so a remote (SSH/WSL) workspace resolves them on the remote side; nothing outside the context implementations reads a local .git
+- [x] #5 A detached HEAD shows the abbreviated commit, and malformed .git contents never crash or hang the app
+- [x] #6 The branch is a semantic element with a stable id (child of the tab) so the driver can inspect and wait for it; rename, reorder, close and sidebar resize behave unchanged with two-row tabs
+- [x] #7 A deterministic Linux check or a zig build e2e scenario creates a real repo, switches branch in the tab and asserts the branch row through the real input path; the UI renderer change is recorded as a Backlog decision; AGENTS.md and docs/architecture.md are updated
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -38,3 +38,15 @@ The sidebar lists tabs by name alone, so a user with several tabs in different c
 4. Sidebar: tab rows become two rows when a branch is known (semantic child element <tab id>.branch), rename/reorder/close/resize unchanged; list limit accounts for it.
 5. Deterministic check (extend --sidebar-test or a new scenario) creating a real repo, switching branches in the tab, asserting the branch row via the real input path; screenshots at scale 1 and 1.25 inspected; docs.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Agent: src/git.zig resolves HEAD only through ExecutionContext statPath/readFile (32-level walk, gitdir: files, 4 KiB HEAD, validated names); app refreshes per session on OSC 7, OSC 133 prompt, reset and a Local-only watch, each as a git.Lookup worker; ui.TextStyle.small via a second font.Manager at 0.6 pt (decision-10); branch row workspace.<k>.tab.<n>.branch in muted; --git-test with two real repos; e2e sidebar-branch (14 scenarios). Coordinator 2026-10-07: merged as 77201ce; local gate green on every check and all 14 scenarios (the one unit failure was the unrelated pty ReaderPark flake, being fixed); screenshots at scale 1 and 1.25 inspected: small dim branch rows, detached short commit, gap, limit case withholding the group.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Git branch under each tab: resolved through the ExecutionContext without spawning git, refreshed on cwd/prompt/reset events and a Local watch, rendered as a small muted second row (decision-10) with a stable semantic id; verified by unit tests, the deterministic --git-test against real repositories, the sidebar-branch scenario and inspected screenshots.
+<!-- SECTION:FINAL_SUMMARY:END -->

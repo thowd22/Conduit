@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its twenty-one Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its twenty-two Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its thirteen declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its fourteen declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -606,6 +606,38 @@ the docs and the opencode `dev` source (v1.18.35) on 2026-10-07; the fixtures un
 `test/fixtures/agent/opencode/` are hand-written, and a fake TCP server test covers the round
 trip. OpenCode is not installed here, so the live check skips.
 
+TASK-76 is complete on Linux. A tab whose focused session's OSC 7 cwd is inside a git work tree
+shows its branch on a second, non-interactive sidebar row, `workspace.<k>.tab.<n>.branch` (role
+`branch`, label = full branch name or the 8-digit short commit of a detached HEAD), drawn in the
+`muted` role with `ui.TextStyle.small`. That style uses a second `font.Manager` at 0.6 of the
+point size, rebuilt with the main face, centred in a normal one-cell row and drawn in its own
+overlay pass over its own atlas (decision-10). A name too long for the row is painted with a
+trailing `…`. A tab outside a repository has no branch row and the list reclaims it; rename,
+reorder (a drop on the branch row targets its tab), close and sidebar resize are unchanged.
+`src/git.zig` resolves the repository only through the workspace `ExecutionContext`
+(`statPath`/`readFile`): it walks up at most 32 directories, follows `gitdir:` files, reads `HEAD`
+(at most 4 KiB) and validates the name. Malformed input means "no repository", and no git process
+is ever started. The app refreshes a session's branch on an OSC 7 cwd, an OSC 133 prompt start or
+a reset, plus a Local-only `watch` on the git directory, each refresh as one `git.Lookup` worker
+polled on the loop, never per frame. The deterministic Linux `--git-test` builds two real
+repositories in a private temporary directory and, through real PTYs and SDL input, covers
+checkout, a watched HEAD rewrite with no prompt, a cwd change to another repository, leaving the
+repository, a detached HEAD and the two-row tab behaviours. The fourteenth scripted scenario
+`sidebar-branch` drives the same path through `conduit-test`. Remote (SSH/WSL) resolution and
+macOS/Windows rendering are unverified.
+
+TASK-77 is complete on Linux. Each workspace after the first listed one, and every row of its
+group, sits 5 logical pixels further down (5, 10, …), scaled by the window scale, while rows inside
+a group keep whole-cell spacing (decision-11). `ui.ElementRegistration.offset_px` is converted once
+by `Geometry.pixel_scale` into the element's device-pixel bounds and into every canvas cell it
+paints (`render.OverlayCell.offset_y_px`). Painting, hit testing, hover, focus and the driver's
+`inspect` bounds therefore all agree, and the driver reports the shifted pixel bounds. Pixels in
+the gap belong to no element. The list limit above the footer drops each group's shift rounded up
+to whole rows, so no shifted row reaches the Palette hint or version line. `--workspaces-test`
+asserts the gap through semantic bounds and, with real SDL events, a no-op click in the gap, a
+drag reorder of shifted tabs, a bottom-edge click selecting the right shifted tab, and keyboard
+focus over the shifted rows. Screenshots at scale 1 and 1.25 were inspected.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -781,7 +813,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:

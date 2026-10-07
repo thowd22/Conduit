@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 20:15'
+updated_date: '2026-10-07 20:44'
 labels:
   - agents
   - claude
@@ -37,3 +37,9 @@ Adapter for Claude Code CLI per the spike: launch and attach, map hook and trans
 2. Detect hand-started sessions by the correlation token in hook payloads or the undocumented PID registry (best effort).
 3. Unit tests from recorded hook/transcript fixtures; an integration test runs the real hook command path without a model call.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Adapter landed (20df52f, dc3e464 rebased onto main as 626b155): ClaudeCodeAdapter writes a per-agent sink (settings.json hooks + POSIX hook.sh relay), launch = claude --settings <sink>/settings.json --session-id <uuid from token>; poll tails events.jsonl into typed events (Stop -> done; observed SessionEnd -> exited); PermissionRequest blocks up to 580 s until respondPermission writes <sink>/decisions/<id>, replying hookSpecificOutput.decision.behavior allow/deny; TranscriptReader; findRunningSession over the undocumented <config>/sessions/<pid>.json registry. 15 unit tests from fixtures recorded with 2.1.292 plus integration tests running the relay through a Local PTY, an unauthenticated real claude -p whose hooks reached poll, and a real interactive claude found, attached and seen to exit. 716/725 unit tests pass on main. Real 2.1.292 field names: SessionEnd.reason, StopFailure.error. Pending: UI gesture path (TASK-57/58), control endpoint instead of the sink (TASK-60), remote contexts (TASK-61); an authenticated live allow/deny was not run (no credentials).
+<!-- SECTION:NOTES:END -->
