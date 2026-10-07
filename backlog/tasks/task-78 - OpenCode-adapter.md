@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-07 15:38'
-updated_date: '2026-10-07 20:16'
+updated_date: '2026-10-07 20:39'
 labels:
   - agents
   - opencode
@@ -28,8 +28,8 @@ The user runs OpenCode alongside Claude Code, Codex and omp (oh-my-pi) and wants
 - [ ] #1 OpenCode launched from Conduit appears in the agent registry with live status (idle, working, waiting for input, waiting for approval, done), mapped from its structured events rather than terminal text
 - [ ] #2 Permission/approval requests, waiting-for-input and turn completion produce agent events that TASK-56 notifications and the sidebar agent state consume without any OpenCode-specific code outside agent/
 - [ ] #3 A manually started opencode process in a Conduit terminal is detected and attached
-- [ ] #4 Harness-neutral tests cover the adapter through the common interface with recorded event fixtures, and an integration check runs against a real opencode binary where it is installed, skipping with a clear message where it is not
-- [ ] #5 The integration surface used (server/API, event stream, session files) is recorded as a Backlog decision; AGENTS.md and docs/architecture.md list OpenCode beside the other harnesses
+- [x] #4 Harness-neutral tests cover the adapter through the common interface with recorded event fixtures, and an integration check runs against a real opencode binary where it is installed, skipping with a clear message where it is not
+- [x] #5 The integration surface used (server/API, event stream, session files) is recorded as a Backlog decision; AGENTS.md and docs/architecture.md list OpenCode beside the other harnesses
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -38,3 +38,9 @@ The user runs OpenCode alongside Claude Code, Codex and omp (oh-my-pi) and wants
 1. Implement agent.Adapter for OpenCode in src/agent/opencode.zig per decision-7 from the documented server API (unverified locally if the CLI is absent): detect, launch with a Conduit-chosen --port, poll via SSE /event (session.status, session.idle, permission.asked), respondPermission via POST /session/:id/permissions/:id, structured events only.
 2. Unit tests from fixture SSE streams; integration test against a fake OpenCode server; mark live verification as pending until opencode is installed.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Adapter landed (8b67fd7, 003ac44 rebased onto main as 9cb1cf2): HTTP/1.1 + SSE client over a Transport vtable, event mapping, permission reply (current route with deprecated fallback), history replay, prompt_async/abort, backoff when unreachable; 34 agent tests + 1 skip (live check skips: opencode not installed). decision-9 records the server/SSE surface. Pending: detect via ExecutionContext.run (agent resumed), app wiring for AC1-3 via TASK-56/58, live verification needs an installed opencode.
+<!-- SECTION:NOTES:END -->
