@@ -258,7 +258,7 @@ non-fatal); `.github/scripts/check-x11-window-icon.sh` proves under Xvfb that th
 Wayland has no window-icon property, so the desktop entry supplies the icon there; native macOS
 and Windows window icons are unverified.
 
-TASK-72 (in progress) separates draining from drawing. When a session asks for service,
+TASK-72 is complete. It separates draining from drawing. When a session asks for service,
 `App.run` drains child output in a bounded loop of 16 KiB pump passes under
 `workspace.DrainBudget.per_wake` (4 MiB or 8 ms, whichever comes first), then decides whether to
 draw with `FramePacer`: while output keeps arriving, frames are coalesced to at most one per
@@ -266,9 +266,17 @@ max(16 ms, last frame's cost), and the moment output stops an owed frame is draw
 test driver is polled on every iteration, an owed frame is drawn before the loop exits, and an
 idle window still blocks in SDL and draws nothing. A 40 MB carriage-return flood dropped from
 12.7 s to 1.4 s in ReleaseSafe, and the scripted `output-flood` E2E scenario covers the path.
-Newline-heavy floods (`seq 1 200000`) remain engine-bound: each LF costs about 75 µs inside
-`Terminal.feed` in ReleaseSafe, and Debug adds Ghostty's per-scroll page-list integrity checks.
-TASK-72 stays open on that cost.
+The remaining per-linefeed cost came from `build.zig`, not Conduit's code:
+`b.dependency("ghostty", .{})` built the `ghostty-vt` module in Ghostty's default Debug mode with
+`slow_runtime_safety` on, even inside ReleaseSafe Conduit builds, so every scroll ran
+`Screen.assertIntegrity` and the page integrity checks (about 79 µs per linefeed in ReleaseSafe,
+1.5 ms in Debug; the shipped v0.1.0 to v0.1.2 binaries had this). `ghosttyDependencyOptions` now
+passes Conduit's target and optimize mode to both Ghostty dependency calls and builds the engine at
+least ReleaseSafe even for a Debug Conduit. `seq 1 200000` went from 14.6 s to 0.12 s in
+ReleaseSafe and from over 260 s to 0.48 s in Debug. `term.zig` reads the engine's mode through
+`@FieldType(PageList, "pause_integrity_checks")`; its tests fail any optimised build that links a
+slow-checked engine and bound a 200,000-line feed to 5 s. Always pass `optimize` to the Ghostty
+dependency.
 
 TASK-36 is complete. Command+F on macOS or Ctrl+Shift+F on Linux/Windows opens an inline semantic
 `Input`; named actions and clickable controls provide next/previous navigation plus case and regex

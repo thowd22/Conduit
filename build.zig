@@ -163,6 +163,26 @@ pub fn build(b: *std.Build) !void {
     if (font_wiring) |wiring| addFontCheck(b, target, optimize, wired[moduleIndex("font")].?, wiring);
 }
 
+/// Options for every `b.dependency("ghostty", ...)` call, so both resolve to one instance.
+///
+/// Left empty, Ghostty builds `ghostty-vt` in its own default Debug mode with
+/// `slow_runtime_safety` on, which runs `Screen.assertIntegrity` and the page-list
+/// integrity checks on every scroll: about 79 µs per linefeed inside a ReleaseSafe
+/// Conduit and 1.5 ms inside a Debug one (TASK-72; `seq 1 200000` took 14.6 s in the
+/// shipped v0.1.x binaries). The engine is therefore always built at least
+/// ReleaseSafe. A Debug Conduit keeps its own safety checks and tests; it only gives
+/// up Ghostty's internal integrity asserts, which Conduit's terminal tests do not
+/// rely on.
+fn ghosttyDependencyOptions(
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) struct { target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode } {
+    return .{
+        .target = target,
+        .optimize = if (optimize == .Debug) .ReleaseSafe else optimize,
+    };
+}
+
 /// The version a development build reports when no `-Dversion=` is given. It
 /// is a valid SemVer prerelease on purpose, so every build passes the same
 /// check a tagged release does.
@@ -240,7 +260,7 @@ fn installLinuxPayload(
         .{ .source = b.path("assets/THIRD-PARTY-LICENSES/HarfBuzz-COPYING.txt"), .destination = "share/licenses/conduit/HarfBuzz-COPYING.txt" },
         .{ .source = b.path("assets/THIRD-PARTY-LICENSES/Oniguruma-COPYING.txt"), .destination = "share/licenses/conduit/Oniguruma-COPYING.txt" },
         .{ .source = b.path("LICENSE"), .destination = "share/licenses/conduit/LICENSE" },
-        .{ .source = b.dependency("ghostty", .{}).path("LICENSE"), .destination = "share/licenses/conduit/Ghostty-LICENSE" },
+        .{ .source = b.dependency("ghostty", ghosttyDependencyOptions(target, optimize)).path("LICENSE"), .destination = "share/licenses/conduit/Ghostty-LICENSE" },
         .{ .source = b.dependency("sdl", .{ .target = target, .optimize = optimize }).path("LICENSE.txt"), .destination = "share/licenses/conduit/SDL-LICENSE.txt" },
         .{ .source = b.dependency("zopengl", .{}).path("LICENSE"), .destination = "share/licenses/conduit/zopengl-LICENSE" },
     };
@@ -324,7 +344,7 @@ fn wireThirdPartySeams(
 ) !?FontWiring {
     // Backlog decision-1: the terminal engine is the Zig module `ghostty-vt`,
     // never the macOS embedding library.
-    const ghostty_vt = b.dependency("ghostty", .{}).module("ghostty-vt");
+    const ghostty_vt = b.dependency("ghostty", ghosttyDependencyOptions(target, optimize)).module("ghostty-vt");
     if (wired[moduleIndex("term")]) |term| {
         term.addImport("ghostty-vt", ghostty_vt);
 

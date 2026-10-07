@@ -10825,3 +10825,69 @@ test "no working directory, accepted or refused, reaches a log line, and refusal
         try testing.expect(std.mem.startsWith(u8, line, "debug: "));
     }
 }
+
+/// Whether the engine was compiled with Ghostty's slow runtime safety, which
+/// re-verifies the screen and page integrity on every scroll.
+///
+/// Upstream does not export its build options, but it sizes one bookkeeping
+/// field by that flag, so the field's type is the flag. Those checks cost a
+/// linefeed about 75 µs in an otherwise ReleaseSafe Conduit and about 1.5 ms
+/// in Debug (TASK-72): they belong to Ghostty's own Debug builds and must
+/// never reach an optimised Conduit.
+const engine_integrity_checks = @FieldType(ghostty_vt.PageList, "pause_integrity_checks") != void;
+
+test "an optimised build never links the engine with its per-scroll integrity checks" {
+    // A Debug Conduit may run the engine in Ghostty's Debug contract; an
+    // optimised one that still carries the checks pays them on every
+    // linefeed, which is what made a 200,000-line flood take 15 s.
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    try std.testing.expect(!engine_integrity_checks);
+}
+
+test "200,000 short lines go through feed in bounded time" {
+    const testing = std.testing;
+    // Ghostty's Debug integrity checks cost about 1.5 ms per scroll by
+    // design, so a Debug build linked with them cannot meet any useful bound;
+    // every other combination must.
+    if (builtin.mode == .Debug and engine_integrity_checks) return error.SkipZigTest;
+
+    var terminal: Terminal = undefined;
+    try terminal.init(testIo(), testing.allocator, .{ .cols = 120, .rows = 40 });
+    defer terminal.deinit(testing.allocator);
+
+    // `seq`-shaped output with the CR LF a PTY's onlcr produces, fed in the
+    // 64 KiB slices a draining pump hands over.
+    var flood: std.ArrayList(u8) = .empty;
+    defer flood.deinit(testing.allocator);
+    const lines = 200_000;
+    for (0..lines) |n| {
+        var line: [32]u8 = undefined;
+        try flood.appendSlice(testing.allocator, try std.fmt.bufPrint(&line, "{d}\r\n", .{n}));
+    }
+
+    const started = std.Io.Clock.awake.now(testing.io).nanoseconds;
+    var offset: usize = 0;
+    while (offset < flood.items.len) {
+        const end = @min(flood.items.len, offset + 64 * 1024);
+        terminal.feed(flood.items[offset..end]);
+        offset = end;
+    }
+    const elapsed = std.Io.Clock.awake.now(testing.io).nanoseconds - started;
+
+    // Measured at about 0.1-0.25 s on the dev box without the engine's
+    // integrity checks and 15 s with them in ReleaseSafe; 5 s leaves a slow
+    // CI runner a wide margin while still catching a per-line regression.
+    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+    try testing.expect(!terminal.isDegraded());
+
+    try terminal.refresh(testing.allocator);
+    // The last line scrolled into place above the cursor, so the flood was
+    // consumed rather than dropped.
+    var expected: [16]u8 = undefined;
+    const last = try std.fmt.bufPrint(&expected, "{d}", .{lines - 1});
+    const row = terminal.gridSize().rows - 2;
+    for (last, 0..) |ch, col| {
+        const c = terminal.cell(.{ .col = @intCast(col), .row = row }) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(u21, ch), c.codepoint);
+    }
+}
