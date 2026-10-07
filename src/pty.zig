@@ -1039,16 +1039,21 @@ const sys = struct {
     const f_setfd: c_int = 2;
     const f_setfl: c_int = 4;
     const fd_cloexec: c_int = 1;
-    const o_nonblock: c_int = 0x800;
+    /// `O_NONBLOCK` as darwin's sys/fcntl.h numbers it. Only the macOS branch uses it; Linux's
+    /// value (0x800) is a different flag there and would leave the wakeup pipe blocking.
+    const o_nonblock: c_int = 0x0004;
     const x_ok: c_int = 1;
     /// `WNOHANG`, which POSIX fixes at 1.
     const w_no_hang: c_int = 1;
     /// The status a child that could not be started exits with.
     const exec_failure_status: u8 = 127;
-    /// TIOCSCTTY as darwin's sys/ttycom.h numbers it: _IO('t', 97) = 0x80007461.
-    const tioc_sctty: c_int = @bitCast(@as(u32, 0x80007461));
-    /// TIOCSWINSZ as darwin's sys/ttycom.h numbers it: _IOW('t', 103, struct winsize).
-    const tioc_swinwsz: c_int = 0x40087467;
+    /// TIOCSCTTY as darwin's sys/ttycom.h numbers it: _IO('t', 97), where darwin's sys/ioccom.h
+    /// has IOC_VOID = 0x20000000, so 0x20007461.
+    const tioc_sctty: c_ulong = 0x20007461;
+    /// TIOCSWINSZ as darwin's sys/ttycom.h numbers it: _IOW('t', 103, struct winsize), where
+    /// IOC_IN = 0x80000000 and the 8-byte size sits in bits 16..28, so 0x80087467. (0x40087467,
+    /// with IOC_OUT, is not a darwin request at all and fails with ENOTTY.)
+    const tioc_swinwsz: c_ulong = 0x80087467;
 
     /// How many descriptors `countOpenDescriptors` probes. Conduit opens tens, not thousands.
     const descriptor_probe_limit = 1024;
@@ -1060,7 +1065,8 @@ const sys = struct {
         extern "c" fn grantpt(fd: c_int) c_int;
         extern "c" fn unlockpt(fd: c_int) c_int;
         extern "c" fn ptsname(fd: c_int) [*:0]const u8;
-        extern "c" fn ioctl(fd: c_int, request: c_int, ...) c_int;
+        /// Darwin declares the request `unsigned long`; a `c_int` would sign-extend IOC_IN requests.
+        extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
     };
 
     fn unsupported() Error {
@@ -2235,13 +2241,13 @@ const WindowsRequest = struct {
         self.owned_wide.deinit(gpa);
     }
 
-    /// Keep an allocation this made, so `deinit` frees it. The whole slice is kept, terminator
-    /// included: a slice shorter than its allocation would free a size the allocator never gave
-    /// out.
-    fn keepWide(self: *WindowsRequest, gpa: Allocator, wide: []u16) Error![:0]u16 {
+    /// Keep an allocation this made, so `deinit` frees it. `wide` is already terminated (see
+    /// `ownedTerminator`), and freeing a `[:0]u16` frees its terminator too, which is the whole
+    /// allocation.
+    fn keepWide(self: *WindowsRequest, gpa: Allocator, wide: [:0]u16) Error![:0]u16 {
         errdefer gpa.free(wide);
-        try self.owned_wide.append(gpa, ownedTerminator(wide));
-        return ownedTerminator(wide);
+        try self.owned_wide.append(gpa, wide);
+        return wide;
     }
 
     fn keepBytes(self: *WindowsRequest, gpa: Allocator, bytes: []u8) Error![]u8 {
@@ -2270,6 +2276,9 @@ fn resolveWindowsProgram(
     extensions: ?[]const u8,
 ) Error![:0]u16 {
     if (program.len == 0) return error.EmptyArgv;
+    // Checked before the search, which would otherwise skip every candidate it cannot convert
+    // and report a mangled name as merely missing.
+    if (!std.unicode.utf8ValidateSlice(program)) return error.InvalidUtf8;
 
     // A path is used exactly as it stands: PATH is what a bare name is searched on, and a path
     // that is not there is the caller's error rather than a reason to run something else.
@@ -2402,7 +2411,9 @@ fn toWide(gpa: Allocator, text: []const u8) Error![:0]u16 {
 /// slice it was handed out as, and a shorter slice would ask the allocator to free a size it never
 /// gave.
 fn ownedTerminator(owned: []u16) [:0]u16 {
-    return owned[0..owned.len :0];
+    // The last element is the terminator, so the text ends one before it; freeing the `[:0]`
+    // slice frees `len + 1` elements, which is the whole allocation again.
+    return owned[0 .. owned.len - 1 :0];
 }
 
 /// A NUL-terminated copy of `wide`, returned whole: the caller frees the whole slice, so handing
@@ -3166,6 +3177,8 @@ test "a backend that is not POSIX implements the whole interface" {
 }
 
 test "a request the OS would only fail on later is refused before anything is created" {
+    // The POSIX backend's checks; the ConPTY backend's are the "Windows backend" test below.
+    if (!has_posix_backend) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     try testing.expectError(
@@ -3631,7 +3644,7 @@ test "spawn refuses a nameless request whichever backend this build has" {
 /// The environment every Windows integration test hands a child: fixed, minimal, and nothing from
 /// the runner's own configuration, so what a test reads back cannot vary with the machine.
 const windows_test_env = [_][]const u8{
-    "PATH=C:\\Windows\\System32;C:\\Windows",
+    "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\WindowsPowerShell\\v1.0",
     "PATHEXT=.COM;.EXE;.BAT;.CMD",
     "SYSTEMROOT=C:\\Windows",
     "TEMP=C:\\Windows\\Temp",
@@ -3695,7 +3708,10 @@ test "a Windows program is looked up on the request's own PATH, through PATHEXT"
     defer gpa.free(resolved);
     const as_utf8 = try std.unicode.utf16LeToUtf8Alloc(gpa, std.mem.sliceTo(resolved, 0));
     defer gpa.free(as_utf8);
-    try testing.expectEqualStrings("C:\\Windows\\System32\\cmd.exe", as_utf8);
+    // The extension is spelled the way PATHEXT spells it (`.EXE`); Windows paths ignore case.
+    if (!std.ascii.eqlIgnoreCase("C:\\Windows\\System32\\cmd.exe", as_utf8)) {
+        try testing.expectEqualStrings("C:\\Windows\\System32\\cmd.exe", as_utf8);
+    }
 
     // A program on no PATH the request carries is not found, and Conduit's own PATH is never
     // consulted: a spawn belongs to an ExecutionContext (P7).

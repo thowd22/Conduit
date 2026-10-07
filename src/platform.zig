@@ -2768,6 +2768,14 @@ pub const DriverTransport = struct {
             // `shutdown` is the cancellation operation documented for a blocked Server.accept.
             const listener_stream: std.Io.net.Stream = .{ .socket = self.listener.socket };
             self.shutdownForStop(listener_stream);
+            // Darwin's shutdown(2) refuses a listening socket with ENOTCONN and leaves a blocked
+            // accept(2) asleep, where Linux's wakes it, so the join below would wait forever. One
+            // connection to the transport's own endpoint wakes it there; the worker sees
+            // `stopping` and closes that connection unserved.
+            if (comptime builtin.os.tag != .linux) {
+                var waker = DriverClient.connect(self.endpoint) catch null;
+                if (waker) |*client| client.deinit();
+            }
         }
 
         self.mutex.lockUncancelable(io);
@@ -2832,6 +2840,11 @@ pub const DriverTransport = struct {
                 if (!self.stopping.load(.acquire)) self.reportIssue(.accept_failed);
                 return;
             };
+            if (self.stopping.load(.acquire)) {
+                // The connection `stop` makes to wake this accept where shutdown cannot.
+                stream.close(io);
+                return;
+            }
 
             self.mutex.lockUncancelable(io);
             self.active_stream = stream;
