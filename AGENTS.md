@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its twenty-two Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its twenty-three Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its fourteen declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its fifteen declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -638,6 +638,33 @@ asserts the gap through semantic bounds and, with real SDL events, a no-op click
 drag reorder of shifted tabs, a bottom-edge click selecting the right shifted tab, and keyboard
 focus over the shifted rows. Screenshots at scale 1 and 1.25 were inspected.
 
+TASK-56 is complete on Linux. `src/app_agents.zig` (part of `app`) owns the one `agent.Registry`,
+a `Runner` per launched agent (adapter, owner-side transport, `EventQueue`, poll worker),
+per-agent `Heuristics`, a bounded notification list and the OS notification seam. `term`
+surfaces OSC 9 and OSC 777 as a cleaned, bounded `notification` event. Agent: launch
+(`agent.launch`) offers the scripted fake when a check enables it, then the harnesses whose
+`detect` answered in the workspace's context, followed by an optional prompt step
+(`agent.launch-prompt`). It creates an `agent_terminal` tab, registers the agent as owned, and
+spawns the adapter's `LaunchSpec` through the workspace ExecutionContext; before the spawn, the
+spawn worker's `Runner.prepare` writes every `LaunchSpec.files` entry into a private 0700 sink
+under `$XDG_STATE_HOME/conduit/agents/<run>`. Claude uses its hook sink, Pi an owner sink
+transport plus `conduit.js`, Codex a lazily connected daemon WebSocket, and OpenCode a bind-0
+loopback port; sink harnesses are Local-only until TASK-61. Every session's terminal events feed
+its agent's heuristics. The sidebar leads agent tabs with `·` idle, `▸` working, `?` input, `!`
+permission, `✓` done and `×` errored, and the workspace row with its most urgent agent's glyph;
+each glyph is also a semantic `<row>.agent.<state>` element. New waits, outcomes, harness
+notifications, OSC 9/777 and background bells fill the list (Notifications, Ctrl+Shift+N /
+Cmd+Shift+N, a modal `Surface` of `notification.<n>` rows); Enter or a click on a row focuses that
+workspace, tab and pane. While the window is unfocused, entries also go to `platform.notify`
+(`notify-send` on Linux; macOS and Windows return Unsupported). `notifications.*` switches
+filter by kind and harness, hot-reload, and live in the settings view's Agents group. Agent: stop
+hangs up an owned agent's PTY; Agent: focus shows its tab. The deterministic Linux `--agent-test`
+and the fifteenth scenario `agent-notifications` drive the fake adapter through real PTYs and
+SDL input (`CONDUIT_TEST_FAKE_AGENT=1` offers the fake only together with `--test-driver`). A
+real Claude Code launch through the palette spawned the hooked command into its sink but stopped
+at onboarding in the isolated HOME, so the structured hook path is unverified end to end;
+observed (hand-started) agents wait for a foreground-process query in `pty`.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -813,7 +840,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:

@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 20:59'
+updated_date: '2026-10-07 21:18'
 labels:
   - workspace
   - persistence
@@ -38,3 +38,9 @@ Part 1 (state model and file, no app wiring): 1. src/state.zig: a versioned snap
 3. Atomic write (temp + rename) to the platform state dir (XDG_STATE_HOME/conduit/state.json), bounded size, unit tests for round trip, migration from a lower version, corruption fallback, and pane-tree fidelity.
 Part 2 (after main.zig frees): save on change/exit, restore on launch, reconnect prompt, --restore-test and an e2e scenario.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Part one landed (2859e98, fbd7f8e rebased onto main as 2dff7b1; build.zig module-list conflict with control resolved): src/state.zig versioned Snapshot model with bounded tolerant JSON codec (limits: 1 MiB, 64 workspaces, 256 tabs, depth 16), migrate on the JSON tree, statePath per OS, atomic save, load, quarantine to state.json.corrupt-<unix>, restoreFromDisk, planRestore steps; WorkspaceRegistry.snapshot/captureState, setPaneSplitRatio, Tab.userNamed. 13 state tests, 60 workspace tests, fuzz/truncation/alloc-failure corruption tests. Part two (app): save on change/exit, restore on launch executing the plan, SSH reconnect prompt, --restore-test and an e2e scenario.
+<!-- SECTION:NOTES:END -->

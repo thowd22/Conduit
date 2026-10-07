@@ -14,9 +14,9 @@ inspect a `screenshot`, and finish with `quit`. If validation fails, use the CLI
 tree identify the failure.
 
 The implemented deterministic app checks are `xvfb-run -a zig build run -- --ui-test`, the same
-command with `--ime-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test` and the other `--*-test` flags listed in `AGENTS.md`, and
+command with `--ime-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test` and the other `--*-test` flags listed in `AGENTS.md`, and
 the same command with `--driver-test`. The aggregated `zig build e2e` scenario runner exists and
-runs fourteen scripted scenarios under a display such as Xvfb with an explicit private
+runs fifteen scripted scenarios under a display such as Xvfb with an explicit private
 `--artifact-dir`; its Linux CI acceptance (TASK-25) still needs a remote Actions run.
 
 The project `.mcp.json` exposes the same surface through `conduit-test mcp` after Claude Code's

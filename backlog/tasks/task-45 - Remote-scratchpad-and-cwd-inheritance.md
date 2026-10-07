@@ -1,9 +1,11 @@
 ---
 id: TASK-45
 title: Remote scratchpad and cwd inheritance
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-03 21:39'
+updated_date: '2026-10-07 21:43'
 labels:
   - ssh
   - scratchpad
@@ -28,3 +30,11 @@ In an SSH workspace the scratchpad is a remote shell started in the background o
 - [ ] #2 New panes and tabs start in the originating session's remote cwd when known
 - [ ] #3 Scratchpad session persists across hide/show and is restored after reconnect where possible
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. In an SSH workspace the scratchpad session spawns through the SshContext once connected (remote login shell), stays hidden until shown, and is respawned in place after reconnect.
+2. New tabs and panes inherit the originating session's remote OSC 7 cwd (already validated per context) through the context-neutral spawn request.
+3. Covered by --ssh-test; docs.
+<!-- SECTION:PLAN:END -->
