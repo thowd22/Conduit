@@ -87,6 +87,20 @@ done
 # candidate, so a context created at any later moment also starts on Hangul.
 ibus engine hangul
 
+# `ibus-daemon --xim` starts the XIM bridge (ibus-x11) asynchronously. SDL opens its X input
+# method once, when the window is created, so if Conduit starts before the bridge has registered
+# itself on the X server every key stays plain ASCII for the whole session (seen on a hosted run
+# as a lone probe 'g'). The root window's XIM_SERVERS property is the readiness signal.
+deadline=$((SECONDS + 20))
+until xprop -root XIM_SERVERS 2>/dev/null | grep -q '@server=ibus'; do
+  if (( SECONDS >= deadline )); then
+    echo "the IBus XIM server did not register with the X server within 20 seconds" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+xprop -root XIM_SERVERS >"$artifact_root/xim-servers.txt"
+
 # `conduit-test launch` gives the app a private HOME and XDG_CONFIG_HOME, so a client looking for
 # the daemon's socket file under the real $XDG_CONFIG_HOME/ibus/bus would not find it. The XIM
 # bridge needs no file, but IBUS_ADDRESS is exported for any D-Bus client (SDL reads it first) and
