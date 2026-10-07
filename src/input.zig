@@ -12,8 +12,10 @@
 //! focus, `term` for key and mouse encoding and terminal writes, and `platform`
 //! for raw events and the clipboard.
 //!
-//! It allocates nothing. An event is a value, and the allocator that will own
-//! composition state, IME state and encoding buffers arrives as a parameter.
+//! Routing allocates nothing. An event is a value, and the allocator that will
+//! own composition state, IME state and encoding buffers arrives as a
+//! parameter. The one allocating operation is `buildBindings` (TASK-37), which
+//! builds a configured binding table into its own arena outside the event path.
 //!
 //! TASK-20 adds the registry and binding layer over the TASK-12 translation:
 //! registered actions are the only commands dispatch can invoke, bindings use
@@ -682,6 +684,7 @@ const macos_default_bindings = [_]Binding{
     .{ .chord = .{ .key = .{ .character = '`' }, .modifiers = .{ .shift = true, .super = true } }, .action = "scratchpad.toggle-90" },
     .{ .chord = .{ .key = .{ .character = 'p' }, .modifiers = .{ .shift = true, .super = true } }, .action = "palette.open" },
     .{ .chord = .{ .key = .{ .named = .f10 }, .modifiers = .{ .shift = true } }, .action = "terminal.context-menu" },
+    .{ .chord = .{ .key = .{ .character = ',' }, .modifiers = .{ .super = true } }, .action = "config.open" },
 };
 
 const linux_windows_default_bindings = [_]Binding{
@@ -723,6 +726,7 @@ const linux_windows_default_bindings = [_]Binding{
     .{ .chord = .{ .key = .{ .character = '`' }, .modifiers = .{ .ctrl = true, .shift = true } }, .action = "scratchpad.toggle-90" },
     .{ .chord = .{ .key = .{ .character = 'p' }, .modifiers = .{ .ctrl = true, .shift = true } }, .action = "palette.open" },
     .{ .chord = .{ .key = .{ .named = .f10 }, .modifiers = .{ .shift = true } }, .action = "terminal.context-menu" },
+    .{ .chord = .{ .key = .{ .character = ',' }, .modifiers = .{ .ctrl = true } }, .action = "config.open" },
 };
 
 /// Conduit's deterministic shipped bindings for `profile`.
@@ -731,6 +735,249 @@ pub fn defaultBindings(profile: PlatformProfile) []const Binding {
         .macos => &macos_default_bindings,
         .linux_windows => &linux_windows_default_bindings,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Configured bindings (TASK-37)
+// ---------------------------------------------------------------------------
+
+/// Why a chord spelling from the settings file was rejected.
+pub const ChordError = error{
+    EmptyChord,
+    UnknownModifier,
+    DuplicateModifier,
+    MissingKey,
+    UnknownKey,
+};
+
+/// Words accepted for a character key that cannot be written literally inside a chord, or that
+/// read better spelled out. `plus` and `equal` are required: `+` separates the chord's parts and
+/// the settings file splits a keybind at its first `=`.
+const character_names = [_]struct { name: []const u8, codepoint: u21 }{
+    .{ .name = "space", .codepoint = ' ' },
+    .{ .name = "plus", .codepoint = '+' },
+    .{ .name = "equal", .codepoint = '=' },
+    .{ .name = "minus", .codepoint = '-' },
+    .{ .name = "comma", .codepoint = ',' },
+    .{ .name = "period", .codepoint = '.' },
+    .{ .name = "slash", .codepoint = '/' },
+    .{ .name = "backslash", .codepoint = '\\' },
+    .{ .name = "semicolon", .codepoint = ';' },
+    .{ .name = "backtick", .codepoint = '`' },
+    .{ .name = "grave", .codepoint = '`' },
+};
+
+/// Named-key words. Each `Named` tag is accepted as written (`page_up`, `f10`); these add the
+/// common alternative spellings.
+const named_aliases = [_]struct { name: []const u8, named: Named }{
+    .{ .name = "return", .named = .enter },
+    .{ .name = "esc", .named = .escape },
+    .{ .name = "pageup", .named = .page_up },
+    .{ .name = "pagedown", .named = .page_down },
+    .{ .name = "del", .named = .delete },
+    .{ .name = "ins", .named = .insert },
+};
+
+/// Parse a chord spelling such as `ctrl+shift+t`, `super+,`, `shift+f10` or `ctrl+backtick`.
+///
+/// Parts are separated by `+` and matched case-insensitively. Every part but the last is a
+/// modifier: `ctrl` (`control`), `shift`, `alt` (`option`, `opt`) or `super` (`cmd`, `command`).
+/// The last part is the key: a named key, a word from `character_names`, or one character. A
+/// letter is stored lowercase because bindings match the unshifted key identity; a shifted symbol
+/// is spelled as its unshifted key plus `shift` (`ctrl+shift+[`, not `ctrl+{`).
+pub fn parseChord(text: []const u8) ChordError!Chord {
+    if (text.len == 0) return error.EmptyChord;
+    var modifiers: Modifiers = .{};
+    var parts = std.mem.splitScalar(u8, text, '+');
+    var current = parts.next() orelse return error.EmptyChord;
+    while (parts.next()) |next| {
+        const part = std.mem.trim(u8, current, " \t");
+        if (part.len == 0) return error.MissingKey;
+        const field = modifierField(part) orelse return error.UnknownModifier;
+        switch (field) {
+            .ctrl => if (modifiers.ctrl) return error.DuplicateModifier else {
+                modifiers.ctrl = true;
+            },
+            .shift => if (modifiers.shift) return error.DuplicateModifier else {
+                modifiers.shift = true;
+            },
+            .alt => if (modifiers.alt) return error.DuplicateModifier else {
+                modifiers.alt = true;
+            },
+            .super => if (modifiers.super) return error.DuplicateModifier else {
+                modifiers.super = true;
+            },
+        }
+        current = next;
+    }
+    const key_text = std.mem.trim(u8, current, " \t");
+    if (key_text.len == 0) return error.MissingKey;
+    return .{ .key = try parseBindingKey(key_text), .modifiers = modifiers };
+}
+
+const ModifierField = enum { ctrl, shift, alt, super };
+
+fn modifierField(part: []const u8) ?ModifierField {
+    const spellings = [_]struct { name: []const u8, field: ModifierField }{
+        .{ .name = "ctrl", .field = .ctrl },
+        .{ .name = "control", .field = .ctrl },
+        .{ .name = "shift", .field = .shift },
+        .{ .name = "alt", .field = .alt },
+        .{ .name = "option", .field = .alt },
+        .{ .name = "opt", .field = .alt },
+        .{ .name = "super", .field = .super },
+        .{ .name = "cmd", .field = .super },
+        .{ .name = "command", .field = .super },
+    };
+    for (spellings) |spelling| {
+        if (std.ascii.eqlIgnoreCase(part, spelling.name)) return spelling.field;
+    }
+    return null;
+}
+
+fn parseBindingKey(text: []const u8) ChordError!BindingKey {
+    for (std.enums.values(Named)) |named| {
+        if (std.ascii.eqlIgnoreCase(text, @tagName(named))) return .{ .named = named };
+    }
+    for (named_aliases) |alias| {
+        if (std.ascii.eqlIgnoreCase(text, alias.name)) return .{ .named = alias.named };
+    }
+    for (character_names) |word| {
+        if (std.ascii.eqlIgnoreCase(text, word.name)) return .{ .character = word.codepoint };
+    }
+    const length = std.unicode.utf8ByteSequenceLength(text[0]) catch return error.UnknownKey;
+    if (length != text.len) return error.UnknownKey;
+    const codepoint = std.unicode.utf8Decode(text) catch return error.UnknownKey;
+    if (codepoint == ' ' or isControl(codepoint)) return error.UnknownKey;
+    if (codepoint < 0x80) return .{ .character = std.ascii.toLower(@intCast(codepoint)) };
+    return .{ .character = codepoint };
+}
+
+/// Whether two chords match the same key transitions: same key, same intent modifiers.
+pub fn chordEql(a: Chord, b: Chord) bool {
+    return bindingKeyEql(a.key, b.key) and std.meta.eql(a.modifiers.normalized(), b.modifiers.normalized());
+}
+
+/// One configured change to the binding table.
+///
+/// Every slice is borrowed for the `buildBindings` call only; the table copies what it keeps.
+pub const BindingOverride = struct {
+    chord: Chord,
+    /// The action to bind, or null to unbind the chord.
+    action: ?[]const u8,
+    arguments: []const Argument = &.{},
+};
+
+/// A binding table built from the shipped defaults plus configured overrides.
+///
+/// Owns `bindings` and every string an override contributed; strings from the shipped defaults
+/// are static and borrowed. Replaced wholesale on reload, on the owner (main) thread.
+pub const BindingTable = struct {
+    arena: std.heap.ArenaAllocator,
+    bindings: []const Binding = &.{},
+
+    pub fn deinit(self: *BindingTable) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Build the binding table: `defaults` in order, then each override applied in file order.
+///
+/// An override first removes every binding whose chord equals its chord, so one chord never maps
+/// to two actions; a binding then takes the position of the first binding it replaced (keeping the
+/// palette's chord order stable) or goes at the end. An unbind only removes. Rebinding an action
+/// to a new chord leaves its default chord bound; unbind that chord to move it.
+pub fn buildBindings(
+    gpa: std.mem.Allocator,
+    defaults: []const Binding,
+    overrides: []const BindingOverride,
+) std.mem.Allocator.Error!BindingTable {
+    var table: BindingTable = .{ .arena = .init(gpa) };
+    errdefer table.deinit();
+    const allocator = table.arena.allocator();
+
+    var list: std.ArrayList(Binding) = .empty;
+    try list.appendSlice(allocator, defaults);
+    for (overrides) |override| {
+        var insert_at: ?usize = null;
+        var index: usize = 0;
+        while (index < list.items.len) {
+            if (chordEql(list.items[index].chord, override.chord)) {
+                if (insert_at == null) insert_at = index;
+                _ = list.orderedRemove(index);
+            } else {
+                index += 1;
+            }
+        }
+        const action = override.action orelse continue;
+        const arguments = try allocator.alloc(Argument, override.arguments.len);
+        for (override.arguments, arguments) |from, *to| {
+            to.* = .{ .name = try allocator.dupe(u8, from.name), .value = try allocator.dupe(u8, from.value) };
+        }
+        const binding: Binding = .{
+            .chord = .{ .key = override.chord.key, .modifiers = override.chord.modifiers.normalized() },
+            .action = try allocator.dupe(u8, action),
+            .arguments = arguments,
+        };
+        try list.insert(allocator, insert_at orelse list.items.len, binding);
+    }
+    table.bindings = list.items;
+    return table;
+}
+
+/// Why a configured keybind's action or argument was rejected.
+pub const KeybindError = error{
+    UnknownAction,
+    NotBindable,
+    MissingArgument,
+    UnexpectedArgument,
+    InvalidArgument,
+};
+
+/// The named argument a keybind for `action` passes, given the text after `:` (if any).
+///
+/// The argument's name comes from the action's palette contract, or, for an action the palette
+/// does not list, from its shipped default bindings. An action that is neither palette-visible nor
+/// bound by default is semantic plumbing (it needs a clicked element) and cannot be bound. A
+/// fixed-choice argument must be one of its choices. The returned slices borrow `registry`
+/// metadata and `value`.
+pub fn keybindArgument(
+    registry: *const Registry,
+    defaults: []const Binding,
+    action: []const u8,
+    value: ?[]const u8,
+) KeybindError!?Argument {
+    const definition = registry.lookup(action) orelse return error.UnknownAction;
+    var name: ?[]const u8 = null;
+    if (definition.palette) |palette| {
+        switch (palette.argument) {
+            .none => {},
+            .input => |argument| name = argument.name,
+            .choices => |argument| {
+                const text = value orelse return error.MissingArgument;
+                for (argument.values) |choice| {
+                    if (std.mem.eql(u8, choice.value, text)) return .{ .name = argument.name, .value = text };
+                }
+                return error.InvalidArgument;
+            },
+        }
+    } else {
+        var bound = false;
+        for (defaults) |binding| {
+            if (!std.mem.eql(u8, binding.action, action)) continue;
+            bound = true;
+            if (binding.arguments.len != 0) name = binding.arguments[0].name;
+        }
+        if (!bound) return error.NotBindable;
+    }
+    const argument_name = name orelse {
+        if (value != null) return error.UnexpectedArgument;
+        return null;
+    };
+    const text = value orelse return error.MissingArgument;
+    if (!validMetadata(text)) return error.InvalidArgument;
+    return .{ .name = argument_name, .value = text };
 }
 
 /// A named action and the invocation metadata a router should dispatch.
@@ -1505,7 +1752,7 @@ test "platform profiles preserve existing defaults before pane bindings" {
     const macos = defaultBindings(.macos);
     const linux_windows = defaultBindings(.linux_windows);
 
-    try testing.expectEqual(@as(usize, 38), macos.len);
+    try testing.expectEqual(@as(usize, 39), macos.len);
     try testing.expectEqualStrings("clipboard.copy", macos[0].action);
     try testing.expect(bindingKeyEql(.{ .character = 'c' }, macos[0].chord.key));
     try testing.expectEqual(Modifiers{ .super = true }, macos[0].chord.modifiers);
@@ -1534,7 +1781,7 @@ test "platform profiles preserve existing defaults before pane bindings" {
     try testing.expect(bindingKeyEql(.{ .character = 'p' }, macos[36].chord.key));
     try testing.expectEqual(Modifiers{ .shift = true, .super = true }, macos[36].chord.modifiers);
 
-    try testing.expectEqual(@as(usize, 38), linux_windows.len);
+    try testing.expectEqual(@as(usize, 39), linux_windows.len);
     try testing.expectEqualStrings("clipboard.copy", linux_windows[0].action);
     try testing.expect(bindingKeyEql(.{ .character = 'c' }, linux_windows[0].chord.key));
     try testing.expectEqual(Modifiers{ .ctrl = true, .shift = true }, linux_windows[0].chord.modifiers);
@@ -1562,6 +1809,12 @@ test "platform profiles preserve existing defaults before pane bindings" {
     try testing.expectEqualStrings("palette.open", linux_windows[36].action);
     try testing.expect(bindingKeyEql(.{ .character = 'p' }, linux_windows[36].chord.key));
     try testing.expectEqual(Modifiers{ .ctrl = true, .shift = true }, linux_windows[36].chord.modifiers);
+    try testing.expectEqualStrings("config.open", macos[38].action);
+    try testing.expect(bindingKeyEql(.{ .character = ',' }, macos[38].chord.key));
+    try testing.expectEqual(Modifiers{ .super = true }, macos[38].chord.modifiers);
+    try testing.expectEqualStrings("config.open", linux_windows[38].action);
+    try testing.expect(bindingKeyEql(.{ .character = ',' }, linux_windows[38].chord.key));
+    try testing.expectEqual(Modifiers{ .ctrl = true }, linux_windows[38].chord.modifiers);
     try testing.expectEqual(@as(usize, 0), macos[0].arguments.len);
     try testing.expectEqual(@as(usize, 0), linux_windows[0].arguments.len);
     try testing.expectEqual(
@@ -3332,4 +3585,175 @@ test "a press translated while composing records nothing" {
     _ = echo.filter(.{ .key = raw });
     echo.recordTerminalPress(raw, translate(&scratch, raw, true));
     try echo_testing.expect(!echo.filter(.{ .text_input = "a" }));
+}
+
+test "configured chord spellings parse to the same chords the defaults use" {
+    const testing = std.testing;
+    try testing.expect(chordEql(.{ .key = .{ .character = 't' }, .modifiers = .{ .ctrl = true, .shift = true } }, try parseChord("ctrl+shift+t")));
+    try testing.expect(chordEql(.{ .key = .{ .character = 't' }, .modifiers = .{ .ctrl = true, .shift = true } }, try parseChord("Shift+CTRL+T")));
+    try testing.expect(chordEql(.{ .key = .{ .character = '`' }, .modifiers = .{ .ctrl = true } }, try parseChord("ctrl+`")));
+    try testing.expect(chordEql(.{ .key = .{ .character = '`' }, .modifiers = .{ .super = true, .shift = true } }, try parseChord("cmd+shift+backtick")));
+    try testing.expect(chordEql(.{ .key = .{ .character = ',' }, .modifiers = .{ .super = true } }, try parseChord("command+,")));
+    try testing.expect(chordEql(.{ .key = .{ .character = '+' }, .modifiers = .{ .ctrl = true } }, try parseChord("ctrl+plus")));
+    try testing.expect(chordEql(.{ .key = .{ .character = '=' }, .modifiers = .{ .ctrl = true } }, try parseChord("ctrl+equal")));
+    try testing.expect(chordEql(.{ .key = .{ .character = ' ' }, .modifiers = .{ .alt = true } }, try parseChord("option+space")));
+    try testing.expect(chordEql(.{ .key = .{ .named = .f10 }, .modifiers = .{ .shift = true } }, try parseChord("shift+F10")));
+    try testing.expect(chordEql(.{ .key = .{ .named = .page_up }, .modifiers = .{ .ctrl = true } }, try parseChord("ctrl+pageup")));
+    try testing.expect(chordEql(.{ .key = .{ .named = .page_down }, .modifiers = .{ .ctrl = true } }, try parseChord("control+page_down")));
+    try testing.expect(chordEql(.{ .key = .{ .named = .escape } }, try parseChord("esc")));
+    try testing.expect(chordEql(.{ .key = .{ .named = .enter }, .modifiers = .{ .alt = true } }, try parseChord(" alt + return ")));
+    try testing.expect(chordEql(.{ .key = .{ .character = 0xe9 }, .modifiers = .{ .alt = true } }, try parseChord("alt+\u{e9}")));
+    // Lock modifiers never take part in chord identity.
+    try testing.expect(chordEql(.{ .key = .{ .character = 'a' }, .modifiers = .{ .ctrl = true, .caps_lock = true } }, try parseChord("ctrl+a")));
+    try testing.expect(!chordEql(try parseChord("ctrl+a"), try parseChord("ctrl+shift+a")));
+    try testing.expect(!chordEql(try parseChord("ctrl+a"), try parseChord("ctrl+b")));
+
+    try testing.expectError(error.EmptyChord, parseChord(""));
+    try testing.expectError(error.MissingKey, parseChord("ctrl+"));
+    try testing.expectError(error.MissingKey, parseChord("ctrl++"));
+    try testing.expectError(error.MissingKey, parseChord("+"));
+    try testing.expectError(error.MissingKey, parseChord("ctrl++t"));
+    try testing.expectError(error.UnknownModifier, parseChord("hyper+t"));
+    try testing.expectError(error.UnknownModifier, parseChord("t+t"));
+    try testing.expectError(error.DuplicateModifier, parseChord("ctrl+control+t"));
+    try testing.expectError(error.UnknownKey, parseChord("ctrl+tt"));
+    try testing.expectError(error.UnknownKey, parseChord("ctrl+f13"));
+    try testing.expectError(error.UnknownKey, parseChord("ctrl+\x01"));
+    try testing.expectError(error.UnknownKey, parseChord("ctrl+\xff"));
+}
+
+test "every default chord survives a round trip through its configured spelling" {
+    const testing = std.testing;
+    for ([_]PlatformProfile{ .macos, .linux_windows }) |profile| {
+        for (defaultBindings(profile)) |binding| {
+            var buffer: [64]u8 = undefined;
+            var used: usize = 0;
+            const modifiers = binding.chord.modifiers;
+            for ([_]struct { on: bool, text: []const u8 }{
+                .{ .on = modifiers.ctrl, .text = "ctrl+" },
+                .{ .on = modifiers.alt, .text = "alt+" },
+                .{ .on = modifiers.super, .text = "super+" },
+                .{ .on = modifiers.shift, .text = "shift+" },
+            }) |part| if (part.on) {
+                @memcpy(buffer[used..][0..part.text.len], part.text);
+                used += part.text.len;
+            };
+            switch (binding.chord.key) {
+                .named => |named| {
+                    const name = @tagName(named);
+                    @memcpy(buffer[used..][0..name.len], name);
+                    used += name.len;
+                },
+                .character => |codepoint| used += try std.unicode.utf8Encode(codepoint, buffer[used..]),
+            }
+            try testing.expect(chordEql(binding.chord, try parseChord(buffer[0..used])));
+        }
+    }
+}
+
+test "overrides replace, add and unbind while defaults stay borrowed" {
+    const testing = std.testing;
+    const defaults = defaultBindings(.linux_windows);
+    const new_palette = try parseChord("ctrl+alt+p");
+    const goto_arguments = [_]Argument{.{ .name = "index", .value = "4" }};
+    var table = try buildBindings(testing.allocator, defaults, &.{
+        .{ .chord = try parseChord("ctrl+shift+p"), .action = null },
+        .{ .chord = new_palette, .action = "palette.open" },
+        .{ .chord = try parseChord("ctrl+shift+t"), .action = "tab.goto", .arguments = &goto_arguments },
+        .{ .chord = try parseChord("ctrl+`"), .action = "scratchpad.toggle-90" },
+        .{ .chord = try parseChord("f7"), .action = null },
+    });
+    defer table.deinit();
+
+    try testing.expectEqual(defaults.len, table.bindings.len);
+    var palette_count: usize = 0;
+    for (table.bindings) |binding| {
+        if (std.mem.eql(u8, binding.action, "palette.open")) {
+            palette_count += 1;
+            try testing.expect(chordEql(binding.chord, new_palette));
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), palette_count);
+
+    // A replaced chord keeps its position, so the palette lists bindings in a stable order.
+    const new_tab_index = for (defaults, 0..) |binding, index| {
+        if (std.mem.eql(u8, binding.action, "tab.new")) break index;
+    } else unreachable;
+    try testing.expectEqualStrings("tab.goto", table.bindings[new_tab_index].action);
+    try testing.expectEqualStrings("index", table.bindings[new_tab_index].arguments[0].name);
+    try testing.expectEqualStrings("4", table.bindings[new_tab_index].arguments[0].value);
+    for (table.bindings) |binding| try testing.expect(!std.mem.eql(u8, binding.action, "tab.new"));
+
+    // Both scratchpad bindings are configurable: the 50 percent chord now opens 90 percent.
+    var ninety: usize = 0;
+    for (table.bindings) |binding| {
+        if (std.mem.eql(u8, binding.action, "scratchpad.toggle-90")) ninety += 1;
+        try testing.expect(!std.mem.eql(u8, binding.action, "scratchpad.toggle-50"));
+    }
+    try testing.expectEqual(@as(usize, 2), ninety);
+}
+
+fn routeThrough(bindings: []const Binding, raw: platform.KeyEvent) Route {
+    var storage: [4]BindingKey = undefined;
+    var state = BindingState.init(&storage);
+    var scratch: TextScratch = .{};
+    return resolve(&state, raw, translate(&scratch, raw, false), bindings);
+}
+
+test "a rebuilt table routes the new chord and leaves an unbound chord to the terminal" {
+    const testing = std.testing;
+    var table = try buildBindings(testing.allocator, defaultBindings(.linux_windows), &.{
+        .{ .chord = try parseChord("ctrl+shift+p"), .action = null },
+        .{ .chord = try parseChord("ctrl+alt+p"), .action = "palette.open" },
+    });
+    defer table.deinit();
+
+    switch (routeThrough(table.bindings, letterKey('p', .{ .ctrl = true, .alt = true }, .press))) {
+        .action => |request| try testing.expectEqualStrings("palette.open", request.action),
+        else => return error.TestExpectedEqual,
+    }
+    switch (routeThrough(table.bindings, letterKey('p', .{ .ctrl = true, .shift = true }, .press))) {
+        .terminal => {},
+        else => return error.TestExpectedEqual,
+    }
+}
+
+fn keybindTestHandler(_: *anyopaque, _: Invocation) anyerror!void {}
+
+test "keybind arguments follow the palette contract or the shipped defaults" {
+    const testing = std.testing;
+    const directions = [_]PaletteChoice{
+        .{ .label = "Right", .value = "right" },
+        .{ .label = "Down", .value = "down" },
+    };
+    var storage: [6]ActionDefinition = undefined;
+    var registry = Registry.init(&storage);
+    try registry.register(.{ .name = "tab.new", .label = "New tab", .handler = keybindTestHandler });
+    try registry.register(.{ .name = "pane.split", .label = "Split pane", .handler = keybindTestHandler, .palette = .{ .argument = .{ .choices = .{
+        .name = "direction",
+        .prompt = "Split",
+        .values = &directions,
+    } } } });
+    try registry.register(.{ .name = "tab.goto", .label = "Go to tab", .handler = keybindTestHandler, .palette = .{ .argument = .{ .input = .{
+        .name = "index",
+        .prompt = "Tab number",
+    } } } });
+    try registry.register(.{ .name = "palette.open", .label = "Open palette", .handler = keybindTestHandler, .palette = null });
+    try registry.register(.{ .name = "tab.activate", .label = "Activate tab", .handler = keybindTestHandler, .palette = null });
+    const defaults = defaultBindings(.linux_windows);
+
+    try testing.expectEqual(@as(?Argument, null), try keybindArgument(&registry, defaults, "tab.new", null));
+    try testing.expectError(error.UnexpectedArgument, keybindArgument(&registry, defaults, "tab.new", "x"));
+    const split = (try keybindArgument(&registry, defaults, "pane.split", "down")).?;
+    try testing.expectEqualStrings("direction", split.name);
+    try testing.expectEqualStrings("down", split.value);
+    try testing.expectError(error.InvalidArgument, keybindArgument(&registry, defaults, "pane.split", "sideways"));
+    try testing.expectError(error.MissingArgument, keybindArgument(&registry, defaults, "pane.split", null));
+    const goto = (try keybindArgument(&registry, defaults, "tab.goto", "3")).?;
+    try testing.expectEqualStrings("index", goto.name);
+    try testing.expectError(error.MissingArgument, keybindArgument(&registry, defaults, "tab.goto", null));
+    // Not palette-visible, but shipped with a default chord: bindable, no argument.
+    try testing.expectEqual(@as(?Argument, null), try keybindArgument(&registry, defaults, "palette.open", null));
+    try testing.expectError(error.NotBindable, keybindArgument(&registry, defaults, "tab.activate", null));
+    try testing.expectError(error.UnknownAction, keybindArgument(&registry, defaults, "no.such", null));
 }
