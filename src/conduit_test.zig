@@ -1197,7 +1197,10 @@ fn writeTool(writer: *std.Io.Writer, spec: ToolSpec, era: McpEra) !void {
     try writeJsonString(writer, spec.description);
     try writer.writeAll(",\"inputSchema\":");
     if (era == .modern and !std.mem.eql(u8, spec.name, "launch")) {
-        try writer.writeAll("{\"allOf\":[");
+        // Clients validate the top-level schema type before looking inside
+        // `allOf` (Claude Code 2.1 rejects a tool list whose schema lacks
+        // `"type":"object"`), so the wrapper states the type the parts share.
+        try writer.writeAll("{\"type\":\"object\",\"allOf\":[");
         try writer.writeAll(spec.input_schema);
         try writer.writeAll(",{\"required\":[\"run\"]}]}");
     } else {
@@ -1778,6 +1781,12 @@ test "MCP tool list covers every CLI capability with valid strict schemas" {
     try std.testing.expectEqualStrings("complete", result.get("resultType").?.string);
     try std.testing.expectEqual(expected.len, result.get("tools").?.array.items.len);
     try std.testing.expect(result.get("tools").?.array.items[1].object.get("inputSchema").?.object.get("allOf") != null);
+    // Every tool's schema, wrapped or not, must declare the object type at the
+    // top level: that is what MCP clients validate first.
+    for (result.get("tools").?.array.items) |tool| {
+        const schema = tool.object.get("inputSchema").?.object;
+        try std.testing.expectEqualStrings("object", schema.get("type").?.string);
+    }
 
     const terminal_spec = findTool("terminal_text") orelse return error.TestUnexpectedResult;
     const terminal_schema = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, terminal_spec.input_schema, .{});

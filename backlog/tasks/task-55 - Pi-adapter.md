@@ -1,9 +1,11 @@
 ---
 id: TASK-55
 title: Pi adapter
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-03 21:39'
+updated_date: '2026-10-07 20:15'
 labels:
   - agents
   - pi
@@ -26,3 +28,10 @@ Adapter for the Pi coding agent CLI per the spike: launch and attach, map its ev
 - [ ] #2 Waiting-for-input and completion produce agent events
 - [ ] #3 A manually started pi process in a Conduit terminal is detected
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Implement agent.Adapter for Pi (omp as a variant) in src/agent/pi.zig per decision-7: detect, launch with a Conduit-supplied Pi extension (-e) that forwards pi.on events to a per-agent sink and gates tools through ctx.ui.confirm; poll tails the sink; respondPermission answers extension_ui_request; session JSONL v3 for history.
+2. Unit tests from fixtures; integration test runs pi --mode rpc with the extension against a mock model endpoint.
+<!-- SECTION:PLAN:END -->

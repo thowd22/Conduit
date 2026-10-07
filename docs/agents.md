@@ -149,13 +149,6 @@ rebuilding.
 Start `claude` in the repository and approve the project server when asked; `claude mcp list`
 shows its status.
 
-> **Known issue (Claude Code 2.1.292, commit 417430e).** Claude Code connects but rejects the
-> tool list: under the current MCP protocol revision `conduit-test` wraps every tool's input
-> schema except `launch`'s in `{"allOf": [...]}` without a top-level `"type": "object"`, and
-> Claude Code requires one (`claude mcp list` reports `tools fetch failed — Invalid result for
-> tools/list ... inputSchema.type expected "object"`). Until that is fixed, use the CLI from
-> Claude Code's shell tool.
-
 **Codex.** Codex does not read `.mcp.json`. Register the server once; this writes
 `[mcp_servers.conduit_test]` to `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`), so give it
 an absolute path:

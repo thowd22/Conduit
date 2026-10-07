@@ -486,6 +486,25 @@ drives the unit tests through every transition. `Harness` now includes `opencode
 `src/agent/{claude_code,codex,pi,opencode}.zig` are stubs for TASK-53/54/55/78; nothing in the app
 is wired to the registry yet.
 
+TASK-70 is complete. `README.md` says what Conduit is, lists the features that exist today (agents
+and Backlog.md marked as coming), shows four screenshots taken from the real app through
+`conduit-test` (`docs/images/main-window.png`, `palette.png`, `theme-picker.png`, `settings.png`),
+and covers Linux install from the release deb, AppImage or tarball with `SHA256SUMS`, building from
+source with the Zig 0.16.0 pin, the headless checks under Xvfb, the bundled third-party licences,
+and `conduit-test`/`.mcp.json` for agents. `docs/user-guide.md` covers the sidebar, terminal
+basics, palette, tabs, panes, scratchpad, workspaces, links and file references, search, context
+menu, settings view, themes, fonts, config location and flags, plus the full default keybinding
+reference for both profiles, generated from `src/input.zig`'s two tables, the fixed search chord
+and the modal keys. `docs/agents.md` describes running Claude Code, Codex, Pi and OpenCode inside
+Conduit today (environment inheritance, glyph coverage, OSC 52 copies refused), marks the
+decision-7 integration as planned, and documents agent access to `conduit-test` through the CLI,
+Claude Code's `.mcp.json`, `codex mcp add` and Pi's shell tool. `docs/config.md` stays the settings
+reference. Writing the docs found that Claude Code 2.1 rejected `conduit-test mcp`'s tool list
+under the 2026-07-28 protocol because the `allOf` wrapper around every non-`launch` schema lacked a
+top-level `"type":"object"`; `writeTool` now emits it and the tools/list test asserts the type on
+every tool. The install flow was checked against the v0.1.7 assets; macOS and Windows content is
+marked unverified.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on

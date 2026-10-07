@@ -1,9 +1,11 @@
 ---
 id: TASK-78
 title: OpenCode adapter
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-07 15:38'
+updated_date: '2026-10-07 20:16'
 labels:
   - agents
   - opencode
@@ -29,3 +31,10 @@ The user runs OpenCode alongside Claude Code, Codex and omp (oh-my-pi) and wants
 - [ ] #4 Harness-neutral tests cover the adapter through the common interface with recorded event fixtures, and an integration check runs against a real opencode binary where it is installed, skipping with a clear message where it is not
 - [ ] #5 The integration surface used (server/API, event stream, session files) is recorded as a Backlog decision; AGENTS.md and docs/architecture.md list OpenCode beside the other harnesses
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Implement agent.Adapter for OpenCode in src/agent/opencode.zig per decision-7 from the documented server API (unverified locally if the CLI is absent): detect, launch with a Conduit-chosen --port, poll via SSE /event (session.status, session.idle, permission.asked), respondPermission via POST /session/:id/permissions/:id, structured events only.
+2. Unit tests from fixture SSE streams; integration test against a fake OpenCode server; mark live verification as pending until opencode is installed.
+<!-- SECTION:PLAN:END -->
