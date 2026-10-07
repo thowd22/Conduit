@@ -7525,6 +7525,10 @@ const tmux_env = [_][]const u8{
 const tmux_config =
     \\set -g automatic-rename off
     \\set -g status-right ""
+    // The test types keys faster than any human. tmux treats a key arriving
+    // within assume-paste-time (default 1 ms) of the previous one as pasted
+    // text and skips bindings for it, so F1 would reach the pane as a literal.
+    \\set -g assume-paste-time 0
     \\bind -n F1 new-window
     \\bind -n M-n next-window
     \\

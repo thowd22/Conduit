@@ -7,7 +7,7 @@ status: Done
 assignee:
   - Claude
 created_date: '2026-10-07 14:09'
-updated_date: '2026-10-07 14:17'
+updated_date: '2026-10-07 14:29'
 labels: []
 dependencies: []
 ordinal: 75000
@@ -46,6 +46,8 @@ The sidebar bottom-left currently stacks thirteen dim clickable control rows (+ 
 
 <!-- SECTION:NOTES:BEGIN -->
 Opus subagent implemented main.zig/e2e; coordinator gate: zig fmt clean, zig build ok, zig build test 101/101 steps (545/553, 8 skipped), all 17 headless checks green under Xvfb including --menu-test, e2e 9/9 PASS with sidebar-palette. Screenshots inspected: 960x540 footer (hint + v0.0.0-dev, no controls), 76-column palette with the 72-cell 'Go to tab' row fully visible, 640x360 footer, 480x300 clamp, 10-column sidebar clip. Hint label is 21 cells so at the default 22-column content width it fills the row; centring is visible once the sidebar is wider. Palette is 76 columns because of 'Go to tab  Alt+1, ... Alt+9'.
+
+Hosted Linux E2E gate run 37635552480 on bc7bbea: attempt 1 failed only the pre-existing workspace 4 MiB flood unit test (PTY lost-wakeup race, filed as TASK-75); attempt 2 passed the whole gate including the nine scripted scenarios.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

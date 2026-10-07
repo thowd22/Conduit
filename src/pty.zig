@@ -23,7 +23,7 @@
 //! |---|---|---|
 //! | `write`, `resize`, `kill`, `takeBytes`, `state`, `waitReadable`, `destroy` | the calling thread, normally the render/UI thread | direct calls |
 //! | the read side of the terminal, the wait that collects the child | one read thread per pty, started by `spawn` | bytes through the byte ring, the child's end through one atomic word |
-//! | the byte ring and the wakeup channel | both threads | atomics, and a pipe on POSIX or events on Windows |
+//! | the byte ring and the wakeup channels | both threads | atomics, and one pipe per direction on POSIX (each drained by exactly one thread) or events on Windows |
 //!
 //! The render/UI thread never blocks on IO: `takeBytes` and `state` are plain reads that cannot
 //! wait, and `waitReadable` blocks only until the owner gives it a deadline, which is what lets an
@@ -38,8 +38,8 @@
 //!
 //! The read thread owns the wait. It is the only thread that blocks on the terminal, so it is the
 //! one that notices the hangup, and the one that collects the child. It publishes the outcome as
-//! a single atomic word the owner reads without waiting (`state`), and signals the wakeup channel
-//! so an owner asleep in `waitReadable` is told at once. A completion rather than a callback
+//! a single atomic word the owner reads without waiting (`state`), and signals the owner's wakeup
+//! channel so an owner asleep in `waitReadable` is told at once. A completion rather than a callback
 //! or a pollable descriptor, because: exactly one thread can ever reap a given child, the owner
 //! never has to hold a lock to ask, and the status can never arrive before the last byte that child
 //! wrote.
@@ -334,11 +334,14 @@ pub fn spawnPosix(gpa: Allocator, request: SpawnRequest) Error!Pty {
         sys.close(status[1]);
     };
 
-    // The second is the wakeup channel between this thread and the read thread: it never blocks,
-    // and a byte on it only ever means "look again".
-    const wake = try sys.wakePipe();
-    errdefer sys.close(wake[0]);
-    errdefer sys.close(wake[1]);
+    // Then the two wakeup channels between this thread and the read thread, one per direction.
+    // Neither ever blocks, and a byte on either only ever means "look again".
+    const owner_wake = try sys.wakePipe();
+    errdefer sys.close(owner_wake[0]);
+    errdefer sys.close(owner_wake[1]);
+    const reader_wake = try sys.wakePipe();
+    errdefer sys.close(reader_wake[0]);
+    errdefer sys.close(reader_wake[1]);
 
     // Everything the child needs from execve is allocated now: after the fork it may not take a
     // lock or call into the allocator.
@@ -346,7 +349,7 @@ pub fn spawnPosix(gpa: Allocator, request: SpawnRequest) Error!Pty {
     defer prepared.deinit(gpa);
 
     const child = try sys.fork();
-    if (child == 0) childMain(pair, wake, status[1], prepared);
+    if (child == 0) childMain(pair, status[1], prepared);
 
     sys.close(pair.slave);
     slave_held = false;
@@ -385,7 +388,8 @@ pub fn spawnPosix(gpa: Allocator, request: SpawnRequest) Error!Pty {
         .child = child,
         .reader = null,
         .queue = undefined,
-        .wake = wake,
+        .owner_wake = owner_wake,
+        .reader_wake = reader_wake,
         .stopping = .init(false),
         .end = .init(EndWord.running),
     };
@@ -447,22 +451,37 @@ const PosixPty = struct {
     /// exiting. Short, so a stop request is noticed; long enough to cost nothing.
     const reap_interval_ms = 20;
 
-    /// How many descriptors a live terminal holds: the master, and both ends of the wake pipe.
-    const descriptor_count = 3;
+    /// How many descriptors a live terminal holds: the master, and both ends of both wake pipes.
+    const descriptor_count = 5;
 
     gpa: Allocator,
     master: sys.fd_t,
     child: sys.pid_t,
     reader: ?std.Thread,
     queue: ByteRing,
-    /// One pipe, used as a wakeup channel in both directions: the read thread writes it when bytes
-    /// or an exit are waiting for the owner, the owner writes it when it has made room or wants
-    /// the read thread to stop. A byte is only ever a hint — both sides re-check the thing they
-    /// are waiting for — so neither can be woken by the other's bytes and no wakeup can be lost.
-    wake: [2]sys.fd_t,
+    /// Reader to owner: the read thread writes it when it has queued bytes or published the
+    /// child's end, and only the owner drains it, in `waitUntilPending`.
+    ///
+    /// Each direction has its own pipe, with exactly one thread that ever drains it, because a
+    /// single pipe shared by both directions loses wakeups. With one pipe the reader, finding the
+    /// ring full, could be overtaken before it waited: the owner took every byte and wrote "room",
+    /// then found the ring empty and, waiting for output, drained that very byte. The reader then
+    /// waited on a pipe nobody would write again — the owner only signals after taking something,
+    /// and the end is published by the stalled reader itself — and the session froze. With one
+    /// consumer per channel a byte written after that consumer's last drain stays there until it
+    /// looks, and every consumer re-checks its predicate after draining, so a hint can be early
+    /// or redundant but never lost.
+    owner_wake: [2]sys.fd_t,
+    /// Owner to reader: the owner writes it when `takeBytes` made room and when `destroy` asks the
+    /// read thread to stop, and only the read thread drains it.
+    reader_wake: [2]sys.fd_t,
     stopping: std.atomic.Value(bool),
     /// The child's end. Written once, by the read thread, and read by everybody.
     end: std.atomic.Value(EndWord),
+    /// Test-only: holds the read thread between finding the ring full and waiting for room, so a
+    /// test can run the owner through exactly the interleaving that once lost a wakeup. Absent
+    /// from every non-test build.
+    park: if (builtin.is_test) ReaderPark else void = if (builtin.is_test) .{} else {},
 
     const vtable: Pty.VTable = .{
         .write = writeTerminal,
@@ -486,13 +505,13 @@ const PosixPty = struct {
         while (!self.stopping.load(.acquire)) {
             var fds = [_]sys.pollfd{
                 .{ .fd = self.master, .events = sys.poll_in, .revents = 0 },
-                .{ .fd = self.wake[0], .events = sys.poll_in, .revents = 0 },
+                .{ .fd = self.reader_wake[0], .events = sys.poll_in, .revents = 0 },
             };
             sys.poll(&fds, -1) catch |err| {
                 log.err("cannot wait on the terminal: {s}", .{@errorName(err)});
                 return;
             };
-            if (fds[1].revents & (sys.poll_in | sys.poll_hup) != 0) self.drainWake();
+            if (fds[1].revents & (sys.poll_in | sys.poll_hup) != 0) drainWake(self.reader_wake);
             if (fds[0].revents & (sys.poll_in | sys.poll_hup) == 0) continue;
 
             // The master reported readable, so this read returns immediately.
@@ -514,17 +533,20 @@ const PosixPty = struct {
             rest = rest[self.queue.append(rest)..];
             if (rest.len == 0) break;
             if (self.stopping.load(.acquire)) return;
+            if (comptime builtin.is_test) self.park.hold(&self.stopping);
             // The owner is not keeping up. Stop reading until it has made room.
-            sys.pollOne(self.wake[0], -1) catch |err| {
+            // Room made after the failed append above left a byte on the reader's own channel,
+            // which nobody else drains, so this wait cannot miss it.
+            sys.pollOne(self.reader_wake[0], -1) catch |err| {
                 log.err("cannot wait for the owner to drain the terminal: {s}", .{@errorName(err)});
                 return;
             };
-            self.drainWake();
+            drainWake(self.reader_wake);
         }
         // Notify on every chunk rather than only on the empty-to-non-empty edge: without a lock
         // that edge is a race, and one byte per read is cheaper than getting it wrong. A pipe that
         // is already full is already readable, so a dropped byte here loses no wakeup.
-        self.notify();
+        notify(self.owner_wake);
     }
 
     /// Wait until the child is over, and publish how it ended.
@@ -535,23 +557,23 @@ const PosixPty = struct {
                 // unknown rather than leaving a session's end unreported.
                 log.err("cannot collect the exit status of the child: {s}", .{@errorName(err)});
                 self.end.store(.unknown, .release);
-                self.notify();
+                notify(self.owner_wake);
                 return;
             };
             if (status) |raw| {
                 self.end.store(EndWord.fromStatus(raw), .release);
-                self.notify();
+                notify(self.owner_wake);
                 return;
             }
             // The child closed its terminal without exiting. Look again in short steps, so a stop
             // request is answered — a terminal being destroyed is one nobody looks at again, and
             // needs no end — instead of blocking on a process that may never end.
             if (self.stopping.load(.acquire)) return;
-            sys.pollOne(self.wake[0], reap_interval_ms) catch |err| {
+            sys.pollOne(self.reader_wake[0], reap_interval_ms) catch |err| {
                 log.err("cannot wait for the child to end: {s}", .{@errorName(err)});
                 return;
             };
-            self.drainWake();
+            drainWake(self.reader_wake);
         }
     }
 
@@ -565,11 +587,11 @@ const PosixPty = struct {
             // A bounded step, so a stop request or an exit is answered promptly even when the
             // timeout is long.
             const step = @min(deadline - now, @as(u64, 50));
-            sys.pollOne(self.wake[0], @intCast(step)) catch |err| {
+            sys.pollOne(self.owner_wake[0], @intCast(step)) catch |err| {
                 log.err("cannot wait on the terminal: {s}", .{@errorName(err)});
                 return false;
             };
-            self.drainWake();
+            drainWake(self.owner_wake);
         }
     }
 
@@ -582,15 +604,16 @@ const PosixPty = struct {
         return self.end.load(.acquire).kind != .running;
     }
 
-    fn notify(self: *PosixPty) void {
-        sys.notify(self.wake[1]);
+    /// Wake the one thread that drains `channel`.
+    fn notify(channel: [2]sys.fd_t) void {
+        sys.notify(channel[1]);
     }
 
-    /// Take whatever wakeup bytes are waiting. Both threads do this: a byte is a hint, and the
-    /// predicate each thread re-checks is the truth.
-    fn drainWake(self: *PosixPty) void {
+    /// Take whatever wakeup bytes are waiting on `channel`. Only that channel's one consumer calls
+    /// this: a byte is a hint, and the predicate the consumer re-checks afterwards is the truth.
+    fn drainWake(channel: [2]sys.fd_t) void {
         var scratch: [64]u8 = undefined;
-        while (sys.readAvailable(self.wake[0], &scratch) catch null) |count| {
+        while (sys.readAvailable(channel[0], &scratch) catch null) |count| {
             if (count == 0) break;
         }
     }
@@ -618,9 +641,10 @@ fn takeBytes(ptr: *anyopaque, dest: []u8) usize {
     const self: *PosixPty = @ptrCast(@alignCast(ptr));
     const taken = self.queue.take(dest);
     // Draining may have made room where there was none, and the read thread is waiting for exactly
-    // that when the queue was full. A byte on the wake pipe costs one syscall per frame and cannot
-    // be lost; leaving the reader asleep there would stall the terminal instead.
-    if (taken != 0) self.notify();
+    // that when the queue was full. A byte on the reader's channel costs one syscall per frame and
+    // cannot be lost, since only the reader drains it; leaving the reader asleep there would stall
+    // the terminal instead.
+    if (taken != 0) PosixPty.notify(self.reader_wake);
     return taken;
 }
 
@@ -637,16 +661,38 @@ fn waitReadable(ptr: *anyopaque, timeout_ms: u32) bool {
 fn destroy(ptr: *anyopaque) void {
     const self: *PosixPty = @ptrCast(@alignCast(ptr));
     self.stopping.store(true, .release);
-    // Wake the read thread wherever it is waiting, so joining it is a deadline, not a hope.
-    self.notify();
+    // Wake the read thread wherever it is waiting, so joining it is a deadline, not a hope. Every
+    // place it waits watches its own channel.
+    PosixPty.notify(self.reader_wake);
     if (self.reader) |thread| thread.join();
     // Closing the master is the hangup: the OS ends the child's terminal when the last one goes.
     sys.close(self.master);
-    sys.close(self.wake[0]);
-    sys.close(self.wake[1]);
+    sys.close(self.owner_wake[0]);
+    sys.close(self.owner_wake[1]);
+    sys.close(self.reader_wake[0]);
+    sys.close(self.reader_wake[1]);
     self.queue.destroy(self.gpa);
     self.gpa.destroy(self);
 }
+
+/// Test-only gate a `PosixPty` read thread passes between finding the ring full and waiting for
+/// room. Armed by a test; the read thread then reports that it is parked and waits for release.
+const ReaderPark = struct {
+    const disarmed = 0;
+    const armed = 1;
+    const parked = 2;
+    const released = 3;
+
+    word: std.atomic.Value(u8) = .init(disarmed),
+
+    fn hold(self: *ReaderPark, stopping: *const std.atomic.Value(bool)) void {
+        if (self.word.cmpxchgStrong(armed, parked, .acq_rel, .acquire) != null) return;
+        while (self.word.load(.acquire) == parked and !stopping.load(.acquire)) std.Thread.yield() catch {
+            // Yielding is only courtesy while spinning; failing to yield still spins correctly.
+        };
+        self.word.store(disarmed, .release);
+    }
+};
 
 /// A single-producer, single-consumer byte ring: the read thread appends, the owner drains.
 ///
@@ -864,8 +910,7 @@ fn duplicate(gpa: Allocator, bytes: []const u8) Allocator.Error![]u8 {
 /// After a fork in a threaded process a child may not allocate, take a lock or call anything that
 /// is not async-signal-safe. Every descriptor is close-on-exec, so the only descriptors this has to
 /// arrange are the three standard ones; the rest disappear at `execve`.
-fn childMain(pair: sys.PtyPair, wake: [2]sys.fd_t, status: sys.fd_t, prepared: Prepared) noreturn {
-    _ = wake;
+fn childMain(pair: sys.PtyPair, status: sys.fd_t, prepared: Prepared) noreturn {
     for ([_]sys.fd_t{ 0, 1, 2 }) |target| {
         sys.dup2(pair.slave, target) catch childFail(status, .terminal, null);
     }
@@ -3435,6 +3480,53 @@ test "killing a child is reported as the signal that ended it" {
 
     // The child is collected now, so its process id is not Conduit's to signal again.
     try testing.expectError(error.Closed, pty.kill(.hangup));
+}
+
+test "a reader waiting for room is woken even when the owner empties the ring and waits first" {
+    if (!has_posix_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Far more than the ring holds, so the reader keeps finding it full.
+    const total = 1024 * 1024;
+    const pty = try spawnPosix(gpa, shellRequest(&.{ "/bin/sh", "-c", "head -c 1048576 /dev/zero" }));
+    defer pty.destroy();
+    const posix: *PosixPty = @ptrCast(@alignCast(pty.ptr));
+
+    var buffer: [16 * 1024]u8 = undefined;
+    var consumed: usize = 0;
+    // Each round is the interleaving that once froze a session: the reader has found the ring
+    // full and is about to wait for room; the owner takes every byte, then waits for more output
+    // the way an idle event loop does — draining its wakeups — before the reader waits.
+    for (0..4) |_| {
+        posix.park.word.store(ReaderPark.armed, .release);
+        const park_deadline = sys.monotonicMillis() + 5000;
+        while (posix.park.word.load(.acquire) != ReaderPark.parked) {
+            if (sys.monotonicMillis() > park_deadline) return error.TimedOut;
+            std.Thread.yield() catch {
+                // Yielding only shortens the spin; a failed yield still waits correctly.
+            };
+        }
+        try testing.expectEqual(@as(usize, PosixPty.queue_capacity), posix.queue.len());
+        while (true) {
+            const count = pty.takeBytes(&buffer);
+            if (count == 0) break;
+            consumed += count;
+        }
+        // The owner's own wait: nothing is pending, so it consumes whatever wakeups it sees.
+        try testing.expect(!pty.waitReadable(5));
+        posix.park.word.store(ReaderPark.released, .release);
+        // The reader was told there is room before it waited, so it must refill the ring.
+        try testing.expect(pty.waitReadable(2000));
+    }
+
+    // And the terminal still runs to completion.
+    const deadline = testDeadline();
+    while (pty.state() == .running or posix.queue.len() != 0) {
+        const count = pty.takeBytes(&buffer);
+        consumed += count;
+        if (count == 0) _ = pty.waitReadable(timeLeft(deadline) orelse return error.TimedOut);
+    }
+    try testing.expectEqual(ChildState{ .exited = .{ .code = 0 } }, pty.state());
+    try testing.expectEqual(@as(usize, total), consumed);
 }
 
 test "starting and destroying a terminal leaks no descriptor and leaves no child" {

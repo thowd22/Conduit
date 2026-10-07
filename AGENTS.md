@@ -298,6 +298,21 @@ inherits; remote contexts supply their own". The eighth `zig build e2e` scenario
 addressing variables for `launch` only, and the child must show the probe, the agent socket, a
 display, the isolated HOME layout, unset driver addressing and Conduit's identity.
 
+TASK-75 fixed a PTY stall. The POSIX backend's read thread and owner thread used one nonblocking
+pipe as the wakeup channel in both directions; after the reader saw a full byte ring but before it
+blocked, the owner could take every byte, notify, and then drain that very byte in
+`waitUntilPending`, leaving the reader asleep with nobody left to wake it, so the child blocked on
+the slave and the session froze until closed. Hosted gate run 37635552480 caught it as the 4 MiB
+flood unit test consuming 1.2 MiB and then nothing for its 10 s deadline. `PosixPty` now has two
+channels, `owner_wake` (reader to owner, drained only by the owner) and `reader_wake` (owner to
+reader, drained only by the read thread), so a wakeup can never be consumed by the thread it was
+not meant for; a test-only `ReaderPark` gate parks the reader at the racy point and the new
+pty test fails on the single-pipe design. `session.drainChildOutput` now observes the child state
+before taking bytes so an end published between the two observations cannot strand the final
+queue (fake-backend test). The faster wakeups exposed that the tmux integration test typed F1
+within tmux's 1 ms `assume-paste-time`, which treats the key as pasted text and skips bindings;
+the test's tmux config sets it to 0.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on

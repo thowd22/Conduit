@@ -257,7 +257,17 @@ nothing else is a legal dependency.
   so this module never opens a workspace-scoped path itself.
 - **May depend on** no other Conduit module. Its platform-specific backends own the syscalls they
   need, as permitted by architecture invariant 10.
-- **Lands** M1 — TASK-8, TASK-16.
+- **Wakeups (TASK-75).** The POSIX backend's read thread and owner thread share a 64 KiB byte
+  ring and signal each other over two nonblocking pipes, one per direction: `owner_wake` carries
+  "bytes queued" and "child ended" from the reader and is drained only by the owner in
+  `waitUntilPending`; `reader_wake` carries "room made" from `takeBytes` and "stop" from
+  `destroy` and is drained only by the read thread. A byte is a hint and each side re-checks its
+  predicate after draining, which is sound only because exactly one thread consumes each channel.
+  The earlier single shared pipe let the owner's drain eat the byte meant for a reader that had
+  just seen a full ring, stalling the session forever; a deterministic test parks the reader at
+  that point and proves it is woken. A live POSIX terminal therefore holds five descriptors. The
+  Windows backend already used separate `space`, `owner_wake` and `stop` events.
+- **Lands** M1 — TASK-8, TASK-16; TASK-75 (per-direction wake channels).
 
 ### `term`
 

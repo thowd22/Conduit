@@ -176,18 +176,24 @@ pub const Session = struct {
     /// blocks nor allocates; callers may repeat it to empty a queue larger than
     /// their buffer. This belongs to the session rather than a view so a
     /// workspace can keep hidden sessions current. With no attached child or
-    /// an empty buffer it returns zero and changes nothing. A zero read from an
-    /// exited child records that its final queue has been observed empty, so
-    /// `needsPump` can stop waking for that child.
+    /// an empty buffer it returns zero and changes nothing. A zero read records
+    /// that an exited child's final queue has been observed empty, so
+    /// `needsPump` can stop waking for that child — but only when the child
+    /// was already seen exited before the take. The backend publishes the end
+    /// after the reader's final enqueue, so an end observed first proves the
+    /// empty queue is final; an end observed after an empty take may have
+    /// arrived together with bytes queued in between, which must not be
+    /// stranded.
     pub fn drainChildOutput(self: *Session, buffer: []u8) usize {
         const child_pty = self.child_handle orelse return 0;
         if (buffer.len == 0) return 0;
+        const exited_before_take = child_pty.state() == .exited;
         const count = child_pty.takeBytes(buffer);
         if (count != 0) {
             self.child_output_quiescent = false;
             self.terminal_ptr.feed(buffer[0..count]);
         } else {
-            self.child_output_quiescent = child_pty.state() == .exited;
+            self.child_output_quiescent = exited_before_take;
         }
         return count;
     }
@@ -358,6 +364,10 @@ const ResponsePty = struct {
     output: []const u8 = "",
     child_state: pty.ChildState = .running,
     readable_override: ?bool = null,
+    /// When set, the first take that finds nothing queued publishes these final bytes and then
+    /// this end before returning zero: the read thread finishing between the owner's two looks.
+    late_end: ?pty.ChildState = null,
+    late_output: []const u8 = "",
 
     const vtable: pty.Pty.VTable = .{
         .write = write,
@@ -401,6 +411,13 @@ const ResponsePty = struct {
         const count = @min(dest.len, self.output.len);
         @memcpy(dest[0..count], self.output[0..count]);
         self.output = self.output[count..];
+        if (count == 0) {
+            if (self.late_end) |end| {
+                self.output = self.late_output;
+                self.child_state = end;
+                self.late_end = null;
+            }
+        }
         return count;
     }
 
@@ -542,6 +559,29 @@ test "an exited child stays pumpable through final output and then quiesces" {
 
     // Even the final positive read needs one more pass: only a zero read can
     // prove that the exited child's queue is empty.
+    try testing.expect(live.needsPump());
+    try testing.expectEqual(@as(usize, 0), live.drainChildOutput(&buffer));
+    try testing.expect(!live.needsPump());
+}
+
+test "final output and the end published after an empty take are not stranded" {
+    const testing = std.testing;
+    var fake: ResponsePty = .{
+        .late_output = "tail",
+        .late_end = .{ .exited = .{ .code = 0 } },
+    };
+    var live = try Session.init(testing.io, testing.allocator, .human_terminal, .{ .cols = 20, .rows = 3 });
+    defer live.deinit() catch |err| std.debug.panic("session cleanup failed: {s}", .{@errorName(err)});
+    try live.attachChild(fake.asPty());
+    var buffer: [8]u8 = undefined;
+
+    // The take finds the ring empty, and only then does the reader queue its last bytes and
+    // publish the end. That end was not seen before the empty take, so it proves nothing about
+    // the queue and the session must keep asking.
+    try testing.expectEqual(@as(usize, 0), live.drainChildOutput(&buffer));
+    try testing.expect(live.needsPump());
+    try testing.expectEqual(@as(usize, 4), live.drainChildOutput(&buffer));
+    try testing.expectEqualStrings("tail", buffer[0..4]);
     try testing.expect(live.needsPump());
     try testing.expectEqual(@as(usize, 0), live.drainChildOutput(&buffer));
     try testing.expect(!live.needsPump());
