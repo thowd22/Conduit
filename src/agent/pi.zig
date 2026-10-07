@@ -788,7 +788,9 @@ pub const PiAdapter = struct {
         defer result.deinit(self.allocator);
         if (result.exit_code) |code| if (code == 127) return null;
         if (!result.succeeded()) return error.Protocol;
-        const version = parseVersion(result.stdout) orelse return error.Protocol;
+        // Pi 0.73 prints its version on stderr and nothing on stdout; omp uses
+        // stdout. Either stream may carry it, stdout first.
+        const version = parseVersion(result.stdout) orelse parseVersion(result.stderr) orelse return error.Protocol;
         if (version.len > request.version_buffer.len) return error.NoSpaceLeft;
         const out = request.version_buffer[0..version.len];
         @memcpy(out, version);
@@ -1432,7 +1434,7 @@ test "variants differ only by executable and session root" {
 /// the request.
 const ScriptedRunContext = struct {
     outcome: union(enum) {
-        result: struct { exit_code: ?u8, stdout: []const u8 = "" },
+        result: struct { exit_code: ?u8, stdout: []const u8 = "", stderr: []const u8 = "" },
         fail: workspace.RunError,
     },
     argv: [4][]const u8 = undefined,
@@ -1478,7 +1480,7 @@ const ScriptedRunContext = struct {
             .result => |r| {
                 const stdout = try allocator.dupe(u8, r.stdout);
                 errdefer allocator.free(stdout);
-                return .{ .exit_code = r.exit_code, .stdout = stdout, .stderr = try allocator.dupe(u8, "") };
+                return .{ .exit_code = r.exit_code, .stdout = stdout, .stderr = try allocator.dupe(u8, r.stderr) };
             },
         }
     }
@@ -1491,7 +1493,8 @@ test "detect runs pi --version through the context" {
     try testing.expect(a.capabilities().detect);
     var version: [max_version_bytes]u8 = undefined;
 
-    var installed: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "0.73.1\n" } } };
+    // The real pi 0.73.1 prints its version on stderr and nothing on stdout.
+    var installed: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "", .stderr = "0.73.1\n" } } };
     try testing.expectEqualStrings("0.73.1", (try a.detect(.{ .context = installed.ref(), .version_buffer = &version })).?);
     try testing.expectEqual(@as(usize, 2), installed.argc);
     try testing.expectEqualStrings("pi", installed.argv[0]);
