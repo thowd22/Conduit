@@ -68,14 +68,16 @@
 //!   has native approvals (`--approval-mode`), `--mode rpc-ui` and ACP, which
 //!   this adapter does not use.
 //!
-//! Detection (`detect`) needs a probe through the workspace ExecutionContext,
-//! which has no run/read capability yet: TODO(TASK-55) implement it with the
-//! ExecutionContext probe once that lands. `recognizeCommand` already lets the
-//! agent core classify a foreground `pi`/`omp` process it found itself.
+//! Detection (`detect`) runs `pi --version` (or `omp --version`) through the
+//! request's ExecutionContext, so it works in SSH and WSL workspaces too;
+//! a missing command (or a remote shell's 127) is "not installed".
+//! `recognizeCommand` lets the agent core classify a foreground `pi`/`omp`
+//! process it found itself.
 //!
 //! Threads: as `adapter.zig` says, every method but `harness` and
 //! `capabilities` runs on one IO worker at a time. The adapter makes no OS
-//! calls itself: all IO goes through the owner-supplied `Transport`.
+//! calls itself: all IO goes through the owner-supplied `Transport` or the
+//! request's ExecutionContext.
 //!
 //! Memory: `init` copies every option string; `deinit` frees them. Lines are
 //! buffered up to `Options.max_line_bytes`; a longer line is dropped except
@@ -87,6 +89,7 @@ const iface = @import("adapter.zig");
 const event = @import("event.zig");
 const state = @import("state.zig");
 const Harness = @import("harness.zig").Harness;
+const workspace = @import("workspace");
 
 const Allocator = std.mem.Allocator;
 const Error = iface.Error;
@@ -114,6 +117,11 @@ pub const max_input_bytes = 64 * 1024;
 /// The longest request id accepted. Sink ids name a file, so they are also
 /// restricted to `[A-Za-z0-9_-]`.
 pub const max_request_id_bytes = 64;
+/// Bounds on the `detect` probe (`pi --version`).
+pub const detect_timeout_ms = 5000;
+pub const detect_max_output = 4096;
+/// The longest version string `detect` accepts.
+pub const max_version_bytes = 64;
 
 const read_chunk_bytes = 16 * 1024;
 const max_read_per_poll = 256 * 1024;
@@ -234,6 +242,28 @@ pub fn sessionDirName(out: []u8, cwd: []const u8) error{NoSpaceLeft}![]const u8 
     }
     @memcpy(out[2 + trimmed.len ..][0..2], "--");
     return out[0 .. trimmed.len + 4];
+}
+
+/// The version in `pi --version` output (`0.73.1`; omp prints `omp/18.6.1`
+/// or similar): the last word of the first non-empty line, after any `/`,
+/// without a leading `v`. Untrusted output: anything that is not a short
+/// run of version characters is null.
+pub fn parseVersion(stdout: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeAny(u8, stdout, "\r\n");
+    const line = std.mem.trim(u8, lines.next() orelse return null, " \t");
+    var words = std.mem.tokenizeAny(u8, line, " \t");
+    var last: ?[]const u8 = null;
+    while (words.next()) |word| last = word;
+    var version = last orelse return null;
+    if (std.mem.lastIndexOfScalar(u8, version, '/')) |slash| version = version[slash + 1 ..];
+    if (version.len > 1 and version[0] == 'v') version = version[1..];
+    if (version.len == 0 or version.len > max_version_bytes) return null;
+    if (!std.ascii.isDigit(version[0])) return null;
+    for (version) |c| switch (c) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '.', '-', '+' => {},
+        else => return null,
+    };
+    return version;
 }
 
 /// Whether `id` may name a decision file: 1–64 bytes of `[A-Za-z0-9_-]`.
@@ -535,6 +565,10 @@ const Resolution = struct {
 
 pub const PiAdapter = struct {
     allocator: Allocator,
+    /// For the `detect` probe through the ExecutionContext.
+    io: std.Io,
+    /// The last launch cwd, where `detect` probes; "/" before any launch.
+    cwd: ?[]u8 = null,
     variant: Variant,
     mode: Mode,
     gate: Gate,
@@ -562,6 +596,7 @@ pub const PiAdapter = struct {
 
     const vtable: iface.Adapter.VTable = .{
         .harness = harness,
+        .detect = detect,
         .capabilities = capabilities,
         .launch = launch,
         .attach = attach,
@@ -575,7 +610,7 @@ pub const PiAdapter = struct {
     /// Ownership: the result owns copies of the option strings and must be
     /// released with `deinit` (or `destroy` through the vtable, which only
     /// deinitialises the value; the caller still owns its memory).
-    pub fn init(allocator: Allocator, options: Options) Allocator.Error!PiAdapter {
+    pub fn init(allocator: Allocator, io: std.Io, options: Options) Allocator.Error!PiAdapter {
         const executable = try allocator.dupe(u8, options.executable orelse options.variant.executable());
         errdefer allocator.free(executable);
         const sink_dir = try allocator.dupe(u8, options.sink_dir);
@@ -592,6 +627,7 @@ pub const PiAdapter = struct {
         }
         return .{
             .allocator = allocator,
+            .io = io,
             .variant = options.variant,
             .mode = options.mode,
             .gate = options.gate,
@@ -608,6 +644,7 @@ pub const PiAdapter = struct {
         const allocator = self.allocator;
         allocator.free(self.executable);
         allocator.free(self.sink_dir);
+        if (self.cwd) |cwd| allocator.free(cwd);
         for (self.extra_args) |arg| allocator.free(arg);
         allocator.free(self.extra_args);
         if (self.initial_prompt) |prompt| allocator.free(prompt);
@@ -660,6 +697,7 @@ pub const PiAdapter = struct {
         const can_decide = if (transport) |t| t.vtable.decide != null else false;
         const rpc = self.mode == .rpc;
         return .{
+            .detect = true,
             .launch = true,
             .attach = true,
             .poll = connected,
@@ -715,8 +753,46 @@ pub const PiAdapter = struct {
             }
         }
         self.mode = mode;
+        try self.rememberCwd(request.cwd);
         self.token = request.token;
         return .{ .argv = try argv.toOwnedSlice(allocator), .env = try env.toOwnedSlice(allocator) };
+    }
+
+    fn rememberCwd(self: *PiAdapter, cwd: []const u8) Allocator.Error!void {
+        const copy = try self.allocator.dupe(u8, cwd);
+        if (self.cwd) |old| self.allocator.free(old);
+        self.cwd = copy;
+    }
+
+    /// `<executable> --version` through the request's context, bounded to
+    /// `detect_timeout_ms` and `detect_max_output`, in the last launch cwd
+    /// (or "/"). Not installed (the command is missing, or a remote shell's
+    /// 127) is null; a context that cannot run commands is `Unsupported`.
+    fn detect(ptr: *anyopaque, request: iface.DetectRequest) Error!?[]const u8 {
+        const self = cast(ptr);
+        var result = request.context.run(self.allocator, self.io, .{
+            .argv = &.{ self.executable, "--version" },
+            .cwd = self.cwd orelse "/",
+            .max_output = detect_max_output,
+            .timeout_ms = detect_timeout_ms,
+        }) catch |err| switch (err) {
+            error.CommandNotFound => return null,
+            error.Unsupported => return error.Unsupported,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unavailable => return error.Disconnected,
+            error.AccessDenied, error.InvalidRequest, error.Timeout, error.OutputTooLarge, error.SpawnFailed => {
+                log.debug("version probe failed: {s}", .{@errorName(err)});
+                return error.Protocol;
+            },
+        };
+        defer result.deinit(self.allocator);
+        if (result.exit_code) |code| if (code == 127) return null;
+        if (!result.succeeded()) return error.Protocol;
+        const version = parseVersion(result.stdout) orelse return error.Protocol;
+        if (version.len > request.version_buffer.len) return error.NoSpaceLeft;
+        const out = request.version_buffer[0..version.len];
+        @memcpy(out, version);
+        return out;
     }
 
     fn attach(ptr: *anyopaque, request: iface.AttachRequest) Error!void {
@@ -1281,7 +1357,7 @@ test "the extension reads its sink and token from the environment and writes one
 }
 
 test "launch describes a TUI with the extension and an RPC agent without a sink" {
-    var pi = try PiAdapter.init(testing.allocator, .{ .sink_dir = "/run/conduit/agent-1", .extra_args = &.{ "--provider", "mock" } });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/run/conduit/agent-1", .extra_args = &.{ "--provider", "mock" } });
     defer pi.deinit();
     const a = pi.adapter();
     try testing.expectEqual(Harness.pi, a.harness());
@@ -1316,12 +1392,12 @@ test "launch describes a TUI with the extension and an RPC agent without a sink"
     try testing.expectEqualStrings("{\"type\":\"prompt\",\"message\":\"go\"}\n", transport.written.items);
 
     // The extension needs a directory to live and report in.
-    var bare = try PiAdapter.init(testing.allocator, .{});
+    var bare = try PiAdapter.init(testing.allocator, testing.io, .{});
     defer bare.deinit();
     try testing.expectError(error.Unsupported, bare.adapter().launch(arena.allocator(), .{ .context_kind = .local, .cwd = "/", .token = test_token }));
     try testing.expectError(error.Unsupported, bare.adapter().launch(arena.allocator(), .{ .context_kind = .local, .cwd = "/", .token = test_token, .headless = true }));
     // An ungated RPC agent runs plain Pi.
-    var plain = try PiAdapter.init(testing.allocator, .{ .gate = .off });
+    var plain = try PiAdapter.init(testing.allocator, testing.io, .{ .gate = .off });
     defer plain.deinit();
     const plain_spec = try plain.adapter().launch(arena.allocator(), .{ .context_kind = .local, .cwd = "/", .token = test_token, .headless = true });
     try testing.expectEqual(@as(usize, 3), plain_spec.argv.len);
@@ -1330,7 +1406,7 @@ test "launch describes a TUI with the extension and an RPC agent without a sink"
 }
 
 test "variants differ only by executable and session root" {
-    var omp = try PiAdapter.init(testing.allocator, .{ .variant = .omp, .sink_dir = "/s" });
+    var omp = try PiAdapter.init(testing.allocator, testing.io, .{ .variant = .omp, .sink_dir = "/s" });
     defer omp.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1352,16 +1428,122 @@ test "variants differ only by executable and session root" {
     try testing.expectError(error.NoSpaceLeft, sessionDirName(buffer[0..4], "/ab"));
 }
 
+/// An ExecutionContext whose `run` returns one scripted outcome and records
+/// the request.
+const ScriptedRunContext = struct {
+    outcome: union(enum) {
+        result: struct { exit_code: ?u8, stdout: []const u8 = "" },
+        fail: workspace.RunError,
+    },
+    argv: [4][]const u8 = undefined,
+    argc: usize = 0,
+    cwd: []const u8 = "",
+    timeout_ms: u32 = 0,
+
+    const vtable: workspace.ExecutionContext.VTable = .{
+        .spawn = spawn,
+        .kind = kind,
+        .destroy = destroy,
+        .run = run,
+    };
+
+    fn ref(self: *ScriptedRunContext) workspace.ExecutionContext.Ref {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    // `agent` does not import `pty`; the spawn entry's types come from the
+    // vtable's own function type.
+    const spawn_fn = @typeInfo(@typeInfo(workspace.ExecutionContext.SpawnFn).pointer.child).@"fn";
+
+    fn spawn(_: *anyopaque, _: spawn_fn.params[1].type.?) spawn_fn.return_type.? {
+        return error.SystemError;
+    }
+
+    fn kind(_: *const anyopaque) workspace.ExecutionContextKind {
+        return .ssh;
+    }
+
+    fn destroy(_: *anyopaque) void {}
+
+    fn run(ptr: *anyopaque, allocator: Allocator, _: std.Io, request: workspace.RunRequest) workspace.RunError!workspace.RunResult {
+        const self: *ScriptedRunContext = @ptrCast(@alignCast(ptr));
+        // Only string literals and adapter-owned strings that outlive the
+        // test's reads are recorded.
+        self.argc = @min(request.argv.len, self.argv.len);
+        @memcpy(self.argv[0..self.argc], request.argv[0..self.argc]);
+        self.cwd = request.cwd;
+        self.timeout_ms = request.timeout_ms;
+        switch (self.outcome) {
+            .fail => |err| return err,
+            .result => |r| {
+                const stdout = try allocator.dupe(u8, r.stdout);
+                errdefer allocator.free(stdout);
+                return .{ .exit_code = r.exit_code, .stdout = stdout, .stderr = try allocator.dupe(u8, "") };
+            },
+        }
+    }
+};
+
+test "detect runs pi --version through the context" {
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/s" });
+    defer pi.deinit();
+    const a = pi.adapter();
+    try testing.expect(a.capabilities().detect);
+    var version: [max_version_bytes]u8 = undefined;
+
+    var installed: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "0.73.1\n" } } };
+    try testing.expectEqualStrings("0.73.1", (try a.detect(.{ .context = installed.ref(), .version_buffer = &version })).?);
+    try testing.expectEqual(@as(usize, 2), installed.argc);
+    try testing.expectEqualStrings("pi", installed.argv[0]);
+    try testing.expectEqualStrings("--version", installed.argv[1]);
+    try testing.expectEqualStrings("/", installed.cwd);
+    try testing.expectEqual(@as(u32, detect_timeout_ms), installed.timeout_ms);
+
+    var missing: ScriptedRunContext = .{ .outcome = .{ .fail = error.CommandNotFound } };
+    try testing.expect((try a.detect(.{ .context = missing.ref(), .version_buffer = &version })) == null);
+    var shell_missing: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 127 } } };
+    try testing.expect((try a.detect(.{ .context = shell_missing.ref(), .version_buffer = &version })) == null);
+    var cannot_run: ScriptedRunContext = .{ .outcome = .{ .fail = error.Unsupported } };
+    try testing.expectError(error.Unsupported, a.detect(.{ .context = cannot_run.ref(), .version_buffer = &version }));
+    var slow: ScriptedRunContext = .{ .outcome = .{ .fail = error.Timeout } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = slow.ref(), .version_buffer = &version }));
+    var failing: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 1, .stdout = "0.73.1\n" } } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = failing.ref(), .version_buffer = &version }));
+    var junk: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "\x1b[31m!!\n" } } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = junk.ref(), .version_buffer = &version }));
+    var tiny: [3]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, a.detect(.{ .context = installed.ref(), .version_buffer = &tiny }));
+
+    // Launch remembers the cwd; later probes run there.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try a.launch(arena.allocator(), .{ .context_kind = .local, .cwd = "/work", .token = test_token });
+    _ = try a.detect(.{ .context = installed.ref(), .version_buffer = &version });
+    try testing.expectEqualStrings("/work", installed.cwd);
+
+    // omp prints `omp/<version>`.
+    var omp = try PiAdapter.init(testing.allocator, testing.io, .{ .variant = .omp });
+    defer omp.deinit();
+    var omp_installed: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "omp/18.6.1\n" } } };
+    try testing.expectEqualStrings("18.6.1", (try omp.adapter().detect(.{ .context = omp_installed.ref(), .version_buffer = &version })).?);
+    try testing.expectEqualStrings("omp", omp_installed.argv[0]);
+
+    try testing.expectEqualStrings("1.2.3", parseVersion("pi v1.2.3\n").?);
+    try testing.expect(parseVersion("") == null);
+    try testing.expect(parseVersion("pi\n") == null);
+    try testing.expect(parseVersion("1.2.3;rm\n") == null);
+}
+
 test "capabilities follow the mode, the gate and the transport" {
     var transport: MemoryTransport = .{};
     defer transport.deinit();
 
-    var pi = try PiAdapter.init(testing.allocator, .{ .sink_dir = "/s" });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/s" });
     defer pi.deinit();
     var caps = pi.adapter().capabilities();
     try testing.expect(caps.launch and caps.attach);
     try testing.expect(!caps.poll and !caps.structured_status and !caps.permission_requests);
-    try testing.expect(!caps.detect and !caps.subagents and !caps.read_prompt and !caps.update_prompt);
+    try testing.expect(caps.detect and !caps.subagents and !caps.read_prompt and !caps.update_prompt);
     pi.setTransport(transport.tui());
     caps = pi.adapter().capabilities();
     try testing.expect(caps.poll and caps.structured_status and caps.transcript);
@@ -1370,12 +1552,12 @@ test "capabilities follow the mode, the gate and the transport" {
     try testing.expectError(error.Unsupported, pi.adapter().sendInput("x"));
     try testing.expectError(error.Unsupported, pi.adapter().readPrompt(&.{}));
 
-    var ungated = try PiAdapter.init(testing.allocator, .{ .gate = .off, .transport = transport.tui() });
+    var ungated = try PiAdapter.init(testing.allocator, testing.io, .{ .gate = .off, .transport = transport.tui() });
     defer ungated.deinit();
     caps = ungated.adapter().capabilities();
     try testing.expect(caps.poll and !caps.permission_requests and !caps.respond_permission);
 
-    var rpc = try PiAdapter.init(testing.allocator, .{ .mode = .rpc, .gate = .off, .transport = transport.rpc() });
+    var rpc = try PiAdapter.init(testing.allocator, testing.io, .{ .mode = .rpc, .gate = .off, .transport = transport.rpc() });
     defer rpc.deinit();
     caps = rpc.adapter().capabilities();
     try testing.expect(caps.send_input and caps.stop and caps.respond_permission and caps.permission_requests);
@@ -1384,7 +1566,7 @@ test "capabilities follow the mode, the gate and the transport" {
 test "sink lines map to events, ignoring other agents and unknown versions" {
     var transport: MemoryTransport = .{ .input = @embedFile("pi/testdata/sink_events.jsonl"), .chunk = 13 };
     defer transport.deinit();
-    var pi = try PiAdapter.init(testing.allocator, .{ .sink_dir = "/s", .transport = transport.tui() });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/s", .transport = transport.tui() });
     defer pi.deinit();
     try pi.adapter().attach(.{ .session = @enumFromInt(3), .token = test_token });
 
@@ -1447,7 +1629,7 @@ test "sink lines map to events, ignoring other agents and unknown versions" {
 test "a confirm round trip through the decision file" {
     var transport: MemoryTransport = .{};
     defer transport.deinit();
-    var pi = try PiAdapter.init(testing.allocator, .{ .sink_dir = "/s", .transport = transport.tui() });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/s", .transport = transport.tui() });
     defer pi.deinit();
     const a = pi.adapter();
     try a.attach(.{ .session = @enumFromInt(1), .token = test_token });
@@ -1491,7 +1673,7 @@ test "a confirm round trip through the decision file" {
 test "RPC lines map to events and answers go back as JSON lines" {
     var transport: MemoryTransport = .{ .input = @embedFile("pi/testdata/rpc_events.jsonl"), .chunk = 100, .end_after_input = true };
     defer transport.deinit();
-    var pi = try PiAdapter.init(testing.allocator, .{ .mode = .rpc, .transport = transport.rpc() });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .mode = .rpc, .transport = transport.rpc() });
     defer pi.deinit();
     const a = pi.adapter();
 
@@ -1547,7 +1729,7 @@ test "RPC lines map to events and answers go back as JSON lines" {
 test "RPC dialogs, failures and steering while streaming" {
     var transport: MemoryTransport = .{ .chunk = 1 << 20 };
     defer transport.deinit();
-    var pi = try PiAdapter.init(testing.allocator, .{ .mode = .rpc, .transport = transport.rpc() });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .mode = .rpc, .transport = transport.rpc() });
     defer pi.deinit();
     const a = pi.adapter();
     const full =
@@ -1592,7 +1774,7 @@ test "RPC dialogs, failures and steering while streaming" {
 test "a full queue keeps the rest of a line for the next poll" {
     var transport: MemoryTransport = .{ .input = @embedFile("pi/testdata/sink_events.jsonl"), .chunk = 1 << 20 };
     defer transport.deinit();
-    var pi = try PiAdapter.init(testing.allocator, .{ .sink_dir = "/s", .transport = transport.tui() });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/s", .transport = transport.tui() });
     defer pi.deinit();
     try pi.adapter().attach(.{ .session = @enumFromInt(3), .token = test_token });
 
@@ -1618,7 +1800,7 @@ test "a full queue keeps the rest of a line for the next poll" {
 test "lines are bounded: an over-long line keeps only its type" {
     var transport: MemoryTransport = .{ .chunk = 50 };
     defer transport.deinit();
-    var pi = try PiAdapter.init(testing.allocator, .{ .mode = .rpc, .transport = transport.rpc(), .max_line_bytes = 128 });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .mode = .rpc, .transport = transport.rpc(), .max_line_bytes = 128 });
     defer pi.deinit();
     const long_end = "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"" ++ "x" ** 400 ++ "\"}],\"stopReason\":\"error\"}]}\n";
     const long_junk = "{\"id\":\"s\",\"type\":\"response\",\"data\":\"" ++ "y" ** 300 ++ "\"}\n";
@@ -1918,7 +2100,7 @@ test "integration: pi --mode rpc with the gate, answered over RPC" {
     var child = try spawnPi(&fixture, &fixture.env);
     defer child.kill(testing.io);
     var pipe: PipeTransport = .{ .child = &child };
-    var pi = try PiAdapter.init(testing.allocator, .{ .mode = .rpc, .transport = pipe.transport() });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .mode = .rpc, .transport = pipe.transport() });
     defer pi.deinit();
     const a = pi.adapter();
 
@@ -1985,7 +2167,7 @@ test "integration: the extension's sink and decision file, as a TUI session uses
     var sink_dir = try fixture.tmp.dir.openDir(testing.io, "sink", .{});
     defer sink_dir.close(testing.io);
     var sink: SinkTransport = .{ .dir = sink_dir };
-    var pi = try PiAdapter.init(testing.allocator, .{ .sink_dir = "unused", .transport = sink.transport() });
+    var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "unused", .transport = sink.transport() });
     defer pi.deinit();
     const a = pi.adapter();
     try a.attach(.{ .session = @enumFromInt(1), .token = test_token });
