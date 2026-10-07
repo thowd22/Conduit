@@ -19,28 +19,31 @@ on:
 permissions:
   contents: read
 
+# One run per ref at a time, and a started run is never cancelled. A cold
+# macOS or Windows leg takes long enough that main used to receive its next
+# push first, and with `cancel-in-progress: true` every push cancelled the
+# matrix, so the macOS leg never finished once (TASK-5). With it false, GitHub
+# lets the running matrix finish and keeps only the newest push queued behind
+# it (an older pending run is replaced), so every leg of the latest queued
+# commit still reports and nothing piles up.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Bounded: a cold leg builds SDL, FreeType, HarfBuzz, Oniguruma and the
+    # terminal engine from source (about seven minutes on macOS) before the
+    # tests, and the test step has its own, tighter bound below so a hung
+    # test fails that step instead of eating the whole job.
+    timeout-minutes: 75
     strategy:
       # One OS failing should not hide the other two; every leg reports.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-
-    env:
-      # Zig keeps its global cache (compiled artifacts, and the fetched
-      # dependency tarballs under `p/`) outside the workspace by default, at a
-      # different path on each OS. Pointing it at a directory inside the
-      # workspace makes every cached path repo-relative, so one cache step
-      # covers all three runners without guessing a per-OS home directory.
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
 
     steps:
       - name: Check out the repository
@@ -64,8 +67,11 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-          # Caching is the next step's job, with keys this workflow owns.
-          cache: false
+          # Caching is the "Restore the Zig caches" step's job, with keys this
+          # workflow owns. (setup-zig's input is `use-cache`; while it was left
+          # on, setup-zig also cached `.zig-cache` and pointed the global cache
+          # into it, so two caches stored the same artifacts.)
+          use-cache: false
 
       # The pin is only worth anything if the toolchain on the runner is the one
       # the pin names, so state the two side by side and fail when they differ.
@@ -77,8 +83,13 @@ jobs:
             echo "::error::installed Zig $installed does not match the pinned $ZIG_VERSION" >&2
             exit 1
           fi
-          echo "zig: $installed ($ZIG_VERSION), global cache $ZIG_GLOBAL_CACHE_DIR"
+          echo "zig: $installed ($ZIG_VERSION), global cache ${ZIG_GLOBAL_CACHE_DIR:-default}"
 
+      # setup-zig points both Zig caches at `.zig-cache` in the workspace on
+      # every OS (even with `use-cache: false`), and Zig 0.16 unpacks fetched
+      # packages into `zig-pkg`, so these repo-relative paths are the whole of
+      # it on all three runners.
+      #
       # `runner.os` is Linux/macOS/Windows, so legs cannot share an entry, and
       # the version sits in the key, so two Zig versions cannot either. The
       # source hash rotates the key when the build or the pins change; the
@@ -91,11 +102,17 @@ jobs:
             .zig-cache
             zig-out
             zig-pkg
-            .zig-global-cache
           key: conduit-${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
             conduit-${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-
             conduit-${{ runner.os }}-zig-
+
+      # The terminal tests drive a real tmux; the Linux image ships it and the
+      # macOS image does not. On Windows those tests skip with the POSIX PTY.
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: brew install tmux
 
       - name: Check formatting
         shell: bash
@@ -111,4 +128,22 @@ jobs:
       # no `continue-on-error`, no `if:` that skips it, and no `|| true`.
       - name: Unit tests
         shell: bash
+        timeout-minutes: 40
         run: zig build test --summary all
+
+      # On a failed macOS or Windows leg, which nobody can reproduce on the
+      # Linux dev box, run each test binary directly, outside the build
+      # runner's protocol, so every test's name and outcome is printed and a
+      # hang names the test it hung in (each binary gets 240 s). Diagnosis
+      # only: the job has already failed by the time this runs.
+      - name: Diagnose failing tests
+        if: failure() && runner.os != 'Linux'
+        shell: bash
+        run: |
+          for name in platform pty config font link version theme term render ui input palette session workspace agent backlog testdriver app conduit-test conduit-e2e; do
+            bin="$(ls -t $(find .zig-cache/o -type f \( -name "$name-test" -o -name "$name-test.exe" \)) 2>/dev/null | head -n 1)"
+            [ -n "$bin" ] || { echo "== $name-test: no binary"; continue; }
+            echo "== $name-test ($bin)"
+            perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 240 "$bin" > diag.txt 2>&1 || echo "== $name-test exited $?"
+            tail -n 300 diag.txt
+          done
