@@ -804,6 +804,13 @@ pub const Atlas = struct {
     /// Every entry ever inserted, live or not. A dead slot is reused rather than removed so an
     /// `Entry` handed to a caller keeps addressing the same slot until that slot is reused.
     slots: std.ArrayList(Slot) = .empty,
+    /// Which slot each key occupies (TASK-67). Slots are never removed and a key only ever gets a
+    /// slot after a miss, so a key has exactly one slot, live or dead, for the atlas's lifetime and
+    /// this map never needs an entry removed. It turns `find`, which the renderer calls for every
+    /// glyph of every redrawn cell, from a scan of every slot into one hash lookup: with a screen
+    /// of distinct CJK glyphs the atlas holds well over a thousand, and the scan was a third of the
+    /// frame (`docs/performance.md`).
+    index: std.AutoHashMapUnmanaged(Key, u32) = .empty,
     free: std.ArrayList(Rect) = .empty,
     live_count: u32 = 0,
     clock: u64 = 0,
@@ -844,6 +851,7 @@ pub const Atlas = struct {
     }
 
     pub fn deinit(self: *Atlas) void {
+        self.index.deinit(self.gpa);
         self.slots.deinit(self.gpa);
         self.free.deinit(self.gpa);
         self.gpa.free(self.pixels);
@@ -891,13 +899,12 @@ pub const Atlas = struct {
 
     /// The cached entry for a key, counted as a hit or a miss.
     pub fn find(self: *Atlas, key: Key) ?Entry {
-        for (self.slots.items, 0..) |slot, index| {
-            if (!slot.live) continue;
-            if (slot.key.glyph_index != key.glyph_index) continue;
-            if (slot.key.face_index != key.face_index) continue;
-            self.stats.hits += 1;
-            self.slots.items[index].last_used = self.tick();
-            return entryFrom(self.slots.items[index], index);
+        if (self.index.get(key)) |index| {
+            if (self.slots.items[index].live) {
+                self.stats.hits += 1;
+                self.slots.items[index].last_used = self.tick();
+                return entryFrom(self.slots.items[index], index);
+            }
         }
         self.stats.misses += 1;
         return null;
@@ -984,14 +991,19 @@ pub const Atlas = struct {
         return self.clock;
     }
 
+    /// The slot a newly inserted `key` goes into: the dead slot it occupied before, else a new one.
+    ///
+    /// Callers insert only after `find` missed, so the key is never live here. Were it live, the
+    /// glyph would get a second slot and `find` would keep answering from the first, as the old
+    /// slot scan did; the atlas stays consistent and only the space is spent twice.
     fn slotFor(self: *Atlas, key: Key) !usize {
-        for (self.slots.items, 0..) |slot, index| {
-            if (!slot.live and slot.key.glyph_index == key.glyph_index and
-                slot.key.face_index == key.face_index)
-            {
-                return index;
-            }
+        const known = self.index.get(key);
+        if (known) |index| {
+            if (!self.slots.items[index].live) return index;
         }
+        // Reserved before the slot is appended, so a failed allocation leaves both unchanged.
+        if (known == null) try self.index.ensureUnusedCapacity(self.gpa, 1);
+        if (self.slots.items.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.slots.append(self.gpa, .{
             .key = key,
             .rect = .{},
@@ -1001,7 +1013,9 @@ pub const Atlas = struct {
             .last_used = 0,
             .live = false,
         });
-        return self.slots.items.len - 1;
+        const index = self.slots.items.len - 1;
+        if (known == null) self.index.putAssumeCapacityNoClobber(key, @intCast(index));
+        return index;
     }
 
     fn entryFrom(slot: Slot, index: usize) Entry {
@@ -1017,25 +1031,34 @@ pub const Atlas = struct {
 
     /// First fit over the free list, splitting what is left of the rectangle it used into the strip
     /// to its right and the strip below it.
+    ///
+    /// The cut runs along the shorter leftover (TASK-67): when less width than height is left over,
+    /// the strip below keeps the rectangle's full width and the strip to the right is only as tall
+    /// as the glyph; otherwise the strip to the right keeps the full height and the strip below is
+    /// only as wide as the glyph. Always cutting the second way narrowed every column to the
+    /// narrowest glyph ever placed in it, so a run of varying-width glyphs (CJK from a fallback
+    /// face) found no column wide enough with most of the atlas still free, and evicted glyphs it
+    /// did not need to. Either way the two remainders are disjoint: a full-width strip below and a
+    /// full-height strip to the right would overlap in the bottom corner, and two glyphs handed the
+    /// same overlapping space is exactly how an atlas corrupts its own contents.
     fn allocate(self: *Atlas, width_px: u32, height_px: u32) ?Rect {
         for (self.free.items, 0..) |rect, index| {
             if (rect.width < width_px or rect.height < height_px) continue;
             const taken = Rect{ .x = rect.x, .y = rect.y, .width = width_px, .height = height_px };
+            const leftover_width = rect.width - width_px;
+            const leftover_height = rect.height - height_px;
+            const full_width_below = leftover_width < leftover_height;
             const right = Rect{
                 .x = rect.x + width_px,
                 .y = rect.y,
-                .width = rect.width - width_px,
-                .height = rect.height,
+                .width = leftover_width,
+                .height = if (full_width_below) height_px else rect.height,
             };
-            // The strip below is only as wide as the rectangle that was taken, so the two remainders
-            // are disjoint. A full-width strip below would overlap the strip to the right in the
-            // bottom corner, and two glyphs handed the same overlapping space is exactly how an
-            // atlas corrupts its own contents.
             const below = Rect{
                 .x = rect.x,
                 .y = rect.y + height_px,
-                .width = width_px,
-                .height = rect.height - height_px,
+                .width = if (full_width_below) rect.width else width_px,
+                .height = leftover_height,
             };
 
             // The remainder replaces the entry in place and the extra strip is inserted after it,
@@ -2473,6 +2496,103 @@ test "a full atlas evicts the least recently used glyph, and its pixels come bac
     var after_eviction: [64]u8 = undefined;
     try testing.expectEqual(@as(usize, 64), atlas.copyInto(again, &after_eviction));
     try testing.expectEqualSlices(u8, &first_bitmap, &after_eviction);
+}
+
+test "the key index answers every lookup the slot scan did, across eviction and slot reuse" {
+    // TASK-67: `find` and `slotFor` read a key-to-slot index instead of scanning every slot. The
+    // index must give the same answers: hits for live keys in any face, misses for evicted ones,
+    // the evicted key's own slot back on re-insertion, and no slot for a key never inserted.
+    var atlas = try Atlas.init(testing.allocator, 32, 32);
+    defer atlas.deinit();
+    const ink = [_]u8{7} ** 16;
+    const bitmap: Bitmap = .{ .data = &ink, .width_px = 4, .height_px = 4, .pitch = 4 };
+
+    // 64 4x4 glyphs fill a 32x32 atlas; the same glyph index in two faces is two keys.
+    var slots: [64]u32 = undefined;
+    for (0..64) |index| {
+        const key: Key = .{ .glyph_index = @intCast(index / 2), .face_index = @intCast(index % 2) };
+        slots[index] = (try atlas.insert(key, bitmap, 0, 4, 4)).slot;
+    }
+    try testing.expectEqual(@as(u32, 64), atlas.live_count);
+    for (0..64) |index| {
+        const key: Key = .{ .glyph_index = @intCast(index / 2), .face_index = @intCast(index % 2) };
+        const found = atlas.find(key).?;
+        try testing.expectEqual(slots[index], found.slot);
+        try testing.expectEqual(key, found.key);
+    }
+    try testing.expectEqual(@as(u64, 64), atlas.stats.hits);
+    try testing.expect(atlas.find(.{ .glyph_index = 999 }) == null);
+    try testing.expect(atlas.find(.{ .glyph_index = 0, .face_index = 2 }) == null);
+    try testing.expectEqual(@as(u64, 2), atlas.stats.misses);
+
+    // Key 0/face 0 is now the least recently used. One more glyph evicts it.
+    for (1..64) |index| {
+        _ = atlas.find(.{ .glyph_index = @intCast(index / 2), .face_index = @intCast(index % 2) });
+    }
+    const newcomer = try atlas.insert(.{ .glyph_index = 500 }, bitmap, 0, 4, 4);
+    try testing.expectEqual(@as(u64, 1), atlas.stats.evictions);
+    try testing.expect(atlas.find(.{ .glyph_index = 0, .face_index = 0 }) == null);
+    try testing.expectEqual(@as(u32, 64), newcomer.slot);
+    try testing.expectEqual(@as(u32, 64), atlas.find(.{ .glyph_index = 500 }).?.slot);
+
+    // Re-inserting the evicted key reuses its own dead slot rather than adding one.
+    const slot_count = atlas.slots.items.len;
+    const returned = try atlas.insert(.{ .glyph_index = 0, .face_index = 0 }, bitmap, 0, 4, 4);
+    try testing.expectEqual(slots[0], returned.slot);
+    try testing.expectEqual(slot_count, atlas.slots.items.len);
+    try testing.expectEqual(slots[0], atlas.find(.{ .glyph_index = 0, .face_index = 0 }).?.slot);
+    try testing.expectEqual(atlas.slots.items.len, atlas.index.count());
+}
+
+test "glyphs of varying size keep fitting while most of the atlas is free" {
+    // TASK-67 regression: the allocator always cut a full-height strip to the right and a strip
+    // below only as wide as the glyph, so each column narrowed to the narrowest glyph placed in it.
+    // A screen of fallback CJK glyphs at display scale 2 (widths and heights from a few pixels to
+    // the full cell) then found no rectangle wide enough with most of the atlas free, evicted glyphs
+    // it was about to draw and failed others outright. These sizes cover under half the atlas.
+    var atlas = try Atlas.init(testing.allocator, 1024, 1024);
+    defer atlas.deinit();
+    const ink = [_]u8{0x80} ** (28 * 29);
+    var state: u32 = 1;
+    var area: u64 = 0;
+    const count = 1800;
+    for (0..count) |index| {
+        state = state *% 1103515245 +% 12345;
+        const width: u32 = 4 + (state >> 16) % 25;
+        state = state *% 1103515245 +% 12345;
+        const height: u32 = 2 + (state >> 16) % 28;
+        area += width * height;
+        _ = try atlas.insert(
+            .{ .glyph_index = @intCast(index) },
+            .{ .data = ink[0 .. width * height], .width_px = width, .height_px = height, .pitch = width },
+            0,
+            @intCast(height),
+            width,
+        );
+    }
+    try testing.expect(area * 2 < 1024 * 1024);
+    try testing.expectEqual(@as(u64, 0), atlas.stats.evictions);
+    try testing.expectEqual(@as(u32, count), atlas.live_count);
+}
+
+test "a failed index reservation leaves the atlas unchanged" {
+    // The index entry is reserved before the slot is appended, so running out of memory part way
+    // through an insert cannot leave a slot the index does not know about.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var atlas = try Atlas.init(failing.allocator(), 16, 16);
+    defer atlas.deinit();
+    failing.fail_index = failing.alloc_index;
+    const ink = [_]u8{1} ** 4;
+    try testing.expectError(error.OutOfMemory, atlas.insert(
+        .{ .glyph_index = 1 },
+        .{ .data = &ink, .width_px = 2, .height_px = 2, .pitch = 2 },
+        0,
+        2,
+        2,
+    ));
+    try testing.expectEqual(@as(usize, 0), atlas.slots.items.len);
+    try testing.expectEqual(@as(u32, 0), atlas.index.count());
+    try testing.expect(atlas.find(.{ .glyph_index = 1 }) == null);
 }
 
 test "a bitmap that is not the size it claims is refused" {
