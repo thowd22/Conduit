@@ -163,6 +163,7 @@ jobs:
             --menu-test
             --config-test
             --theme-test
+            --font-test
             --driver-test
           )
           for check in "${checks[@]}"; do

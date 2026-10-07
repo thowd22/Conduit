@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its nineteen Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its twenty Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its ten declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its twelve declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -330,8 +330,7 @@ layer. The first problem shows in the sidebar as the clipping `config.error` Tex
 `config_error`, `config:<line>: <message>`) above the footer until fixed. `font.family` and
 `font.size` rebuild the face (`--font` stays the session layer); `scratchpad.size` and
 `scratchpad.large_size` set the two dock heights (default 50/90); `mouse.right_click` applies under
-`--right-click`; `font.bold`/`italic`/`bold_italic`/`ligatures`/`nerd_symbols` and `theme` are
-validated and stored for TASK-38/39/40 but have no effect yet. `input.parseChord` and
+`--right-click`; `theme` is consumed by TASK-38 and the remaining `font.*` keys by TASK-40. `input.parseChord` and
 `buildBindings` rebuild the whole binding table from the profile defaults plus the file, so every
 bound action, including both scratchpad toggles, is rebindable; the search chord and modal keys are
 not yet. A watcher thread (inotify on the parent directory on Linux, catching rename-replace saves
@@ -371,9 +370,7 @@ re-rasterises every glyph, sprite and emoji. The tenth `zig build e2e` scenario,
 prints a Starship-style prompt, box drawing, blocks, braille, CJK, U+273B, a Nerd icon, ligatures
 and colour emoji; its 1x and 2x screenshots were inspected. The Linux gate installs
 `fonts-noto-color-emoji`, `fonts-noto-cjk` and `fonts-dejavu-core`. The bundled-face Hangul preedit
-gap noted under TASK-50 is closed wherever a CJK font is installed. The `font.ligatures`,
-`font.nerd_symbols` and style-family settings TASK-37 already parses are wired to these `Request`
-fields by TASK-40.
+gap noted under TASK-50 is closed wherever a CJK font is installed. TASK-40 wires the `font.*` settings to these `Request` fields.
 
 TASK-38 is complete. `theme` owns a `Scheme` (16 ANSI colours, foreground, background, cursor,
 selection, optional cursor-text and selection-foreground) and `derive`, which maps it onto every
@@ -400,6 +397,35 @@ Linux `--theme-test` drives a bundled theme, a dropped user file, keyboard previ
 hover preview, a mouse commit saved to the file, an unknown-name error and the `auto:` pair through
 real SDL events and frame readback; its picker frame was visually inspected. Native macOS and
 Windows dark-mode reporting is unverified, and under Xvfb SDL reports the preference as unknown.
+
+TASK-40 is complete on Linux. Every `font.*` setting now reaches font manager v2:
+`font.bold`/`italic`/`bold_italic` name style-face families (`Request.bold_family` etc.; the
+family's exact style face, else its regular face; empty or uninstalled keeps the derived face),
+`font.ligatures`, `font.nerd_symbols`, and the new one-line comma-separated `font.fallbacks` (at
+most 8 families; an uninstalled one is skipped and shown as `config.error`). `app` owns the
+committed settings as one owned `FontSettings` and identifies a face by `FontValues.faceKey`
+(everything but ligatures, plus the display scale), so a request for the face already drawn or
+being built starts no worker, and a ligature change toggles `Manager.setLigatures` and invalidates
+every grid instead of rebuilding. Seven palette commands are registered after `theme.pick`:
+`font.pick` "Font: Change Family", `font.size.increase`/`decrease`/`reset` (1 point, 6–72; reset
+writes `font.size = 14`), `font.ligatures.toggle`, `font.symbols.toggle` and `font.fallbacks` (free
+text, `none` clears). Each commits live state first and then writes its key with
+`config.writeDocumentValue`, so the watcher's reload of that write is a no-op. Ctrl+= /
+Ctrl+Shift+= / Ctrl+- / Ctrl+0 (Command on macOS) are the size defaults; none collides with a
+default or a terminal control code, and Ctrl+Shift+- stays terminal input. The picker lists
+"JetBrains Mono (bundled)" plus `font.Catalog.monospaceFamilies` (fixed-width, non-colour, covering
+`M` and `0`; sorted, at most 256), current family first; the keyboard highlight or a hover after
+real pointer motion previews by rebuilding the manager (a still pointer may not move the preview,
+because the previewed face's cell height moves the rows under it), Escape or an outside click
+reverts, Enter or a click commits without a second build, and the dialog's `palette.preview` Text
+names the drawn family only once the highlighted face has loaded. Palette choice ids are stored
+per visible row, so choice lists may exceed the registry size. The deterministic Linux
+`--font-test` drives sizes by chord, keyboard palette and clicked row with cell-metric readback,
+ligatures with frame readback, symbols, fallbacks, and picker preview/revert/hover/mouse commit,
+checking the file after each and that each self-caused reload rebuilt nothing. The eleventh and
+twelfth `zig build e2e` scenarios, `theme-picker` and `font-picker`, drive both pickers by keyboard
+and by a clicked choice row; the picker frames were inspected. The family list is a fixed-choice
+step, not type-to-filter, and macOS and Windows chords and fonts are unverified.
 
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
@@ -576,7 +602,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:
