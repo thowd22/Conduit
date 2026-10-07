@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-06 16:07'
-updated_date: '2026-10-06 23:02'
+updated_date: '2026-10-07 00:42'
 labels:
   - release
   - infra
@@ -62,6 +62,8 @@ Ship the verified Linux MVP without waiting for macOS and Windows packaging. Thi
 2026-10-06 tag v0.1.0-rc.2 (commit 00d7272) -> run 37541210521 succeeded end to end; GitHub prerelease v0.1.0-rc.2 holds conduit-0.1.0-rc.2-x86_64-linux.tar.gz, conduit_0.1.0-rc.2_amd64.deb, Conduit-0.1.0-rc.2-x86_64.AppImage and SHA256SUMS. Downloaded the published assets: sha256sum -c passes for all three; release-verify.sh on the published set passes 37/37 after chmod +x on the AppImage (GitHub downloads carry no mode bit, the standard AppImage step), including apt install in pristine ubuntu:22.04 printing 'conduit 0.1.0-rc.2'. Rerun of the same tag (attempt 2) requested for the idempotency criterion. The rc.1 rerun had failed in the Linux gate's IBus step (flaky, see TASK-50/the new keyboard bug task), not in publish.
 
 2026-10-06 AC4 evidence: gh run rerun of the v0.1.0-rc.2 workflow (run 37541210521 attempt 2) passed validate-tag, gate, build and publish again; the release kept exactly four assets, all replaced in place at 22:57Z under the same names via --clobber, prerelease flag still true; the re-downloaded set passes sha256sum -c and the extracted tar.gz binary prints 'conduit 0.1.0-rc.2'. macOS and Windows artifacts remain explicitly deferred to TASK-69 in the workflow header and docs/release.md.
+
+2026-10-07 v0.1.1 (bfc4818) never published: its release gate failed twice in the flaky IBus step (the tag's commit predates the engine-readiness fix 2c273a0), and tags are not rewritten, so v0.1.2 was tagged from 2c273a0 to ship the application icon.
 <!-- SECTION:NOTES:END -->
 
 ## Comments

@@ -196,7 +196,10 @@ package file keeps the SemVer spelling (`conduit_<version>_amd64.deb`) while onl
 fixed before rc.4. The published rc.2 and rc.4 assets were downloaded and re-verified locally
 (checksums, an isolated `ubuntu:22.04` apt install printing the stamped version, AppImage
 extraction). `v0.1.0` was tagged from the rc.4 commit and published as the first full Linux release
-(https://github.com/thowd22/Conduit/releases/tag/v0.1.0), re-verified locally the same way. `zig build
+(https://github.com/thowd22/Conduit/releases/tag/v0.1.0), re-verified locally the same way.
+`v0.1.2` (https://github.com/thowd22/Conduit/releases/tag/v0.1.2) ships the application icon in
+every package plus the window icon; `v0.1.1` was tagged but never published because its gate hit
+the IBus engine-readiness flake fixed in the following commit. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
 re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
 the log sink or SDL start, and an unstamped build prints `conduit 0.0.0-dev`.
