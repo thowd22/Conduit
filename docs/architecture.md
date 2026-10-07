@@ -739,8 +739,40 @@ nothing else is a legal dependency.
 - **May depend on** `config`, `input`, `session`, `theme`, `ui`, and `workspace`. An agent's own
   PTYs are sessions spawned in the workspace's ExecutionContext, and its views are composed from
   the four `ui` primitives.
-- **Lands** M6 — TASK-51 – TASK-61. Explicitly a v0.1 non-goal. What the harnesses actually
-  expose is [undecided](#9-undecided) (TASK-51).
+- **Lands** M6 — TASK-51 – TASK-61. Explicitly a v0.1 non-goal. decision-7 (from TASK-51's
+  `doc-3`) fixes the strategy: the harness TUI always runs in a Conduit PTY, each adapter adds
+  the harness's structured side channel, and PTY heuristics are the baseline every agent gets.
+- **Today (TASK-52)** the core is in place, split under `src/agent/` and re-exported from
+  `agent.zig`; no real harness adapter exists yet.
+  - `state.zig`: `State` (`idle`, `working`, `waiting_input`, `waiting_permission`, `done`,
+    `errored`), `Source` (`structured`, `heuristic`) and the `canTransition` table. `done` and
+    `errored` are turn outcomes, left only for `idle` or a new `working` turn; the two waiting
+    states are unreachable from them, and `idle → done` is refused.
+  - `event.zig`: the typed `Event` union (`message`, `tool_use`, `file_reference`,
+    `permission_request` with the harness's own decision list, `permission_resolved` including
+    `resolved_elsewhere`, `status_change` with its source, `subagent`, `notification`, `exited`).
+    Payload text is untrusted and never acted on. `EventQueue` is the bounded, mutex-guarded
+    hand-over from adapter IO threads to the owner thread; each slot deep-copies one event into
+    fixed inline storage, truncating free text at a UTF-8 boundary and refusing over-long
+    identifiers, and a full queue refuses the push so the adapter keeps the event.
+  - `adapter.zig`: the type-erased `Adapter` (`detect`, `launch`, `attach`, `poll`, `sendInput`,
+    `respondPermission`, `readPrompt`, `updatePrompt`, `stop`, `destroy`). Every method is gated
+    by the instance's `Capabilities` and returns `error.Unsupported` when off. `launch` returns a
+    `LaunchSpec` (argv plus extra env) that the workspace spawns through its ExecutionContext into
+    an `agent_terminal` session; `CorrelationToken` is the `CONDUIT_AGENT_TOKEN` value hooks and
+    extensions report back. Methods other than `harness`/`capabilities` run on IO workers only.
+  - `registry.zig`: `Registry` of `Agent` records under monotonic, never-reused `AgentId`s, each
+    bound to one `WorkspaceKey` and `SessionId`, iterated per workspace. An *owned* agent needs
+    an `agent_terminal` session; an *observed* one (started by hand) lives in a `human_terminal`
+    the human keeps; the scratchpad is refused for both by id (the caller passes
+    `Workspace.scratchpadId()`) and by kind. `apply` folds events into state, tracks pending
+    permission ids, ignores heuristic status once a structured event has arrived, and freezes the
+    record at `exited`. Owner thread only.
+  - `heuristics.zig`: `Heuristics.observe` maps terminal facts (output, title, BEL, OSC 9/777,
+    OSC 133 command start and prompt, human input, quiet ticks, child exit) to heuristic
+    `status_change`, `notification` and `exited` events. Pure; the caller supplies timestamps.
+  - `fake.zig`: `FakeAdapter`, a scripted implementation of every method used by the unit tests
+    and available to later fake-adapter E2E scenarios.
 
 ### `backlog`
 
