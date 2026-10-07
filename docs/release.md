@@ -53,7 +53,8 @@ fallback font, the bash/zsh/fish shell integration, the freedesktop desktop
 entry and the application icon as PNGs at the hicolor sizes 16, 22, 24, 32,
 48, 64, 128, 256 and 512, Conduit's MIT `LICENSE` and the third-party notices
 `build.zig` installs under `share/licenses/conduit/` (Ghostty, SDL, zopengl,
-FreeType, HarfBuzz, Oniguruma, JetBrains Mono OFL). The development-only
+FreeType, HarfBuzz, Oniguruma, zlib, libpng, JetBrains Mono OFL, and the Nerd
+Fonts licence and audit for the bundled symbols face). The development-only
 `conduit-test` driver CLI is deliberately not packaged.
 
 ## Runtime baseline

@@ -156,8 +156,9 @@ from the same scheme so they stay readable on dark and light schemes alike.
   matched ignoring case, spaces, hyphens and underscores, so `Tokyo Night`, `tokyo-night` and
   `TokyoNight` are the same theme; the display names (`Rosé Pine`) also match.
 - **Your own themes.** Drop a theme file in Ghostty's format into the `themes` directory beside
-  the settings file (`~/.config/conduit/themes/` on Linux, `~/Library/Application
-  Support/conduit/themes/` on macOS, `%APPDATA%\conduit\themes\` on Windows) and name it in
+  the settings file (`$XDG_CONFIG_HOME/conduit/themes/`, else `~/.config/conduit/themes/`, on
+  Linux, `~/Library/Application Support/conduit/themes/` on macOS, `%APPDATA%\conduit\themes\`
+  on Windows) and name it in
   `theme`, by its file name. A user file wins over a bundled scheme of the same name. Files from
   Ghostty's own theme collection work as they are:
 
@@ -249,8 +250,9 @@ ordinary terminal input again.
 
 ### Shipped bindings
 
-The defaults are per platform; the palette shows the live chord for every command. The ones most
-often rebound are:
+The defaults are per platform; the palette shows the live chord for every command, and
+[the user guide](user-guide.md#keybinding-reference) lists every default for both profiles. The
+ones most often rebound are:
 
 | Action | Linux and Windows | macOS |
 |---|---|---|
