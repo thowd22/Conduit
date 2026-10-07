@@ -767,7 +767,7 @@ nothing else is a legal dependency.
   `doc-3`) fixes the strategy: the harness TUI always runs in a Conduit PTY, each adapter adds
   the harness's structured side channel, and PTY heuristics are the baseline every agent gets.
 - **Today (TASK-52)** the core is in place, split under `src/agent/` and re-exported from
-  `agent.zig`; no real harness adapter exists yet.
+  `agent.zig`; the harness adapters land beside it (Codex below).
   - `state.zig`: `State` (`idle`, `working`, `waiting_input`, `waiting_permission`, `done`,
     `errored`), `Source` (`structured`, `heuristic`) and the `canTransition` table. `done` and
     `errored` are turn outcomes, left only for `idle` or a new `working` turn; the two waiting
@@ -878,6 +878,30 @@ nothing else is a legal dependency.
     TASK-60 control endpoint; sink, transcript and registry reads are local until TASK-61.
     Fixtures live in `src/agent/claude_code/fixtures/` because `@embedFile` cannot leave the
     module's directory.
+  - `codex.zig` (TASK-54): `CodexAdapter`, the Codex app-server client. JSON-RPC (without the
+    `jsonrpc` member) runs over a `Transport`: `WebSocketTransport` (a minimal RFC 6455 client:
+    verified handshake, masked text frames, ping/pong, close, fragments, oversized messages
+    skipped as they stream) over `FdStream.connectUnix` to the shared daemon's
+    `$CODEX_HOME/app-server-control/app-server-control.sock` (`Mode.daemon`, joining a TUI's
+    thread), or `LineTransport` (newline-delimited) over the pipes of an owner-spawned
+    `codex app-server --listen stdio://` (`Mode.stdio`, a headless agent). `attach` runs
+    `initialize`/`initialized`, then `thread/resume` for a known harness session id,
+    `thread/start` in stdio mode, or — for a hand-started TUI — `thread/loaded/list` plus
+    `thread/list` filtered to the agent's cwd, resuming the most recently updated loaded thread.
+    `poll` maps `thread/status/changed`, `turn/started`/`completed`, `item/started`/`completed`,
+    `serverRequest/resolved` and `error` to events, emitting only legal state transitions; the
+    approval server requests (`item/commandExecution/requestApproval`,
+    `item/fileChange/requestApproval`, `item/permissions/requestApproval`, the legacy
+    `execCommandApproval`/`applyPatchApproval`) become `permission_request`s with Codex's own
+    `availableDecisions`, and `respondPermission` replies with exactly the chosen decision's JSON.
+    `sendInput` is `turn/start` or `turn/steer`; `stop` is `turn/interrupt`. The app-server is
+    version-gated to 0.160.0 ≤ v < 0.162.0 (from the owner's `codex --version` probe and the
+    `initialize` `userAgent`); outside it the adapter reports heuristic-only capabilities and
+    `attach` fails with `error.Protocol`. `detect` is unsupported until the ExecutionContext can
+    run a probe. `RolloutReader` parses `sessions/YYYY/MM/DD/rollout-*.jsonl` incrementally into
+    message, tool-use and status events (approvals are never in rollouts). Fixtures under
+    `test/fixtures/agent/codex/` hold the 0.160.1 schema's method list, an approval round trip
+    recorded from the real binary against a local mock provider, and a trimmed mock rollout.
 
 ### `backlog`
 
