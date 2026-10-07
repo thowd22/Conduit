@@ -6224,6 +6224,12 @@ test "a letter with ctrl is the C0 byte, and with ctrl and shift it is a sequenc
     try terminal.init(testIo(), testing.allocator, .{ .cols = 20, .rows = 2 });
     defer terminal.deinit(testing.allocator);
 
+    // These expectations are Alt's: ESC-prefixed. On macOS the key is Option,
+    // which composes characters unless Option-as-Alt is configured (and the
+    // product policy for that is TASK-15), so ask for Alt explicitly there.
+    // Off macOS the setting is inert.
+    terminal.setMacosOptionAsAlt(true);
+
     var encoded: EncodedKey = .{};
 
     // ctrl+c: the byte every shell in history binds SIGINT to.
@@ -7441,6 +7447,9 @@ const line_editor_env = [_][]const u8{
     "LANG=C",
     "INPUTRC=/dev/null",
     "PS1=conduit> ",
+    // macOS's /bin/bash otherwise opens with two lines saying zsh is the default shell, which
+    // pushes the prompt off the row the tests read. Other systems ignore it.
+    "BASH_SILENCE_DEPRECATION_WARNING=1",
 };
 
 test "an editor on the far side of the pty acts on the keys this module encoded" {
@@ -7558,6 +7567,11 @@ test "a line editor moves its cursor on the alt key the encoder sent" {
     var terminal: Terminal = undefined;
     try terminal.init(testIo(), gpa, .{ .cols = 80, .rows = 24 });
     defer terminal.deinit(gpa);
+    // These expectations are Alt's: ESC-prefixed. On macOS the key is Option,
+    // which composes characters unless Option-as-Alt is configured (and the
+    // product policy for that is TASK-15), so ask for Alt explicitly there.
+    // Off macOS the setting is inert.
+    terminal.setMacosOptionAsAlt(true);
 
     var encoded: EncodedKey = .{};
     var row: [256]u8 = undefined;
@@ -7662,7 +7676,9 @@ test "ctrl+c reaches a real process as the interrupt, and the process dies of it
 /// window after the command it starts, so the window list this test reads off
 /// the status line is only fixed if the shell is.
 const tmux_env = [_][]const u8{
-    "PATH=/usr/bin:/bin",
+    // Homebrew's prefixes come after the system's, so where a distribution ships tmux in
+    // /usr/bin that is the one found; macOS has no system tmux, and CI installs it with brew.
+    "PATH=/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
     "HOME=/tmp",
     "TERM=xterm-256color",
     "LANG=C",

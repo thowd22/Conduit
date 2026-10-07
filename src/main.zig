@@ -24379,7 +24379,8 @@ test "the theme catalog lists user files first by precedence and puts the active
 }
 
 test "--config-test owns a fixed real-child viewport and the settings path follows the run" {
-    const env = test_env{ .vars = &.{ .{ "XDG_CONFIG_HOME", "/xdg" }, .{ "HOME", "/home/u" } } };
+    // APPDATA is where Windows keeps the settings file; Linux and macOS ignore it.
+    const env = test_env{ .vars = &.{ .{ "XDG_CONFIG_HOME", "/xdg" }, .{ "HOME", "/home/u" }, .{ "APPDATA", "C:\\Users\\u\\AppData\\Roaming" } } };
     const parsed = try parseArgs(&.{ "conduit", "--config-test" }, env.source());
     const resolved = optionsForRun(parsed);
     try std.testing.expect(parsed.run.config_test);

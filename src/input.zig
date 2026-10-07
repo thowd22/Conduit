@@ -3093,6 +3093,11 @@ test "the modifier matrix decides what a key means and what it sends" {
     var terminal: term.Terminal = undefined;
     try terminal.init(threaded.io(), testing.allocator, .{ .cols = 20, .rows = 2 });
     defer terminal.deinit(testing.allocator);
+    // These expectations are Alt's: ESC-prefixed. On macOS the key is Option,
+    // which composes characters unless Option-as-Alt is configured (and the
+    // product policy for that is TASK-15), so ask for Alt explicitly there.
+    // Off macOS the setting is inert.
+    terminal.setMacosOptionAsAlt(true);
 
     var scratch: TextScratch = .{};
     var encoded: term.EncodedKey = .{};
@@ -3113,8 +3118,11 @@ test "the modifier matrix decides what a key means and what it sends" {
         .{ .mods = .{ .shift = true }, .bytes = "A", .text = true },
         .{ .mods = .{ .alt = true }, .bytes = "\x1ba", .text = false },
         .{ .mods = .{ .alt = true, .shift = true }, .bytes = "\x1bA", .text = false },
-        .{ .mods = .{ .super = true }, .bytes = "a", .text = false },
-        .{ .mods = .{ .super = true, .shift = true }, .bytes = "A", .text = false },
+        // Super with only the character is the character on Linux and Windows,
+        // and nothing at all on macOS, where Command+key never types text in
+        // Terminal.app or iTerm2 and the engine follows them.
+        .{ .mods = .{ .super = true }, .bytes = if (builtin.os.tag == .macos) "" else "a", .text = false },
+        .{ .mods = .{ .super = true, .shift = true }, .bytes = if (builtin.os.tag == .macos) "" else "A", .text = false },
         .{ .mods = .{ .alt = true, .super = true }, .bytes = "\x1ba", .text = false },
         .{ .mods = .{ .alt = true, .shift = true, .super = true }, .bytes = "\x1bA", .text = false },
         .{ .mods = .{ .ctrl = true }, .bytes = "\x01", .text = false },

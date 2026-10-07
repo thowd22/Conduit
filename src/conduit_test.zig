@@ -1748,10 +1748,12 @@ test "local JSON failures are one machine-readable response" {
 test "run paths place all mutable state under one run directory" {
     var paths = try deriveRunPaths(std.testing.allocator, "/tmp/conduit-test", "run-safe_1");
     defer paths.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("/tmp/conduit-test/run-safe_1", paths.run_dir);
-    try std.testing.expectEqualStrings("/tmp/conduit-test/run-safe_1/home", paths.home);
-    try std.testing.expectEqualStrings("/tmp/conduit-test/run-safe_1/tmp", paths.temp);
-    try std.testing.expectEqualStrings("/tmp/conduit-test/run-safe_1/artifacts", paths.artifacts);
+    // Joined with the platform's separator, which is `\` on Windows.
+    const run = "/tmp/conduit-test" ++ std.fs.path.sep_str ++ "run-safe_1";
+    try std.testing.expectEqualStrings(run, paths.run_dir);
+    try std.testing.expectEqualStrings(run ++ std.fs.path.sep_str ++ "home", paths.home);
+    try std.testing.expectEqualStrings(run ++ std.fs.path.sep_str ++ "tmp", paths.temp);
+    try std.testing.expectEqualStrings(run ++ std.fs.path.sep_str ++ "artifacts", paths.artifacts);
     if (builtin.os.tag != .windows) try std.testing.expectEqualStrings("/tmp/conduit-test/run-safe_1/driver.sock", paths.endpoint);
 }
 
@@ -1970,7 +1972,10 @@ test "MCP framing appends exactly one delimiter" {
 test "MCP screenshot paths cannot escape the selected artifact directory" {
     var paths = try deriveRunPaths(std.testing.allocator, "/tmp/conduit-test", "run-safe");
     defer paths.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("screenshot-0001.png", try validateScreenshotPath(paths, "/tmp/conduit-test/run-safe/artifacts/screenshot-0001.png"));
-    try std.testing.expectError(error.UnsafeArtifactPath, validateScreenshotPath(paths, "/tmp/conduit-test/run-safe/artifacts/../state/screenshot-0001.png"));
-    try std.testing.expectError(error.UnsafeArtifactPath, validateScreenshotPath(paths, "/tmp/conduit-test/run-safe/artifacts/not-a-shot.png"));
+    // The artifact directory is joined with the platform's separator, which is `\` on Windows.
+    const sep = std.fs.path.sep_str;
+    const artifacts = "/tmp/conduit-test" ++ sep ++ "run-safe" ++ sep ++ "artifacts" ++ sep;
+    try std.testing.expectEqualStrings("screenshot-0001.png", try validateScreenshotPath(paths, artifacts ++ "screenshot-0001.png"));
+    try std.testing.expectError(error.UnsafeArtifactPath, validateScreenshotPath(paths, artifacts ++ ".." ++ sep ++ "state" ++ sep ++ "screenshot-0001.png"));
+    try std.testing.expectError(error.UnsafeArtifactPath, validateScreenshotPath(paths, artifacts ++ "not-a-shot.png"));
 }
