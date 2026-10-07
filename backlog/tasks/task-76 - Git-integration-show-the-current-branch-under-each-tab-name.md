@@ -1,9 +1,11 @@
 ---
 id: TASK-76
 title: 'Git integration: show the current branch under each tab name'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-07 15:34'
+updated_date: '2026-10-07 20:25'
 labels: []
 dependencies: []
 priority: medium
@@ -26,3 +28,13 @@ The sidebar lists tabs by name alone, so a user with several tabs in different c
 - [ ] #6 The branch is a semantic element with a stable id (child of the tab) so the driver can inspect and wait for it; rename, reorder, close and sidebar resize behave unchanged with two-row tabs
 - [ ] #7 A deterministic Linux check or a zig build e2e scenario creates a real repo, switches branch in the tab and asserts the branch row through the real input path; the UI renderer change is recorded as a Backlog decision; AGENTS.md and docs/architecture.md are updated
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. src/git.zig: resolve repo root and HEAD (branch or short commit) for a cwd through ExecutionContext.readFile/statPath only (walk up to .git, handle gitdir: files for worktrees, packed refs not needed for HEAD), bounded and never fatal.
+2. App tracks per-session branch state refreshed on OSC 7 cwd change and OSC 133 prompt marks (no per-frame git work), watching .git/HEAD via ExecutionContext.watch where available.
+3. UI renderer: a secondary small face (about half point size) for a 'small text' style on Text elements, drawn within a full cell row; record as a Backlog decision.
+4. Sidebar: tab rows become two rows when a branch is known (semantic child element <tab id>.branch), rename/reorder/close/resize unchanged; list limit accounts for it.
+5. Deterministic check (extend --sidebar-test or a new scenario) creating a real repo, switching branches in the tab, asserting the branch row via the real input path; screenshots at scale 1 and 1.25 inspected; docs.
+<!-- SECTION:PLAN:END -->

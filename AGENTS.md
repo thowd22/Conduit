@@ -505,6 +505,30 @@ top-level `"type":"object"`; `writeTool` now emits it and the tools/list test as
 every tool. The install flow was checked against the v0.1.7 assets; macOS and Windows content is
 marked unverified.
 
+TASK-62 is complete. The type-erased `ExecutionContext` now carries file, watch and command
+capabilities beside `spawn`: `readFile` (caller-bounded buffer), `listDir` (visitor), `statPath`,
+`watch` (a `WatchHandle` with no thread and no callback, polled by its owner) and `run` (argv
+without a shell, cwd, optional stdin up to 16 KiB, capped stdout and stderr, whole-run timeout that
+kills the child). Every entry defaults to `error.Unsupported`, so SSH and WSL contexts implement
+them later; Local inherits, remote contexts supply their own. On Linux the Local watch drains a
+non-blocking inotify descriptor; elsewhere, and while a directory does not exist yet, it compares a
+bounded fingerprint at most once a second. `backlog.Project.load` reads a `backlog/` directory
+through a borrowed context: `config.yml`, plus tasks, completed, drafts, milestones, docs and
+decisions. Front matter goes through a bounded YAML subset that accepts only what Backlog.md
+writes; sections and numbered acceptance criteria are read from the tool's markers, with a heading
+fallback. Every malformed file becomes a line-numbered diagnostic and is never fatal. Each file
+owns an arena. `Project.watch` and `Project.poll` re-read only files whose size or mtime changed
+and return added/updated/removed `Change` records; a `config.yml` rewrite re-parses only when the
+statuses change. `backlog.Cli` runs the `backlog` CLI through `ExecutionContext.run` in the project
+directory (`setStatus`, `checkAcceptance`, `editTitle`, `addNote`, `setAssignee`, `setPriority`),
+passing validated ids and values as single `--option=value` argv entries, and returns
+`.failed{exit_code, stderr}` or `error.CliUnavailable`; Conduit never edits backlog markdown
+itself. Unit tests parse valid, malformed and empty fixture projects under `test/fixtures/backlog`
+and the repository's own `backlog/` (0 diagnostics), cover live update through a temp directory
+and the CLI wrappers through a scripted context, and a manual check against the real `backlog`
+1.53.0 showed a CLI edit returning through `poll` as one update. There is no view or E2E scenario
+yet; that is TASK-63.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on

@@ -1,11 +1,11 @@
 ---
 id: TASK-62
 title: Backlog.md data layer
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 19:57'
+updated_date: '2026-10-07 20:27'
 labels:
   - backlog
 milestone: m-7
@@ -23,10 +23,10 @@ Read a workspace's Backlog.md project (backlog/ directory: tasks, milestones, do
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Tasks, statuses, milestones, labels, dependencies and acceptance criteria are parsed
-- [ ] #2 External changes to backlog files update the model live
-- [ ] #3 Edits go through the backlog CLI and failures are reported
-- [ ] #4 Unit tests parse fixture backlog directories
+- [x] #1 Tasks, statuses, milestones, labels, dependencies and acceptance criteria are parsed
+- [x] #2 External changes to backlog files update the model live
+- [x] #3 Edits go through the backlog CLI and failures are reported
+- [x] #4 Unit tests parse fixture backlog directories
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -38,3 +38,15 @@ Read a workspace's Backlog.md project (backlog/ directory: tasks, milestones, do
 4. Writes through the backlog CLI (run through the context) with reported failures.
 5. Fixture backlog directories under test data; unit tests for parsing, live update and CLI failure reporting.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Agent: ExecutionContext gained readFile/listDir/statPath/watch/run (Local impl; defaults error.Unsupported); backlog.zig + backlog/{yaml,markdown}.zig typed model with bounded YAML subset, diagnostics, live poll via WatchHandle, Cli wrappers via run; fixtures valid/malformed/empty; 20 backlog tests, 4 new workspace tests; manual check against backlog 1.53.0. Coordinator 2026-10-07: rebased (docs/architecture.md thread-table conflict resolved), fast-forwarded as 695f0ac..7628342; full gate run recorded below. pty ReaderPark test flaked once under load (also seen once by the coordinator): follow-up queued.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Backlog.md data layer: a typed, bounded, never-fatal model of a backlog/ directory read through the ExecutionContext (which gained file, directory, stat, watch and command-run capabilities with a Local implementation), live change detection via context watches, and CLI-mediated writes with reported failures; verified by fixture-directory unit tests, a live-update temp-dir test, scripted and real CLI runs.
+<!-- SECTION:FINAL_SUMMARY:END -->

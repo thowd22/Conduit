@@ -1,9 +1,11 @@
 ---
 id: TASK-77
 title: 'Sidebar: a few pixels of vertical spacing before each workspace'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-07 15:34'
+updated_date: '2026-10-07 20:25'
 labels: []
 dependencies: []
 priority: low
@@ -24,3 +26,11 @@ In the sidebar, one workspace's tabs run straight into the next workspace's name
 - [ ] #4 The --workspaces-test or --sidebar-test (or a zig build e2e scenario) lists two workspaces with tabs and asserts the gap through semantic bounds, and a screenshot at scale 1 and at 1.25 is visually inspected
 - [ ] #5 The layout approach (sub-cell offset vs blank row) is recorded as a Backlog decision; AGENTS.md and docs/architecture.md describe the sidebar spacing
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Decide sub-cell pixel offset (about 5 logical px, scaled) for every workspace group after the first in the sidebar overlay, with the semantic tree carrying a pixel offset so hit testing, hover, drag targets and focus stay exact; record as a Backlog decision.
+2. Implement in the sidebar layout and overlay compositor; list limit accounts for accumulated gaps.
+3. Assert in --workspaces-test via semantic bounds; screenshots at scale 1 and 1.25 inspected; docs.
+<!-- SECTION:PLAN:END -->
