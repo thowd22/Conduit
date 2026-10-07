@@ -167,6 +167,7 @@ jobs:
             --settings-test
             --git-test
             --agent-test
+            --ssh-test
             --driver-test
           )
           for check in "${checks[@]}"; do

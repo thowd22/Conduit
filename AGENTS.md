@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its twenty-three Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its twenty-four Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -665,6 +665,47 @@ real Claude Code launch through the palette spawned the hooked command into its 
 at onboarding in the isolated HOME, so the structured hook path is unverified end to end;
 observed (hand-started) agents wait for a foreground-process query in `pty`.
 
+TASK-43 is complete on Linux. `SshContext` is created with the local `ssh` client's inherited
+environment (`ChildSpec.buildSshClient`: Conduit's environment minus `inherited_exclusions`) and
+control sockets under `$XDG_RUNTIME_DIR`. SSH sessions get only the remote overlay
+(`ChildSpec.buildRemote`: TERM, COLORTERM, TERM_PROGRAM and a LANG fallback, never local PATH or
+HOME) and an empty argv, which means the remote login shell. Each SSH workspace has a `connection`
+session (a new `session.Kind`) whose PTY is the master's terminal. It replaces the panes, under a
+`workspace.<k>.connection` header, until the state is `connected`, so OpenSSH's own host-key,
+passphrase, password and 2FA prompts are typed there; `remote.show-connection` brings it back
+later. The sidebar row shows `↕` connecting, `⚠` lost, `✗` failed or `○` disconnected, and
+registers `workspace.<k>.ssh.<state>`; `workspace.status` names each transition. When the
+workspace connects, one exec learns the remote host name for OSC 7
+(`term.Terminal.setWorkingDirectoryHost`), and then the first tab and the scratchpad start.
+`remote.reconnect` (palette, or the view's clickable `reconnect`) starts a new master; once it
+connects, every session whose client ended as `ssh.sessionEnd(...) == .disconnected` is respawned
+under its id at its last OSC 7 cwd (`Workspace.respawnRequest`/`replaceSessionChild`).
+`remote.disconnect` is the non-blocking `SshContext.hangUp`. Spawns are refused until the
+connection is ready. The deterministic `--ssh-test` drives all of this through real SDL input
+against the `test/fixtures/ssh` container (one authentication for the first tab, a split, a tab
+and the scratchpad; the host-key and passphrase prompts; simulated loss by killing sshd's
+per-connection processes; reconnect restoring all four sessions) and is skipped (exit 0) without
+Docker. Password, 2FA and changed-host-key prompts, remote shell integration (`.auto` still
+behaves as `.off`, so a remote cwd exists only when the remote shell sends OSC 7) and macOS/Windows
+are unverified.
+
+TASK-44 is complete on Linux. Remote: connect (`remote.connect`) lists concrete `Host` aliases
+from `~/.ssh/config` and its `Include` files, read one level deep through a Local context and
+never reading key files, plus `remote.profile = <name> = <[user@]host[:port]>` profiles
+(repeatable, at most 32), the `remote.recent` destinations (at most 10, rewritten through
+`config.writeDocumentValue`), and "Enter user@host…"; this is the one palette choice step with a
+fuzzy filter field (`palette.filter`). The ad hoc path is validated by `config.parseDestination`
+(no leading `-`, no whitespace, optional port) and is followed by a Save as profile step.
+Connecting opens an SSH workspace named after the alias, profile or host, at the remote home. The
+grammar is in `docs/config.md`.
+
+TASK-45 is complete on Linux. In an SSH workspace the scratchpad is a remote login shell started
+over the shared master once connected. It stays hidden until shown, survives hide and show, and
+`scratchpad.restart` replaces it over the same master. New tabs and panes snapshot the
+originating session's remote OSC 7 cwd, which is believed because each SSH terminal accepts the
+remote host's own name, and the context's session script does the remote `cd`. After a reconnect
+the scratchpad is restored in place: same id, a fresh shell in its last remote cwd.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -840,7 +881,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:
