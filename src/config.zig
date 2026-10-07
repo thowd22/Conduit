@@ -853,6 +853,119 @@ pub fn setDocumentValue(gpa: Allocator, document: []const u8, key: Key, value: [
     return out.toOwnedSlice();
 }
 
+/// Why a value typed for `key` would be rejected: the message a settings file line holding it
+/// reports after `<key>: `, or null when `parse` would accept it. `value` is the text that would
+/// follow `key = ` in the file, written bare: a double quote anywhere is refused because
+/// `setDocumentValue` adds the quotes itself. Allocates nothing. `keybind` is never a single value.
+pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
+    const failure: ValueError = check: {
+        if (!std.unicode.utf8ValidateSlice(value)) break :check error.ControlCharacter;
+        switch (key) {
+            .font_family, .font_bold, .font_italic, .font_bold_italic, .theme, .font_fallbacks => {
+                if (std.mem.indexOfScalar(u8, value, '"') != null) break :check error.Unquoted;
+                const text = parseString(value) catch |err| break :check err;
+                if (key == .font_fallbacks) {
+                    var names: [max_font_fallbacks][]const u8 = undefined;
+                    _ = splitFallbacks(text, &names) catch |err| break :check err;
+                }
+                return null;
+            },
+            .font_size => {
+                _ = parsePoints(value) catch |err| break :check err;
+                return null;
+            },
+            .font_ligatures, .font_nerd_symbols => {
+                _ = parseBool(value) catch |err| break :check err;
+                return null;
+            },
+            .scratchpad_size, .scratchpad_large_size => {
+                _ = parsePercent(value) catch |err| break :check err;
+                return null;
+            },
+            .mouse_right_click => {
+                _ = RightClick.parse(value) catch break :check error.NotRightClick;
+                return null;
+            },
+            .keybind => break :check error.KeybindShape,
+        }
+    };
+    return valueMessage(key, failure);
+}
+
+/// `document` with the `keybind` lines that bind `action` replaced, as a new allocation the caller
+/// owns.
+///
+/// Every uncommented `keybind = <chord>=<action>[:<argument>]` line naming `action` is removed, as
+/// is every `keybind = <chord>=unbind` line whose chord is spelled (ignoring ASCII case) as one of
+/// `unbind_chords`, so repeated edits never pile up duplicates. Then one `keybind = <chord>=unbind`
+/// line per `unbind_chords` entry and, when `chord` is not null, `keybind = <chord>=<action>` are
+/// appended in that order, so they win over every earlier line. Every other line, comments and
+/// blank lines included, is kept byte for byte. A keybind line replaces whatever its chord was
+/// bound to, so the appended `<chord>=<action>` takes that chord from any other action. Chords are
+/// written as given: non-empty, without `=`, a quote, a control character or surrounding blanks.
+pub fn setActionKeybinds(
+    gpa: Allocator,
+    document: []const u8,
+    action: []const u8,
+    unbind_chords: []const []const u8,
+    chord: ?[]const u8,
+) EditError![]u8 {
+    if (!validActionName(action)) return error.InvalidValue;
+    for (unbind_chords) |text| if (!validChordText(text)) return error.InvalidValue;
+    if (chord) |text| if (!validChordText(text)) return error.InvalidValue;
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    writeKeybindEdit(&out.writer, document, action, unbind_chords, chord) catch return error.OutOfMemory;
+    if (out.written().len > max_file_bytes) return error.TooLarge;
+    return out.toOwnedSlice();
+}
+
+fn writeKeybindEdit(
+    writer: *std.Io.Writer,
+    document: []const u8,
+    action: []const u8,
+    unbind_chords: []const []const u8,
+    chord: ?[]const u8,
+) std.Io.Writer.Error!void {
+    var start: usize = 0;
+    var last: u8 = '\n';
+    while (start < document.len) {
+        const newline = std.mem.indexOfScalarPos(u8, document, start, '\n');
+        var end = newline orelse document.len;
+        const next = if (newline) |index| index + 1 else document.len;
+        if (end > start and document[end - 1] == '\r') end -= 1;
+        if (!keybindLineIsReplaced(document[start..end], action, unbind_chords)) {
+            try writer.writeAll(document[start..next]);
+            last = document[next - 1];
+        }
+        start = next;
+    }
+    if (last != '\n') try writer.writeByte('\n');
+    for (unbind_chords) |text| try writer.print("keybind = {s}=unbind\n", .{text});
+    if (chord) |text| try writer.print("keybind = {s}={s}\n", .{ text, action });
+}
+
+fn validChordText(text: []const u8) bool {
+    return text.len != 0 and text.len <= max_string_bytes and !hasControl(text) and
+        std.mem.indexOfAny(u8, text, "=\"") == null and std.mem.trim(u8, text, " \t").len == text.len;
+}
+
+/// Whether `line` is a `keybind` line `setActionKeybinds` drops for `action`.
+fn keybindLineIsReplaced(line: []const u8, action: []const u8, unbind_chords: []const []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len == 0 or trimmed[0] == '#') return false;
+    const equals = std.mem.indexOfScalar(u8, trimmed, '=') orelse return false;
+    const key = Key.fromName(std.mem.trim(u8, trimmed[0..equals], " \t")) orelse return false;
+    if (key != .keybind) return false;
+    const split = splitKeybind(std.mem.trim(u8, trimmed[equals + 1 ..], " \t")) catch return false;
+    if (split.action) |bound| return std.mem.eql(u8, bound, action);
+    for (unbind_chords) |text| {
+        if (std.ascii.eqlIgnoreCase(text, split.chord)) return true;
+    }
+    return false;
+}
+
 fn writeEdited(
     writer: *std.Io.Writer,
     document: []const u8,
@@ -894,6 +1007,33 @@ pub fn writeDocumentValue(io: Io, gpa: Allocator, path: []const u8, key: Key, va
     defer if (existing) |bytes| gpa.free(bytes);
     const edited = try setDocumentValue(gpa, existing orelse defaults_document, key, value);
     defer gpa.free(edited);
+    try replaceDocument(io, path, edited);
+}
+
+/// Rewrite the `keybind` lines for `action` in the settings file at `path` as `setActionKeybinds`
+/// does, creating the file from `defaults_document` when it is missing, with the same
+/// write-and-rename as `writeDocumentValue`. Main thread only.
+pub fn writeActionKeybinds(
+    io: Io,
+    gpa: Allocator,
+    path: []const u8,
+    action: []const u8,
+    unbind_chords: []const []const u8,
+    chord: ?[]const u8,
+) !void {
+    const existing: ?[]u8 = switch (try readFile(io, gpa, path)) {
+        .missing => null,
+        .bytes => |bytes| bytes,
+        .failed => return error.Unreadable,
+    };
+    defer if (existing) |bytes| gpa.free(bytes);
+    const edited = try setActionKeybinds(gpa, existing orelse defaults_document, action, unbind_chords, chord);
+    defer gpa.free(edited);
+    try replaceDocument(io, path, edited);
+}
+
+/// Write `edited` beside `path` and rename it over the original, creating the directory first.
+fn replaceDocument(io: Io, path: []const u8, edited: []const u8) !void {
     if (directoryOf(path)) |dir| try Io.Dir.cwd().createDirPath(io, dir);
     var temporary_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const temporary = std.fmt.bufPrint(&temporary_buffer, "{s}.conduit-edit", .{path}) catch return error.NameTooLong;
@@ -1733,6 +1873,107 @@ test "each font command's write leaves the rest of the file, comments included, 
     try testing.expect(!loaded.settings.font_nerd_symbols);
     try testing.expectEqualStrings("Noto Sans Mono CJK SC", loaded.settings.font_fallbacks[0]);
     try testing.expectEqualStrings("nord", loaded.settings.theme);
+}
+
+test "a typed value is checked with the message its file line would report" {
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.font_size, "13.5"));
+    try testing.expectEqualStrings("expected 1 to 72 points", checkValue(.font_size, "99").?);
+    try testing.expectEqualStrings("expected a number of points", checkValue(.font_size, "big").?);
+    try testing.expectEqualStrings("expected a value", checkValue(.font_size, "").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.scratchpad_size, "40%"));
+    try testing.expectEqualStrings("expected a whole percentage from 10 to 100", checkValue(.scratchpad_size, "5").?);
+    try testing.expectEqualStrings("expected a whole percentage from 10 to 100", checkValue(.scratchpad_large_size, "abc").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.font_ligatures, "false"));
+    try testing.expectEqualStrings("expected `true` or `false`", checkValue(.font_nerd_symbols, "yes").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.mouse_right_click, "paste"));
+    try testing.expectEqualStrings("expected `menu` or `paste`", checkValue(.mouse_right_click, "both").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.font_bold, "DejaVu Sans Mono"));
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.font_bold, ""));
+    try testing.expectEqualStrings("unbalanced quotes", checkValue(.font_italic, "\"x\"").?);
+    try testing.expectEqualStrings("value contains a control character", checkValue(.font_bold_italic, "a\tb").?);
+    try testing.expectEqualStrings("value is longer than 256 bytes", checkValue(.font_bold, "x" ** 257).?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.font_fallbacks, "a, b"));
+    try testing.expectEqualStrings("expected at most 8 comma-separated families", checkValue(.font_fallbacks, "a,b,c,d,e,f,g,h,i").?);
+    try testing.expect(checkValue(.keybind, "ctrl+a=tab.new") != null);
+    // Every accepted value is accepted by the parser too, written the way the editor writes it.
+    for ([_]struct { key: Key, value: []const u8 }{
+        .{ .key = .font_size, .value = "13.5" },
+        .{ .key = .scratchpad_size, .value = "40%" },
+        .{ .key = .font_bold, .value = "" },
+        .{ .key = .font_fallbacks, .value = "a, b" },
+    }) |case| {
+        const document = try setDocumentValue(testing.allocator, "", case.key, case.value);
+        defer testing.allocator.free(document);
+        var parsed = try parse(testing.allocator, document, null);
+        defer parsed.deinit();
+        try testing.expect(!parsed.hasDiagnostics());
+    }
+}
+
+test "rewriting an action's keybinds drops its old lines, keeps the rest and appends the new ones" {
+    const original =
+        "# my keys\n" ++
+        "keybind = ctrl+shift+p=unbind\n" ++
+        "keybind = ctrl+alt+p=palette.open\n" ++
+        "font.size = 13\n" ++
+        "# keybind = ctrl+q=palette.open\n" ++
+        "keybind = ctrl+alt+t=tab.new\n" ++
+        "  keybind = alt+p = palette.open  \r\n" ++
+        "keybind = ctrl+alt+k=unbind\n" ++
+        "keybind = f5=pane.split:right\n";
+    const edited = try setActionKeybinds(testing.allocator, original, "palette.open", &.{"Ctrl+Alt+K"}, "ctrl+alt+k");
+    defer testing.allocator.free(edited);
+    try testing.expectEqualStrings(
+        "# my keys\n" ++
+            "keybind = ctrl+shift+p=unbind\n" ++
+            "font.size = 13\n" ++
+            "# keybind = ctrl+q=palette.open\n" ++
+            "keybind = ctrl+alt+t=tab.new\n" ++
+            "keybind = f5=pane.split:right\n" ++
+            "keybind = Ctrl+Alt+K=unbind\n" ++
+            "keybind = ctrl+alt+k=palette.open\n",
+        edited,
+    );
+    var parsed = try parse(testing.allocator, edited, null);
+    defer parsed.deinit();
+    try testing.expect(!parsed.hasDiagnostics());
+    const last = parsed.keybinds.items[parsed.keybinds.items.len - 1];
+    try testing.expectEqualStrings("ctrl+alt+k", last.chord);
+    try testing.expectEqualStrings("palette.open", last.action.?);
+
+    // Applying it again changes nothing; an action with an argument is matched by its name.
+    const again = try setActionKeybinds(testing.allocator, edited, "palette.open", &.{"Ctrl+Alt+K"}, "ctrl+alt+k");
+    defer testing.allocator.free(again);
+    try testing.expectEqualStrings(edited, again);
+    const split = try setActionKeybinds(testing.allocator, original, "pane.split", &.{}, null);
+    defer testing.allocator.free(split);
+    try testing.expect(std.mem.indexOf(u8, split, "pane.split") == null);
+    try testing.expect(std.mem.indexOf(u8, split, "keybind = ctrl+alt+p=palette.open\n") != null);
+
+    // Clearing to unbound writes only the unbind lines; a file without a final newline gets one.
+    const cleared = try setActionKeybinds(testing.allocator, "font.size = 13", "tab.new", &.{ "ctrl+shift+t", "f9" }, null);
+    defer testing.allocator.free(cleared);
+    try testing.expectEqualStrings("font.size = 13\nkeybind = ctrl+shift+t=unbind\nkeybind = f9=unbind\n", cleared);
+
+    try testing.expectError(error.InvalidValue, setActionKeybinds(testing.allocator, "", "Bad Action", &.{}, "f5"));
+    try testing.expectError(error.InvalidValue, setActionKeybinds(testing.allocator, "", "tab.new", &.{}, "ctrl+="));
+    try testing.expectError(error.InvalidValue, setActionKeybinds(testing.allocator, "", "tab.new", &.{"a\nb"}, null));
+    try testing.expectError(error.InvalidValue, setActionKeybinds(testing.allocator, "", "tab.new", &.{}, ""));
+}
+
+test "writing an action's keybinds creates the file from the defaults and edits it in place" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/conduit/config", .{tmp.sub_path[0..]});
+    try writeActionKeybinds(testing.io, testing.allocator, path, "palette.open", &.{"ctrl+shift+p"}, "ctrl+alt+k");
+    var buffer: [8192]u8 = undefined;
+    const written = try Io.Dir.cwd().readFile(testing.io, path, &buffer);
+    try testing.expect(std.mem.startsWith(u8, written, defaults_document));
+    try testing.expect(std.mem.endsWith(u8, written, "keybind = ctrl+shift+p=unbind\nkeybind = ctrl+alt+k=palette.open\n"));
+    try writeActionKeybinds(testing.io, testing.allocator, path, "palette.open", &.{"ctrl+shift+p"}, "ctrl+alt+j");
+    const rewritten = try Io.Dir.cwd().readFile(testing.io, path, &buffer);
+    try testing.expectEqualStrings(defaults_document ++ "keybind = ctrl+shift+p=unbind\nkeybind = ctrl+alt+j=palette.open\n", rewritten);
 }
 
 const WakeProbe = struct {
