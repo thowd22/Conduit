@@ -345,7 +345,10 @@ configured scratchpad size through SDL, a malformed edit's line-numbered `config
 previous and still-valid values working, a rename-replace repair that clears it and applies new
 values including a larger font, return to defaults on deletion, and `config.open` by Ctrl+, and by
 a clicked palette row. macOS/Windows locations and the polling watcher backend are
-runtime-unverified.
+runtime-unverified. Its first hosted run exposed that a child attached after an asynchronous spawn
+kept the PTY size from spawn time when the grid had changed meanwhile (here the deletion step's
+face reload finished 40 ms after the editor spawned); `Session.syncChildSize` now tells a
+late-attached child the current grid when it differs from the requested one.
 
 TASK-39 is complete on Linux. `src/font_sprite.zig` draws box drawing (U+2500–257F), block
 elements, braille and the Powerline arrow/rounded/triangle separators (U+E0B0–E0BF, E0D2, E0D4) at

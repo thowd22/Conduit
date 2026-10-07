@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 17:42'
+updated_date: '2026-10-07 18:22'
 labels:
   - config
 milestone: m-4
@@ -44,6 +44,8 @@ Human-editable config file in the platform config directory covering fonts, them
 
 <!-- SECTION:NOTES:BEGIN -->
 Coordinator verification 2026-10-07: branch rebased onto main and fast-forwarded (9fc1116, dcac52a, b0da00d). Full local gate green on main: zig fmt, build, 566/574 unit tests (8 skipped), all 18 headless checks including --config-test and --menu-test, and the nine e2e scenarios. Screenshot of the clipped red config.error line above the Palette hint inspected. The agent's two platform EndpointTooLong unit failures were caused by the long worktree path and do not occur on main. Not yet done: font.bold/italic/bold_italic/ligatures/nerd_symbols wiring waits for TASK-39's Request fields; a scripted config e2e scenario needs the runner to write into the run's config dir; search chord and modal keys remain hard-coded.
+
+2026-10-07 follow-up (24ae4bc): hosted gate run 37664686277 failed the --config-test editor step because the deletion step's asynchronous face load finished 40 ms after the editor spawned, resizing the new tab from 34x14 to 56x18 while vim started and leaving its screen shifted. The check now waits for the face load to settle first. Tracing it exposed a latent bug: a child attached after an asynchronous spawn kept the PTY size from spawn time if the grid changed meanwhile; Session.syncChildSize now resizes the child to the current grid when it differs (failing-first unit tests), called from the spawn-completion path.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
