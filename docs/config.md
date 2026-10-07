@@ -48,12 +48,13 @@ keybind = ctrl+alt+p=palette.open
 | Key | Value | Default | Effect today |
 |---|---|---|---|
 | `font.family` | string | `""` (bundled JetBrains Mono) | Applies; a family that is not installed falls back to the bundled face and is reported |
-| `font.bold` | string | `""` (derived from the family) | Validated and stored; the font manager does not load configured style faces yet |
-| `font.italic` | string | `""` | As `font.bold` |
-| `font.bold_italic` | string | `""` | As `font.bold` |
+| `font.bold` | family name | `""` (derived from the family) | Applies; bold text uses this family's bold face (else its regular face). Empty uses the family's own bold face, or emboldens its regular face. A family that is not installed keeps the derived face |
+| `font.italic` | family name | `""` | As `font.bold`, for italic (a missing italic face is slanted) |
+| `font.bold_italic` | family name | `""` | As `font.bold`, for bold italic |
 | `font.size` | points, `1` to `72`, decimals allowed | `14` | Applies; the face is rebuilt and the grid re-measured |
-| `font.ligatures` | `true` or `false` | `true` | Validated and stored for the font manager |
-| `font.nerd_symbols` | `true` or `false` | `true` | Validated and stored for the font manager |
+| `font.ligatures` | `true` or `false` | `true` | Applies at once; programming ligatures (`=>`, `!=`, `->`) form only when `true` |
+| `font.nerd_symbols` | `true` or `false` | `true` | Applies; `true` draws box drawing, blocks, braille and Powerline separators at the exact cell size, `false` takes them from the fonts |
+| `font.fallbacks` | comma-separated family names, at most 8 | `""` (none) | Applies; these families are tried, in order, for a character the family lacks, before any other installed font. A family that is not installed is skipped and reported |
 | `theme` | theme name or `auto:<dark>,<light>` | `""` (`conduit-dark`) | Applies to the terminal and every UI colour; see [Themes](#themes) |
 | `scratchpad.size` | whole percent, `10` to `100`, optional `%` | `50` | Height of the scratchpad opened by `scratchpad.toggle-50` |
 | `scratchpad.large_size` | whole percent, `10` to `100`, optional `%` | `90` | Height of the scratchpad opened by `scratchpad.toggle-90` |
@@ -62,6 +63,41 @@ keybind = ctrl+alt+p=palette.open
 
 Command-line flags are a session layer above the file: `--font=<family>` wins over `font.family`
 and `--right-click=<menu|paste>` wins over `mouse.right_click`, for that run only.
+
+## Fonts
+
+`font.fallbacks` is one line holding a comma-separated list, for example
+`font.fallbacks = Noto Sans Mono CJK SC, Symbols Nerd Font Mono`. Spaces around each name are
+ignored and empty entries are skipped; more than 8 names is reported and the previous list stays.
+Characters no configured family has still reach every other installed font and, last, Conduit's
+bundled symbols and JetBrains Mono faces, so a missing glyph does not become a box.
+
+Every font setting can also be changed from the command palette, and each change is written to the
+settings file at once (creating it from the defaults when it does not exist, and leaving every other
+line and comment as it was), so the file and the window always agree:
+
+| Command | Action | Writes |
+|---|---|---|
+| Font: Change Family | `font.pick` | `font.family` |
+| Font: Increase Size | `font.size.increase` | `font.size` |
+| Font: Decrease Size | `font.size.decrease` | `font.size` |
+| Font: Reset Size | `font.size.reset` | `font.size = 14` |
+| Font: Toggle Ligatures | `font.ligatures.toggle` | `font.ligatures` |
+| Font: Toggle Built-in Symbols | `font.symbols.toggle` | `font.nerd_symbols` |
+| Font: Configure Fallbacks | `font.fallbacks` | `font.fallbacks` |
+
+- **Change Family** lists the bundled JetBrains Mono and every installed monospace family (up to
+  255, sorted, the one in use first). Moving the highlight with the arrow keys, or moving the
+  pointer over a row, redraws the whole window in that family; the line under the list names the
+  family on screen once it has loaded. Enter or a click keeps it; Escape or a click outside goes
+  back to the family you had. Choosing the bundled entry writes `font.family = ""`.
+- **Size** steps one point at a time between 6 and 72. **Reset** returns to the built-in 14 points
+  and writes `font.size = 14` rather than removing the line, so the file says what is on screen.
+  The shipped chords are Ctrl+= (or Ctrl+Plus), Ctrl+- and Ctrl+0 on Linux and Windows, and
+  Command with the same keys on macOS.
+- **Configure Fallbacks** asks for the comma-separated list; `none` clears it.
+- With `--font=<family>` on the command line, a chosen family is still saved to the file, but the
+  flag keeps deciding the family for that run.
 
 ## Themes
 
@@ -179,6 +215,8 @@ often rebound are:
 | `config.open` | `ctrl+,` | `super+,` |
 | `tab.new` | `ctrl+shift+t` | `super+t` |
 | `pane.split:right` / `:down` | `ctrl+shift+e` / `ctrl+shift+o` | `super+d` / `super+shift+d` |
+| `font.size.increase` | `ctrl+equal`, `ctrl+shift+equal` | `super+equal`, `super+shift+equal` |
+| `font.size.decrease` / `font.size.reset` | `ctrl+minus` / `ctrl+0` | `super+minus` / `super+0` |
 
 Not configurable yet: the search chord (Ctrl+Shift+F, Cmd+F on macOS) and the keys inside modal
 UI (palette, search field, context menu, rename and confirmation prompts) are handled by those
@@ -218,6 +256,12 @@ palette chord and a configured scratchpad size through real SDL key events, rewr
 a malformed line and proves `config.error` names that line while previous and still-valid values
 keep working, repairs it with a rename-replace save and proves the error clears and the new
 values (including a larger `font.size`) apply, then deletes the file and opens it again through
-Ctrl+, and through a clicked palette row. `conduit-test launch` isolates `XDG_CONFIG_HOME`, so an
+Ctrl+, and through a clicked palette row. `xvfb-run -a zig build run -- --font-test` drives the font commands the same way, against its own
+private settings file: the size chords, the palette's size commands by keyboard and by a clicked
+row with the cell height and the file checked after each, ligatures toggled in place with frame
+readback, built-in symbols, fallbacks typed into the palette (an uninstalled one reported in the
+sidebar), and the family picker's keyboard preview, Escape revert, hover preview and clicked
+choice saved as `font.family`. Each command's own write is shown to reload without building the
+face a second time. `conduit-test launch` isolates `XDG_CONFIG_HOME`, so an
 agent can write `<root>/<run>/config/conduit/config` and observe the reload through `inspect` and
 `wait-for element config.error`.

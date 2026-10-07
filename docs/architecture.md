@@ -210,6 +210,27 @@ nothing else is a legal dependency.
   `search.toggle-regex` and `search.activate-match` share the action registry and mouse/key paths.
   The terminal owns match discovery and viewport reveal. Regex search uses the statically bundled,
   Ghostty-pinned Oniguruma source behind the same bounded cursor/page contract as literal search.
+- **Font actions (TASK-40).** `app` owns the committed font settings as one owned `FontSettings`
+  (family after the `--font` session layer, the three style families, fallbacks, size, ligatures,
+  built-in symbols) and builds every `font.Request` from it, at startup and on each reload. Each
+  font worker gets its own copy, so a commit never frees strings a worker reads. A face is
+  identified by `FontValues.faceKey` (everything but ligatures, plus the display scale);
+  `requestFontReload` starts nothing when the wanted key is the one drawn or the one being built,
+  so the config reload a command's own write causes is a no-op, and a ligature change toggles
+  `Manager.setLigatures` and invalidates every pane, scratchpad and overlay grid instead of
+  rebuilding. The palette commands are `font.pick` (fixed choices from a heap `FontChoices` list:
+  the bundled face plus `font.Catalog.monospaceFamilies`, at most 256, committed family first,
+  relisted only while the palette is closed), `font.size.increase`/`decrease`/`reset` (1 point,
+  6–72; reset writes 14), `font.ligatures.toggle`, `font.symbols.toggle` and `font.fallbacks` (free
+  text, comma-separated, `none` clears). Each commits live state first and then writes its key with
+  `config.writeDocumentValue`. The picker previews the keyboard-highlighted or, after a real
+  pointer motion, hovered family by rebuilding the manager with it (a failed build keeps the
+  previous face and reports through `config.error`); Escape or an outside click reverts, a choice
+  is adopted without a second build. Only a pointer motion may move a hover preview, because the
+  previewed face's cell size moves the rows under a still pointer. The dialog's `palette.preview`
+  Text names the drawn family and exists only once the highlighted face has landed, which is what
+  scripted checks wait on. Palette choice ids are stored per visible row, so a choice list can be
+  longer than the action registry.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
@@ -225,7 +246,8 @@ nothing else is a legal dependency.
   and rendering), TASK-31 (command-palette composition and modal interaction), TASK-32
   (scratchpad process coordination, presentation and interaction), TASK-33 (multi-workspace
   presentation, action routing and lifecycle), TASK-34 (URL/OSC 8 opening and file-reference
-  editor tabs), TASK-36 (bounded literal and regex search UI).
+  editor tabs), TASK-36 (bounded literal and regex search UI); M4 — TASK-40 (font settings,
+  commands and family picker).
 
 ### `platform`
 
@@ -349,6 +371,12 @@ nothing else is a legal dependency.
   `FT_Face`, because `hb-ft` resizes that face to its own scale. `Request.ligatures` /
   `Manager.setLigatures` turn `liga`, `calt` and `dlig` off. A size or display-scale change is a
   new `Manager` at the new `Size`: every face, sprite and emoji is rasterised again at that size.
+  TASK-40: `Request.bold_family`, `italic_family` and `bold_italic_family` replace a style slot
+  with the named family's exact style face (else its regular face); an empty or uninstalled one
+  keeps the derived face. `Catalog.monospaceFamilies` lists picker candidates — families with a
+  non-colour file FreeType reports fixed-width that maps `M` and `0` — sorted, de-duplicated
+  case-insensitively and bounded, borrowing the catalog's strings. `Manager.configuredFallbackCount`,
+  `builtinSymbols` and `styleFamilyName` let the app and its checks observe the request's effect.
 - **Never** know about sessions, workspaces, agents or UI (`AGENTS.md`). Never draw anything
   itself. Never let a missing glyph turn a terminal into boxes (CONDUIT.md §8).
 - **May depend on** no other Conduit module, plus the external FreeType and HarfBuzz seam.
@@ -442,6 +470,12 @@ nothing else is a legal dependency.
   bindings; an action that is neither is semantic plumbing and cannot be bound. Both default
   profiles add `config.open` (Command+, on macOS, Ctrl+, on Linux/Windows). The search chord and
   modal-surface keys remain fixed in `app`.
+- **TASK-40 font size defaults.** Ctrl+= and Ctrl+Shift+= (Ctrl+Plus on layouts where `+` is
+  shifted) increase, Ctrl+- decreases and Ctrl+0 resets on Linux and Windows; macOS uses Command
+  with the same keys. They resolve to `font.size.increase`, `font.size.decrease` and
+  `font.size.reset`. The legacy terminal encoding sends `=` and `0` with Ctrl as the plain
+  character and has no control code for Ctrl+-, so no common program loses input; Ctrl+Shift+-
+  (Ctrl+_, a C0 control) stays the terminal's.
 
 ### `palette`
 
@@ -599,7 +633,8 @@ nothing else is a legal dependency.
   systems. The thread only sets an atomic flag and calls the owner's wake callback; `app` reads,
   validates and applies the file on the main thread. `app` resolves `font.family` and
   `mouse.right_click` through `Layer` with `--font` / `--right-click` as the session layer, and
-  built-in checks other than `--config-test` and `--theme-test` never read the user's file.
+  built-in checks other than `--config-test`, `--theme-test` and `--font-test` never read the
+  user's file.
 - **TASK-38 additions.** `themesDirectory` names the user theme directory (`themes` beside the
   settings file). `setDocumentValue` returns the document with one key set: the winning line is
   replaced in place (indentation and line ending kept), every other line and comment is kept byte
@@ -608,6 +643,15 @@ nothing else is a legal dependency.
   uses it; TASK-40 and TASK-41 can reuse it. Theme files are not watched by themselves: the
   watcher watches the settings file's directory, and `app` re-reads the theme directory on every
   settings reload.
+- **TASK-40 additions.** `font.fallbacks` is a comma-separated list (at most
+  `max_font_fallbacks` = 8 trimmed, non-empty names; more is a line diagnostic that keeps the
+  previous list), parsed by `splitFallbacks` into `Settings.font_fallbacks` and written back by
+  `formatFallbacks` as `A, B`. Every `font.*` key now reaches `font.Request` through `app`.
+  `stepFontPoints` is the size commands' rule: whole points, one at a time, within
+  `min_step_font_points` (6) and `max_font_points` (72), never jumping across the range. The font
+  commands write `font.family`, `font.size`, `font.ligatures`, `font.nerd_symbols` and
+  `font.fallbacks` through `writeDocumentValue`; `--font-test` is the third check that reads a
+  (private) settings file.
 
 ### `theme`
 
