@@ -209,7 +209,8 @@ pub const Settings = struct {
     /// Stored for the font manager; `docs/config.md` says which keys take effect today.
     font_ligatures: bool = true,
     font_nerd_symbols: bool = true,
-    /// The colour scheme name. Stored for TASK-38; no effect yet.
+    /// The colour scheme: empty for Conduit's default, a bundled or user theme name, or
+    /// `auto:<dark>,<light>`. `app` resolves it through `theme`; an unknown name is reported there.
     theme: []const u8 = "",
     /// The two scratchpad presentations, in percent of the window height.
     scratchpad_size: u8 = 50,
@@ -675,6 +676,15 @@ fn baseNameOf(path: []const u8) []const u8 {
     return path[index + 1 ..];
 }
 
+/// The user theme directory for a settings path: `themes` beside the settings file, written into
+/// `buffer` with the path's own separator. Null when the path has no directory or does not fit.
+pub fn themesDirectory(buffer: []u8, settings_path: []const u8) ?[]const u8 {
+    const dir = directoryOf(settings_path) orelse return null;
+    const separator: u8 = if (std.mem.lastIndexOfScalar(u8, settings_path, '\\') != null and
+        std.mem.lastIndexOfScalar(u8, settings_path, '/') == null) '\\' else '/';
+    return std.fmt.bufPrint(buffer, "{s}{c}themes", .{ dir, separator }) catch null;
+}
+
 // ---------------------------------------------------------------------------
 // The defaults document
 // ---------------------------------------------------------------------------
@@ -708,7 +718,9 @@ pub const defaults_document =
     "# font.ligatures = true\n" ++
     "# font.nerd_symbols = true\n" ++
     "\n" ++
-    "# Colour scheme name (reserved; no effect yet).\n" ++
+    "# Colour scheme: a bundled name (gruvbox-dark, catppuccin-latte, dracula, nord, ...), the\n" ++
+    "# name of a Ghostty-format file in the themes directory next to this file, or\n" ++
+    "# auto:<dark>,<light> to follow the system preference. Empty is conduit-dark.\n" ++
     "# theme = \"\"\n" ++
     "\n" ++
     "# Scratchpad heights in percent of the window, 10 to 100.\n" ++
@@ -721,6 +733,111 @@ pub const defaults_document =
     "# Keybindings: keybind = <chord>=<action>[:<argument>], or <chord>=unbind.\n" ++
     "# Modifiers are ctrl, shift, alt and super (cmd). These lines repeat some defaults.\n" ++
     keybind_examples;
+
+// ---------------------------------------------------------------------------
+// Editing the document
+// ---------------------------------------------------------------------------
+
+/// Why `setDocumentValue` refused an edit.
+pub const EditError = error{
+    /// The value is not something `parse` would read back as the same string.
+    InvalidValue,
+    /// The edited document would exceed `max_file_bytes`.
+    TooLarge,
+} || Allocator.Error;
+
+/// `document` with `key` set to `value`, as a new allocation the caller owns.
+///
+/// The last uncommented line for `key` (the one that wins when the file is parsed) is replaced in
+/// place, keeping its indentation and line ending; every other line, comments and blank lines
+/// included, is kept byte for byte. When no line sets the key, `key = value` is appended. The value
+/// is written bare when that reads back unchanged, otherwise in double quotes. Only string values
+/// without control characters or double quotes are accepted, and never `keybind`, which repeats.
+pub fn setDocumentValue(gpa: Allocator, document: []const u8, key: Key, value: []const u8) EditError![]u8 {
+    if (key == .keybind) return error.InvalidValue;
+    if (value.len > max_string_bytes or !std.unicode.utf8ValidateSlice(value) or hasControl(value) or
+        std.mem.indexOfScalar(u8, value, '"') != null) return error.InvalidValue;
+    const quoted = value.len == 0 or std.mem.trim(u8, value, " \t").len != value.len;
+
+    // The byte range of the last line that sets `key`, without its line ending.
+    var target_start: ?usize = null;
+    var target_end: usize = 0;
+    var start: usize = 0;
+    while (start < document.len) {
+        const newline = std.mem.indexOfScalarPos(u8, document, start, '\n');
+        var end = newline orelse document.len;
+        const next = if (newline) |index| index + 1 else document.len;
+        if (end > start and document[end - 1] == '\r') end -= 1;
+        const line = document[start..end];
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (trimmed.len != 0 and trimmed[0] != '#') {
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |equals| {
+                if (std.mem.eql(u8, std.mem.trim(u8, trimmed[0..equals], " \t"), key.name())) {
+                    target_start = start + (line.len - trimmed.len);
+                    target_end = end;
+                }
+            }
+        }
+        start = next;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    writeEdited(&out.writer, document, target_start, target_end, key.name(), value, quoted) catch return error.OutOfMemory;
+    if (out.written().len > max_file_bytes) return error.TooLarge;
+    return out.toOwnedSlice();
+}
+
+fn writeEdited(
+    writer: *std.Io.Writer,
+    document: []const u8,
+    target_start: ?usize,
+    target_end: usize,
+    name: []const u8,
+    value: []const u8,
+    quoted: bool,
+) std.Io.Writer.Error!void {
+    if (target_start) |line_start| {
+        try writer.writeAll(document[0..line_start]);
+        try writeSetting(writer, name, value, quoted);
+        try writer.writeAll(document[target_end..]);
+        return;
+    }
+    try writer.writeAll(document);
+    if (document.len != 0 and document[document.len - 1] != '\n') try writer.writeByte('\n');
+    try writeSetting(writer, name, value, quoted);
+    try writer.writeByte('\n');
+}
+
+fn writeSetting(writer: *std.Io.Writer, name: []const u8, value: []const u8, quoted: bool) std.Io.Writer.Error!void {
+    if (quoted) {
+        try writer.print("{s} = \"{s}\"", .{ name, value });
+    } else {
+        try writer.print("{s} = {s}", .{ name, value });
+    }
+}
+
+/// Set `key` in the settings file at `path`, creating the file (and its directory) from
+/// `defaults_document` when it is missing. The new file is written beside the old one and renamed
+/// over it, so a reader never sees half a file and the watcher sees one change. Main thread only.
+pub fn writeDocumentValue(io: Io, gpa: Allocator, path: []const u8, key: Key, value: []const u8) !void {
+    const existing: ?[]u8 = switch (try readFile(io, gpa, path)) {
+        .missing => null,
+        .bytes => |bytes| bytes,
+        .failed => return error.Unreadable,
+    };
+    defer if (existing) |bytes| gpa.free(bytes);
+    const edited = try setDocumentValue(gpa, existing orelse defaults_document, key, value);
+    defer gpa.free(edited);
+    if (directoryOf(path)) |dir| try Io.Dir.cwd().createDirPath(io, dir);
+    var temporary_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const temporary = std.fmt.bufPrint(&temporary_buffer, "{s}.conduit-edit", .{path}) catch return error.NameTooLong;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = temporary, .data = edited });
+    errdefer Io.Dir.cwd().deleteFile(io, temporary) catch |err| {
+        log.warn("could not remove the temporary settings file: {s}", .{@errorName(err)});
+    };
+    try Io.Dir.cwd().rename(temporary, Io.Dir.cwd(), path, io);
+}
 
 // ---------------------------------------------------------------------------
 // Watching
@@ -1360,6 +1477,82 @@ test "loading: a missing file is the defaults, an unreadable one keeps the previ
     var at_limit = try load(testing.io, testing.allocator, path, &first);
     defer at_limit.deinit();
     try testing.expect(!at_limit.hasDiagnostics());
+}
+
+test "the themes directory sits beside the settings file" {
+    var buffer: [128]u8 = undefined;
+    try testing.expectEqualStrings("/home/u/.config/conduit/themes", themesDirectory(&buffer, "/home/u/.config/conduit/config").?);
+    try testing.expectEqualStrings("C:\\Users\\u\\conduit\\themes", themesDirectory(&buffer, "C:\\Users\\u\\conduit\\config").?);
+    try testing.expect(themesDirectory(&buffer, "config") == null);
+    var tiny: [8]u8 = undefined;
+    try testing.expect(themesDirectory(&tiny, "/home/u/.config/conduit/config") == null);
+}
+
+test "editing the document replaces the winning line in place and keeps everything else" {
+    const document =
+        "# my settings\n" ++
+        "# theme = \"\"\n" ++
+        "theme = nord\n" ++
+        "scratchpad.size = 30 \n" ++
+        "  theme=gruvbox-dark\r\n" ++
+        "\n" ++
+        "# trailing comment\n";
+    const edited = try setDocumentValue(testing.allocator, document, .theme, "Rosé Pine");
+    defer testing.allocator.free(edited);
+    try testing.expectEqualStrings(
+        "# my settings\n" ++
+            "# theme = \"\"\n" ++
+            "theme = nord\n" ++
+            "scratchpad.size = 30 \n" ++
+            "  theme = Rosé Pine\r\n" ++
+            "\n" ++
+            "# trailing comment\n",
+        edited,
+    );
+    var parsed = try parse(testing.allocator, edited, null);
+    defer parsed.deinit();
+    try testing.expect(!parsed.hasDiagnostics());
+    try testing.expectEqualStrings("Rosé Pine", parsed.settings.theme);
+    try testing.expectEqual(@as(u8, 30), parsed.settings.scratchpad_size);
+}
+
+test "editing the document appends a key it does not set and quotes when it must" {
+    const appended = try setDocumentValue(testing.allocator, "# only a comment", .theme, "dracula");
+    defer testing.allocator.free(appended);
+    try testing.expectEqualStrings("# only a comment\ntheme = dracula\n", appended);
+
+    const from_defaults = try setDocumentValue(testing.allocator, defaults_document, .theme, "dracula");
+    defer testing.allocator.free(from_defaults);
+    try testing.expect(std.mem.startsWith(u8, from_defaults, defaults_document));
+    try testing.expect(std.mem.endsWith(u8, from_defaults, "\ntheme = dracula\n"));
+
+    const empty = try setDocumentValue(testing.allocator, "", .theme, "");
+    defer testing.allocator.free(empty);
+    try testing.expectEqualStrings("theme = \"\"\n", empty);
+
+    try testing.expectError(error.InvalidValue, setDocumentValue(testing.allocator, "", .theme, "a\"b"));
+    try testing.expectError(error.InvalidValue, setDocumentValue(testing.allocator, "", .theme, "a\nb"));
+    try testing.expectError(error.InvalidValue, setDocumentValue(testing.allocator, "", .keybind, "f5=tab.new"));
+}
+
+test "writing a value creates the file from the defaults and edits it in place afterwards" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/conduit/config", .{tmp.sub_path[0..]});
+
+    try writeDocumentValue(testing.io, testing.allocator, path, .theme, "dracula");
+    var first = try load(testing.io, testing.allocator, path, null);
+    defer first.deinit();
+    try testing.expect(!first.hasDiagnostics());
+    try testing.expectEqualStrings("dracula", first.settings.theme);
+
+    try writeDocumentValue(testing.io, testing.allocator, path, .theme, "nord");
+    var buffer: [4096]u8 = undefined;
+    const text = try Io.Dir.cwd().readFile(testing.io, path, &buffer);
+    try testing.expect(std.mem.startsWith(u8, text, defaults_document));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\ntheme = "));
+    try testing.expect(std.mem.endsWith(u8, text, "\ntheme = nord\n"));
 }
 
 const WakeProbe = struct {
