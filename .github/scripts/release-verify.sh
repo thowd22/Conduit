@@ -73,6 +73,10 @@ payload_files=(
   share/licenses/conduit/HarfBuzz-COPYING.txt
   share/licenses/conduit/Oniguruma-COPYING.txt
   share/licenses/conduit/JetBrainsMono-OFL-1.1.txt
+  share/licenses/conduit/zlib-LICENSE.txt
+  share/licenses/conduit/libpng-LICENSE.txt
+  share/licenses/conduit/NerdFonts-LICENSE.txt
+  share/licenses/conduit/NerdFonts-license-audit.md
 )
 # The application icon at every freedesktop hicolor size build.zig installs.
 icon_sizes=(16 22 24 32 48 64 128 256 512)

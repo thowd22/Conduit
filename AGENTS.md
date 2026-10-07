@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its nine declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its ten declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -346,6 +346,31 @@ previous and still-valid values working, a rename-replace repair that clears it 
 values including a larger font, return to defaults on deletion, and `config.open` by Ctrl+, and by
 a clicked palette row. macOS/Windows locations and the polling watcher backend are
 runtime-unverified.
+
+TASK-39 is complete on Linux. `src/font_sprite.zig` draws box drawing (U+2500–257F), block
+elements, braille and the Powerline arrow/rounded/triangle separators (U+E0B0–E0BF, E0D2, E0D4) at
+the exact cell size so they tile without a Nerd Font; `Request.builtin_symbols = false` hands them
+back to the font. `font.Manager.resolve` walks a per-codepoint chain: sprites, the primary style
+face, the primary regular face with synthetic bold (FreeType emboldening) or oblique (12° shear),
+`Request.fallbacks` families, installed system faces found through cmap coverage read at scan time
+(monospaced regular first, colour faces last or first for emoji presentation, private-use
+codepoints preferring the bundled symbols face), the bundled Nerd Fonts v3.5.1 Symbols Nerd Font
+Mono face (OFL/MIT, licences in `assets/fonts/`), then the bundled JetBrains Mono. Fallback glyphs
+are scaled and pixel-snapped into one or two cells, so the grid never changes. FreeType is built
+with the Ghostty-pinned libpng 1.6.43 and zlib 1.3.1, so Noto Color Emoji CBDT glyphs load into a
+separate premultiplied RGBA atlas that `render` draws in a third instanced pass.
+`Request.ligatures`/`Manager.setLigatures` toggle `liga`/`calt`/`dlig`, and `render` shapes
+ligature runs of printable ASCII per row while keeping every glyph in its cluster's cell. HarfBuzz
+now shapes through its own OpenType functions rather than `hb-ft`, which had resized the shared
+`FT_Face` to upem/64 px on the first shape and so drew text at about 15.6 px at every size and
+scale (2x text was half size since v0.1.0). A size or scale change re-creates the manager and
+re-rasterises every glyph, sprite and emoji. The tenth `zig build e2e` scenario, `font-coverage`,
+prints a Starship-style prompt, box drawing, blocks, braille, CJK, U+273B, a Nerd icon, ligatures
+and colour emoji; its 1x and 2x screenshots were inspected. The Linux gate installs
+`fonts-noto-color-emoji`, `fonts-noto-cjk` and `fonts-dejavu-core`. The bundled-face Hangul preedit
+gap noted under TASK-50 is closed wherever a CJK font is installed. The `font.ligatures`,
+`font.nerd_symbols` and style-family settings TASK-37 already parses are wired to these `Request`
+fields by TASK-40.
 
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
