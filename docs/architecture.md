@@ -121,6 +121,21 @@ nothing else is a legal dependency.
   or receives user input, but pumping and asynchronous terminal/scratchpad jobs retain their
   initiating workspace key so hidden workspaces continue running without selection redirecting
   their results.
+- **Child environment (TASK-73).** `ChildSpec` builds every child's argv and environment for the
+  context kind of the workspace that spawns it. A Local child starts from Conduit's own process
+  environment — the desktop session (DISPLAY/WAYLAND_DISPLAY, XDG_RUNTIME_DIR,
+  DBUS_SESSION_BUS_ADDRESS, SSH_AUTH_SOCK, LC_*) and the user's exports — with
+  `TERM=xterm-256color`, `COLORTERM=truecolor` and `TERM_PROGRAM=conduit` set on top, the
+  PATH/HOME/LANG fallbacks applied when unset or empty, and shell-integration variables added only
+  when that spawn injects integration. It drops exactly `ChildSpec.inherited_exclusions`:
+  `CONDUIT_TEST_RUN`/`CONDUIT_TEST_ROOT` (they would aim a child's `conduit-test` at a driver),
+  `CONDUIT_LOG_FILE` (this run's exact log file), the four `CONDUIT_*` shell-integration handshake
+  variables of an enclosing Conduit, and `TERM_PROGRAM_VERSION` (it describes the replaced
+  `TERM_PROGRAM`). The driver endpoint and artifact directory reach the app only as flags, so the
+  environment never names them; `conduit-test launch`'s isolated HOME/XDG_*/TMPDIR are the app's
+  environment and therefore also the child's. SSH and WSL contexts cannot forward this machine's
+  environment, so they receive only the curated identity-plus-fallback set and their remote side
+  supplies the rest. The scratchpad and `--command`/check children use the same rule.
 - **Tab actions.** User commands are `tab.new`, `tab.close`, `tab.rename`, `tab.previous`,
   `tab.next`, `tab.goto` and `tab.move`. Semantic pointer paths use `tab.activate` and
   `tab.reorder`; the overlays complete through `tab.rename.commit`/`tab.rename.cancel` and
@@ -387,6 +402,11 @@ nothing else is a legal dependency.
   nodes retain split direction, divider identity and resize weight. The Local implementation is
   the only production call to `pty.spawn`; SSH and WSL supply later implementations of the same
   vtable.
+- **Environment rule.** Local inherits; remote contexts supply their own. A Local context is this
+  machine, so its children inherit Conduit's process environment minus the driver/isolation
+  exclusions documented under `app`; a context whose processes run elsewhere (SSH, WSL) gets only
+  the curated terminal identity and fallbacks, because this process's DISPLAY, sockets and paths
+  mean nothing there. `ExecutionContextKind` selects the rule explicitly, so a new kind must choose.
 - **Owns eventually** the rest of each product aggregate described by CONDUIT.md §3: theme and
   state metadata, agent and backlog state, and their composed views.
 - **Workspace registry.** Each heap-allocated record remains address-stable until removal and has
@@ -661,7 +681,13 @@ its screenshot. A fifth `terminal-file-reference` scenario does the same for a `
 reference and then waits for the new tab's sidebar row and for vi's quoted path in the active
 terminal, proving the editor tab through the same external route. A sixth `context-menu` scenario
 right-clicks the pane through `conduit-test right-click`, waits for the `context-menu.search` row,
-clicks it and waits for the search `Input` to exist and the menu to be gone.
+clicks it and waits for the search `Input` to exist and the menu to be gone. An eighth
+`child-environment` scenario (TASK-73) has the runner set a profile-style variable, a stand-in
+`SSH_AUTH_SOCK` and both `conduit-test` addressing variables for the `launch` client only, then
+waits for the child's own expansions: the probe and agent socket arrive, a display variable is
+present, HOME/XDG_CONFIG_HOME/TMPDIR still have the launcher's isolated layout, the driver
+addressing is unset and the terminal identity is Conduit's. A scenario's optional `launch_env`
+applies only to that launch; every other client inherits the runner's environment unchanged.
 
 The runner reports PASS/FAIL for every scenario without stopping at the first failure and writes a
 run-unique suite directory beneath the explicit `--artifact-dir`. Each scenario retains

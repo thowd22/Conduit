@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 03:59'
+updated_date: '2026-10-07 04:42'
 labels:
   - platform
   - linux
@@ -71,6 +71,8 @@ Approved CI evidence is now checked in: the Linux workflow explicitly installs i
 2026-10-07 second IBus flake on a hosted run (release 37552145736, 1 of 6 executions of the hardened script): the child received gksrmf once, so the keys reached the terminal before ibus-engine-hangul (spawned lazily on first focus-in) was answering. check-ibus-hangul.sh now waits for the engine process (pgrep -f, the comm name is truncated) and probes with 'g' until ime.preedit exists, erasing a passed-through probe with Backspace, bounded to five attempts; container 5/5 with one probe each.
 
 2026-10-07 third IBus flake mode (gate 37554433896 on 6c49246): every probe arrived as ASCII with the engine process already running. Cause: ibus-daemon --xim starts ibus-x11 asynchronously while SDL opens its XIM once at window creation, so a Conduit launched before the bridge registered never attaches to an input method. check-ibus-hangul.sh now waits for xprop -root XIM_SERVERS to contain @server=ibus (recorded as xim-servers.txt) before launching; container 5/5 with one probe each.
+
+2026-10-07 Wayland harness pass on headless Weston 14 (SDL_VIDEODRIVER=wayland, 1000x640): Codex 0.160.1, Claude Code 2.1.292 and omp 18.6.1 all started inside isolated Conduit runs reporting 'window backend wayland'; Claude Code answered a prompt; omp with openrouter/anthropic/claude-haiku-4.5 answered a prompt and ran two parallel subagents to completion; Codex exercised its overlays, agents view and a new Conduit tab (Ctrl+Shift+T from the driver) without a crash. Frames inspected. Found TASK-73: children get only a curated environment, so a harness started without the user's interactive shell lacks profile exports and every desktop session variable.
 <!-- SECTION:NOTES:END -->
 
 ## Comments

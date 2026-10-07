@@ -27,12 +27,21 @@ pub const Step = union(enum) {
     screenshot,
 };
 
+/// One variable the runner sets on top of its own environment for `launch`.
+pub const EnvVar = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 /// Fixed launch geometry and ordered user-visible operations for one run.
 pub const Scenario = struct {
     name: []const u8,
     width: u32 = 640,
     height: u32 = 360,
     scale: f32 = 1,
+    /// Set for the `launch` client only; every other client inherits the
+    /// runner's environment unchanged.
+    launch_env: []const EnvVar = &.{},
     command: []const u8,
     steps: []const Step,
 };
@@ -212,6 +221,47 @@ const output_flood_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-73: a Local child inherits the environment Conduit was launched with.
+// The runner sets a profile-style export, a stand-in agent socket and both
+// conduit-test addressing variables for the launch only; the app inherits
+// them from `conduit-test launch`, and its child must see the first two but
+// never the driver addressing. The display variable comes from the display
+// the suite runs under (Xvfb in CI), and the isolated HOME/XDG/TMPDIR layout
+// that `launch` imposes must still be what the child sees. The command is
+// not typed, so no label can be satisfied by echo; every wait needs the child
+// to have expanded the variable itself.
+const child_environment_launch_env = [_]EnvVar{
+    .{ .name = "CONDUIT_PROBE_VAR", .value = "inherited" },
+    .{ .name = "SSH_AUTH_SOCK", .value = "/conduit-e2e/agent.sock" },
+    .{ .name = "CONDUIT_TEST_RUN", .value = "run-leak-probe" },
+    .{ .name = "CONDUIT_TEST_ROOT", .value = "/conduit-e2e/leak-probe" },
+};
+
+const child_environment_command =
+    "stty -echo; printf '\x1b[2J\x1b[H'; " ++
+    "printf 'ENV_PROBE=%s\\n' \"$CONDUIT_PROBE_VAR\"; " ++
+    "if [ -n \"$DISPLAY$WAYLAND_DISPLAY\" ]; then d=present; else d=absent; fi; " ++
+    "printf 'ENV_DISPLAY=%s\\n' \"$d\"; " ++
+    "printf 'ENV_AGENT=%s\\n' \"$SSH_AUTH_SOCK\"; " ++
+    "r=\"${HOME%/home}\"; " ++
+    "if [ \"$r\" != \"$HOME\" ] && [ \"$XDG_CONFIG_HOME\" = \"$r/config\" ] && [ \"$TMPDIR\" = \"$r/tmp\" ]; " ++
+    "then i=isolated; else i=leaked; fi; " ++
+    "printf 'ENV_HOME=%s\\n' \"$i\"; " ++
+    "printf 'ENV_DRIVER=%s/%s\\n' \"${CONDUIT_TEST_RUN:-unset}\" \"${CONDUIT_TEST_ROOT:-unset}\"; " ++
+    "printf 'ENV_TERM=%s/%s\\n' \"$TERM\" \"$TERM_PROGRAM\"; " ++
+    "while :; do sleep 60; done";
+
+const child_environment_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "ENV_PROBE=inherited" } },
+    .{ .wait_terminal_text = .{ .contains = "ENV_DISPLAY=present" } },
+    .{ .wait_terminal_text = .{ .contains = "ENV_AGENT=/conduit-e2e/agent.sock" } },
+    .{ .wait_terminal_text = .{ .contains = "ENV_HOME=isolated" } },
+    .{ .wait_terminal_text = .{ .contains = "ENV_DRIVER=unset/unset" } },
+    .{ .wait_terminal_text = .{ .contains = "ENV_TERM=xterm-256color/conduit" } },
+    .inspect,
+    .screenshot,
+};
+
 /// All scenarios in deterministic execution and report order.
 pub const all = [_]Scenario{
     .{
@@ -248,6 +298,12 @@ pub const all = [_]Scenario{
         .name = "context-menu",
         .command = deterministic_shell,
         .steps = &context_menu_steps,
+    },
+    .{
+        .name = "child-environment",
+        .launch_env = &child_environment_launch_env,
+        .command = child_environment_command,
+        .steps = &child_environment_steps,
     },
 };
 
@@ -330,7 +386,7 @@ test "file reference scenario pins the production semantic identity and the new 
 }
 
 test "context menu scenario right-clicks the terminal pane and activates the search row" {
-    const scenario = all[all.len - 1];
+    const scenario = all[6];
     try std.testing.expectEqualStrings("context-menu", scenario.name);
     try std.testing.expectEqualStrings(deterministic_shell, scenario.command);
     switch (scenario.steps[1]) {
@@ -376,4 +432,16 @@ test "output flood scenario waits for a marker the typed command cannot echo" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "child environment scenario waits only on values the child expanded" {
+    const scenario = all[7];
+    try std.testing.expectEqualStrings("child-environment", scenario.name);
+    try std.testing.expectEqual(child_environment_launch_env.len, scenario.launch_env.len);
+    for (scenario.steps) |step| switch (step) {
+        // The command text is never shown, but even if it were, no expected
+        // line appears in it verbatim: each needs a shell expansion.
+        .wait_terminal_text => |wait| try std.testing.expect(std.mem.indexOf(u8, scenario.command, wait.contains) == null),
+        else => {},
+    };
 }

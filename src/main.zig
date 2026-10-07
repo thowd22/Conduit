@@ -170,6 +170,9 @@ pub const path_capacity = 1024;
 pub const EnvSource = struct {
     ctx: *const anyopaque,
     getFn: *const fn (ctx: *const anyopaque, key: []const u8) ?[]const u8,
+    /// Enumerate the source by position, or null for a lookup-only source.
+    /// Only a Local child inherits through this; see `ChildSpec`.
+    entryFn: ?*const fn (ctx: *const anyopaque, index: usize) ?Entry = null,
 
     /// The value of `key`, or `null` when it is unset or empty. An empty
     /// variable counts as unset: `FOO=` is how a shell says "nothing", not
@@ -177,6 +180,18 @@ pub const EnvSource = struct {
     pub fn get(self: EnvSource, key: []const u8) ?[]const u8 {
         const value = self.getFn(self.ctx, key) orelse return null;
         return if (value.len == 0) null else value;
+    }
+
+    /// One variable of an enumerable source, exactly as the source holds it:
+    /// an empty value is kept, because a child inheriting `FOO=` must see the
+    /// same `FOO=` its parent did.
+    pub const Entry = struct { key: []const u8, value: []const u8 };
+
+    /// The `index`th variable, or null past the end or for a lookup-only
+    /// source.
+    pub fn entry(self: EnvSource, index: usize) ?Entry {
+        const entry_fn = self.entryFn orelse return null;
+        return entry_fn(self.ctx, index);
     }
 };
 
@@ -854,9 +869,16 @@ fn environGet(ctx: *const anyopaque, key: []const u8) ?[]const u8 {
     return map.get(key);
 }
 
+fn environEntry(ctx: *const anyopaque, index: usize) ?EnvSource.Entry {
+    const map: *const std.process.Environ.Map = @ptrCast(@alignCast(ctx));
+    const keys = map.keys();
+    if (index >= keys.len) return null;
+    return .{ .key = keys[index], .value = map.values()[index] };
+}
+
 /// This process's environment, as an `EnvSource`.
 pub fn processEnv(init: std.process.Init) EnvSource {
-    return .{ .ctx = init.environ_map, .getFn = environGet };
+    return .{ .ctx = init.environ_map, .getFn = environGet, .entryFn = environEntry };
 }
 
 /// Build a fresh, unique run id from the wall clock and the entropy source.
@@ -1290,10 +1312,15 @@ const Load = struct {
 /// `deinit`, and the child is given copies of what it needs, so the whole
 /// struct can go once the child has been spawned.
 ///
-/// Conduit never hands a child the process's own environment: a spawn belongs
-/// to an execution context (P7), so the environment here is built from what the
-/// run was configured with plus the handful of variables a shell notices are
-/// missing.
+/// Where the environment starts depends on the execution context (P7). A
+/// Local context is this machine, so its children inherit Conduit's own
+/// environment exactly as every other terminal's local shell does: the
+/// desktop session (DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR,
+/// DBUS_SESSION_BUS_ADDRESS, SSH_AUTH_SOCK, LC_*) and whatever the user
+/// exported before starting Conduit. Only `inherited_exclusions` is dropped.
+/// A context that cannot forward this process's environment (SSH, WSL) gets
+/// the curated set instead, and its remote side supplies the rest. Either way
+/// Conduit's terminal identity and the PATH/HOME/LANG fallbacks are set on top.
 const ChildSpec = struct {
     allocator: Allocator,
     argv: [][]const u8,
@@ -1308,8 +1335,45 @@ const ChildSpec = struct {
     /// none, because an empty `PATH` means "find nothing".
     const fallback_path = "/usr/local/bin:/usr/bin:/bin";
 
-    fn build(allocator: Allocator, io: Io, env: EnvSource, options: Options) !ChildSpec {
-        return buildIn(allocator, io, env, options, null);
+    /// Variables a Local child never inherits, and why:
+    ///
+    /// - `CONDUIT_TEST_RUN` / `CONDUIT_TEST_ROOT` are `conduit-test`'s run and
+    ///   root fallbacks. Inherited, they would point any `conduit-test` a child
+    ///   runs at a test driver and its isolated run by default.
+    /// - `CONDUIT_LOG_FILE` names one exact log file that this run truncated
+    ///   and owns; a nested Conduit inheriting it would truncate and share it.
+    /// - `CONDUIT_SHELL_INTEGRATION_DIR`, `CONDUIT_BASH_INJECT`,
+    ///   `CONDUIT_ZSH_ZDOTDIR` and `CONDUIT_SHELL_INTEGRATION_XDG_DIR` are this
+    ///   builder's own per-spawn shell-integration handshake. They are set only
+    ///   when this spawn injects integration, never copied from an enclosing
+    ///   Conduit, so `--no-shell-integration` and `--command` stay clean.
+    /// - `TERM_PROGRAM_VERSION` describes the enclosing terminal's
+    ///   `TERM_PROGRAM`, which Conduit replaces.
+    ///
+    /// The test driver itself and the artifact directory reach the app only as
+    /// flags (`--test-driver`, `--test-artifact-dir`), never through the
+    /// environment, so nothing else names them. `conduit-test launch`'s
+    /// isolated HOME/XDG_*/TMPDIR overrides are deliberately kept: they are
+    /// this process's environment, and a child of an isolated run must not
+    /// touch the user's real config either.
+    const inherited_exclusions = [_][]const u8{
+        "CONDUIT_TEST_RUN",
+        "CONDUIT_TEST_ROOT",
+        "CONDUIT_LOG_FILE",
+        "CONDUIT_SHELL_INTEGRATION_DIR",
+        "CONDUIT_BASH_INJECT",
+        "CONDUIT_ZSH_ZDOTDIR",
+        "CONDUIT_SHELL_INTEGRATION_XDG_DIR",
+        "TERM_PROGRAM_VERSION",
+    };
+
+    /// A child's environment while it is being built: the key-replacing map
+    /// std uses for spawns, so an identity variable set on top of an
+    /// inherited one replaces it rather than appearing twice.
+    const Variables = std.process.Environ.Map;
+
+    fn build(allocator: Allocator, io: Io, env: EnvSource, context: workspace.ExecutionContextKind, options: Options) !ChildSpec {
+        return buildIn(allocator, io, env, context, options, null);
     }
 
     /// Build the workspace scratchpad's interactive shell independently of
@@ -1319,22 +1383,17 @@ const ChildSpec = struct {
         allocator: Allocator,
         io: Io,
         env: EnvSource,
+        context: workspace.ExecutionContextKind,
         no_shell_integration: bool,
         shell_override: ?[]const u8,
     ) !ChildSpec {
         var argv: std.ArrayList([]const u8) = .empty;
         errdefer freeEntries(allocator, argv.items);
-        var variables: std.ArrayList([]const u8) = .empty;
-        errdefer freeEntries(allocator, variables.items);
+        var variables = try baseEnvironment(allocator, env, context);
+        defer variables.deinit();
 
         const shell = shell_override orelse env.get("SHELL") orelse "/bin/sh";
         try put(allocator, &argv, shell);
-        try variable(allocator, &variables, "TERM", "xterm-256color");
-        try variable(allocator, &variables, "COLORTERM", "truecolor");
-        try variable(allocator, &variables, "TERM_PROGRAM", "conduit");
-        try variable(allocator, &variables, "PATH", env.get("PATH") orelse fallback_path);
-        try variable(allocator, &variables, "HOME", env.get("HOME") orelse "/");
-        try variable(allocator, &variables, "LANG", env.get("LANG") orelse "C.UTF-8");
 
         if (!no_shell_integration) {
             if (ShellKind.detect(shell)) |kind| {
@@ -1342,21 +1401,24 @@ const ChildSpec = struct {
             }
         }
 
-        return .{
-            .allocator = allocator,
-            .argv = try argv.toOwnedSlice(allocator),
-            .env = try variables.toOwnedSlice(allocator),
-        };
+        return finish(allocator, &argv, &variables);
     }
 
     /// `build`, with the directory the integration scripts are written to
     /// chosen by the caller. A test passes its own temporary directory; the app
     /// passes null and gets `shellIntegrationDir`.
-    fn buildIn(allocator: Allocator, io: Io, env: EnvSource, options: Options, integration_root: ?[]const u8) !ChildSpec {
+    fn buildIn(
+        allocator: Allocator,
+        io: Io,
+        env: EnvSource,
+        context: workspace.ExecutionContextKind,
+        options: Options,
+        integration_root: ?[]const u8,
+    ) !ChildSpec {
         var argv: std.ArrayList([]const u8) = .empty;
         errdefer freeEntries(allocator, argv.items);
-        var variables: std.ArrayList([]const u8) = .empty;
-        errdefer freeEntries(allocator, variables.items);
+        var variables = try baseEnvironment(allocator, env, context);
+        defer variables.deinit();
 
         // The PTY checks run fixed children, so what the program receives is
         // known and nothing of the user's shell configuration is involved.
@@ -1392,34 +1454,77 @@ const ChildSpec = struct {
         } else env.get("SHELL") orelse "/bin/sh";
         if (shell) |program| try put(allocator, &argv, program);
 
-        // The two that decide what a program draws and how much colour it may
-        // use, then the three it cannot start without.
-        try variable(allocator, &variables, "TERM", "xterm-256color");
-        try variable(allocator, &variables, "COLORTERM", "truecolor");
-        try variable(allocator, &variables, "TERM_PROGRAM", "conduit");
-        try variable(allocator, &variables, "PATH", env.get("PATH") orelse fallback_path);
-        try variable(allocator, &variables, "HOME", env.get("HOME") orelse "/");
-        try variable(allocator, &variables, "LANG", env.get("LANG") orelse "C.UTF-8");
-
         if (shell) |program| if (!options.run.no_shell_integration) {
             if (ShellKind.detect(program)) |kind| {
                 try injectShellIntegration(allocator, io, env, kind, integration_root, &argv, &variables);
             }
         };
 
+        return finish(allocator, &argv, &variables);
+    }
+
+    /// The environment every child of `context` starts from: inherited for
+    /// Local, empty otherwise, then Conduit's terminal identity and the three
+    /// variables a program cannot start without. The caller owns the map.
+    fn baseEnvironment(allocator: Allocator, env: EnvSource, context: workspace.ExecutionContextKind) !Variables {
+        var variables = Variables.init(allocator);
+        errdefer variables.deinit();
+        switch (context) {
+            .local => {
+                var index: usize = 0;
+                while (env.entry(index)) |inherited| : (index += 1) {
+                    // A malformed name from the parent cannot become a child's
+                    // variable; it is dropped rather than trusted.
+                    if (!Variables.validateKeyForPut(inherited.key)) continue;
+                    if (isExcluded(inherited.key)) continue;
+                    try variables.put(inherited.key, inherited.value);
+                }
+            },
+            // This process's environment belongs to this machine; a remote
+            // side supplies its own, so only the curated set crosses.
+            .ssh, .wsl => {},
+        }
+        // The two that decide what a program draws and how much colour it may
+        // use, then the three it cannot start without. An inherited empty
+        // value counts as unset, as everywhere else Conduit reads one.
+        try variables.put("TERM", "xterm-256color");
+        try variables.put("COLORTERM", "truecolor");
+        try variables.put("TERM_PROGRAM", "conduit");
+        try variables.put("PATH", env.get("PATH") orelse fallback_path);
+        try variables.put("HOME", env.get("HOME") orelse "/");
+        try variables.put("LANG", env.get("LANG") orelse "C.UTF-8");
+        return variables;
+    }
+
+    fn isExcluded(key: []const u8) bool {
+        for (inherited_exclusions) |excluded| {
+            if (std.mem.eql(u8, key, excluded)) return true;
+        }
+        return false;
+    }
+
+    /// Transfer `argv` and copies of `variables` into an owned spec.
+    fn finish(allocator: Allocator, argv: *std.ArrayList([]const u8), variables: *const Variables) !ChildSpec {
+        var entries: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (entries.items) |entry| allocator.free(entry);
+            entries.deinit(allocator);
+        }
+        try entries.ensureTotalCapacity(allocator, variables.count());
+        for (variables.keys(), variables.values()) |key, value| {
+            entries.appendAssumeCapacity(try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value }));
+        }
+        const env_entries = try entries.toOwnedSlice(allocator);
+        errdefer freeEntries(allocator, env_entries);
         return .{
             .allocator = allocator,
             .argv = try argv.toOwnedSlice(allocator),
-            .env = try variables.toOwnedSlice(allocator),
+            .env = env_entries,
         };
     }
 
     fn put(allocator: Allocator, list: *std.ArrayList([]const u8), text: []const u8) !void {
         try list.append(allocator, try allocator.dupe(u8, text));
-    }
-
-    fn variable(allocator: Allocator, list: *std.ArrayList([]const u8), key: []const u8, value: []const u8) !void {
-        try list.append(allocator, try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value }));
     }
 };
 
@@ -1491,7 +1596,7 @@ fn injectShellIntegration(
     kind: ShellKind,
     integration_root: ?[]const u8,
     argv: *std.ArrayList([]const u8),
-    variables: *std.ArrayList([]const u8),
+    variables: *ChildSpec.Variables,
 ) !void {
     var root_buffer: [path_capacity]u8 = undefined;
     const relative = integration_root orelse try shellIntegrationDir(&root_buffer, env);
@@ -1509,7 +1614,7 @@ fn injectShellIntegration(
     };
     defer allocator.free(root);
 
-    try ChildSpec.variable(allocator, variables, "CONDUIT_SHELL_INTEGRATION_DIR", root);
+    try variables.put("CONDUIT_SHELL_INTEGRATION_DIR", root);
     var path: [path_capacity]u8 = undefined;
     switch (kind) {
         // POSIX mode makes an interactive bash read `ENV` instead of its usual
@@ -1517,27 +1622,27 @@ fn injectShellIntegration(
         .bash => {
             try ChildSpec.put(allocator, argv, "--posix");
             const script = try std.fmt.bufPrint(&path, "{s}{c}bash{c}conduit.bash", .{ root, std.fs.path.sep, std.fs.path.sep });
-            try ChildSpec.variable(allocator, variables, "ENV", script);
-            try ChildSpec.variable(allocator, variables, "CONDUIT_BASH_INJECT", "1");
+            try variables.put("ENV", script);
+            try variables.put("CONDUIT_BASH_INJECT", "1");
         },
         // `ZDOTDIR` points at the integration directory, and the user's own
         // value — or its absence, as an empty value — rides along so the
         // script's `.zshenv` can put it back before anything else runs.
         .zsh => {
-            try ChildSpec.variable(allocator, variables, "CONDUIT_ZSH_ZDOTDIR", env.get("ZDOTDIR") orelse "");
+            try variables.put("CONDUIT_ZSH_ZDOTDIR", env.get("ZDOTDIR") orelse "");
             const dir = try std.fmt.bufPrint(&path, "{s}{c}zsh", .{ root, std.fs.path.sep });
-            try ChildSpec.variable(allocator, variables, "ZDOTDIR", dir);
+            try variables.put("ZDOTDIR", dir);
         },
         // Untested by decision (see the README). fish reads `vendor_conf.d`
         // from every directory in `XDG_DATA_DIRS`, and the script removes this
         // one again so programs the shell starts see the user's value.
         .fish => {
             const dir = try std.fmt.bufPrint(&path, "{s}{c}fish", .{ root, std.fs.path.sep });
-            try ChildSpec.variable(allocator, variables, "CONDUIT_SHELL_INTEGRATION_XDG_DIR", dir);
+            try variables.put("CONDUIT_SHELL_INTEGRATION_XDG_DIR", dir);
             var data_dirs: [path_capacity]u8 = undefined;
             const existing = env.get("XDG_DATA_DIRS") orelse "/usr/local/share:/usr/share";
             const joined = try std.fmt.bufPrint(&data_dirs, "{s}:{s}", .{ dir, existing });
-            try ChildSpec.variable(allocator, variables, "XDG_DATA_DIRS", joined);
+            try variables.put("XDG_DATA_DIRS", joined);
         },
     }
 }
@@ -3532,13 +3637,14 @@ const App = struct {
         var spec: ChildSpec = .{ .allocator = allocator, .argv = &.{}, .env = &.{} };
         errdefer spec.deinit();
         if (wantsChild(options)) {
-            spec = try ChildSpec.build(allocator, io, env, options);
+            spec = try ChildSpec.build(allocator, io, env, workspace_state.contextKind(), options);
         }
         const deterministic_scratchpad = usesDeterministicScratchpad(options);
         var scratchpad_spec = try ChildSpec.buildInteractive(
             allocator,
             io,
             env,
+            workspace_state.contextKind(),
             options.run.no_shell_integration or deterministic_scratchpad,
             if (deterministic_scratchpad) "/bin/sh" else null,
         );
@@ -16150,8 +16256,14 @@ const test_env = struct {
         return null;
     }
 
+    fn entry(ctx: *const anyopaque, index: usize) ?EnvSource.Entry {
+        const self: *const @This() = @ptrCast(@alignCast(ctx));
+        if (index >= self.vars.len) return null;
+        return .{ .key = self.vars[index][0], .value = self.vars[index][1] };
+    }
+
     fn source(self: *const @This()) EnvSource {
-        return .{ .ctx = self, .getFn = get };
+        return .{ .ctx = self, .getFn = get, .entryFn = entry };
     }
 };
 
@@ -16270,7 +16382,7 @@ test "--clipboard-test is documented and runs its fixed PTY peer" {
     try std.testing.expect(!wantsChild(try parseArgs(&.{ "conduit", "--mouse-test" }, env.source())));
     try std.testing.expect(std.mem.indexOf(u8, usage, "--clipboard-test") != null);
     // The child it runs is the fixed script, never the user's shell.
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), options);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, options);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(clipboard_test_script, spec.argv[2]);
@@ -16282,7 +16394,7 @@ test "--ime-test is documented and runs its fixed PTY peer" {
     try std.testing.expect(options.run.ime_test);
     try std.testing.expect(wantsChild(options));
     try std.testing.expect(std.mem.indexOf(u8, usage, "--ime-test") != null);
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), options);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, options);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(ime_test_script, spec.argv[2]);
@@ -16303,7 +16415,7 @@ test "--tabs-test is documented and runs its fixed PTY peers" {
     try std.testing.expect(sidebarEnabled(resolved));
     try std.testing.expect(sidebarStartsVisible(resolved));
 
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), resolved);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(tabs_test_script, spec.argv[2]);
@@ -16324,7 +16436,7 @@ test "--panes-test is documented and runs its fixed PTY peers" {
     try std.testing.expect(sidebarEnabled(resolved));
     try std.testing.expect(sidebarStartsVisible(resolved));
 
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), resolved);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(panes_test_script, spec.argv[2]);
@@ -16350,6 +16462,7 @@ test "--scratchpad-test is documented and its shell spec is independently intera
         std.testing.allocator,
         std.testing.io,
         env.source(),
+        .local,
         false,
         "/bin/sh",
     );
@@ -16381,7 +16494,7 @@ test "--palette-test owns a fixed real-child production viewport" {
     try std.testing.expect(wantsChild(resolved));
     try std.testing.expect(sidebarEnabled(resolved));
 
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), resolved);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(palette_test_script, spec.argv[2]);
@@ -16402,7 +16515,7 @@ test "--workspaces-test owns a fixed real-child production viewport" {
     try std.testing.expect(sidebarEnabled(resolved));
     try std.testing.expect(sidebarStartsVisible(resolved));
 
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), resolved);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(workspaces_test_script, spec.argv[2]);
@@ -16422,7 +16535,7 @@ test "--links-test owns a fixed real-child terminal viewport" {
     try std.testing.expect(wantsChild(resolved));
     try std.testing.expect(!sidebarEnabled(resolved));
 
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), resolved);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(links_test_script, spec.argv[2]);
@@ -16442,7 +16555,7 @@ test "--search-test owns a fixed real-child terminal viewport" {
     try std.testing.expect(wantsChild(resolved));
     try std.testing.expect(!sidebarEnabled(resolved));
 
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), resolved);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(search_test_script, spec.argv[2]);
@@ -16463,7 +16576,7 @@ test "--menu-test owns a fixed real-child terminal viewport" {
     try std.testing.expect(wantsChild(resolved));
     try std.testing.expect(!sidebarEnabled(resolved));
 
-    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), resolved);
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(menu_test_script, spec.argv[2]);
@@ -17543,7 +17656,7 @@ fn shellTestSpec(gpa: Allocator, home_relative: []const u8, shell: []const u8, r
     } };
     var options: Options = .{};
     options.run.no_shell_integration = disabled;
-    return ChildSpec.buildIn(gpa, std.testing.io, env.source(), options, root);
+    return ChildSpec.buildIn(gpa, std.testing.io, env.source(), .local, options, root);
 }
 
 /// Run `cd /tmp && false` in a real shell started by Conduit's own `ChildSpec`,
@@ -17738,10 +17851,145 @@ test "the flag is parsed, and a script run never gets shell integration" {
     var options_cmd: Options = .{};
     options_cmd.run.command = "echo hi";
     const shell_env = test_env{ .vars = &.{.{ "SHELL", "/usr/bin/bash" }} };
-    var spec = try ChildSpec.buildIn(std.testing.allocator, std.testing.io, shell_env.source(), options_cmd, root);
+    var spec = try ChildSpec.buildIn(std.testing.allocator, std.testing.io, shell_env.source(), .local, options_cmd, root);
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     for (spec.env) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry, "CONDUIT_BASH_INJECT="));
+}
+
+fn countKey(entries: []const []const u8, key: []const u8) usize {
+    var found: usize = 0;
+    for (entries) |entry| {
+        if (std.mem.startsWith(u8, entry, key) and entry.len > key.len and entry[key.len] == '=') found += 1;
+    }
+    return found;
+}
+
+/// A launching session as a desktop and a test harness would leave it: the
+/// session variables a child must see, a variable only the user's profile set,
+/// and every driver/isolation variable a child must not inherit.
+const inheriting_env = test_env{ .vars = &.{
+    .{ "CONDUIT_PROBE_VAR", "hello" },
+    .{ "DISPLAY", ":99" },
+    .{ "WAYLAND_DISPLAY", "wayland-1" },
+    .{ "XDG_RUNTIME_DIR", "/run/user/1000" },
+    .{ "DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus" },
+    .{ "SSH_AUTH_SOCK", "/run/user/1000/ssh" },
+    .{ "LC_TIME", "en_GB.UTF-8" },
+    .{ "XDG_CONFIG_HOME", "/isolated/config" },
+    .{ "EMPTY_ON_PURPOSE", "" },
+    .{ "TERM", "dumb" },
+    .{ "COLORTERM", "24bit" },
+    .{ "TERM_PROGRAM", "vscode" },
+    .{ "TERM_PROGRAM_VERSION", "1.2.3" },
+    .{ "CONDUIT_TEST_RUN", "run-1" },
+    .{ "CONDUIT_TEST_ROOT", "/private/root" },
+    .{ "CONDUIT_LOG_FILE", "/private/outer.log" },
+    .{ "CONDUIT_SHELL_INTEGRATION_DIR", "/outer/integration" },
+    .{ "CONDUIT_BASH_INJECT", "1" },
+    .{ "CONDUIT_ZSH_ZDOTDIR", "/outer/zdotdir" },
+    .{ "CONDUIT_SHELL_INTEGRATION_XDG_DIR", "/outer/fish" },
+    .{ "HOME", "" },
+    .{ "SHELL", "/bin/sh" },
+} };
+
+test "a Local child inherits Conduit's environment under its own terminal identity" {
+    var options: Options = .{};
+    options.run.command = "true";
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, inheriting_env.source(), .local, options);
+    defer spec.deinit();
+
+    // The desktop session and the user's own exports arrive unchanged,
+    // including the isolated XDG override a launcher set for this process
+    // and a deliberately empty value.
+    for ([_][]const u8{
+        "CONDUIT_PROBE_VAR=hello",
+        "DISPLAY=:99",
+        "WAYLAND_DISPLAY=wayland-1",
+        "XDG_RUNTIME_DIR=/run/user/1000",
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+        "SSH_AUTH_SOCK=/run/user/1000/ssh",
+        "LC_TIME=en_GB.UTF-8",
+        "XDG_CONFIG_HOME=/isolated/config",
+        "EMPTY_ON_PURPOSE=",
+        "SHELL=/bin/sh",
+    }) |wanted| try std.testing.expect(hasEntry(spec.env, wanted));
+
+    // Conduit's identity replaces the enclosing terminal's, exactly once.
+    try std.testing.expect(hasEntry(spec.env, "TERM=xterm-256color"));
+    try std.testing.expect(hasEntry(spec.env, "COLORTERM=truecolor"));
+    try std.testing.expect(hasEntry(spec.env, "TERM_PROGRAM=conduit"));
+    for ([_][]const u8{ "TERM", "COLORTERM", "TERM_PROGRAM", "PATH", "HOME", "LANG" }) |key| {
+        try std.testing.expectEqual(@as(usize, 1), countKey(spec.env, key));
+    }
+
+    // The fallbacks still apply: PATH and LANG are unset, HOME is empty.
+    try std.testing.expect(hasEntry(spec.env, "PATH=" ++ ChildSpec.fallback_path));
+    try std.testing.expect(hasEntry(spec.env, "HOME=/"));
+    try std.testing.expect(hasEntry(spec.env, "LANG=C.UTF-8"));
+
+    // Nothing that addresses the driver, this run's log or an enclosing
+    // Conduit's shell-integration handshake survives.
+    for (ChildSpec.inherited_exclusions) |key| {
+        try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, key));
+    }
+    // Everything else was kept: the inherited set minus the exclusions, plus
+    // PATH and LANG which the parent lacked.
+    try std.testing.expectEqual(
+        inheriting_env.vars.len - ChildSpec.inherited_exclusions.len + 2,
+        spec.env.len,
+    );
+}
+
+test "the Local scratchpad shell inherits the same environment" {
+    var spec = try ChildSpec.buildInteractive(
+        std.testing.allocator,
+        std.testing.io,
+        inheriting_env.source(),
+        .local,
+        true,
+        "/bin/sh",
+    );
+    defer spec.deinit();
+    try std.testing.expect(hasEntry(spec.env, "CONDUIT_PROBE_VAR=hello"));
+    try std.testing.expect(hasEntry(spec.env, "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"));
+    try std.testing.expect(hasEntry(spec.env, "TERM=xterm-256color"));
+    for (ChildSpec.inherited_exclusions) |key| {
+        try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, key));
+    }
+}
+
+test "a context that cannot forward this environment keeps the curated set" {
+    var options: Options = .{};
+    options.run.command = "true";
+    for ([_]workspace.ExecutionContextKind{ .ssh, .wsl }) |context| {
+        var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, inheriting_env.source(), context, options);
+        defer spec.deinit();
+        try std.testing.expectEqual(@as(usize, 6), spec.env.len);
+        try std.testing.expect(hasEntry(spec.env, "TERM=xterm-256color"));
+        try std.testing.expect(hasEntry(spec.env, "COLORTERM=truecolor"));
+        try std.testing.expect(hasEntry(spec.env, "TERM_PROGRAM=conduit"));
+        try std.testing.expect(hasEntry(spec.env, "PATH=" ++ ChildSpec.fallback_path));
+        try std.testing.expect(hasEntry(spec.env, "HOME=/"));
+        try std.testing.expect(hasEntry(spec.env, "LANG=C.UTF-8"));
+        try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, "CONDUIT_PROBE_VAR"));
+        try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, "DISPLAY"));
+    }
+}
+
+test "a lookup-only environment source gives a Local child only the curated set" {
+    const lookup = struct {
+        fn get(_: *const anyopaque, key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "PATH")) "/only/path" else null;
+        }
+    };
+    const source: EnvSource = .{ .ctx = &lookup, .getFn = lookup.get };
+    var options: Options = .{};
+    options.run.command = "true";
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, source, .local, options);
+    defer spec.deinit();
+    try std.testing.expectEqual(@as(usize, 6), spec.env.len);
+    try std.testing.expect(hasEntry(spec.env, "PATH=/only/path"));
 }
 
 fn hasEntry(entries: []const []const u8, wanted: []const u8) bool {

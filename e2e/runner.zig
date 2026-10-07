@@ -355,6 +355,26 @@ fn runCli(
     run_id: ?[]const u8,
     tail: []const []const u8,
 ) !CommandResult {
+    return runCliWithEnv(init, executable, root, run_id, tail, &.{});
+}
+
+/// `runCli` with `extra_env` set on top of the runner's own environment, so
+/// a `launch` can hand the app (and through it the child) known variables.
+fn runCliWithEnv(
+    init: std.process.Init,
+    executable: []const u8,
+    root: []const u8,
+    run_id: ?[]const u8,
+    tail: []const []const u8,
+    extra_env: []const scenarios.EnvVar,
+) !CommandResult {
+    var environ: ?std.process.Environ.Map = null;
+    defer if (environ) |*map| map.deinit();
+    if (extra_env.len != 0) {
+        environ = try init.environ_map.clone(init.gpa);
+        for (extra_env) |variable| try environ.?.put(variable.name, variable.value);
+    }
+
     const root_arg = try std.fmt.allocPrint(init.gpa, "--root={s}", .{root});
     defer init.gpa.free(root_arg);
     const run_arg = if (run_id) |id| try std.fmt.allocPrint(init.gpa, "--run={s}", .{id}) else null;
@@ -368,6 +388,7 @@ fn runCli(
 
     const result = try std.process.run(init.gpa, init.io, .{
         .argv = argv.items,
+        .environ_map = if (environ) |*map| map else null,
         .stdout_limit = .limited(max_command_output),
         .stderr_limit = .limited(max_command_output),
         .timeout = .{ .duration = .{
@@ -787,7 +808,7 @@ fn runScenario(
     const command = try std.fmt.allocPrint(init.gpa, "--command={s}", .{scenario.command});
     defer init.gpa.free(command);
 
-    var launched = runCli(init, executable, root, null, &.{ "launch", width, height, scale, command }) catch |err| {
+    var launched = runCliWithEnv(init, executable, root, null, &.{ "launch", width, height, scale, command }, scenario.launch_env) catch |err| {
         try log.writer.print("launch: could not start conduit-test: {s}\n", .{@errorName(err)});
         try ensureFailureArtifacts(
             init.io,
@@ -990,11 +1011,11 @@ test "run ids accepted from conduit-test cannot escape a scenario root" {
 }
 
 test "summary reporting is deterministic and names every scenario" {
-    const results = [_]bool{ true, false, true, true, true, true, true };
+    const results = [_]bool{ true, false, true, true, true, true, true, true };
     const summary = try renderSummary(std.testing.allocator, &results);
     defer std.testing.allocator.free(summary);
     try std.testing.expectEqualStrings(
-        "{\"passed\":6,\"failed\":1,\"scenarios\":[{\"name\":\"launch-prompt\",\"passed\":true},{\"name\":\"type-command\",\"passed\":false},{\"name\":\"select-copy\",\"passed\":true},{\"name\":\"terminal-links\",\"passed\":true},{\"name\":\"terminal-file-reference\",\"passed\":true},{\"name\":\"output-flood\",\"passed\":true},{\"name\":\"context-menu\",\"passed\":true}]}\n",
+        "{\"passed\":7,\"failed\":1,\"scenarios\":[{\"name\":\"launch-prompt\",\"passed\":true},{\"name\":\"type-command\",\"passed\":false},{\"name\":\"select-copy\",\"passed\":true},{\"name\":\"terminal-links\",\"passed\":true},{\"name\":\"terminal-file-reference\",\"passed\":true},{\"name\":\"output-flood\",\"passed\":true},{\"name\":\"context-menu\",\"passed\":true},{\"name\":\"child-environment\",\"passed\":true}]}\n",
         summary,
     );
 }

@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its seven declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its eight declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -279,6 +279,22 @@ ReleaseSafe and from over 260 s to 0.48 s in Debug. `term.zig` reads the engine'
 `@FieldType(PageList, "pause_integrity_checks")`; its tests fail any optimised build that links a
 slow-checked engine and bound a 200,000-line feed to 5 s. Always pass `optimize` to the Ghostty
 dependency.
+
+TASK-73: Local children inherit the environment. `ChildSpec` builds every child's environment for
+the spawning workspace's `ExecutionContextKind`. A Local child (interactive shells, `--command`,
+new tabs, panes, the scratchpad and the vi editor tab) starts with Conduit's own process
+environment, so the desktop session (DISPLAY/WAYLAND_DISPLAY, XDG_RUNTIME_DIR,
+DBUS_SESSION_BUS_ADDRESS, SSH_AUTH_SOCK, LC_*) and the user's exports reach it. `TERM`,
+`COLORTERM` and `TERM_PROGRAM` are set on top, along with the PATH/HOME/LANG fallbacks when unset.
+Only `ChildSpec.inherited_exclusions` is dropped: `CONDUIT_TEST_RUN`/`CONDUIT_TEST_ROOT`,
+`CONDUIT_LOG_FILE`, an enclosing Conduit's four shell-integration handshake variables, and
+`TERM_PROGRAM_VERSION`. The driver endpoint and artifact directory are flags, never environment,
+and `conduit-test launch`'s isolated HOME/XDG_*/TMPDIR still apply to the app and therefore to its
+children. SSH and WSL contexts receive only the curated identity-plus-fallback set: "Local
+inherits; remote contexts supply their own". The eighth `zig build e2e` scenario,
+`child-environment`, sets a probe variable, a stand-in SSH_AUTH_SOCK and both `conduit-test`
+addressing variables for `launch` only, and the child must show the probe, the agent socket, a
+display, the isolated HOME layout, unset driver addressing and Conduit's identity.
 
 TASK-36 is complete. Command+F on macOS or Ctrl+Shift+F on Linux/Windows opens an inline semantic
 `Input`; named actions and clickable controls provide next/previous navigation plus case and regex
