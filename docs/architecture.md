@@ -1406,12 +1406,13 @@ Which level proves what, by concern:
 
 Rules that apply to all levels:
 
-- The twenty verified Linux headless app checks are `--grid-test`, `--self-test`,
+- The twenty-one verified Linux headless app checks are `--grid-test`, `--self-test`,
   `--scroll-test`, `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`,
   `--sidebar-test`, `--tabs-test`, `--panes-test`, `--palette-test`, `--scratchpad-test`,
   `--workspaces-test`, `--links-test`, `--search-test`, `--menu-test`, `--config-test`,
-  `--theme-test`, `--font-test` and `--driver-test`; the scripted `zig build e2e` runner has
-  twelve scenarios, the latest being `font-coverage`, `theme-picker` and `font-picker`. Real-window checks use
+  `--theme-test`, `--font-test`, `--settings-test` and `--driver-test`; the scripted `zig build
+  e2e` runner has thirteen scenarios, the latest being `font-coverage`, `theme-picker`,
+  `font-picker` and `settings-view`. Real-window checks use
   Xvfb locally; `--clipboard-test` deliberately uses SDL's offscreen driver.
   TASK-28's `--sidebar-test` uses the production sidebar and real SDL events to switch provisioned
   tabs by click and through an independently entered keyboard focus path, hide and reveal the

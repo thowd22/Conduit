@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its twenty Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its twenty-one Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its twelve declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its thirteen declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -427,6 +427,29 @@ twelfth `zig build e2e` scenarios, `theme-picker` and `font-picker`, drive both 
 and by a clicked choice row; the picker frames were inspected. The family list is a fixed-choice
 step, not type-to-filter, and macOS and Windows chords and fonts are unverified.
 
+TASK-41 is complete on Linux. `settings.open` ("Settings" in the palette; Ctrl+Shift+, on
+Linux/Windows, Cmd+Shift+, on macOS) opens a centred modal `Surface` (`settings.dialog`) built only
+from the four primitives. Dim `Text` headings group the rows under Appearance, Fonts, Keys,
+Scratchpad and Mouse. Each setting is an `InteractiveText` row `settings.row.<key>` reading
+`<key>  <value>`, with `·` when the settings file sets the value. Keys has
+`settings.row.keybind.<action>` for every palette command without an argument plus `palette.open`.
+The last row, `settings.raw`, dispatches `config.open`. Up/Down/Tab move the highlight over the
+headings, Home/End jump, and the list scrolls. Enter or a click edits a row: bools toggle,
+`mouse.right_click` cycles, `theme` and `font.family` open the existing choosers, and numbers and
+text open the inline `settings.input`. Left/Right toggle, cycle or step by one. Every commit is
+checked with `config.checkValue`; a refusal shows the parser's own message in `settings.error` and
+writes nothing. Otherwise it writes through `config.writeDocumentValue` and reloads at once, so the
+watcher's reload of the same write rebuilds nothing. The view takes every key press before any
+binding runs, so the keybinding editor captures the next real chord without triggering it. It
+refuses bare text keys (and bare Enter, Tab, Backspace and Escape), names a chord another command
+holds (`conflict: <label>`), keeps the old binding on Escape and takes the chord on a second Enter.
+It writes through `config.writeActionKeybinds`: the command's old lines go, its remaining shipped
+chords are unbound, and `<chord>=<action>` is appended. Pointer and text input are modal like the
+palette. The deterministic Linux `--settings-test` drives all of this through real SDL events with
+file readback, and its 640x360 frame was inspected. The thirteenth scripted scenario,
+`settings-view`, opens the view by keyboard and through `sidebar.palette`, then clicks a bool row.
+macOS and Windows are unverified.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -602,7 +625,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:
