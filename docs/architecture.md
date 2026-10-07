@@ -309,19 +309,46 @@ nothing else is a legal dependency.
   TASK-30 adds absolute, scissored pane viewports and independent retained grid state for each
   pane. A dedicated overlay `Grid` adopts the current font cell, baseline and ascent, then draws
   the semantic-tree overlay once across the full canvas after all visible pane grids.
+  TASK-39: every cell's glyph comes from `font.Manager.resolve` (the fallback chain, sprites
+  included), a wide cell passes `font.face_flag_wide` so a fallback glyph is fitted to two cells,
+  and colour glyphs (emoji) are queued separately and drawn in a third instanced pass that samples
+  a lazily created `RGBA8` texture of the manager's colour atlas with premultiplied blending (the
+  same glyph program, switched by `u_color_mode`). `attachAtlas` also invalidates the colour
+  texture, so a new manager (font size or display scale change) re-uploads both atlases. While
+  `font.Manager.ligatures()` is on, a repainted row is read once and each maximal run of
+  same-style printable-ASCII cells containing ligature punctuation is shaped as one HarfBuzz run;
+  every glyph is still placed in the cell its cluster came from, so the grid never moves.
 - **Never** own product or layout state; it draws terminal cells or UI primitives supplied by
   callers. Never call SDL event or window functions (those are `platform`'s). Never block on IO.
 - **May depend on** `font` (glyphs), `platform` (window and context), `term` (terminal cells and
   damage), and the external `zopengl` GL bindings.
 - **Lands** M1 — TASK-7 (FBO and present), TASK-11 (grid renderer); M2 — TASK-22 (`capture`);
   M3 — TASK-28 (terminal inset origin and full-canvas overlay geometry), TASK-30 (independent pane
-  viewports and the font-metric-aware overlay compositor).
+  viewports and the font-metric-aware overlay compositor); M4 — TASK-39 (fallback glyphs, colour
+  glyph pass, ligature runs).
 
 ### `font`
 
 - **Owns** discovery, loading, shaping and the glyph atlas, plus the per-OS discovery backends
   (macOS, Windows, Linux/fontconfig, bundled fallback — CONDUIT.md §8). With `platform` and `pty`
   it is one of the only places an OS conditional is allowed.
+  TASK-39 (v2): `Manager.resolve` walks a per-codepoint chain — built-in sprites
+  (`font_sprite.zig`: box drawing U+2500–U+257F, blocks U+2580–U+259F, braille U+2800–U+28FF,
+  Powerline U+E0B0–U+E0BF, U+E0D2, U+E0D4, drawn at the cell size so they tile; off with
+  `Request.builtin_symbols = false`), the primary style face then its regular face (missing styles
+  are synthesised with FreeType emboldening and a 12° shear), `Request.fallbacks` families, system
+  faces by coverage (each file's cmap is read into sorted ranges at scan time, on the loader thread;
+  monospaced regular faces first, colour faces last or first for emoji presentation; private-use
+  codepoints try the bundled symbols face first), the bundled Nerd Fonts Symbols Nerd Font Mono face
+  and finally the bundled JetBrains Mono. Extra faces are numbered from `font.sprite_face + 1`,
+  opened lazily (a system face is opened on first use, once) and their glyphs scaled into the one-
+  or two-cell box. FreeType is built with libpng and zlib so CBDT/sbix colour emoji load; they go to
+  a separate premultiplied RGBA `color_atlas`, box-filtered to the cell box. Face indices carry
+  `face_flag_bold`, `face_flag_oblique` and `face_flag_wide` in their top bits. Shaping uses
+  HarfBuzz's own OpenType functions over the same font bytes, never `hb-ft` on the rasteriser's
+  `FT_Face`, because `hb-ft` resizes that face to its own scale. `Request.ligatures` /
+  `Manager.setLigatures` turn `liga`, `calt` and `dlig` off. A size or display-scale change is a
+  new `Manager` at the new `Size`: every face, sprite and emoji is rasterised again at that size.
 - **Never** know about sessions, workspaces, agents or UI (`AGENTS.md`). Never draw anything
   itself. Never let a missing glyph turn a terminal into boxes (CONDUIT.md §8).
 - **May depend on** no other Conduit module, plus the external FreeType and HarfBuzz seam.
