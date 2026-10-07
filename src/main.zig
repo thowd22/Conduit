@@ -297,6 +297,16 @@ pub const Run = struct {
     /// keyboard navigation, the paste alternative and DEC mouse reporting
     /// through real PTYs and SDL events, then exit.
     menu_test: bool = false,
+    /// Exercise the settings file: startup load, configured keybindings and
+    /// scratchpad sizes, a malformed line's visible error, hot reload and the
+    /// open-config action, through real SDL events, then exit.
+    config_test: bool = false,
+    /// The settings file to load and watch instead of the platform location.
+    /// Not a command-line flag: `runApp` sets it for `--config-test`, which
+    /// writes into a private directory. Null means the platform location for
+    /// an ordinary run and no file at all for every other built-in check, so
+    /// a user's settings never change what a check measures.
+    config_path: ?[]const u8 = null,
     /// The session layer of the `mouse.right_click` setting, from
     /// `--right-click=`. Null leaves the built-in default standing.
     right_click: ?config.RightClick = null,
@@ -332,8 +342,8 @@ pub const Run = struct {
     no_child: bool = false,
     /// Start the shell exactly as it would start without Conduit: no `--posix`,
     /// no `ENV`, no `ZDOTDIR` swap, and therefore no working-directory or prompt
-    /// reports from Conduit's scripts. v0.1 has no config file, so this flag is
-    /// how shell integration is turned off.
+    /// reports from Conduit's scripts. The settings file has no shell key yet, so
+    /// this flag is how shell integration is turned off.
     no_shell_integration: bool = false,
 };
 
@@ -413,7 +423,7 @@ fn optionsForRun(options: Options) Options {
         !options.run.sidebar_test and !options.run.tabs_test and !options.run.panes_test and
         !options.run.scratchpad_test and !options.run.palette_test and
         !options.run.workspaces_test and !options.run.links_test and
-        !options.run.search_test and !options.run.menu_test) return options;
+        !options.run.search_test and !options.run.menu_test and !options.run.config_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -551,6 +561,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.search_test = true;
         } else if (std.mem.eql(u8, arg, "--menu-test")) {
             run.menu_test = true;
+        } else if (std.mem.eql(u8, arg, "--config-test")) {
+            run.config_test = true;
         } else if (namesValue(arg, "--right-click")) {
             run.right_click = config.RightClick.parse(try takeValue(arg, "--right-click", args, &i)) catch
                 return error.InvalidRightClick;
@@ -1229,6 +1241,9 @@ const Load = struct {
     io: Io,
     /// The face to build, or null when this job is only spawning a child.
     font_request: ?font.Request = null,
+    /// The owned copy `font_request.family` borrows. A reload may replace the
+    /// app's family while this worker still reads it, so the job keeps its own.
+    font_family_owned: ?[]u8 = null,
     /// The child to start, or null when this job is only loading a face.
     spawn: ?pty.SpawnRequest = null,
     /// A copied cwd used by `spawn`, or null when the request borrows the
@@ -1272,6 +1287,8 @@ const Load = struct {
     /// Release the copied cwd and owned argv a spawn job carried. Safe on
     /// every completion and failure path once the worker is no longer running.
     fn freeSpawnInputs(self: *Load) void {
+        if (self.font_family_owned) |family| self.allocator.free(family);
+        self.font_family_owned = null;
         if (self.spawn_cwd) |cwd| self.allocator.free(cwd);
         self.spawn_cwd = null;
         if (self.spawn_argv) |argv| freeEntries(self.allocator, argv);
@@ -1440,6 +1457,8 @@ const ChildSpec = struct {
             search_test_script
         else if (options.run.menu_test)
             menu_test_script
+        else if (options.run.config_test)
+            config_test_script
         else
             options.run.command;
         const shell: ?[]const u8 = if (command) |line| blk: {
@@ -1665,7 +1684,7 @@ fn gridSizeFor(cell: font.CellSize, size: render.Size) !term.GridSize {
 /// scale. The scale multiplies it, so a 2x display rasterises 28px glyphs
 /// rather than enlarging 14px ones — which is the whole of TASK-11's HiDPI
 /// story, and why the grid never has to scale anything itself.
-const font_points: f32 = 14.0;
+const font_points: f32 = config.default_font_points;
 
 /// The glyph atlas, in pixels. `font` allocates it and `render` uploads it as
 /// one texture, so both are told the same number.
@@ -1702,7 +1721,8 @@ fn wantsChild(options: Options) bool {
     if (options.run.ui_test or options.run.sidebar_test) return false;
     if (options.run.clipboard_test or options.run.ime_test or options.run.tabs_test or
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
-        options.run.links_test or options.run.search_test or options.run.menu_test) return true;
+        options.run.links_test or options.run.search_test or options.run.menu_test or
+        options.run.config_test) return true;
     return !options.run.no_child and !options.run.self_test and !options.run.grid_test and
         !options.run.scroll_test and !options.run.mouse_test and !options.run.ui_test and
         !options.run.sidebar_test;
@@ -1718,7 +1738,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.clipboard_test or run.ui_test or run.ime_test or run.sidebar_test or
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
-        run.driver_test;
+        run.config_test or run.driver_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -1792,19 +1812,22 @@ const pane_direction_choices = [_]inputmod.PaletteChoice{
     .{ .label = "Down", .value = "down" },
 };
 
+/// The scratchpad's presentation. `fifty` and `ninety` name the two bindings
+/// (`scratchpad.toggle-50` / `-90`); their heights are the configured
+/// `scratchpad.size` and `scratchpad.large_size`, 50 and 90 percent by default.
 const ScratchpadPresentation = enum {
     hidden,
     fifty,
     ninety,
-
-    fn percent(self: ScratchpadPresentation) u32 {
-        return switch (self) {
-            .hidden => 0,
-            .fifty => 50,
-            .ninety => 90,
-        };
-    }
 };
+
+/// The widest visible config error line, in bytes. It clips in the sidebar,
+/// so this only bounds the copy the semantic tree borrows.
+const config_error_capacity: usize = 192;
+/// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
+const action_capacity_base: usize = 50;
+const config_open_action = "config.open";
+const config_reload_action = "config.reload";
 
 const sidebar_default_width: u16 = 24;
 const sidebar_min_width: u16 = 12;
@@ -1828,7 +1851,7 @@ const pane_ui_capacity: usize = 64;
 const tab_name_capacity: usize = 256;
 const palette_input_capacity: usize = 256;
 const palette_visible_rows: usize = 10;
-const palette_action_capacity: usize = 48;
+const palette_action_capacity: usize = action_capacity_base;
 const palette_semantic_capacity: usize = 48;
 const palette_label_capacity: usize = 192;
 const workspace_semantic_capacity: usize = 96;
@@ -2862,8 +2885,132 @@ const EditorSpawnObserver = struct {
     }
 };
 
-/// The built-in v0.1 editor for file references (decision-5). v0.1 has no
-/// config file, so the "configured editor command" is this default. It is
+/// How many app-bound keys may be held at once.
+const binding_key_capacity: usize = 64;
+
+/// What a configured family that is not installed reports. The bundled face
+/// stands in, which the font manager already guarantees.
+const missing_family_message = "font.family: not installed; using the bundled face";
+
+/// The settings file a run loads: the explicit path a check supplies, none for
+/// every other built-in check (a user's settings must not change what a check
+/// measures), and otherwise the platform location from the environment.
+fn configPathFor(options: Options, env: EnvSource, buffer: []u8) ?[]const u8 {
+    if (options.run.config_path) |path| return path;
+    if (usesDeterministicScratchpad(options)) return null;
+    return config.defaultPath(buffer, builtin.os.tag, .{
+        .xdg_config_home = env.get("XDG_CONFIG_HOME"),
+        .home = env.get("HOME"),
+        .appdata = env.get("APPDATA"),
+    });
+}
+
+/// `font.family` through its layers: `--font` beats the file, which beats the
+/// bundled face (the empty family).
+fn configuredFamily(session_layer: ?[]const u8, file: ?[]const u8) []const u8 {
+    return config.Layer.resolve([]const u8, "", file, session_layer);
+}
+
+fn chordErrorMessage(err: inputmod.ChordError) []const u8 {
+    return switch (err) {
+        error.EmptyChord => "keybind: empty chord",
+        error.UnknownModifier => "keybind: unknown modifier (use ctrl, shift, alt or super)",
+        error.DuplicateModifier => "keybind: repeated modifier",
+        error.MissingKey => "keybind: chord has no key (spell + as plus)",
+        error.UnknownKey => "keybind: unknown key",
+    };
+}
+
+/// Build the binding table for `loaded`: the profile's shipped defaults plus
+/// the file's keybind lines in order. Each line is checked here, where the
+/// registry is known; a rejected line is reported on `loaded` with its line
+/// number, and its chord keeps what `previous` bound it to (at startup, the
+/// default). The returned table owns everything it holds.
+fn buildConfiguredBindings(
+    allocator: Allocator,
+    registry: *const inputmod.Registry,
+    profile: inputmod.PlatformProfile,
+    loaded: *config.Config,
+    previous: ?*const inputmod.BindingTable,
+) !inputmod.BindingTable {
+    const defaults = inputmod.defaultBindings(profile);
+    var overrides: std.ArrayList(inputmod.BindingOverride) = .empty;
+    defer overrides.deinit(allocator);
+    // One argument per configured line at most; reserved up front so the
+    // slices overrides borrow never move.
+    var arguments: std.ArrayList(inputmod.Argument) = .empty;
+    defer arguments.deinit(allocator);
+    try arguments.ensureTotalCapacity(allocator, loaded.keybinds.items.len);
+
+    for (loaded.keybinds.items) |keybind| {
+        const chord = inputmod.parseChord(keybind.chord) catch |err| {
+            loaded.addDiagnostic(keybind.line, "{s}", .{chordErrorMessage(err)});
+            continue;
+        };
+        const action = keybind.action orelse {
+            try overrides.append(allocator, .{ .chord = chord, .action = null });
+            continue;
+        };
+        const argument = inputmod.keybindArgument(registry, defaults, action, keybind.argument) catch |err| {
+            switch (err) {
+                error.UnknownAction => loaded.addDiagnostic(keybind.line, "keybind: unknown action", .{}),
+                error.NotBindable => loaded.addDiagnostic(keybind.line, "keybind: {s} cannot be bound to a key", .{action}),
+                error.MissingArgument => loaded.addDiagnostic(keybind.line, "keybind: {s} needs an argument", .{action}),
+                error.UnexpectedArgument => loaded.addDiagnostic(keybind.line, "keybind: {s} takes no argument", .{action}),
+                error.InvalidArgument => loaded.addDiagnostic(keybind.line, "keybind: invalid argument for {s}", .{action}),
+            }
+            if (previous) |table| {
+                var kept = false;
+                for (table.bindings) |binding| {
+                    if (!inputmod.chordEql(binding.chord, chord)) continue;
+                    try overrides.append(allocator, .{ .chord = chord, .action = binding.action, .arguments = binding.arguments });
+                    kept = true;
+                }
+                if (!kept) try overrides.append(allocator, .{ .chord = chord, .action = null });
+            }
+            continue;
+        };
+        var argument_slice: []const inputmod.Argument = &.{};
+        if (argument) |value| {
+            arguments.appendAssumeCapacity(value);
+            argument_slice = arguments.items[arguments.items.len - 1 ..];
+        }
+        try overrides.append(allocator, .{ .chord = chord, .action = action, .arguments = argument_slice });
+    }
+    return inputmod.buildBindings(allocator, defaults, overrides.items);
+}
+
+/// Report every diagnostic of a load at warn level as `<path>:<line>: <message>`.
+/// Messages name the key, never the user's value.
+fn logConfigDiagnostics(path: []const u8, loaded: *const config.Config) void {
+    for (loaded.diagnostics.items) |diagnostic| {
+        if (diagnostic.line == 0) {
+            config.log.warn("{s}: {s}", .{ path, diagnostic.message });
+        } else {
+            config.log.warn("{s}:{d}: {s}", .{ path, diagnostic.line, diagnostic.message });
+        }
+    }
+    if (loaded.dropped_diagnostics != 0) {
+        config.log.warn("{s}: {d} more problem(s) not shown", .{ path, loaded.dropped_diagnostics });
+    }
+}
+
+/// Create the settings file with the commented defaults document when it does
+/// not exist yet. An existing file is never touched.
+fn ensureConfigFile(io: Io, path: []const u8) !void {
+    if (config.directoryOf(path)) |dir| try Dir.cwd().createDirPath(io, dir);
+    Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = config.defaults_document,
+        .flags = .{ .exclusive = true },
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        else => return err,
+    };
+}
+
+/// The built-in v0.1 editor for file references (decision-5) and `config.open`. The
+/// settings file has no editor key yet, so the "configured editor command" is this default. It is
 /// always spawned as shell-free argv `vi +<line> -- <path>`; a detected column
 /// is kept for identity but never passed.
 const file_reference_editor = "vi";
@@ -3109,6 +3256,43 @@ const App = struct {
     /// startup: the built-in `menu` unless `--right-click=` supplied a
     /// session value. Owned by the main thread with every other UI state.
     right_click: config.RightClick = config.RightClick.built_in,
+    /// The session layer of `mouse.right_click` (`--right-click=`), kept so a
+    /// reload re-resolves the setting with the flag still winning.
+    session_right_click: ?config.RightClick = null,
+    /// The session layer of `font.family` (`--font=`), or null without the flag.
+    session_font_family: ?[]const u8 = null,
+    /// The settings file this run loads and watches, owned; null when the run
+    /// has none (no home directory, or a built-in check).
+    config_path: ?[]u8 = null,
+    /// The settings last applied: the file layer plus its diagnostics. Main
+    /// thread; replaced wholesale by `reloadConfig`.
+    config_current: config.Config,
+    /// Watches `config_path`. Its thread only sets a flag and posts a wake;
+    /// `poll` reads and applies the file here on the main thread.
+    config_watcher: ?*config.Watcher = null,
+    /// Applied reloads, so the deterministic check can wait for one.
+    config_reload_count: usize = 0,
+    /// The visible `config:<line>: <message>` line, or empty when clean.
+    config_error_storage: [config_error_capacity]u8 = undefined,
+    config_error_len: usize = 0,
+    /// A font problem found after the file was applied: the face is resolved
+    /// on a worker, so this arrives later than the parse diagnostics.
+    font_diagnostic: ?config.Diagnostic = null,
+    /// The scratchpad heights in percent for the two presentations.
+    scratchpad_percent_small: u8 = 50,
+    scratchpad_percent_large: u8 = 90,
+    /// The face's size in points (`font.size`).
+    font_points: f32 = config.default_font_points,
+    /// Owned storage behind `family`.
+    family_owned: []u8,
+    /// Whether `family` came from the settings file rather than `--font`, so a
+    /// missing family is reported against the file.
+    family_from_file: bool = false,
+    /// A font change arrived while a load was in flight; request again when
+    /// that load lands so the newest settings win.
+    font_reload_pending: bool = false,
+    /// The defaults plus the file's keybind lines. `bindings` borrows it.
+    binding_table: inputmod.BindingTable,
     /// The open terminal context menu, or null. Composed into `ui_tree` each
     /// frame while open; it is modal for pointer and key input like the palette.
     context_menu: ?ContextMenu = null,
@@ -3269,35 +3453,78 @@ const App = struct {
         const atlas = render.AtlasSize{ .width_px = atlas_width_px, .height_px = atlas_height_px };
         const colors = gridColors(default_palette);
 
+        // The settings file is read before the first face, so a configured
+        // family and size are what the first frame draws with. It is small and
+        // bounded (`config.max_file_bytes`), and startup may wait.
+        var config_path_buffer: [path_capacity]u8 = undefined;
+        const config_path = configPathFor(options, env, &config_path_buffer);
+        var loaded_config = if (config_path) |path|
+            try config.load(io, allocator, path, null)
+        else
+            config.Config.initDefaults(allocator);
+        errdefer loaded_config.deinit();
+        if (config_path) |path| log.info("settings from {s}", .{path}) else log.info("no settings file for this run", .{});
+        const session_font_family: ?[]const u8 = if (options.run.font_family.len == 0) null else options.run.font_family;
+        var family_from_file = session_font_family == null and loaded_config.settings.font_family != null;
+        var configured_family = configuredFamily(session_font_family, loaded_config.settings.font_family);
+        var configured_points = loaded_config.settings.font_size;
+        var font_diagnostic: ?config.Diagnostic = null;
+
         // Opening a face means walking every font directory on the machine and
         // asking FreeType about every file in it, which is a lot of IO. It runs
         // on a worker and is waited for once, here, before the first frame:
         // there is nothing to draw until a face exists, and a startup that is
         // not yet the loop is allowed to wait.
         var fonts = loaded: {
-            const job = try allocator.create(Load);
-            errdefer allocator.destroy(job);
-            job.* = .{
-                .allocator = allocator,
-                .io = io,
-                .font_request = .{
-                    .family = options.run.font_family,
-                    .size = try font.Size.init(font_points, scale),
-                    .home_dir = env.get("HOME"),
-                    .atlas_width_px = atlas_width_px,
-                    .atlas_height_px = atlas_height_px,
-                },
-            };
-            try job.start();
-            job.thread.?.join();
-            job.thread = null;
-            if (job.font_failure) |name| log.warn("the font could not be loaded: {s}", .{name});
-            const loaded_fonts = job.fonts orelse return error.NoFaceAvailable;
-            job.fonts = null;
-            allocator.destroy(job);
-            break :loaded loaded_fonts;
+            var attempt: usize = 0;
+            while (true) : (attempt += 1) {
+                const job = try allocator.create(Load);
+                errdefer allocator.destroy(job);
+                job.* = .{
+                    .allocator = allocator,
+                    .io = io,
+                    .font_request = .{
+                        .family = configured_family,
+                        .size = try font.Size.init(configured_points, scale),
+                        .home_dir = env.get("HOME"),
+                        .atlas_width_px = atlas_width_px,
+                        .atlas_height_px = atlas_height_px,
+                    },
+                };
+                try job.start();
+                job.thread.?.join();
+                job.thread = null;
+                if (job.font_failure) |name| log.warn("the font could not be loaded: {s}", .{name});
+                const loaded_fonts = job.fonts orelse {
+                    // A configured face that cannot be built must not stop
+                    // the app from starting: retry once with the built-in
+                    // request and report the setting. The errdefer above
+                    // releases the job on the error return.
+                    const configured = family_from_file or configured_points != font_points;
+                    if (attempt != 0 or !configured) return error.NoFaceAvailable;
+                    allocator.destroy(job);
+                    font_diagnostic = .{
+                        .line = @max(loaded_config.lines.get(.font_family), loaded_config.lines.get(.font_size)),
+                        .message = "font: the configured face could not be loaded",
+                    };
+                    configured_family = session_font_family orelse "";
+                    configured_points = font_points;
+                    family_from_file = false;
+                    continue;
+                };
+                job.fonts = null;
+                allocator.destroy(job);
+                break :loaded loaded_fonts;
+            }
         };
         errdefer fonts.deinit();
+        if (family_from_file and configured_family.len != 0 and fonts.isFallback()) {
+            font_diagnostic = .{ .line = loaded_config.lines.get(.font_family), .message = missing_family_message };
+        }
+        const family_owned = try allocator.dupe(u8, configured_family);
+        errdefer allocator.free(family_owned);
+        const config_path_owned: ?[]u8 = if (config_path) |path| try allocator.dupe(u8, path) else null;
+        errdefer if (config_path_owned) |path| allocator.free(path);
         log.info("drawing with {s}, {d}x{d}px cells, from {s}{s}", .{
             fonts.familyName(),
             fonts.metrics().cell.width_px,
@@ -3359,7 +3586,7 @@ const App = struct {
         var ui_tree = try ui.Tree.init(allocator, semantic_element_capacity, 6);
         errdefer ui_tree.deinit();
 
-        const action_capacity: usize = if (options.run.ui_test or options.run.driver_test) 49 else 48;
+        const action_capacity: usize = if (options.run.ui_test or options.run.driver_test) action_capacity_base + 1 else action_capacity_base;
         const action_definitions = try allocator.alloc(inputmod.ActionDefinition, action_capacity);
         errdefer allocator.free(action_definitions);
         var actions = inputmod.Registry.init(action_definitions);
@@ -3655,6 +3882,16 @@ const App = struct {
             .label = "Open terminal context menu",
             .handler = terminalContextMenuAction,
         });
+        try actions.register(.{
+            .name = config_open_action,
+            .label = "Open config file",
+            .handler = configOpenAction,
+        });
+        try actions.register(.{
+            .name = config_reload_action,
+            .label = "Reload config",
+            .handler = configReloadAction,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -3663,8 +3900,12 @@ const App = struct {
         });
 
         const binding_profile = inputmod.PlatformProfile.native;
-        const bindings = inputmod.defaultBindings(binding_profile);
-        const binding_keys = try allocator.alloc(inputmod.BindingKey, @max(bindings.len, 4));
+        var binding_table = try buildConfiguredBindings(allocator, &actions, binding_profile, &loaded_config, null);
+        errdefer binding_table.deinit();
+        if (config_path) |path| logConfigDiagnostics(path, &loaded_config);
+        // How many app-bound keys may be held at once; independent of the
+        // table's length so a reload never reallocates it under a held key.
+        const binding_keys = try allocator.alloc(inputmod.BindingKey, binding_key_capacity);
         errdefer allocator.free(binding_keys);
 
         var palette_model = try palette_mod.Model.init(allocator, actions.definitions());
@@ -3744,9 +3985,20 @@ const App = struct {
             .palette_query = palette_query,
             .palette_argument = palette_argument,
             .search_query = search_query,
-            .right_click = config.Layer.resolve(config.RightClick, config.RightClick.built_in, null, options.run.right_click),
+            .right_click = config.Layer.resolve(config.RightClick, config.RightClick.built_in, loaded_config.settings.right_click, options.run.right_click),
+            .session_right_click = options.run.right_click,
+            .session_font_family = session_font_family,
+            .config_current = loaded_config,
+            .config_path = config_path_owned,
+            .font_diagnostic = font_diagnostic,
+            .scratchpad_percent_small = loaded_config.settings.scratchpad_size,
+            .scratchpad_percent_large = loaded_config.settings.scratchpad_large_size,
+            .font_points = configured_points,
+            .family_owned = family_owned,
+            .family_from_file = family_from_file,
+            .binding_table = binding_table,
             .binding_profile = binding_profile,
-            .bindings = bindings,
+            .bindings = binding_table.bindings,
             .binding_keys = binding_keys,
             .binding_state = inputmod.BindingState.init(binding_keys),
             .sidebar_enabled = sidebarEnabled(options),
@@ -3756,7 +4008,7 @@ const App = struct {
             .pending_child_bytes = .empty,
             .pending_child_offset = 0,
             .font_load = null,
-            .family = options.run.font_family,
+            .family = family_owned,
             .font_scale = scale,
             .home_dir = env.get("HOME"),
             .blink_epoch_ns = Io.Clock.real.now(io).nanoseconds,
@@ -3767,6 +4019,7 @@ const App = struct {
             .screenshot = options.run.screenshot,
             .driver_artifact_dir = options.run.test_artifact_dir,
         };
+        app.refreshConfigError();
         try app.syncGrid();
         if (testdriver.isEnabled(options.run.test_driver_endpoint != null)) {
             const endpoint = options.run.test_driver_endpoint.?;
@@ -3778,6 +4031,7 @@ const App = struct {
         // the returned App owns and joins it during deinit.
         app.startScratchpad(false);
         app.startChild();
+        app.startConfigWatcher();
         return app;
     }
 
@@ -3843,6 +4097,8 @@ const App = struct {
     /// Give back everything the app owns, in the reverse of the order it was
     /// built. The window belongs to `main`, which outlives the app.
     fn deinit(self: *App) void {
+        if (self.config_watcher) |watcher| watcher.stop();
+        self.config_watcher = null;
         if (self.driver) |driver| {
             driver.stop();
             // SDL text-input events borrow the retained request bytes. Consume
@@ -3876,6 +4132,10 @@ const App = struct {
         self.ui_tree.deinit();
         self.ui_canvas.deinit();
         self.allocator.free(self.binding_keys);
+        self.binding_table.deinit();
+        self.config_current.deinit();
+        if (self.config_path) |path| self.allocator.free(path);
+        self.allocator.free(self.family_owned);
         self.allocator.free(self.action_definitions);
         self.overlay_grid.deinit();
         for (self.workspace_presentations.items) |presentation| {
@@ -4198,10 +4458,11 @@ const App = struct {
     /// not the frame that blocks on the scan.
     fn requestFontReload(self: *App) void {
         if (self.font_load != null) {
-            log.debug("a load is already in flight; the new scale will be picked up by it", .{});
+            log.debug("a load is already in flight; requesting again when it lands", .{});
+            self.font_reload_pending = true;
             return;
         }
-        const size = font.Size.init(font_points, self.font_scale) catch |err| {
+        const size = font.Size.init(self.font_points, self.font_scale) catch |err| {
             log.err("a display scale of {d:.2} is not a usable font size: {s}", .{
                 self.font_scale,
                 @errorName(err),
@@ -4212,11 +4473,17 @@ const App = struct {
             log.warn("no memory to re-load the font: {s}", .{@errorName(err)});
             return;
         };
+        const family = self.allocator.dupe(u8, self.family) catch |err| {
+            log.warn("no memory to re-load the font: {s}", .{@errorName(err)});
+            self.allocator.destroy(job);
+            return;
+        };
         job.* = .{
             .allocator = self.allocator,
             .io = self.io,
+            .font_family_owned = family,
             .font_request = .{
-                .family = self.family,
+                .family = family,
                 .size = size,
                 .home_dir = self.home_dir,
                 .atlas_width_px = atlas_width_px,
@@ -4225,6 +4492,7 @@ const App = struct {
         };
         job.start() catch |err| {
             log.warn("could not start the worker that re-loads the font: {s}", .{@errorName(err)});
+            job.freeSpawnInputs();
             self.allocator.destroy(job);
             return;
         };
@@ -4334,12 +4602,32 @@ const App = struct {
             self.syncGrid() catch |err| {
                 log.warn("the grid could not be resized for the new face: {s}", .{@errorName(err)});
             };
+            self.font_diagnostic = if (self.family_from_file and self.family.len != 0 and self.fonts.isFallback())
+                .{ .line = self.config_current.lines.get(.font_family), .message = missing_family_message }
+            else
+                null;
+            changed = true;
+        } else if (job.font_failure != null) {
+            // The previous manager stays: the screen keeps drawing with the
+            // face it had, and the setting that asked for this one is named.
+            self.font_diagnostic = .{
+                .line = @max(self.config_current.lines.get(.font_family), self.config_current.lines.get(.font_size)),
+                .message = "font: the configured face could not be loaded; keeping the previous face",
+            };
             changed = true;
         }
         if (job.font_failure) |name| log.warn("the font could not be loaded: {s}", .{name});
         job.freeSpawnInputs();
         self.allocator.destroy(job);
         self.font_load = null;
+        if (changed) {
+            self.refreshConfigError();
+            self.invalidateUi();
+        }
+        if (self.font_reload_pending) {
+            self.font_reload_pending = false;
+            self.requestFontReload();
+        }
         return changed;
     }
 
@@ -4462,7 +4750,11 @@ const App = struct {
         if (!self.scratchpadVisible()) return null;
         const canvas = self.ui_canvas.bounds();
         if (canvas.width < 3 or canvas.height < 3) return null;
-        const percent = self.activePresentationConst().scratchpad_presentation.percent();
+        const percent: u32 = switch (self.activePresentationConst().scratchpad_presentation) {
+            .hidden => 0,
+            .fifty => self.scratchpad_percent_small,
+            .ninety => self.scratchpad_percent_large,
+        };
         const wanted = (canvas.height * percent + 99) / 100;
         const height = @min(canvas.height, @max(@as(u32, 3), wanted));
         return .{
@@ -5641,7 +5933,9 @@ const App = struct {
             if (content_width != 0 and canvas_bounds.height > 2) {
                 // Palette hint and version, plus the transient status line
                 // above them while one is shown.
-                const footer_rows: u32 = if (self.workspace_status != null) 4 else 3;
+                const config_error = self.configErrorText();
+                const footer_rows: u32 = 3 + @as(u32, if (self.workspace_status != null) 1 else 0) +
+                    @as(u32, if (config_error != null) 1 else 0);
                 const list_limit = canvas_bounds.height -| (footer_rows + 1);
                 const active_key = self.workspace_registry.activeKey();
                 var workspace_storage_index: usize = 0;
@@ -5731,6 +6025,22 @@ const App = struct {
                 }
 
                 if (canvas_bounds.height > footer_rows + 1) {
+                    // A settings problem stays visible until the file is
+                    // fixed; it sits above the transient status line and
+                    // clips at the sidebar edge rather than wrapping.
+                    if (config_error) |message| {
+                        const error_runs = [_]ui.Run{.{
+                            .text = message,
+                            .style = .{ .foreground = .bright_red },
+                        }};
+                        try self.ui_tree.addText(.{
+                            .id = .{ .value = "config.error" },
+                            .parent = .{ .value = "sidebar" },
+                            .role = "config_error",
+                            .label = message,
+                            .bounds = .{ .x = 1, .y = canvas_bounds.height - footer_rows, .width = content_width, .height = 1 },
+                        }, .{ .runs = &error_runs });
+                    }
                     if (self.workspace_status) |status| {
                         const runs = [_]ui.Run{.{
                             .text = status,
@@ -6698,6 +7008,17 @@ const App = struct {
                 return false;
             },
         };
+        cwd_owned = false;
+        return self.openEditorTab(fileReferenceLabel(path), cwd, argv);
+    }
+
+    /// Create a tab named `label` in the active workspace and start `argv` in
+    /// it through the workspace `ExecutionContext`, exactly as a file
+    /// reference does. Takes ownership of `cwd` and `argv` on every path.
+    /// Returns false when nothing changed.
+    fn openEditorTab(self: *App, label: []const u8, cwd: []u8, argv: [][]const u8) !bool {
+        var cwd_owned = true;
+        defer if (cwd_owned) self.allocator.free(cwd);
         var argv_owned = true;
         defer if (argv_owned) freeEntries(self.allocator, argv);
         if (!try self.prepareToLeaveActiveSession()) return false;
@@ -6707,7 +7028,7 @@ const App = struct {
         var pane_renderer = try self.newPaneRenderer(expected_session);
         var renderer_owned = true;
         errdefer if (renderer_owned) pane_renderer.deinit();
-        const created = try self.activeWorkspace().createTab(fileReferenceLabel(path), self.activeLive().terminal().gridSize());
+        const created = try self.activeWorkspace().createTab(label, self.activeLive().terminal().gridSize());
         pane_renderer.session_id = created.session_id;
         self.activePresentation().pane_renderers.appendAssumeCapacity(pane_renderer);
         renderer_owned = false;
@@ -6717,6 +7038,169 @@ const App = struct {
         argv_owned = false;
         self.startTabChildWith(created.session_id, cwd, argv);
         return true;
+    }
+
+    /// Start watching the settings file. A watcher that cannot start costs hot
+    /// reload, not the run: `config.reload` still applies edits.
+    fn startConfigWatcher(self: *App) void {
+        const path = self.config_path orelse return;
+        self.config_watcher = config.Watcher.start(self.allocator, self.io, path, self, configWake) catch |err| blk: {
+            log.warn("the config file is not watched ({s}); use Reload config after editing it", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    /// The watcher thread's wake: post an event so a blocked loop iterates and
+    /// `poll` sees the change. `window` is set once at startup and
+    /// `SDL_PushEvent` is thread-safe; nothing else is touched here.
+    fn configWake(context: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(context));
+        self.window.postDriverWake() catch |err| {
+            config.log.warn("could not wake the event loop for a config change: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// The visible error line, or null when the settings applied cleanly.
+    fn configErrorText(self: *const App) ?[]const u8 {
+        if (self.config_error_len == 0) return null;
+        return self.config_error_storage[0..self.config_error_len];
+    }
+
+    /// Recompute the visible error line from the parse diagnostics and the
+    /// asynchronous font result: the lowest line wins, file-wide first.
+    fn refreshConfigError(self: *App) void {
+        var best = self.config_current.firstDiagnostic();
+        if (self.font_diagnostic) |diagnostic| {
+            if (best == null or diagnostic.line < best.?.line) best = diagnostic;
+        }
+        const diagnostic = best orelse {
+            self.config_error_len = 0;
+            return;
+        };
+        var writer: std.Io.Writer = .fixed(&self.config_error_storage);
+        if (diagnostic.line == 0) {
+            writer.print("config: {s}", .{diagnostic.message}) catch {};
+        } else {
+            writer.print("config:{d}: {s}", .{ diagnostic.line, diagnostic.message }) catch {};
+        }
+        var len = writer.end;
+        // A message cut by the fixed buffer still has to be UTF-8.
+        while (len != 0 and !std.unicode.utf8ValidateSlice(self.config_error_storage[0..len])) len -= 1;
+        self.config_error_len = len;
+    }
+
+    /// Read the settings file again and apply it. Main thread only.
+    ///
+    /// A bad line keeps that key's previous value; an unreadable file keeps
+    /// every previous value; a missing file returns to the built-in layer.
+    fn reloadConfig(self: *App) void {
+        const path = self.config_path orelse return;
+        var next = config.load(self.io, self.allocator, path, &self.config_current) catch |err| {
+            log.warn("the config file could not be reloaded: {s}", .{@errorName(err)});
+            return;
+        };
+        const table = buildConfiguredBindings(self.allocator, &self.actions, self.binding_profile, &next, &self.binding_table) catch |err| {
+            log.warn("the configured keybindings could not be rebuilt: {s}", .{@errorName(err)});
+            next.deinit();
+            return;
+        };
+        self.binding_table.deinit();
+        self.binding_table = table;
+        self.bindings = self.binding_table.bindings;
+        self.config_current.deinit();
+        self.config_current = next;
+        self.config_reload_count += 1;
+        logConfigDiagnostics(path, &self.config_current);
+        self.applyConfigSettings() catch |err| {
+            log.warn("the reloaded settings could not be fully applied: {s}", .{@errorName(err)});
+        };
+        self.refreshConfigError();
+        self.refreshActiveUi() catch |err| log.warn("the UI could not be rebuilt after a config reload: {s}", .{@errorName(err)});
+        log.info("config reloaded ({d} problem(s))", .{self.config_current.diagnostics.items.len + self.config_current.dropped_diagnostics});
+    }
+
+    /// Push `config_current`'s values into the running app: right click,
+    /// scratchpad heights and, when the font request changed, a new face.
+    fn applyConfigSettings(self: *App) !void {
+        const settings = self.config_current.settings;
+        self.right_click = config.Layer.resolve(config.RightClick, config.RightClick.built_in, settings.right_click, self.session_right_click);
+
+        const sizes_changed = settings.scratchpad_size != self.scratchpad_percent_small or
+            settings.scratchpad_large_size != self.scratchpad_percent_large;
+        self.scratchpad_percent_small = settings.scratchpad_size;
+        self.scratchpad_percent_large = settings.scratchpad_large_size;
+        if (sizes_changed and self.scratchpadVisible()) try self.syncGrid();
+
+        const family = configuredFamily(self.session_font_family, settings.font_family);
+        const from_file = self.session_font_family == null and settings.font_family != null;
+        if (!std.mem.eql(u8, family, self.family) or settings.font_size != self.font_points) {
+            const owned = try self.allocator.dupe(u8, family);
+            self.allocator.free(self.family_owned);
+            self.family_owned = owned;
+            self.family = owned;
+            self.font_points = settings.font_size;
+            self.family_from_file = from_file;
+            self.font_diagnostic = null;
+            log.info("the font settings changed; re-loading the face at {d:.1} points", .{self.font_points});
+            self.requestFontReload();
+        } else {
+            self.family_from_file = from_file;
+            // The family line may have moved within the file.
+            if (self.font_diagnostic != null and from_file) {
+                self.font_diagnostic.?.line = self.config_current.lines.get(.font_family);
+            }
+        }
+    }
+
+    fn configOpenAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        if (!try self.openConfigFile()) return;
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+    }
+
+    fn configReloadAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        if (self.config_path == null) {
+            self.setWorkspaceStatus("No config file for this run");
+            return;
+        }
+        self.reloadConfig();
+    }
+
+    /// Open the settings file in a new editor tab, creating it from the
+    /// documented defaults first when it does not exist. The editor is the
+    /// file-reference editor (`vi -- <path>`), spawned through the workspace
+    /// `ExecutionContext`. Returns false when nothing changed.
+    fn openConfigFile(self: *App) !bool {
+        const path = self.config_path orelse {
+            self.setWorkspaceStatus("No config file for this run");
+            return false;
+        };
+        if (self.activePresentation().load != null) {
+            log.debug("config open ignored while another load is in flight", .{});
+            return false;
+        }
+        ensureConfigFile(self.io, path) catch |err| {
+            log.warn("the config file could not be created: {s}", .{@errorName(err)});
+            self.setWorkspaceStatus("Config file could not be created");
+            return false;
+        };
+        const inherited = self.activeLive().workingDirectory() orelse self.activeWorkspace().workingDirectory();
+        const cwd = try self.allocator.dupe(u8, inherited);
+        var cwd_owned = true;
+        defer if (cwd_owned) self.allocator.free(cwd);
+        const argv = buildFileReferenceArgv(self.allocator, path, null, cwd) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsafePath, error.PathTooLong => {
+                log.warn("the config path cannot be passed to the editor: {s}", .{@errorName(err)});
+                return false;
+            },
+        };
+        cwd_owned = false;
+        return self.openEditorTab("config", cwd, argv);
     }
 
     fn clipboardCopyAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
@@ -8860,6 +9344,12 @@ const App = struct {
     /// wrong: a finished job, the child's output, and the cursor's blink.
     fn poll(self: *App) bool {
         var changed = self.pollLoad();
+        if (self.config_watcher) |watcher| {
+            if (watcher.takeChanged()) {
+                self.reloadConfig();
+                changed = true;
+            }
+        }
         changed = self.advanceSearch() or changed;
         changed = self.pollScratchpadLoad() or changed;
         changed = self.finalizeClosingPresentations() or changed;
@@ -11952,7 +12442,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 49 and
+    failures += reportCheck(out, registered_actions.len == 51 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -12001,7 +12491,9 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[45].name, search_regex_action) and
         std.mem.eql(u8, registered_actions[46].name, search_activate_match_action) and
         std.mem.eql(u8, registered_actions[47].name, terminal_context_menu_action) and
-        std.mem.eql(u8, registered_actions[48].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[48].name, config_open_action) and
+        std.mem.eql(u8, registered_actions[49].name, config_reload_action) and
+        std.mem.eql(u8, registered_actions[50].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -14705,6 +15197,248 @@ fn menuTest(self: *App, io: Io, out: *Writer) !u8 {
     return if (failures == 0) 0 else 1;
 }
 
+/// The deterministic peer behind `--config-test`'s terminals: a line echo, so
+/// a chord that is no longer bound demonstrably reaches the terminal route.
+const config_test_script =
+    "stty -echo; " ++
+    "printf 'CONFIG-READY\\r\\n'; " ++
+    "while IFS= read -r line; do printf 'CONFIG-ECHO:%s\\r\\n' \"$line\"; done";
+
+const config_test_budget_ms: i64 = 8000;
+
+/// The settings `--config-test` starts with: the palette moved from its
+/// shipped chord to Ctrl+Alt+P and a 30 percent scratchpad.
+const config_test_initial =
+    "# --config-test initial settings\n" ++
+    "keybind = ctrl+shift+p=unbind\n" ++
+    "keybind = ctrl+alt+p=palette.open\n" ++
+    "scratchpad.size = 30\n";
+
+/// Line 3 is malformed; line 4 is valid and must still apply; line 5 names an
+/// action the registry does not have.
+const config_test_malformed =
+    "keybind = ctrl+shift+p=unbind\n" ++
+    "keybind = ctrl+alt+p=palette.open\n" ++
+    "scratchpad.size = banana\n" ++
+    "scratchpad.large_size = 70\n" ++
+    "keybind = ctrl+alt+k=no.such.action\n";
+
+/// The repaired file, saved the way many editors save: a sibling written and
+/// renamed over the original.
+const config_test_fixed =
+    "keybind = ctrl+shift+p=unbind\n" ++
+    "keybind = ctrl+alt+o=palette.open\n" ++
+    "scratchpad.size = 40\n" ++
+    "scratchpad.large_size = 70\n" ++
+    "font.size = 18\n";
+
+/// A private absolute path for `--config-test`'s settings file, under the
+/// platform temporary directory, so the user's real file is never read.
+fn configTestPath(io: Io, env: EnvSource, buffer: []u8) ![]const u8 {
+    const base = firstEnv(env, temp_dir_vars[0..]) orelse "/tmp";
+    const root = if (base.len != 0 and base[0] == '/') base else "/tmp";
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = try generateRunId(io, &id_buffer);
+    return std.fmt.bufPrint(buffer, "{s}/conduit-config-test-{s}/conduit/config", .{ root, id });
+}
+
+fn writeConfigTestFile(io: Io, path: []const u8, data: []const u8) !void {
+    if (config.directoryOf(path)) |dir| try Dir.cwd().createDirPath(io, dir);
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+}
+
+/// Replace the file by writing a sibling and renaming it over the original.
+fn renameConfigTestFile(io: Io, path: []const u8, data: []const u8) !void {
+    var buffer: [path_capacity]u8 = undefined;
+    const temporary = try std.fmt.bufPrint(&buffer, "{s}.tmp", .{path});
+    try Dir.cwd().writeFile(io, .{ .sub_path = temporary, .data = data });
+    try Dir.cwd().rename(temporary, Dir.cwd(), path, io);
+}
+
+/// Remove `--config-test`'s private directory: two levels above the file.
+fn removeConfigTestDir(io: Io, path: []const u8) void {
+    const conduit_dir = config.directoryOf(path) orelse return;
+    const root = config.directoryOf(conduit_dir) orelse return;
+    if (std.mem.indexOf(u8, root, "conduit-config-test-") == null) return;
+    Dir.cwd().deleteTree(io, root) catch |err| {
+        log.warn("could not remove the config-test directory: {s}", .{@errorName(err)});
+    };
+}
+
+const ConfigWait = union(enum) {
+    reloads: usize,
+    element: []const u8,
+    no_element: []const u8,
+    active_text: []const u8,
+    cell_height_above: u32,
+};
+
+fn configWaitMet(self: *App, condition: ConfigWait) !bool {
+    return switch (condition) {
+        .reloads => |count| self.config_reload_count >= count,
+        .element => |id| self.ui_tree.byId(.{ .value = id }) != null,
+        .no_element => |id| self.ui_tree.byId(.{ .value = id }) == null,
+        .active_text => |text| found: {
+            try self.activeLive().terminal().refresh(self.allocator);
+            break :found self.activeLive().terminal().visibleTextContains(text);
+        },
+        .cell_height_above => |height| self.font_load == null and self.fonts.metrics().cell.height_px > height,
+    };
+}
+
+fn waitForConfig(self: *App, io: Io, out: *Writer, condition: ConfigWait) !bool {
+    const deadline = Io.Clock.real.now(io).nanoseconds + config_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (try configWaitMet(self, condition)) return true;
+        const event = self.window.pump(@min(eventWaitBudget(io, deadline, false), idle_tick_ms));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return false;
+        }
+        if (self.poll()) self.scheduler.invalidate();
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) return try configWaitMet(self, condition);
+    }
+}
+
+fn configCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("config-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// The scratchpad's outer height for `percent` of the current canvas, the
+/// same rounding `scratchpadBounds` uses.
+fn expectedScratchpadHeight(self: *const App, percent: u32) u32 {
+    const canvas = self.ui_canvas.bounds();
+    const wanted = (canvas.height * percent + 99) / 100;
+    return @min(canvas.height, @max(@as(u32, 3), wanted));
+}
+
+fn configChord(self: *App, io: Io, out: *Writer, letter: u21) !bool {
+    return postKey(self, io, out, letter, .{ .ctrl = true, .alt = true });
+}
+
+/// Exercise TASK-37 end to end: a settings file in a private directory is
+/// loaded at startup, its keybindings and scratchpad size take effect through
+/// real SDL keys, a malformed edit shows a specific `config.error` line while
+/// every previous and still-valid value keeps working, a rename-replace save
+/// repairs it without a restart, and `config.open` creates the file and opens
+/// it in an editor tab by keyboard and by mouse.
+fn configTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    const path_copy = self.config_path orelse {
+        out.writeAll("config-test: FAIL no settings path\n") catch {};
+        return 1;
+    };
+    var path_buffer: [path_capacity]u8 = undefined;
+    @memcpy(path_buffer[0..path_copy.len], path_copy);
+    const path = path_buffer[0..path_copy.len];
+    var editor_trace: EditorSpawnTrace = .{};
+    self.editor_spawn_observer = .{ .context = &editor_trace, .observe_fn = recordEditorSpawn };
+    defer self.editor_spawn_observer = .{};
+
+    try self.drawFrame();
+    configCheck(out, &failures, try waitForPanes(self, io, out, .{ .focused_text = "CONFIG-READY" }), "the real config-test child became ready", .{});
+    configCheck(out, &failures, self.config_watcher != null and self.configErrorText() == null and
+        self.ui_tree.byId(.{ .value = "config.error" }) == null, "the startup file loaded cleanly and is watched", .{});
+
+    // Configured keybinding: Ctrl+Alt+P opens the palette, the shipped chord no longer does.
+    configCheck(out, &failures, try configChord(self, io, out, 'p') and self.paletteVisible(), "the configured Ctrl+Alt+P opened the palette through SDL", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    const routes_before_unbound = self.terminal_key_route_count;
+    _ = try paletteChord(self, io, out);
+    configCheck(out, &failures, !self.paletteVisible() and self.terminal_key_route_count > routes_before_unbound, "the unbound shipped chord reached the terminal instead of the palette", .{});
+
+    // Configured scratchpad size, through the shipped 50-percent binding.
+    _ = try scratchpadChord(self, io, out, false);
+    const small = self.scratchpadBounds();
+    configCheck(out, &failures, small != null and small.?.height == expectedScratchpadHeight(self, 30), "scratchpad.size = 30 sized the small scratchpad", .{});
+    _ = try scratchpadChord(self, io, out, false);
+    configCheck(out, &failures, !self.scratchpadVisible(), "the small scratchpad binding hid it again", .{});
+
+    // A malformed edit: visible, specific, and the previous value stands.
+    const reloads_before_malformed = self.config_reload_count;
+    try writeConfigTestFile(io, path, config_test_malformed);
+    configCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_malformed + 1 }) and
+        try waitForConfig(self, io, out, .{ .element = "config.error" }), "the watcher applied the edit without a restart and showed config.error", .{});
+    const error_element = self.ui_tree.byId(.{ .value = "config.error" });
+    configCheck(out, &failures, error_element != null and std.mem.eql(u8, error_element.?.role, "config_error") and
+        std.mem.startsWith(u8, error_element.?.label, "config:3: scratchpad.size:"), "config.error names line 3 and the key: '{s}'", .{if (error_element) |element| element.label else ""});
+    var saw_action_line = false;
+    for (self.config_current.diagnostics.items) |diagnostic| {
+        if (diagnostic.line == 5 and std.mem.eql(u8, diagnostic.message, "keybind: unknown action")) saw_action_line = true;
+    }
+    configCheck(out, &failures, saw_action_line, "an unknown keybind action was reported on its own line", .{});
+    configCheck(out, &failures, try configChord(self, io, out, 'p') and self.paletteVisible(), "the still-valid keybinding kept working with an error present", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try scratchpadChord(self, io, out, false);
+    const kept = self.scratchpadBounds();
+    configCheck(out, &failures, kept != null and kept.?.height == expectedScratchpadHeight(self, 30), "the malformed scratchpad.size kept the previous 30 percent", .{});
+    _ = try scratchpadChord(self, io, out, false);
+    _ = try scratchpadChord(self, io, out, true);
+    const large = self.scratchpadBounds();
+    configCheck(out, &failures, large != null and large.?.height == expectedScratchpadHeight(self, 70), "the valid line after the error still applied scratchpad.large_size = 70", .{});
+    _ = try scratchpadChord(self, io, out, true);
+    try self.drawFrame();
+    _ = try self.capture();
+
+    // Repair by rename-replace: the error clears and the new values apply.
+    const reloads_before_fix = self.config_reload_count;
+    const cell_height_before = self.fonts.metrics().cell.height_px;
+    try renameConfigTestFile(io, path, config_test_fixed);
+    configCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_fix + 1 }) and
+        try waitForConfig(self, io, out, .{ .no_element = "config.error" }), "a rename-replace save was seen and cleared config.error", .{});
+    configCheck(out, &failures, try configChord(self, io, out, 'o') and self.paletteVisible(), "the newly configured Ctrl+Alt+O opened the palette", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try configChord(self, io, out, 'p');
+    configCheck(out, &failures, !self.paletteVisible(), "the chord removed from the file no longer opens the palette", .{});
+    _ = try scratchpadChord(self, io, out, false);
+    const repaired = self.scratchpadBounds();
+    configCheck(out, &failures, repaired != null and repaired.?.height == expectedScratchpadHeight(self, 40), "scratchpad.size = 40 applied without a restart", .{});
+    _ = try scratchpadChord(self, io, out, false);
+    configCheck(out, &failures, try waitForConfig(self, io, out, .{ .cell_height_above = cell_height_before }), "font.size = 18 re-created the face with taller cells ({d} -> {d} px)", .{ cell_height_before, self.fonts.metrics().cell.height_px });
+
+    // Missing file: the built-in layer returns, including the shipped palette chord.
+    const reloads_before_delete = self.config_reload_count;
+    try Dir.cwd().deleteFile(io, path);
+    configCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_delete + 1 }) and
+        self.configErrorText() == null and self.scratchpad_percent_small == 50, "deleting the file returned to the documented defaults with no error", .{});
+
+    // Keyboard path: the shipped Ctrl+, creates the file and opens it in an editor tab.
+    const tabs_before_keyboard = self.activeWorkspace().tabCount();
+    _ = try postKey(self, io, out, ',', switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true },
+    });
+    var expected_argv_buffer: [path_capacity + 16]u8 = undefined;
+    const expected_argv = try std.fmt.bufPrint(&expected_argv_buffer, "vi -- {s}", .{path});
+    configCheck(out, &failures, self.activeWorkspace().tabCount() == tabs_before_keyboard + 1 and
+        editor_trace.calls == 1 and std.mem.eql(u8, editor_trace.argv(), expected_argv), "Ctrl+, opened an editor tab with argv '{s}'", .{editor_trace.argv()});
+    var written_buffer: [config.defaults_document.len + 1]u8 = undefined;
+    const written = Dir.cwd().readFile(io, path, &written_buffer) catch "";
+    configCheck(out, &failures, std.mem.eql(u8, written, config.defaults_document), "config.open created the file from the documented defaults", .{});
+    configCheck(out, &failures, try waitForConfig(self, io, out, .{ .active_text = "Conduit configuration" }), "the editor drew the new file in its tab", .{});
+
+    // Mouse path: the palette row, clicked.
+    _ = try paletteChord(self, io, out);
+    _ = try postPaletteText(self, io, out, "open config");
+    const open_index = definitionIndex(self, config_open_action) orelse return 1;
+    var open_id_storage: [palette_semantic_capacity]u8 = undefined;
+    const open_id = try std.fmt.bufPrint(&open_id_storage, "palette.action.{d}", .{open_index});
+    const open_row = self.ui_tree.byId(.{ .value = open_id });
+    configCheck(out, &failures, open_row != null and std.mem.indexOf(u8, open_row.?.label, "Open config file") != null and
+        std.mem.indexOf(u8, open_row.?.label, if (self.binding_profile == .macos) "Cmd+," else "Ctrl+,") != null, "the palette lists Open config file with its chord", .{});
+    const tabs_before_mouse = self.activeWorkspace().tabCount();
+    configCheck(out, &failures, try clickTabsElement(self, io, out, open_id) and
+        self.activeWorkspace().tabCount() == tabs_before_mouse + 1 and editor_trace.calls == 2, "clicking the palette row opened a second editor tab", .{});
+    const reread = Dir.cwd().readFile(io, path, &written_buffer) catch "";
+    configCheck(out, &failures, std.mem.eql(u8, reread, config.defaults_document), "opening an existing file left it untouched", .{});
+
+    out.print("config-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
 const ime_test_commit: [:0]const u8 = "日本語";
 const ime_test_preedit: [:0]const u8 = "にほん";
 const ime_test_wide: [:0]const u8 = "日本";
@@ -15942,6 +16676,9 @@ const usage =
     \\  --menu-test                        drive the right-click context menu, its keyboard
     \\                                    path, the paste alternative and DEC mouse
     \\                                    reporting through SDL, then exit
+    \\  --config-test                      drive the settings file: configured keys and
+    \\                                    sizes, a visible error, hot reload and the
+    \\                                    open-config action through SDL, then exit
     \\  --right-click=<menu|paste>         what a right click over a terminal does when
     \\                                    the program has not captured the mouse
     \\                                    (default: menu)
@@ -16080,6 +16817,12 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         options.run.test_artifact_dir = try generatedArtifactDir(init.io, options.dir, &artifact_dir_buffer);
     }
     const env = processEnv(init);
+    var config_path_buffer: [path_capacity]u8 = undefined;
+    if (options.run.config_test) {
+        options.run.config_path = try configTestPath(init.io, env, &config_path_buffer);
+        try writeConfigTestFile(init.io, options.run.config_path.?, config_test_initial);
+    }
+    defer if (options.run.config_test) removeConfigTestDir(init.io, options.run.config_path.?);
     try platform.setAppMetadata(.{
         .name = app_name,
         .version = version,
@@ -16109,7 +16852,7 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.ime_test or options.run.sidebar_test or options.run.tabs_test or options.run.panes_test or
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
-                options.run.driver_test) return err;
+                options.run.config_test or options.run.driver_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
                 "no usable display ({s}): there is no window to draw in. Set DISPLAY, or run under xvfb-run",
@@ -16215,6 +16958,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try searchTest(app, init.io, out);
     } else if (options.run.menu_test) {
         check_status = try menuTest(app, init.io, out);
+    } else if (options.run.config_test) {
+        check_status = try configTest(app, init.io, out);
     } else {
         try app.run(init.io, runDeadline(init.io, options.run.run_ms));
     }
@@ -16621,6 +17366,115 @@ test "--menu-test owns a fixed real-child terminal viewport" {
     defer spec.deinit();
     try std.testing.expectEqualStrings("/bin/sh", spec.argv[0]);
     try std.testing.expectEqualStrings(menu_test_script, spec.argv[2]);
+}
+
+test "--config-test owns a fixed real-child viewport and the settings path follows the run" {
+    const env = test_env{ .vars = &.{ .{ "XDG_CONFIG_HOME", "/xdg" }, .{ "HOME", "/home/u" } } };
+    const parsed = try parseArgs(&.{ "conduit", "--config-test" }, env.source());
+    const resolved = optionsForRun(parsed);
+    try std.testing.expect(parsed.run.config_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--config-test") != null);
+    try std.testing.expectEqual(ui_test_width, resolved.run.width);
+    try std.testing.expect(resolved.run.hidden);
+    try std.testing.expect(wantsChild(resolved));
+    try std.testing.expect(sidebarEnabled(resolved));
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
+    defer spec.deinit();
+    try std.testing.expectEqualStrings(config_test_script, spec.argv[2]);
+
+    var buffer: [path_capacity]u8 = undefined;
+    // A built-in check never reads the user's settings unless it names its own file.
+    try std.testing.expectEqual(@as(?[]const u8, null), configPathFor(resolved, env.source(), &buffer));
+    try std.testing.expectEqual(@as(?[]const u8, null), configPathFor(optionsForRun(try parseArgs(&.{ "conduit", "--palette-test" }, env.source())), env.source(), &buffer));
+    var explicit = resolved;
+    explicit.run.config_path = "/private/conduit/config";
+    try std.testing.expectEqualStrings("/private/conduit/config", configPathFor(explicit, env.source(), &buffer).?);
+    // An ordinary run uses the platform location.
+    const plain = try parseArgs(&.{"conduit"}, env.source());
+    const expected = if (builtin.os.tag == .linux) "/xdg/conduit/config" else configPathFor(plain, env.source(), &buffer).?;
+    try std.testing.expectEqualStrings(expected, configPathFor(plain, env.source(), &buffer).?);
+    // `--font` is the session layer over the file's family.
+    try std.testing.expectEqualStrings("Flag", configuredFamily("Flag", "File"));
+    try std.testing.expectEqualStrings("File", configuredFamily(null, "File"));
+    try std.testing.expectEqualStrings("", configuredFamily(null, null));
+}
+
+fn configTestHandler(_: *anyopaque, _: inputmod.Invocation) anyerror!void {}
+
+test "configured keybind lines are validated against the registry with their line numbers" {
+    var storage: [8]inputmod.ActionDefinition = undefined;
+    var registry = inputmod.Registry.init(&storage);
+    try registry.register(.{ .name = "palette.open", .label = "Open palette", .handler = configTestHandler, .palette = null });
+    try registry.register(.{ .name = "tab.new", .label = "New tab", .handler = configTestHandler });
+    try registry.register(.{ .name = "pane.split", .label = "Split pane", .handler = configTestHandler, .palette = .{ .argument = .{ .choices = .{
+        .name = "direction",
+        .prompt = "Split",
+        .values = &pane_split_choices,
+    } } } });
+    try registry.register(.{ .name = "scratchpad.toggle-50", .label = "Scratchpad 50", .handler = configTestHandler });
+    try registry.register(.{ .name = "scratchpad.toggle-90", .label = "Scratchpad 90", .handler = configTestHandler });
+
+    var first = try config.parse(std.testing.allocator,
+        \\keybind = ctrl+shift+p=unbind
+        \\keybind = ctrl+alt+p=palette.open
+        \\keybind = ctrl+alt+s=pane.split:down
+        \\keybind = ctrl+`=scratchpad.toggle-90
+        \\keybind = ctrl+shift+`=scratchpad.toggle-50
+    , null);
+    defer first.deinit();
+    var table = try buildConfiguredBindings(std.testing.allocator, &registry, .linux_windows, &first, null);
+    defer table.deinit();
+    try std.testing.expect(!first.hasDiagnostics());
+    var split_down = false;
+    var palette_chords: usize = 0;
+    for (table.bindings) |binding| {
+        if (std.mem.eql(u8, binding.action, "palette.open")) palette_chords += 1;
+        if (std.mem.eql(u8, binding.action, "pane.split") and binding.arguments.len == 1 and
+            std.mem.eql(u8, binding.arguments[0].value, "down") and
+            inputmod.chordEql(binding.chord, try inputmod.parseChord("ctrl+alt+s"))) split_down = true;
+        // Both scratchpad bindings are swapped.
+        if (inputmod.chordEql(binding.chord, try inputmod.parseChord("ctrl+`"))) try std.testing.expectEqualStrings("scratchpad.toggle-90", binding.action);
+        if (inputmod.chordEql(binding.chord, try inputmod.parseChord("ctrl+shift+`"))) try std.testing.expectEqualStrings("scratchpad.toggle-50", binding.action);
+    }
+    try std.testing.expectEqual(@as(usize, 1), palette_chords);
+    try std.testing.expect(split_down);
+
+    // A broken edit: each bad line is reported on its line, and its chord keeps
+    // what the previous table bound it to.
+    var second = try config.parse(std.testing.allocator,
+        \\keybind = ctrl+alt+p=no.such
+        \\keybind = hyper+x=tab.new
+        \\keybind = ctrl+alt+s=pane.split:sideways
+        \\keybind = ctrl+alt+n=tab.new:extra
+        \\keybind = ctrl+alt+m=pane.split
+        \\keybind = ctrl+=tab.new
+    , &first);
+    defer second.deinit();
+    var next = try buildConfiguredBindings(std.testing.allocator, &registry, .linux_windows, &second, &table);
+    defer next.deinit();
+    const expected = [_]struct { line: u32, message: []const u8 }{
+        .{ .line = 1, .message = "keybind: unknown action" },
+        .{ .line = 2, .message = "keybind: unknown modifier (use ctrl, shift, alt or super)" },
+        .{ .line = 3, .message = "keybind: invalid argument for pane.split" },
+        .{ .line = 4, .message = "keybind: tab.new takes no argument" },
+        .{ .line = 5, .message = "keybind: pane.split needs an argument" },
+        .{ .line = 6, .message = "keybind: chord has no key (spell + as plus)" },
+    };
+    try std.testing.expectEqual(expected.len, second.diagnostics.items.len);
+    for (expected, second.diagnostics.items) |want, have| {
+        try std.testing.expectEqual(want.line, have.line);
+        try std.testing.expectEqualStrings(want.message, have.message);
+    }
+    var kept_palette = false;
+    var kept_split = false;
+    for (next.bindings) |binding| {
+        if (inputmod.chordEql(binding.chord, try inputmod.parseChord("ctrl+alt+p")) and std.mem.eql(u8, binding.action, "palette.open")) kept_palette = true;
+        if (inputmod.chordEql(binding.chord, try inputmod.parseChord("ctrl+alt+s")) and std.mem.eql(u8, binding.action, "pane.split")) kept_split = true;
+        // The file no longer unbinds the shipped chord, so it is back.
+        if (inputmod.chordEql(binding.chord, try inputmod.parseChord("ctrl+shift+p"))) try std.testing.expectEqualStrings("palette.open", binding.action);
+    }
+    try std.testing.expect(kept_palette);
+    try std.testing.expect(kept_split);
 }
 
 test "the right-click setting is a validated session layer over the built-in default" {
@@ -17480,6 +18334,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
         "--links-test",
         "--search-test",
         "--menu-test",
+        "--config-test",
         "--no-child",
     }, env);
     try testing.expectEqualStrings("echo hi", options.run.command.?);
@@ -17499,6 +18354,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
     try testing.expect(options.run.links_test);
     try testing.expect(options.run.search_test);
     try testing.expect(options.run.menu_test);
+    try testing.expect(options.run.config_test);
     try testing.expect(options.run.no_child);
 
     // The defaults are the ones a plain run uses: an interactive shell, no
@@ -17521,6 +18377,8 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
     try testing.expect(!plain.run.links_test);
     try testing.expect(!plain.run.search_test);
     try testing.expect(!plain.run.menu_test);
+    try testing.expect(!plain.run.config_test);
+    try testing.expect(plain.run.config_path == null);
     try testing.expect(!plain.run.no_child);
     try testing.expect(wantsChild(plain));
 

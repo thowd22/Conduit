@@ -396,6 +396,20 @@ nothing else is a legal dependency.
 - **TASK-36 search defaults.** Command+F on macOS or Ctrl+Shift+F on Linux/Windows opens
   `search.open`. Enter/F3 and Shift+Enter/F3 navigate next/previous, Alt+C toggles case, Alt+R
   toggles regex, and Escape closes. Both toggles are also clickable semantic controls.
+- **TASK-37 configured bindings.** `parseChord` turns a settings-file chord (`ctrl+shift+t`,
+  `super+,`, `ctrl+backtick`, `shift+f10`; modifiers `ctrl`/`shift`/`alt`/`super` and their
+  aliases, `plus`/`equal` for the separator characters) into the same `Chord` the defaults use,
+  lowercasing letters because bindings match the unshifted key. `buildBindings` copies the
+  profile defaults, then applies `BindingOverride`s in file order: each removes every binding with
+  an equal chord (`chordEql`, lock modifiers ignored) and either binds in the first removed
+  position or appends, or only removes for `unbind`. The resulting `BindingTable` owns its
+  override strings in an arena and is swapped wholesale by `app` on reload; `BindingState`'s
+  held-key storage is a fixed 64 entries independent of the table, so a reload never reallocates
+  it under a held key. `keybindArgument` derives a keybind's argument name from the action's
+  palette contract (validating fixed choices) or, for a palette-hidden action, from its shipped
+  bindings; an action that is neither is semantic plumbing and cannot be bound. Both default
+  profiles add `config.open` (Command+, on macOS, Ctrl+, on Linux/Windows). The search chord and
+  modal-surface keys remain fixed in `app`.
 
 ### `palette`
 
@@ -523,14 +537,37 @@ nothing else is a legal dependency.
 
 - **Owns** the settings file, its schema, its validation, hot reload, and the built-in defaults
   every other module reads when there is no file.
-- **Never** be required for v0.1 to start: v0.1 has no config file and resolves every value to a
-  built-in default (CONDUIT.md §5). Never treat a malformed file as fatal — malformed external
-  input must never crash the app (§11).
-- **May depend on** no other Conduit module. Workspace-scoped state belongs to `workspace`;
-  *how* workspace state is persisted is TASK-65.
-- **Lands** M4 — TASK-37. Explicitly a v0.1 non-goal. TASK-35 added the first resolved setting
-  declaration ahead of the file layer: `RightClick` (`mouse.right_click`, built-in `menu`, with
-  `paste` supplied through the session layer by the `--right-click=` launch flag).
+- **Never** be required to start: a missing file is the built-in layer, and a file that cannot be
+  read keeps the previous values. Never treat a malformed file as fatal — malformed external
+  input must never crash the app (§11). Never parse a chord or decide whether an action exists:
+  a `keybind` line is carried as text for `input` and the registry.
+- **May depend on** no other Conduit module (`std` and `builtin` only; `builtin.os.tag` selects
+  the location and the watch backend). Workspace-scoped state belongs to `workspace`; *how*
+  workspace state is persisted is TASK-65.
+- **Lands** M4 — TASK-37. TASK-35 added the first resolved setting declaration ahead of the file
+  layer: `RightClick` (`mouse.right_click`, built-in `menu`, with `paste` supplied through the
+  session layer by the `--right-click=` launch flag).
+- **TASK-37 file layer.** `docs/config.md` is the user-facing grammar. The file is Ghostty-style
+  text (`key = value`, `#` comment lines, repeatable `keybind = <chord>=<action>[:<argument>]` or
+  `<chord>=unbind`) at `$XDG_CONFIG_HOME/conduit/config` (else `~/.config/conduit/config`) on
+  Linux, `~/Library/Application Support/conduit/config` on macOS and `%APPDATA%\conduit\config`
+  on Windows (`defaultPath`). `parse` is bounded (256 KiB file, 1024-byte lines, 256-byte
+  strings, 256 keybind lines, 64 stored diagnostics) and never fails on input: each bad line
+  becomes a `Diagnostic` with its 1-based line and a terse message naming the key (never the
+  value), and the rest of the file applies. A key whose every line was rejected keeps the
+  previous `Config`'s value (`kept_previous`). Supported keys: `font.family`, `font.bold`,
+  `font.italic`, `font.bold_italic`, `font.size` (1–72 points), `font.ligatures`,
+  `font.nerd_symbols`, `theme` (stored for TASK-38), `scratchpad.size` and
+  `scratchpad.large_size` (10–100 percent, default 50/90), `mouse.right_click` and `keybind`.
+  A `Config` owns everything through one arena and is replaced wholesale on reload.
+  `defaults_document` is the commented self-documenting file `config.open` writes; a unit test
+  proves that uncommenting it changes nothing. `Watcher` owns one thread: inotify on the parent
+  directory on Linux (rename-replace saves are seen; bursts coalesce after 100 ms of quiet), and
+  size/mtime/inode polling every second while the directory is missing and on other operating
+  systems. The thread only sets an atomic flag and calls the owner's wake callback; `app` reads,
+  validates and applies the file on the main thread. `app` resolves `font.family` and
+  `mouse.right_click` through `Layer` with `--font` / `--right-click` as the session layer, and
+  built-in checks other than `--config-test` never read the user's file.
 
 ### `theme`
 
