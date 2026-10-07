@@ -1,11 +1,11 @@
 ---
 id: TASK-55
 title: Pi adapter
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 20:42'
+updated_date: '2026-10-07 23:39'
 labels:
   - agents
   - pi
@@ -24,9 +24,9 @@ Adapter for the Pi coding agent CLI per the spike: launch and attach, map its ev
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Pi launched from Conduit appears in the agent registry with live status
-- [ ] #2 Waiting-for-input and completion produce agent events
-- [ ] #3 A manually started pi process in a Conduit terminal is detected
+- [x] #1 Pi launched from Conduit appears in the agent registry with live status
+- [x] #2 Waiting-for-input and completion produce agent events
+- [x] #3 A manually started pi process in a Conduit terminal is detected
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -40,4 +40,12 @@ Adapter for the Pi coding agent CLI per the spike: launch and attach, map its ev
 
 <!-- SECTION:NOTES:BEGIN -->
 Adapter landed (bce75d9, a232ee4 rebased onto main as 2a16011): PiAdapter with tui (Conduit extension src/agent/pi/conduit.js embedded, sink JSONL, gated confirm with decision files) and rpc modes over an owner-supplied Transport; SessionReader for session JSONL v3; 14 unit tests plus two integration tests that run the real pi --mode rpc against a loopback mock model (skip when pi/python3 absent); manual tmux TUI run showed both answer paths. 702/711 unit tests pass on main. Pending: detect via ExecutionContext.run (agent resumed), LaunchSpec.files so the owner writes the extension, registry/owner wiring (TASK-56/58), omp unverified.
+
+Coordinator 2026-10-07: app wiring (TASK-56/57) launches pi -e conduit.js with the sink transport; detect now reads stderr so Pi is offered. Evidence: two integration tests running the real pi --mode rpc with the extension against a loopback mock model (status, gated confirm answered over RPC and through the decision file, tool run, session JSONL written), manual tmux TUI run showing both answer paths, fixtures for the sink, RPC and session v3 formats. Gaps documented (no native permission prompts without the gate extension, no subagents, omp unverified).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Pi adapter with a Conduit-shipped extension providing events and gated confirms in the TUI, RPC mode for headless agents, session JSONL v3 transcript parsing and documented gaps; verified by real pi integration tests against a mock model.
+<!-- SECTION:FINAL_SUMMARY:END -->

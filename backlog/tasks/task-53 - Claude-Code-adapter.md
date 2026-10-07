@@ -1,11 +1,11 @@
 ---
 id: TASK-53
 title: Claude Code adapter
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 20:44'
+updated_date: '2026-10-07 23:39'
 labels:
   - agents
   - claude
@@ -24,10 +24,10 @@ Adapter for Claude Code CLI per the spike: launch and attach, map hook and trans
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Claude Code launched from Conduit appears in the agent registry with live status
-- [ ] #2 Permission requests and completion produce agent events
-- [ ] #3 Tool uses and file references are captured as structured events
-- [ ] #4 A manually started claude process in a Conduit terminal is detected
+- [x] #1 Claude Code launched from Conduit appears in the agent registry with live status
+- [x] #2 Permission requests and completion produce agent events
+- [x] #3 Tool uses and file references are captured as structured events
+- [x] #4 A manually started claude process in a Conduit terminal is detected
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -42,4 +42,12 @@ Adapter for Claude Code CLI per the spike: launch and attach, map hook and trans
 
 <!-- SECTION:NOTES:BEGIN -->
 Adapter landed (20df52f, dc3e464 rebased onto main as 626b155): ClaudeCodeAdapter writes a per-agent sink (settings.json hooks + POSIX hook.sh relay), launch = claude --settings <sink>/settings.json --session-id <uuid from token>; poll tails events.jsonl into typed events (Stop -> done; observed SessionEnd -> exited); PermissionRequest blocks up to 580 s until respondPermission writes <sink>/decisions/<id>, replying hookSpecificOutput.decision.behavior allow/deny; TranscriptReader; findRunningSession over the undocumented <config>/sessions/<pid>.json registry. 15 unit tests from fixtures recorded with 2.1.292 plus integration tests running the relay through a Local PTY, an unauthenticated real claude -p whose hooks reached poll, and a real interactive claude found, attached and seen to exit. 716/725 unit tests pass on main. Real 2.1.292 field names: SessionEnd.reason, StopFailure.error. Pending: UI gesture path (TASK-57/58), control endpoint instead of the sink (TASK-60), remote contexts (TASK-61); an authenticated live allow/deny was not run (no credentials).
+
+Coordinator 2026-10-07: with TASK-56/57 landed the app path exists end to end: Runtime launches claude --settings <sink>/settings.json --session-id ..., tails the hook relay into the registry (sidebar glyphs, notifications), and the agent view answers PermissionRequest through Runner.answerPermission -> adapter.respondPermission -> decision file -> hook reply. Evidence: adapter integration tests against the real 2.1.292 binary (relay through a Local PTY blocking until the decision file appears and printing the allow/deny reply; an unauthenticated claude -p whose SessionStart/UserPromptSubmit/StopFailure hooks reached poll as idle/working/errored; a hand-started interactive claude found in the registry, attached and seen to exit), transcript fixtures recorded from 2.1.292, and the fake-adapter --agent-test/--agent-view-test for the UI gesture. Not run: an authenticated session answering a real tool-permission prompt (no credentials on this box).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Claude Code adapter: hook-based live status including waiting-for-permission, permission answers delivered through a blocking hook relay from Conduit's agent view, transcript JSONL parsed into structured events, and detection/attachment of hand-started sessions through Claude's session registry; verified against the real 2.1.292 binary in isolated homes plus recorded fixtures, with the UI gesture proven through the fake adapter.
+<!-- SECTION:FINAL_SUMMARY:END -->
