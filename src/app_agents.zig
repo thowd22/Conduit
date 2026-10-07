@@ -104,8 +104,8 @@ pub const ManagerColumns = struct {
     harness: []const u8,
     workspace: []const u8,
     tab: []const u8,
-    /// The backlog task the agent works on. TASK-64 fills it; until then it
-    /// is null and the column shows `–`.
+    /// The backlog task the agent works on (TASK-64, `Runner.taskId`), or
+    /// null for an agent not started from a task: the column shows `–`.
     task: ?[]const u8 = null,
     state: []const u8,
     age: []const u8,
@@ -665,6 +665,10 @@ pub const Runner = struct {
     view: agent_view.View,
     /// The fake's release schedule (checks only).
     fake_step_ends: []const usize = &fake_step_ends,
+    /// The backlog task the agent was started on (TASK-64), a copy of its
+    /// validated id; empty when it was not started from a task.
+    task_id_bytes: [max_task_id_bytes]u8 = undefined,
+    task_id_len: usize = 0,
     /// Answers and messages waiting for the worker, the adapter's one caller.
     requests_mutex: Io.Mutex = .init,
     requests: [request_capacity]Answer = undefined,
@@ -693,6 +697,15 @@ pub const Runner = struct {
     };
 
     pub const AnswerError = error{ QueueFull, IdTooLong };
+
+    /// The longest backlog task id a runner records (`backlog.isTaskId`).
+    pub const max_task_id_bytes = 64;
+
+    /// The backlog task this agent works on, if it was started from one.
+    pub fn taskId(self: *const Runner) ?[]const u8 {
+        if (self.task_id_len == 0) return null;
+        return self.task_id_bytes[0..self.task_id_len];
+    }
     pub const MessageError = error{ QueueFull, MessageTooLong };
 
     /// Queue the human's answer to permission request `request_id` for the
@@ -1055,6 +1068,9 @@ pub const LaunchRequest = struct {
     home: ?[]const u8 = null,
     claude_config_dir: ?[]const u8 = null,
     codex_home: ?[]const u8 = null,
+    /// The backlog task the agent is started on (TASK-64). The caller passes
+    /// a validated id; one longer than `Runner.max_task_id_bytes` is dropped.
+    task_id: ?[]const u8 = null,
 };
 
 pub const LaunchError = Allocator.Error || error{
@@ -1257,6 +1273,10 @@ pub const Runtime = struct {
             .view = view,
         };
         errdefer runner.arena.deinit();
+        if (request.task_id) |task| if (task.len <= runner.task_id_bytes.len) {
+            @memcpy(runner.task_id_bytes[0..task.len], task);
+            runner.task_id_len = task.len;
+        };
         try self.initBackend(runner, request);
         try self.runners.append(self.allocator, runner);
         return runner;
@@ -1606,6 +1626,7 @@ pub const Runtime = struct {
             .context_kind = runner.context_kind,
             .cwd = runner.cwd,
             .prompt = runner.prompt,
+            .task_id = runner.taskId(),
         };
     }
 
@@ -2053,7 +2074,8 @@ test "a message reaches the adapter through the worker's queue, and a restart re
     const key = WorkspaceKey.fromOrdinal(0);
     const session_id = SessionId.fromOrdinal(1);
     const binding: agent.Binding = .{ .workspace = key, .session = session_id, .session_kind = .agent_terminal, .scratchpad = .first };
-    const runner = try runtime.createRunner(.{ .choice = .fake, .workspace = key, .session = session_id, .context_kind = .local, .cwd = "/w", .prompt = "go" });
+    const runner = try runtime.createRunner(.{ .choice = .fake, .workspace = key, .session = session_id, .context_kind = .local, .cwd = "/w", .prompt = "go", .task_id = "TASK-7" });
+    try testing.expectEqualStrings("TASK-7", runner.taskId().?);
     _ = try runner.prepare(&.{"PATH=/bin"});
     const id = try runtime.register(runner, binding);
     try testing.expect(runtime.lastActivity(id) != null);
@@ -2086,6 +2108,8 @@ test "a message reaches the adapter through the worker's queue, and a restart re
     try testing.expectEqual(@as(?AgentId, new_id), runtime.selected_agent);
     try testing.expectEqualStrings("/w", replacement.cwd);
     try testing.expectEqualStrings("go", replacement.prompt.?);
+    // The restarted agent still works on the task it was started on.
+    try testing.expectEqualStrings("TASK-7", replacement.taskId().?);
     try testing.expectEqual(@as(usize, 1), runtime.runners.items.len);
     try testing.expectError(error.NotRestartable, runtime.replaceRunner(new_id, runtime.relaunchRequest(new_id).?, binding));
 }

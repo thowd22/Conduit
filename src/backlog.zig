@@ -1314,6 +1314,94 @@ pub const Cli = struct {
     }
 };
 
+/// The most bytes `taskPrompt` writes: an agent's initial prompt is one argv
+/// entry, so a huge task is cut rather than handed over whole.
+pub const max_task_prompt_bytes: usize = 16 * 1024;
+
+/// What a cut prompt ends with.
+pub const task_prompt_truncated = "\n[… task truncated]";
+
+/// The initial prompt of an agent started on `task` (TASK-64):
+///
+/// ```text
+/// TASK-7: <title>
+///
+/// <description>
+///
+/// Acceptance criteria:
+/// - [ ] #1 <criterion>
+/// ```
+///
+/// Written into `buffer` (at most `max_task_prompt_bytes` of it are used)
+/// and returned. Task text is untrusted: invalid UTF-8 becomes U+FFFD and
+/// control characters other than line breaks and tabs become spaces. A task
+/// that does not fit is cut on a character boundary and ends with
+/// `task_prompt_truncated`. The prompt is handed to the agent only by the
+/// human's explicit start gesture, and is never logged.
+pub fn taskPrompt(buffer: []u8, task: *const Task) []const u8 {
+    const limit = @min(buffer.len, max_task_prompt_bytes);
+    if (limit <= task_prompt_truncated.len) return buffer[0..0];
+    const body_limit = limit - task_prompt_truncated.len;
+    var writer: std.Io.Writer = .fixed(buffer[0..body_limit]);
+    const complete = writePrompt(&writer, task);
+    var len = writer.end;
+    if (complete) return buffer[0..len];
+    while (len != 0 and !std.unicode.utf8ValidateSlice(buffer[0..len])) len -= 1;
+    @memcpy(buffer[len .. len + task_prompt_truncated.len], task_prompt_truncated);
+    return buffer[0 .. len + task_prompt_truncated.len];
+}
+
+/// Whether the whole prompt fit.
+fn writePrompt(writer: *std.Io.Writer, task: *const Task) bool {
+    writeClean(writer, task.id) catch return false;
+    writer.writeAll(": ") catch return false;
+    writeClean(writer, task.title) catch return false;
+    writer.writeAll("\n") catch return false;
+    if (task.description) |description| {
+        writer.writeAll("\n") catch return false;
+        writeClean(writer, description) catch return false;
+        writer.writeAll("\n") catch return false;
+    }
+    if (task.acceptance_criteria.len != 0) {
+        writer.writeAll("\nAcceptance criteria:\n") catch return false;
+        for (task.acceptance_criteria) |criterion| {
+            writer.print("- [{s}] #{d} ", .{ if (criterion.checked) "x" else " ", criterion.index }) catch return false;
+            writeClean(writer, criterion.text) catch return false;
+            writer.writeAll("\n") catch return false;
+        }
+    }
+    return true;
+}
+
+fn writeClean(writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+    var index: usize = 0;
+    while (index < text.len) {
+        const length = std.unicode.utf8ByteSequenceLength(text[index]) catch {
+            try writer.writeAll("\u{FFFD}");
+            index += 1;
+            continue;
+        };
+        if (index + length > text.len) {
+            try writer.writeAll("\u{FFFD}");
+            return;
+        }
+        const codepoint = std.unicode.utf8Decode(text[index .. index + length]) catch {
+            try writer.writeAll("\u{FFFD}");
+            index += 1;
+            continue;
+        };
+        const control = codepoint < 0x20 or (codepoint >= 0x7f and codepoint < 0xa0);
+        if (codepoint == '\r') {
+            // Dropped: a CRLF is one line break.
+        } else if (control and codepoint != '\n' and codepoint != '\t') {
+            try writer.writeByte(' ');
+        } else {
+            try writer.writeAll(text[index .. index + length]);
+        }
+        index += length;
+    }
+}
+
 test "a task id round-trips through its canonical spelling" {
     try testing.expectEqual(@as(u32, 1), (try TaskId.parse("TASK-1")).number);
     try testing.expectEqual(@as(u32, 70), (try TaskId.parse("TASK-70")).number);
@@ -1541,6 +1629,39 @@ test "malformed files become diagnostics, never errors" {
     try testing.expect(project.findTask("--force") != null);
     try testing.expectEqual(@as(usize, 1), countDiagnostics(&project, "Flag-id"));
     try testing.expectEqual(@as(usize, 2), project.taskCount());
+}
+
+test "a task's agent prompt carries its id, title, description and criteria within its bound" {
+    var context = try localContext();
+    defer context.deinit();
+    var project = try Project.load(testing.allocator, testing.io, context.borrow(), "test/fixtures/backlog/valid", .{});
+    defer project.deinit();
+    var buffer: [max_task_prompt_bytes]u8 = undefined;
+    try testing.expectEqualStrings(
+        "TASK-1: First task: parse the model\n\nRead the project into a typed model.\n\n" ++
+            "Acceptance criteria:\n- [ ] #1 Tasks are parsed\n- [x] #2 Statuses are parsed\n- [ ] #3 Criteria keep their numbers\n",
+        taskPrompt(&buffer, project.findTask("TASK-1").?),
+    );
+    try testing.expectEqualStrings("TASK-2.1: Subtask\n", taskPrompt(&buffer, project.findTask("TASK-2.1").?));
+
+    // Controls are neutralised; a CRLF is one break.
+    const hostile: Task = .{ .id = "TASK-9", .title = "a\x1b[2Jb", .status = "To Do", .description = "x\r\ny\x07", .path = "", .state = .active };
+    try testing.expectEqualStrings("TASK-9: a [2Jb\n\nx\ny \n", taskPrompt(&buffer, &hostile));
+
+    // A task larger than the bound is cut on a character boundary and marked.
+    const huge = try testing.allocator.alloc(u8, 3 * max_task_prompt_bytes);
+    defer testing.allocator.free(huge);
+    var index: usize = 0;
+    while (index + 3 <= huge.len) : (index += 3) @memcpy(huge[index .. index + 3], "é.");
+    const big: Task = .{ .id = "TASK-10", .title = "big", .status = "To Do", .description = huge[0..index], .path = "", .state = .active };
+    var large: [2 * max_task_prompt_bytes]u8 = undefined;
+    const cut = taskPrompt(&large, &big);
+    try testing.expect(cut.len <= max_task_prompt_bytes);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try testing.expect(std.mem.startsWith(u8, cut, "TASK-10: big\n\n"));
+    try testing.expect(std.mem.endsWith(u8, cut, task_prompt_truncated));
+    var tiny: [8]u8 = undefined;
+    try testing.expectEqualStrings("", taskPrompt(&tiny, &big));
 }
 
 test "an empty project has its config and nothing else" {
