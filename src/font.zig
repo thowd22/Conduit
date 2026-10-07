@@ -595,6 +595,40 @@ pub const Catalog = struct {
         return found;
     }
 
+    /// The families a person can pick as a terminal font: every family with a non-colour file
+    /// that FreeType reports as fixed-width and that maps `M` and `0`, so a symbols or emoji face
+    /// that happens to be monospaced is not offered as a text font.
+    ///
+    /// Sorted case-insensitively (bytes break ties) with case-insensitive duplicates removed, and
+    /// bounded to `limit` names. The strings are borrowed from the catalog; the caller frees only
+    /// the returned slice, with `gpa`.
+    pub fn monospaceFamilies(self: Catalog, gpa: Allocator, limit: usize) Allocator.Error![][]const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        for (self.files.items) |file| {
+            if (!file.fixed_width or file.color) continue;
+            if (!file.covers('M') or !file.covers('0')) continue;
+            try names.append(gpa, file.family);
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return switch (std.ascii.orderIgnoreCase(a, b)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => std.mem.order(u8, a, b) == .lt,
+                };
+            }
+        }.lessThan);
+        var unique: std.ArrayList([]const u8) = .empty;
+        errdefer unique.deinit(gpa);
+        for (names.items) |name| {
+            if (unique.items.len == limit) break;
+            if (unique.items.len != 0 and std.ascii.eqlIgnoreCase(unique.items[unique.items.len - 1], name)) continue;
+            try unique.append(gpa, name);
+        }
+        return unique.toOwnedSlice(gpa);
+    }
+
     pub fn deinit(self: *Catalog) void {
         for (self.files.items) |file| {
             self.gpa.free(file.path);
@@ -1064,6 +1098,13 @@ pub const Request = struct {
     /// The configured family. Empty means the bundled face, which is also what a family that is not
     /// installed gets.
     family: []const u8 = "",
+    /// Families whose bold, italic and bold-italic faces replace the ones derived from `family`.
+    /// Empty derives the style from the primary family (its own style file, else synthesis). The
+    /// family's exact style face is used when it has one, otherwise its regular face. A family that
+    /// is not installed keeps the derived face and is logged. Borrowed only for `Manager.init`.
+    bold_family: []const u8 = "",
+    italic_family: []const u8 = "",
+    bold_italic_family: []const u8 = "",
     size: Size,
     /// The user's home directory, when the caller knows it. See `systemFontDirectories`.
     home_dir: ?[]const u8 = null,
@@ -1389,6 +1430,27 @@ pub const Manager = struct {
     /// Whether the configured family was missing and the bundled face is standing in for it.
     pub fn isFallback(self: Manager) bool {
         return self.used_fallback;
+    }
+
+    /// How many `Request.fallbacks` families were installed and opened.
+    pub fn configuredFallbackCount(self: Manager) usize {
+        var count: usize = 0;
+        for (self.extras.items) |extra| {
+            if (extra.kind == .configured) count += 1;
+        }
+        return count;
+    }
+
+    /// Whether box drawing, blocks, braille and Powerline separators are drawn as sprites.
+    pub fn builtinSymbols(self: Manager) bool {
+        return self.builtin_symbols;
+    }
+
+    /// The family a style draws with: the primary family unless a style face, from the family
+    /// itself or a `Request` style override, is loaded for it.
+    pub fn styleFamilyName(self: Manager, style: FaceStyle) []const u8 {
+        const face = self.faces[styleIndex(style)] orelse return self.family;
+        return face.familyName();
     }
 
     /// The cell metrics of the loaded face.
@@ -1980,8 +2042,61 @@ const Resolution = struct {
     }
 };
 
-/// Pick the primary face and any distinct exact-style faces from the configured family.
+/// Pick the primary face and its style faces: the configured family's own, replaced by any
+/// `Request` style-family override.
 fn resolveFaces(
+    gpa: Allocator,
+    library: ft.FT_Library,
+    catalog: *const Catalog,
+    request: Request,
+    size_px: u32,
+) !Resolution {
+    var resolution = try resolvePrimary(gpa, library, catalog, request, size_px);
+    errdefer resolution.deinit(gpa);
+    applyStyleOverrides(library, catalog, request, size_px, &resolution);
+    return resolution;
+}
+
+/// Replace a style slot with the face a `Request` style family names. A family that is not
+/// installed, or a file that will not open, keeps whatever the slot held: the family's own style
+/// face, or nothing, which synthesises the style from the primary face.
+fn applyStyleOverrides(
+    library: ft.FT_Library,
+    catalog: *const Catalog,
+    request: Request,
+    size_px: u32,
+    resolution: *Resolution,
+) void {
+    const overrides = [_]struct { style: FaceStyle, family: []const u8 }{
+        .{ .style = .bold, .family = request.bold_family },
+        .{ .style = .italic, .family = request.italic_family },
+        .{ .style = .bold_italic, .family = request.bold_italic_family },
+    };
+    for (overrides) |override| {
+        if (override.family.len == 0) continue;
+        const file = catalog.findFamilyFaces(override.family).get(override.style) orelse
+            catalog.findFamily(override.family) orelse {
+            log.warn("{s} font family '{s}' is not installed; keeping the derived face", .{
+                canonicalStyleName(override.style),
+                override.family,
+            });
+            continue;
+        };
+        const face = Face.open(library, file.path, size_px) catch |err| {
+            log.warn("font style file {s} could not be opened ({s}); keeping the derived face", .{
+                file.path,
+                @errorName(err),
+            });
+            continue;
+        };
+        const slot = &resolution.faces[styleIndex(override.style)];
+        if (slot.*) |*previous| previous.deinit();
+        slot.* = face;
+    }
+}
+
+/// Pick the primary face and any distinct exact-style faces from the configured family.
+fn resolvePrimary(
     gpa: Allocator,
     library: ft.FT_Library,
     catalog: *const Catalog,
@@ -3096,4 +3211,85 @@ test "shaping never resizes the face glyphs are rasterised from" {
     // And the size is the configured one: JetBrains Mono's cap height is 730 of 1000 units, so a
     // 28px 'M' stands about 20px tall.
     try testing.expect(after.rect.height >= 19 and after.rect.height <= 22);
+}
+
+fn appendCatalogFile(
+    catalog: *Catalog,
+    path: []const u8,
+    family: []const u8,
+    fixed_width: bool,
+    color: bool,
+    coverage: []const CodepointRange,
+) !void {
+    try appendSyntheticFont(catalog, path, family, "Regular", .regular);
+    const file = &catalog.files.items[catalog.files.items.len - 1];
+    file.coverage = try catalog.gpa.dupe(CodepointRange, coverage);
+    file.fixed_width = fixed_width;
+    file.color = color;
+}
+
+test "the monospace family list is sorted, de-duplicated, bounded and text faces only" {
+    var catalog: Catalog = .{ .gpa = testing.allocator };
+    defer catalog.deinit();
+    const latin = [_]CodepointRange{.{ .first = 0x20, .last = 0x7E }};
+    const symbols = [_]CodepointRange{.{ .first = 0xE000, .last = 0xF8FF }};
+    try appendCatalogFile(&catalog, "/f/zed.ttf", "Zed Mono", true, false, &latin);
+    try appendCatalogFile(&catalog, "/f/dejavu.ttf", "DejaVu Sans Mono", true, false, &latin);
+    try appendCatalogFile(&catalog, "/f/dejavu-bold.ttf", "DejaVu Sans Mono", true, false, &latin);
+    try appendCatalogFile(&catalog, "/f/dejavu-case.ttf", "dejavu sans mono", true, false, &latin);
+    try appendCatalogFile(&catalog, "/f/sans.ttf", "Proportional Sans", false, false, &latin);
+    try appendCatalogFile(&catalog, "/f/emoji.ttf", "Colour Emoji", true, true, &latin);
+    try appendCatalogFile(&catalog, "/f/symbols.ttf", "Symbols Mono", true, false, &symbols);
+    try appendCatalogFile(&catalog, "/f/agave.ttf", "agave", true, false, &latin);
+
+    const all = try catalog.monospaceFamilies(testing.allocator, 16);
+    defer testing.allocator.free(all);
+    try testing.expectEqual(@as(usize, 3), all.len);
+    try testing.expectEqualStrings("agave", all[0]);
+    try testing.expectEqualStrings("DejaVu Sans Mono", all[1]);
+    try testing.expectEqualStrings("Zed Mono", all[2]);
+
+    const bounded = try catalog.monospaceFamilies(testing.allocator, 2);
+    defer testing.allocator.free(bounded);
+    try testing.expectEqual(@as(usize, 2), bounded.len);
+    try testing.expectEqualStrings("DejaVu Sans Mono", bounded[1]);
+}
+
+test "a configured style family replaces the derived style face" {
+    const directories = try systemFontDirectories(testing.allocator, null);
+    defer freeAll(testing.allocator, directories);
+    var catalog = try Catalog.scan(testing.io, testing.allocator, directories);
+    defer catalog.deinit();
+    if (catalog.findFamily("DejaVu Sans Mono") == null) {
+        log.info("DejaVu Sans Mono is not installed here; skipping", .{});
+        return;
+    }
+
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .bold_family = "DejaVu Sans Mono",
+        .italic_family = "Conduit Family That Does Not Exist",
+        .system_fallback = false,
+    });
+    defer manager.deinit();
+    // The primary stays the bundled face; only bold comes from the configured family.
+    try testing.expect(manager.isFallback());
+    try testing.expectEqualStrings("DejaVu Sans Mono", manager.styleFamilyName(.bold));
+    // A family that is not installed keeps the derived (here synthesised) style.
+    try testing.expectEqualStrings(manager.familyName(), manager.styleFamilyName(.italic));
+    try testing.expect(manager.glyphIndexForStyle(.bold, 'M') != 0);
+}
+
+test "the fallback count reports only installed configured families" {
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .fallbacks = &.{"Conduit Family That Does Not Exist"},
+        .builtin_symbols = false,
+        .system_fallback = false,
+    });
+    defer manager.deinit();
+    try testing.expectEqual(@as(usize, 0), manager.configuredFallbackCount());
+    try testing.expect(!manager.builtinSymbols());
 }

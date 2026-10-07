@@ -145,6 +145,49 @@ pub const default_font_points: f32 = 14.0;
 /// glyph inside the atlas the app allocates.
 pub const min_font_points: f32 = 1.0;
 pub const max_font_points: f32 = 72.0;
+/// The range the size commands step within. A file may set a smaller size; the commands never
+/// step below this, and never step a smaller size further down.
+pub const min_step_font_points: f32 = 6.0;
+/// The most `font.fallbacks` families one file may name.
+pub const max_font_fallbacks: usize = 8;
+
+/// Which way a size command moves `font.size`.
+pub const FontStep = enum { increase, decrease };
+
+/// The size after one step of `step`: whole points, one at a time, within `min_step_font_points`
+/// and `max_font_points`. A fractional size moves to the next whole point in that direction. A
+/// step that would leave the range returns `points` unchanged rather than jumping across it.
+pub fn stepFontPoints(points: f32, step: FontStep) f32 {
+    return switch (step) {
+        .increase => if (points >= max_font_points) points else @min(max_font_points, @max(min_step_font_points, @floor(points) + 1)),
+        .decrease => if (points <= min_step_font_points) points else @max(min_step_font_points, @ceil(points) - 1),
+    };
+}
+
+/// Split a `font.fallbacks` value (already unquoted) into trimmed, non-empty family names stored
+/// in `out`, borrowing from `text`. More than `max_font_fallbacks` names is an error.
+pub fn splitFallbacks(text: []const u8, out: *[max_font_fallbacks][]const u8) error{TooManyFallbacks}![]const []const u8 {
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, text, ',');
+    while (parts.next()) |part| {
+        const name = std.mem.trim(u8, part, " \t");
+        if (name.len == 0) continue;
+        if (count == max_font_fallbacks) return error.TooManyFallbacks;
+        out[count] = name;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// The `font.fallbacks` value for `families`: the names joined by `, `, as `parse` reads back.
+pub fn formatFallbacks(buffer: []u8, families: []const []const u8) error{NoSpaceLeft}![]const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    for (families, 0..) |family, index| {
+        if (index != 0) writer.writeAll(", ") catch return error.NoSpaceLeft;
+        writer.writeAll(family) catch return error.NoSpaceLeft;
+    }
+    return writer.buffered();
+}
 /// Scratchpad presentation bounds in percent of the window height.
 pub const min_scratchpad_percent: u8 = 10;
 pub const max_scratchpad_percent: u8 = 100;
@@ -159,6 +202,7 @@ pub const Key = enum {
     font_size,
     font_ligatures,
     font_nerd_symbols,
+    font_fallbacks,
     theme,
     scratchpad_size,
     scratchpad_large_size,
@@ -175,6 +219,7 @@ pub const Key = enum {
             .font_size => "font.size",
             .font_ligatures => "font.ligatures",
             .font_nerd_symbols => "font.nerd_symbols",
+            .font_fallbacks => "font.fallbacks",
             .theme => "theme",
             .scratchpad_size => "scratchpad.size",
             .scratchpad_large_size => "scratchpad.large_size",
@@ -200,15 +245,19 @@ pub const Settings = struct {
     /// The primary family. Null means the file is silent, so the built-in (bundled face) or a
     /// session `--font` decides; an explicit empty string also means the bundled face.
     font_family: ?[]const u8 = null,
-    /// Style-face families. Empty derives the style from the primary family. Validated and
-    /// stored; the font manager consumes them once it can load configured style faces.
+    /// Style-face families. Empty derives the style from the primary family; otherwise the named
+    /// family's bold, italic or bold-italic face (else its regular face) draws that style.
     font_bold: []const u8 = "",
     font_italic: []const u8 = "",
     font_bold_italic: []const u8 = "",
     font_size: f32 = default_font_points,
-    /// Stored for the font manager; `docs/config.md` says which keys take effect today.
+    /// Whether HarfBuzz forms programming ligatures (`liga`, `calt`, `dlig`).
     font_ligatures: bool = true,
+    /// Whether box drawing, blocks, braille and Powerline separators are drawn as built-in sprites.
     font_nerd_symbols: bool = true,
+    /// Families searched, in order, for a codepoint the primary family lacks, before any other
+    /// installed face. At most `max_font_fallbacks`; each name is trimmed and non-empty.
+    font_fallbacks: []const []const u8 = &.{},
     /// The colour scheme: empty for Conduit's default, a bundled or user theme name, or
     /// `auto:<dark>,<light>`. `app` resolves it through `theme`; an unknown name is reported there.
     theme: []const u8 = "",
@@ -311,6 +360,11 @@ pub const Config = struct {
             .font_size => to.font_size = from.font_size,
             .font_ligatures => to.font_ligatures = from.font_ligatures,
             .font_nerd_symbols => to.font_nerd_symbols = from.font_nerd_symbols,
+            .font_fallbacks => {
+                const list = try self.arena.allocator().alloc([]const u8, from.font_fallbacks.len);
+                for (list, from.font_fallbacks) |*slot, family| slot.* = try self.dupe(family);
+                to.font_fallbacks = list;
+            },
             .theme => to.theme = try self.dupe(from.theme),
             .scratchpad_size => to.scratchpad_size = from.scratchpad_size,
             .scratchpad_large_size => to.scratchpad_large_size = from.scratchpad_large_size,
@@ -355,6 +409,7 @@ const ValueError = error{
     NotBool,
     NotRightClick,
     NotPercent,
+    TooManyFallbacks,
     KeybindShape,
     KeybindAction,
     KeybindArgument,
@@ -455,6 +510,7 @@ fn valueMessage(key: Key, err: ValueError) []const u8 {
         error.NotBool => "expected `true` or `false`",
         error.NotRightClick => "expected `menu` or `paste`",
         error.NotPercent => "expected a whole percentage from 10 to 100",
+        error.TooManyFallbacks => "expected at most 8 comma-separated families",
         error.KeybindShape => "expected `<chord>=<action>[:<argument>]`",
         error.KeybindAction => "invalid action name",
         error.KeybindArgument => "invalid argument",
@@ -472,6 +528,13 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
         .font_size => settings.font_size = try parsePoints(value),
         .font_ligatures => settings.font_ligatures = try parseBool(value),
         .font_nerd_symbols => settings.font_nerd_symbols = try parseBool(value),
+        .font_fallbacks => {
+            var names: [max_font_fallbacks][]const u8 = undefined;
+            const parsed = try splitFallbacks(try parseString(value), &names);
+            const list = try allocator.alloc([]const u8, parsed.len);
+            for (list, parsed) |*slot, family| slot.* = try allocator.dupe(u8, family);
+            settings.font_fallbacks = list;
+        },
         .scratchpad_size => settings.scratchpad_size = try parsePercent(value),
         .scratchpad_large_size => settings.scratchpad_large_size = try parsePercent(value),
         .mouse_right_click => settings.right_click = RightClick.parse(value) catch return error.NotRightClick,
@@ -717,6 +780,8 @@ pub const defaults_document =
     "# font.size = 14\n" ++
     "# font.ligatures = true\n" ++
     "# font.nerd_symbols = true\n" ++
+    "# Families tried, in order, for characters the family lacks: a comma-separated list.\n" ++
+    "# font.fallbacks = \"\"\n" ++
     "\n" ++
     "# Colour scheme: a bundled name (gruvbox-dark, catppuccin-latte, dracula, nord, ...), the\n" ++
     "# name of a Ghostty-format file in the themes directory next to this file, or\n" ++
@@ -1188,6 +1253,7 @@ test "every key accepts its documented spellings" {
         \\font.size = 15.5
         \\font.ligatures = false
         \\font.nerd_symbols = false
+        \\font.fallbacks = "Noto Sans Mono CJK SC, ,Symbols Nerd Font Mono "
         \\theme = "solarized"
         \\scratchpad.size = 30
         \\scratchpad.large_size = 100%
@@ -1207,6 +1273,9 @@ test "every key accepts its documented spellings" {
     try testing.expectEqual(@as(f32, 15.5), settings.font_size);
     try testing.expect(!settings.font_ligatures);
     try testing.expect(!settings.font_nerd_symbols);
+    try testing.expectEqual(@as(usize, 2), settings.font_fallbacks.len);
+    try testing.expectEqualStrings("Noto Sans Mono CJK SC", settings.font_fallbacks[0]);
+    try testing.expectEqualStrings("Symbols Nerd Font Mono", settings.font_fallbacks[1]);
     try testing.expectEqualStrings("solarized", settings.theme);
     try testing.expectEqual(@as(u8, 30), settings.scratchpad_size);
     try testing.expectEqual(@as(u8, 100), settings.scratchpad_large_size);
@@ -1216,7 +1285,7 @@ test "every key accepts its documented spellings" {
     try testing.expectEqualStrings("ctrl+shift+t", config.keybinds.items[0].chord);
     try testing.expectEqualStrings("tab.new", config.keybinds.items[0].action.?);
     try testing.expectEqual(@as(?[]const u8, null), config.keybinds.items[0].argument);
-    try testing.expectEqual(@as(u32, 12), config.keybinds.items[0].line);
+    try testing.expectEqual(@as(u32, 13), config.keybinds.items[0].line);
     try testing.expectEqualStrings("alt+1", config.keybinds.items[1].chord);
     try testing.expectEqualStrings("tab.goto", config.keybinds.items[1].action.?);
     try testing.expectEqualStrings("1", config.keybinds.items[1].argument.?);
@@ -1414,6 +1483,7 @@ test "the defaults document round-trips: uncommented, it changes nothing and rep
     try testing.expectEqual(built_in.font_size, config.settings.font_size);
     try testing.expectEqual(built_in.font_ligatures, config.settings.font_ligatures);
     try testing.expectEqual(built_in.font_nerd_symbols, config.settings.font_nerd_symbols);
+    try testing.expectEqual(@as(usize, 0), config.settings.font_fallbacks.len);
     try testing.expectEqual(built_in.scratchpad_size, config.settings.scratchpad_size);
     try testing.expectEqual(built_in.scratchpad_large_size, config.settings.scratchpad_large_size);
     try testing.expectEqual(RightClick.built_in, config.settings.right_click.?);
@@ -1553,6 +1623,116 @@ test "writing a value creates the file from the defaults and edits it in place a
     try testing.expect(std.mem.startsWith(u8, text, defaults_document));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\ntheme = "));
     try testing.expect(std.mem.endsWith(u8, text, "\ntheme = nord\n"));
+}
+
+test "size steps are whole points within 6 to 72 and never jump across the range" {
+    try testing.expectEqual(@as(f32, 15), stepFontPoints(14, .increase));
+    try testing.expectEqual(@as(f32, 13), stepFontPoints(14, .decrease));
+    try testing.expectEqual(@as(f32, 14), stepFontPoints(13.5, .increase));
+    try testing.expectEqual(@as(f32, 13), stepFontPoints(13.5, .decrease));
+    try testing.expectEqual(@as(f32, 72), stepFontPoints(71.5, .increase));
+    try testing.expectEqual(@as(f32, 72), stepFontPoints(72, .increase));
+    try testing.expectEqual(@as(f32, 71), stepFontPoints(72, .decrease));
+    try testing.expectEqual(@as(f32, 6), stepFontPoints(7, .decrease));
+    try testing.expectEqual(@as(f32, 6), stepFontPoints(6, .decrease));
+    try testing.expectEqual(@as(f32, 6), stepFontPoints(6.5, .decrease));
+    // A file may set a size below the stepping range: decrease leaves it, increase enters it.
+    try testing.expectEqual(@as(f32, 3), stepFontPoints(3, .decrease));
+    try testing.expectEqual(@as(f32, 6), stepFontPoints(3, .increase));
+    // Every step parses back as a valid `font.size`.
+    var points: f32 = 1;
+    while (points < 72) {
+        const next = stepFontPoints(points, .increase);
+        var buffer: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "{d}", .{next});
+        try testing.expectEqual(next, try parsePoints(text));
+        points = next;
+    }
+}
+
+test "font.fallbacks splits, trims, bounds and serialises back to itself" {
+    var names: [max_font_fallbacks][]const u8 = undefined;
+    const parsed = try splitFallbacks(" DejaVu Sans Mono ,, Noto Sans Mono CJK SC,", &names);
+    try testing.expectEqual(@as(usize, 2), parsed.len);
+    try testing.expectEqualStrings("DejaVu Sans Mono", parsed[0]);
+    try testing.expectEqualStrings("Noto Sans Mono CJK SC", parsed[1]);
+    // The parsed names live in `names`; other splits use their own storage.
+    var scratch: [max_font_fallbacks][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), (try splitFallbacks("", &scratch)).len);
+    try testing.expectEqual(@as(usize, 8), (try splitFallbacks("a,b,c,d,e,f,g,h", &scratch)).len);
+    try testing.expectError(error.TooManyFallbacks, splitFallbacks("a,b,c,d,e,f,g,h,i", &scratch));
+
+    var buffer: [256]u8 = undefined;
+    const text = try formatFallbacks(&buffer, parsed);
+    try testing.expectEqualStrings("DejaVu Sans Mono, Noto Sans Mono CJK SC", text);
+    try testing.expectEqualStrings("", try formatFallbacks(&buffer, &.{}));
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, formatFallbacks(&tiny, parsed));
+
+    // Written by the edit helper and parsed back, the list is the same.
+    const edited = try setDocumentValue(testing.allocator, "# fonts\n", .font_fallbacks, text);
+    defer testing.allocator.free(edited);
+    try testing.expectEqualStrings("# fonts\nfont.fallbacks = DejaVu Sans Mono, Noto Sans Mono CJK SC\n", edited);
+    var config = try parse(testing.allocator, edited, null);
+    defer config.deinit();
+    try testing.expect(!config.hasDiagnostics());
+    try testing.expectEqual(@as(usize, 2), config.settings.font_fallbacks.len);
+    try testing.expectEqualStrings("Noto Sans Mono CJK SC", config.settings.font_fallbacks[1]);
+
+    // Too many names is a line-numbered problem that keeps the previous list.
+    var rejected = try parse(testing.allocator, "font.fallbacks = a,b,c,d,e,f,g,h,i\n", &config);
+    defer rejected.deinit();
+    try expectDiagnostic(&rejected, 1, "font.fallbacks: expected at most 8 comma-separated families");
+    try testing.expectEqual(@as(usize, 2), rejected.settings.font_fallbacks.len);
+    try testing.expectEqualStrings("DejaVu Sans Mono", rejected.settings.font_fallbacks[0]);
+}
+
+test "each font command's write leaves the rest of the file, comments included, as it was" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/conduit/config", .{tmp.sub_path[0..]});
+    const original =
+        "# my fonts\n" ++
+        "font.size = 13.5 \n" ++
+        "# keep this\n" ++
+        "theme = nord\n";
+    try Io.Dir.cwd().createDirPath(testing.io, directoryOf(path).?);
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = original });
+
+    var buffer: [4096]u8 = undefined;
+    try writeDocumentValue(testing.io, testing.allocator, path, .font_size, "14");
+    try testing.expectEqualStrings(
+        "# my fonts\nfont.size = 14\n# keep this\ntheme = nord\n",
+        try Io.Dir.cwd().readFile(testing.io, path, &buffer),
+    );
+    try writeDocumentValue(testing.io, testing.allocator, path, .font_family, "DejaVu Sans Mono");
+    try writeDocumentValue(testing.io, testing.allocator, path, .font_ligatures, "false");
+    try writeDocumentValue(testing.io, testing.allocator, path, .font_nerd_symbols, "false");
+    try writeDocumentValue(testing.io, testing.allocator, path, .font_fallbacks, "Noto Sans Mono CJK SC");
+    try writeDocumentValue(testing.io, testing.allocator, path, .font_size, "15");
+    try testing.expectEqualStrings(
+        "# my fonts\n" ++
+            "font.size = 15\n" ++
+            "# keep this\n" ++
+            "theme = nord\n" ++
+            "font.family = DejaVu Sans Mono\n" ++
+            "font.ligatures = false\n" ++
+            "font.nerd_symbols = false\n" ++
+            "font.fallbacks = Noto Sans Mono CJK SC\n",
+        try Io.Dir.cwd().readFile(testing.io, path, &buffer),
+    );
+    // The bundled face is the empty family, written quoted so it reads back as empty.
+    try writeDocumentValue(testing.io, testing.allocator, path, .font_family, "");
+    var loaded = try load(testing.io, testing.allocator, path, null);
+    defer loaded.deinit();
+    try testing.expect(!loaded.hasDiagnostics());
+    try testing.expectEqualStrings("", loaded.settings.font_family.?);
+    try testing.expectEqual(@as(f32, 15), loaded.settings.font_size);
+    try testing.expect(!loaded.settings.font_ligatures);
+    try testing.expect(!loaded.settings.font_nerd_symbols);
+    try testing.expectEqualStrings("Noto Sans Mono CJK SC", loaded.settings.font_fallbacks[0]);
+    try testing.expectEqualStrings("nord", loaded.settings.theme);
 }
 
 const WakeProbe = struct {
