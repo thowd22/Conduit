@@ -1722,8 +1722,13 @@ pub fn spawnConPty(gpa: Allocator, request: SpawnRequest) Error!Pty {
     var input = try win.createInputPipe();
     errdefer input.close();
 
-    var console = try win.createPseudoConsole(request.size, output.conpty, input.conpty);
+    var console = try win.createPseudoConsole(request.size, input.conpty, output.conpty);
     errdefer win.closePseudoConsole(console);
+    // The pseudoconsole holds its own duplicates of its two ends now. Conduit's copies go at
+    // once: a held copy of the output pipe's write end is a writer that never leaves, so the
+    // pipe could never break when the pseudoconsole exits and the final drain would never end.
+    input.closeConPtyEnd();
+    output.closeConPtyEnd();
 
     var child = try win.createProcess(gpa, prepared, console);
     errdefer child.close();
@@ -2502,8 +2507,13 @@ const WindowsPipe = struct {
 
     fn close(self: *WindowsPipe) void {
         win.closeHandle(self.conduit);
-        win.closeHandle(self.conpty);
         self.conduit = invalid_handle;
+        self.closeConPtyEnd();
+    }
+
+    /// Release the pseudoconsole's end once `CreatePseudoConsole` has duplicated it.
+    fn closeConPtyEnd(self: *WindowsPipe) void {
+        win.closeHandle(self.conpty);
         self.conpty = invalid_handle;
     }
 };
@@ -3884,6 +3894,8 @@ fn diagRun(gpa: Allocator, use_std_handles: bool, named_output: bool) !void {
     } else if (win.CreatePipe(&output.conduit, &output.conpty, null, 0) == .FALSE) return error.SystemError;
     defer output.close();
     const console = try win.createPseudoConsole(WindowSize.init(24, 80), input.conpty, output.conpty);
+    input.closeConPtyEnd();
+    output.closeConPtyEnd();
     var child = try win.createProcess(gpa, prepared, console);
     defer child.close();
     var collected: std.ArrayList(u8) = .empty;

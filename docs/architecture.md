@@ -542,6 +542,22 @@ nothing else is a legal dependency.
   just seen a full ring, stalling the session forever; a deterministic test parks the reader at
   that point and proves it is woken. A live POSIX terminal therefore holds five descriptors. The
   Windows backend already used separate `space`, `owner_wake` and `stop` events.
+- **ConPTY (TASK-16).** The Windows backend gives `CreatePseudoConsole` the read end of an
+  anonymous input pipe (Conduit keeps the write end and writes it synchronously, like a pty
+  master) and the client end of a one-instance, remote-rejecting named output pipe opened
+  write-only; Conduit's server end is opened `FILE_FLAG_OVERLAPPED`, because an anonymous pipe
+  cannot be read with overlapped IO and the read thread must be woken out of a pending read by
+  the `stop` event. The child gets `STARTF_USESTDHANDLES` with null handles so a Conduit whose
+  own stdio is redirected cannot hand the child those handles instead of the pseudoconsole's.
+  Three threads touch a terminal: the owner (write, resize under an SRW lock, take, destroy),
+  the read thread (overlapped reads into the ring, then the single exit-code observation) and an
+  exit watcher that waits on the process handle and closes the pseudoconsole when the child
+  ends. Closing it is what makes the pseudoconsole flush its last frame and break the pipe, so
+  the read thread drains to `BROKEN_PIPE` and only then publishes the end; the watcher is a
+  separate thread because before Windows 11 24H2 `ClosePseudoConsole` blocks until the output is
+  drained and must not run on the reading thread. `destroy` stops and joins both threads, then
+  closes Conduit's output end before `ClosePseudoConsole` for the same reason. Ctrl+C is the
+  byte 0x03 on the input pipe; hangup/terminate/kill are `TerminateProcess` with 128+signal.
 - **Lands** M1 — TASK-8, TASK-16; TASK-75 (per-direction wake channels).
 
 ### `term`
