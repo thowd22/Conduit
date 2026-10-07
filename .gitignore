@@ -11,3 +11,5 @@ spikes/*/zig-pkg/
 spikes/*/readback.ppm
 # Per-user Claude Code permissions
 .claude/settings.local.json
+# Agent worktrees created by the coordinator harness
+.claude/worktrees/
