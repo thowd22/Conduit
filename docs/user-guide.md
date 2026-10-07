@@ -220,7 +220,8 @@ Ctrl+Shift+G (Cmd+Shift+G), or **Agents** in the palette, opens one list of ever
 workspace: Conduit's own launches and harnesses it noticed you start in a terminal. The
 scratchpad never appears. Each row reads `<glyph> <harness>  <workspace> › <tab>  <task>  <state>
 <last activity>`, ordered like the sidebar (workspace, then tab); states and ages update live while
-the list is open. The task column shows `–` until backlog tasks are linked to agents.
+the list is open. The task column names the backlog task an agent was started on from the
+[backlog view](#backlog-view), or shows `–`.
 
 | Key | Click | Does |
 |---|---|---|
@@ -235,6 +236,50 @@ the list is open. The task column shows `–` until backlog tasks are linked to 
 A message goes to the harness's structured channel without leaving the list. A harness that has
 none (Claude Code today) says `message unsupported` in the status line; type into its tab instead.
 Keys and text over the list never reach the terminal beneath it.
+
+## Backlog view
+
+Ctrl+Shift+K (Cmd+Shift+K), or **Backlog** in the palette, covers the active tab's panes with the
+workspace's [Backlog.md](https://github.com/MrLesk/Backlog.md) project: the `backlog/` directory in
+the focused terminal's current directory (as its shell reports it), else the workspace's directory.
+The view belongs to its workspace and stays open while you switch away; the sidebar, the palette and
+every chord keep working, and the terminals beneath keep running. A directory without `backlog/`
+says `no backlog/ here`. Only Local workspaces are read for now.
+
+The **board** has a column per status in `config.yml`, each card `<id> <title>` over a dim row with
+the agent working on it (glyph, harness, state), labels and assignees. The **list** has every task
+in ordinal order with its status. Completed and draft tasks are not shown. Changes to the files —
+from the `backlog` CLI, an agent, an editor or `git` — appear on their own.
+
+| Key | Click | Does |
+|---|---|---|
+| Left/Right, Up/Down | — | move between columns and cards (Up/Down in the list) |
+| Home/End, PageUp/PageDown | the wheel | first/last card, a page (the wheel scrolls the column under it) |
+| l / b | `list` / `board` | switch mode |
+| Enter | a card | open the task's detail |
+| Escape | `close` | close the view |
+
+The **detail** shows the title, status, priority, assignees, labels, milestone, dependencies, the
+agent working on it, description, acceptance criteria and notes.
+
+| Key | Click | Does |
+|---|---|---|
+| Up/Down, Tab, Home/End, PageUp/PageDown | the wheel | move the cursor between the status and the criteria (and scroll) |
+| s, or Enter on the status | the status row | move the task to the next configured status |
+| Enter or Space on a criterion | the criterion | check or uncheck it |
+| a | `▶ start agent` | choose a harness, then start it on the task (below) |
+| v | `▶ open in vi` | open the task's markdown in `vi` in a new tab and close the view |
+| Escape | `close`, or outside the detail | close the detail |
+
+Status and criteria change through the `backlog` CLI (`backlog task edit`), run in the project
+directory on a worker; the view then reloads the file it rewrote. A CLI error appears in the
+detail's message line; without the CLI the view is read-only (`backlog CLI not found`).
+
+**Start agent** offers the harnesses `agent.launch` would (Enter or a click starts one, Escape or
+`back` returns). The agent opens in a new tab of the workspace, in the project directory, with the
+task as its initial prompt: `TASK-7: <title>`, the description and the acceptance criteria (at most
+16 KiB; longer tasks are cut and marked). Its card, list row and detail then show its glyph, harness
+and state live, and the [agent manager](#agent-manager) names the task in its task column.
 
 ## Settings view
 
@@ -373,6 +418,7 @@ command except the fixed ones at the end can be rebound or unbound with `keybind
 | Open terminal search (fixed) | `search.open` | Ctrl+Shift+F |
 | Agent: toggle view | `agent.view` | Ctrl+Shift+A |
 | Agents | `agents.open` | Ctrl+Shift+G |
+| Backlog | `backlog.open` | Ctrl+Shift+K |
 
 ### macOS
 
@@ -410,6 +456,7 @@ macOS chords are the shipped defaults for macOS builds; they have not been run o
 | Open terminal search (fixed) | `search.open` | Cmd+F |
 | Agent: toggle view | `agent.view` | Cmd+Shift+A |
 | Agents | `agents.open` | Cmd+Shift+G |
+| Backlog | `backlog.open` | Cmd+Shift+K |
 
 ### Commands with no default chord
 
@@ -440,4 +487,6 @@ These belong to the surface that has focus and are not rebindable yet. All platf
 | Scratchpad (shown) | Escape hides it |
 | Agent view | Up/Down, PageUp/PageDown, Home/End scroll; Tab/Shift+Tab move between references and choices; Left/Right between a request's choices; Enter opens or answers; Shift+arrows select; Escape clears |
 | Agent manager | Up/Down, Tab/Shift+Tab, Home/End move; Enter focuses; s stop; r restart; m message; n new; Escape closes or goes back |
+| Backlog view | arrows, Home/End, PageUp/PageDown move; l list; b board; Enter opens a task; Escape closes |
+| Backlog task detail | Up/Down, Tab, Home/End, PageUp/PageDown move; Enter or Space toggles; s status; a start agent; v open in vi; Escape closes (or leaves the harness choice) |
 | Any text field | Left/Right/Home/End (Shift extends the selection), Backspace, Delete; Ctrl+A / Ctrl+C / Ctrl+V (Cmd on macOS) select all, copy, paste |

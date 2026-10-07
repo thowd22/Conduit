@@ -98,6 +98,9 @@ const agent = @import("agent");
 const remote = @import("remote.zig");
 /// The agent view's log, rows, selection and search model (TASK-57).
 const agent_view = @import("agent_view.zig");
+/// The backlog view's board, list, detail and write-queue model (TASK-63).
+const backlog_view = @import("backlog_view.zig");
+const backlog = @import("backlog");
 const ssh = workspace.ssh;
 
 test {
@@ -105,6 +108,7 @@ test {
     _ = app_agents;
     _ = remote;
     _ = agent_view;
+    _ = backlog_view;
 }
 /// The input module, imported under a name that does not collide with the app's
 /// `input` buffer field. A module shadowed by a local reads as "the buffer"
@@ -349,6 +353,11 @@ pub const Run = struct {
     /// palette, keyboard and mouse. Runs in `--agent-test`'s environment
     /// (the flag sets `agent_test` too) with TASK-56's fake script.
     agent_manager_test: bool = false,
+    /// Exercise TASK-63 and TASK-64: the backlog view over a fixture project
+    /// with a fake `backlog` CLI, its board, list and detail by keyboard and
+    /// mouse, writes, live reloads and an agent started on a task. Runs in
+    /// `--agent-test`'s environment (the flag sets `agent_test` too).
+    backlog_test: bool = false,
     /// The private directory `--agent-test` keeps its agent sinks and its
     /// background-tab trigger in. Not a command-line flag: `runApp` sets it.
     agent_test_dir: ?[]const u8 = null,
@@ -618,6 +627,9 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
         } else if (std.mem.eql(u8, arg, "--agent-manager-test")) {
             run.agent_test = true;
             run.agent_manager_test = true;
+        } else if (std.mem.eql(u8, arg, "--backlog-test")) {
+            run.agent_test = true;
+            run.backlog_test = true;
         } else if (std.mem.eql(u8, arg, "--ssh-test")) {
             run.ssh_test = true;
         } else if (std.mem.eql(u8, arg, "--font-test")) {
@@ -1515,6 +1527,8 @@ const ChildSpec = struct {
         "CONDUIT_AGENT_SINK",
         "CONDUIT_AGENT_GATE",
         fake_agent_env,
+        // The backlog view's test stand-in (TASK-63) is the app's, not a child's.
+        backlog_cli_env,
     };
 
     /// A child's environment while it is being built: the key-replacing map
@@ -2008,6 +2022,39 @@ const manager_hint = "Enter focus  s stop  r restart  m message  n new  Esc clos
 /// What the manager is doing: listing agents, typing a message to the
 /// highlighted one, or one step of the new-agent flow.
 const ManagerMode = enum { browse, message, new_harness, new_workspace, new_prompt };
+/// TASK-63: the backlog view, and the semantic action its cards, rows and
+/// controls dispatch.
+const backlog_open_action = "backlog.open";
+const backlog_activate_action = "backlog.activate";
+/// The most board cards (or list rows) one frame registers; each takes a
+/// row, a meta row and an agent-state element.
+const backlog_card_capacity: usize = 160;
+/// The most detail rows one frame registers.
+const backlog_detail_row_capacity: usize = 128;
+/// Every backlog-view element one frame registers: cards (each a row, a meta
+/// row, an agent-state and a column-state element), detail rows, column
+/// headings and the view's controls, message and hint.
+const backlog_element_capacity: usize = 4 * backlog_card_capacity + backlog_detail_row_capacity +
+    backlog_view.max_columns + backlog_harness_capacity + 16;
+const backlog_harness_capacity: usize = agent.Harness.all.len + 1;
+/// The longest backlog element id an activation copies.
+const backlog_id_capacity: usize = 160;
+
+/// Where the last frame laid the board out, in cells.
+const BacklogLayout = struct {
+    x0: u32 = 0,
+    column_width: u32 = 1,
+    gap: u32 = 0,
+    columns: u32 = 0,
+    /// Cards (board) or rows (list) one page holds.
+    page: usize = 1,
+};
+/// How often an open view looks for changed backlog files while nothing
+/// else wakes the loop, in milliseconds.
+const backlog_tick_ms: i32 = 250;
+const backlog_hint = "←→↑↓ move  Enter open  l list  b board  Esc close";
+const backlog_detail_hint = "↑↓ Enter toggle  s status  a agent  v vi  Esc";
+const backlog_chooser_hint = "Enter start  Esc back";
 /// The most agent-view elements one frame registers: the surfaces, visible
 /// rows and their controls of every pane that shows a view.
 const agent_view_element_capacity: usize = 384;
@@ -2032,6 +2079,18 @@ const no_remote_choices = [_]inputmod.PaletteChoice{.{ .label = "Enter user@host
 /// Offers the scripted fake harness (TASK-56) to a run that also has the test
 /// driver, which is how the `agent-notifications` E2E scenario reaches it.
 const fake_agent_env = "CONDUIT_TEST_FAKE_AGENT";
+/// Names the program the backlog view runs instead of `backlog` (TASK-63), for
+/// a run that also has the test driver: how the `backlog-board` E2E scenario
+/// moves a task without the real CLI. A relative path resolves in the
+/// project directory, where the CLI runs. Ignored without the driver.
+const backlog_cli_env = "CONDUIT_TEST_BACKLOG_CLI";
+
+/// The CLI the backlog view runs: `backlog`, or a driven run's stand-in.
+fn backlogProgram(options: Options, env: EnvSource) []const u8 {
+    if (options.run.test_driver_endpoint == null) return "backlog";
+    const program = env.get(backlog_cli_env) orelse return "backlog";
+    return if (program.len == 0) "backlog" else program;
+}
 /// The file `--agent-test`'s background tab waits for.
 const agent_test_trigger_env = "CONDUIT_AGENT_TEST_TRIGGER";
 const agent_choice_capacity: usize = 32;
@@ -2075,7 +2134,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 78;
+const action_capacity_base: usize = 80;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 const settings_open_action = "settings.open";
@@ -2196,10 +2255,11 @@ const search_candidate_budget: usize = 32;
 // one per tab row.
 const semantic_element_capacity: usize = sidebar_element_capacity + terminal_link_capacity +
     search_highlight_capacity + 13 + settings_visible_capacity + 4 + sidebar_element_capacity +
-    agent_view_element_capacity + manager_element_capacity;
+    agent_view_element_capacity + manager_element_capacity + backlog_element_capacity;
 /// Copied Run descriptors per frame: the preedit's three, a few chrome
-/// rows, and up to four per agent-view row (TASK-57).
-const semantic_run_capacity: usize = 6 + 4 * agent_view_element_capacity + 8;
+/// rows, up to four per agent-view row (TASK-57) and one per backlog-view
+/// text (TASK-63).
+const semantic_run_capacity: usize = 6 + 4 * agent_view_element_capacity + 8 + backlog_element_capacity;
 
 /// The vertical gap, in logical pixels, above every workspace after the first
 /// in the sidebar (TASK-77). It is scaled by the window scale where it is
@@ -3227,7 +3287,19 @@ const WorkspacePresentation = struct {
     /// The SSH half of an SSH workspace (TASK-43), or null for a Local one.
     /// Owned; released with the presentation.
     remote: ?*RemotePresentation = null,
+    /// The workspace's backlog view (TASK-63), created the first time it
+    /// opens. Owned; released (its write joined) before the workspace.
+    backlog: ?*backlog_view.Panel = null,
 };
+
+/// Release a workspace's backlog view, joining a write in flight that borrows
+/// the workspace's context. Main thread.
+fn releaseBacklog(allocator: Allocator, presentation: *WorkspacePresentation) void {
+    const panel = presentation.backlog orelse return;
+    panel.deinit();
+    allocator.destroy(panel);
+    presentation.backlog = null;
+}
 
 /// The app's state for one SSH workspace (TASK-43 part two, decision-8).
 ///
@@ -3687,6 +3759,7 @@ fn buildConfiguredBindings(
     try overrides.append(allocator, .{ .chord = notificationsChord(profile), .action = notifications_open_action });
     try overrides.append(allocator, .{ .chord = agentViewChord(profile), .action = agent_view_action });
     try overrides.append(allocator, .{ .chord = agentsManagerChord(profile), .action = agents_open_action });
+    try overrides.append(allocator, .{ .chord = backlogChord(profile), .action = backlog_open_action });
     for (loaded.keybinds.items) |keybind| {
         const chord = inputmod.parseChord(keybind.chord) catch |err| {
             loaded.addDiagnostic(keybind.line, "{s}", .{chordErrorMessage(err)});
@@ -3744,6 +3817,15 @@ fn agentSinkRoot(io: Io, env: EnvSource, options: Options, buffer: []u8) ?[]cons
 /// Ctrl+Shift+N on Linux and Windows, Cmd+Shift+N on macOS: the notification
 /// list (TASK-56). Free in both shipped default tables.
 /// TASK-57's view toggle, an app default beside the list chord.
+/// TASK-63's backlog view: Command+Shift+K on macOS, Ctrl+Shift+K elsewhere
+/// (`K` for kanban: Ctrl+Shift+B is the sidebar toggle).
+fn backlogChord(profile: inputmod.PlatformProfile) inputmod.Chord {
+    return switch (profile) {
+        .macos => .{ .key = .{ .character = 'k' }, .modifiers = .{ .shift = true, .super = true } },
+        .linux_windows => .{ .key = .{ .character = 'k' }, .modifiers = .{ .ctrl = true, .shift = true } },
+    };
+}
+
 /// TASK-58's agent manager: Command+Shift+G on macOS, Ctrl+Shift+G elsewhere.
 fn agentsManagerChord(profile: inputmod.PlatformProfile) inputmod.Chord {
     return switch (profile) {
@@ -4460,6 +4542,30 @@ const App = struct {
     manager_choice_selected: usize = 0,
     manager_new_choice: ?app_agents.Choice = null,
     manager_new_workspace: ?workspace.WorkspaceKey = null,
+    /// The backlog view (TASK-63). Main thread. Each workspace's state is
+    /// its presentation's `backlog` panel; this is what composing it needs.
+    /// Element ids and labels of the last two frames live in alternating
+    /// arenas (reset, never freed, between frames), so focus and a press
+    /// survive recomposition as the manager's two-generation ids do.
+    backlog_frames: [2]std.heap.ArenaAllocator,
+    backlog_frame: u1 = 0,
+    backlog_pointer_owned: bool = false,
+    /// Hover is shown only after real pointer motion over the view, so a
+    /// pointer resting where the view opens does not highlight a card.
+    backlog_hover_armed: bool = false,
+    /// The CLI the view's writes run, resolved on the context's PATH.
+    /// `--backlog-test` points it at a fake.
+    backlog_program: []const u8 = "backlog",
+    /// The harnesses the detail's start-agent chooser offers (TASK-64).
+    backlog_harness: [backlog_harness_capacity]app_agents.Choice = undefined,
+    backlog_harness_labels: [backlog_harness_capacity][96]u8 = undefined,
+    backlog_harness_label_lens: [backlog_harness_capacity]usize = undefined,
+    backlog_harness_count: usize = 0,
+    /// Where the last frame put the board's columns, for the wheel, and how
+    /// many cards or rows one page holds.
+    backlog_layout: BacklogLayout = .{},
+    /// Rows one detail page holds, from the last frame.
+    backlog_detail_page: usize = 1,
     /// TASK-57: element ids and their targets for the agent views of the
     /// last two frames (ids must outlive one frame for focus reconciliation).
     agent_view_index: usize = 0,
@@ -5289,6 +5395,18 @@ const App = struct {
             .handler = agentsActivateAction,
             .palette = null,
         });
+        // TASK-63: the workspace's backlog board, list and task detail.
+        try actions.register(.{
+            .name = backlog_open_action,
+            .label = "Backlog",
+            .handler = backlogOpenAction,
+        });
+        try actions.register(.{
+            .name = backlog_activate_action,
+            .label = "Activate backlog view element",
+            .handler = backlogActivateAction,
+            .palette = null,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -5434,6 +5552,8 @@ const App = struct {
             .search_query = search_query,
             .settings_input = settings_input,
             .manager_input = manager_input,
+            .backlog_frames = .{ .init(allocator), .init(allocator) },
+            .backlog_program = backlogProgram(options, env),
             .right_click = config.Layer.resolve(config.RightClick, config.RightClick.built_in, loaded_config.settings.right_click, options.run.right_click),
             .session_right_click = options.run.right_click,
             .session_font_family = session_font_family,
@@ -6383,7 +6503,10 @@ const App = struct {
         self.agent_spec.deinit();
         // Host probes borrow their workspaces' contexts: joined before the
         // registry releases them below.
-        for (self.workspace_presentations.items) |presentation| self.releaseRemote(presentation);
+        for (self.workspace_presentations.items) |presentation| {
+            self.releaseRemote(presentation);
+            releaseBacklog(self.allocator, presentation);
+        }
         self.remote_spec.deinit();
         self.ssh_client_spec.deinit();
         self.local_files.deinit();
@@ -6394,6 +6517,7 @@ const App = struct {
         self.search_query.deinit();
         self.settings_input.deinit();
         self.manager_input.deinit();
+        for (&self.backlog_frames) |*frame| frame.deinit();
         self.palette_argument.deinit();
         self.palette_query.deinit();
         self.palette_model.deinit();
@@ -7209,7 +7333,7 @@ const App = struct {
     fn openContextMenu(self: *App, col: u32, row: u32, link_id: ?[]const u8) !void {
         if (self.contextMenuVisible() or self.notificationsVisible() or self.paletteVisible() or self.settingsVisible() or self.closeModalActive() or
             self.managerVisible() or self.rename_tab_id != null or self.search_visible or self.scratchpadVisible() or
-            self.ui_pointer_owned or self.sidebar_dragging or self.dragged_divider_id != null or
+            self.backlogShown() or self.ui_pointer_owned or self.sidebar_dragging or self.dragged_divider_id != null or
             self.dragged_tab_id != null) return;
         var menu: ContextMenu = .{
             .col = col,
@@ -7527,6 +7651,19 @@ const App = struct {
     /// process spawned through the workspace's ExecutionContext in the
     /// invoking session's cwd. Refusals are status lines, never errors.
     fn launchAgent(self: *App, choice: app_agents.Choice, prompt: ?[]const u8) !void {
+        return self.launchAgentWith(choice, prompt, .{});
+    }
+
+    /// Where and for what an agent starts beyond `agent.launch`'s defaults.
+    const AgentLaunchOptions = struct {
+        /// The agent's cwd instead of the active session's; borrowed.
+        cwd: ?[]const u8 = null,
+        /// The backlog task it works on (TASK-64); borrowed, copied by the
+        /// runner.
+        task_id: ?[]const u8 = null,
+    };
+
+    fn launchAgentWith(self: *App, choice: app_agents.Choice, prompt: ?[]const u8, options: AgentLaunchOptions) !void {
         const presentation = self.activePresentation();
         if (presentation.load != null) {
             self.setWorkspaceStatus("agent launch deferred: a start is in progress");
@@ -7536,7 +7673,7 @@ const App = struct {
         if (!try self.prepareToLeaveActiveSession()) return;
         const key = presentation.key;
         const model = self.activeWorkspace();
-        const inherited = self.activeLive().workingDirectory() orelse model.workingDirectory();
+        const inherited = options.cwd orelse self.activeLive().workingDirectory() orelse model.workingDirectory();
         const cwd = try self.allocator.dupe(u8, inherited);
         var cwd_owned = true;
         defer if (cwd_owned) self.allocator.free(cwd);
@@ -7561,6 +7698,7 @@ const App = struct {
             .home = self.home_dir,
             .claude_config_dir = self.claude_config_dir,
             .codex_home = self.codex_home,
+            .task_id = options.task_id,
         }) catch |err| {
             self.setWorkspaceStatus(switch (err) {
                 error.RemoteUnsupported => "this agent needs a local workspace for now",
@@ -9028,7 +9166,7 @@ const App = struct {
                 .harness = self.agents.displayName(record),
                 .workspace = workspace_name,
                 .tab = self.sessionTabName(record.workspace, record.session) orelse "(closed)",
-                .task = null,
+                .task = if (self.agents.runnerForAgent(id)) |runner| runner.taskId() else null,
                 .state = app_agents.managerStateWord(record),
                 .age = formatAge(&age_buffer, self.agents.lastActivity(id) orelse now, now),
             });
@@ -9599,6 +9737,922 @@ const App = struct {
         if (origin.value.len > id_storage.len) return;
         @memcpy(id_storage[0..origin.value.len], origin.value);
         try self.activateManagerElement(id_storage[0..origin.value.len]);
+    }
+
+    // The backlog view (TASK-63, TASK-64) -------------------------------------
+
+    /// The active workspace's panel, when its view is open.
+    fn shownBacklog(self: *App) ?*backlog_view.Panel {
+        if (self.workspace_registry.count() == 0) return null;
+        const panel = self.activePresentation().backlog orelse return null;
+        return if (panel.open) panel else null;
+    }
+
+    fn backlogShown(self: *const App) bool {
+        if (self.workspace_registry.count() == 0) return false;
+        const panel = self.activePresentationConst().backlog orelse return false;
+        return panel.open;
+    }
+
+    /// Whether the loop should wake on `backlog_tick_ms` to look for changed
+    /// files or a finished write.
+    fn backlogNeedsTick(self: *const App) bool {
+        for (self.workspace_presentations.items) |presentation| {
+            const panel = presentation.backlog orelse continue;
+            if (panel.open or panel.busy()) return true;
+        }
+        return false;
+    }
+
+    /// Poll every open view's files and every write in flight; true when the
+    /// active workspace's view changed.
+    fn pollBacklog(self: *App) bool {
+        const active = self.workspace_registry.activeKey();
+        var changed = false;
+        for (self.workspace_presentations.items) |presentation| {
+            const panel = presentation.backlog orelse continue;
+            if (!panel.open and !panel.busy()) continue;
+            const panel_changed = panel.poll(self.backlog_program) catch |err| {
+                log.warn("the backlog could not be refreshed: {s}", .{@errorName(err)});
+                continue;
+            };
+            if (panel_changed and active != null and presentation.key == active.?) changed = true;
+        }
+        return changed;
+    }
+
+    /// The worker's wake: post an event so a blocked loop collects the write.
+    fn backlogWake(context: ?*anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(context.?));
+        self.window.postDriverWake() catch |err| {
+            log.debug("could not wake the event loop for a backlog write: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// `<dir>/backlog` for the active session's tracked cwd, else the
+    /// workspace's directory, else (an unnamed Local workspace) this
+    /// process's own directory.
+    fn backlogRoot(self: *App, buffer: []u8) ?[]const u8 {
+        const dir = self.activeLive().workingDirectory() orelse self.activeWorkspace().workingDirectory();
+        if (dir.len != 0) return backlog.Project.rootFor(buffer, dir) catch null;
+        const cwd = std.process.currentPathAlloc(self.io, self.allocator) catch return null;
+        defer self.allocator.free(cwd);
+        return backlog.Project.rootFor(buffer, cwd) catch null;
+    }
+
+    fn openBacklog(self: *App) !void {
+        if (self.workspace_registry.count() == 0 or self.backlogShown()) return;
+        if (self.closeModalActive() or self.rename_tab_id != null or self.ui_pointer_owned or self.sidebar_dragging or
+            self.dragged_divider_id != null or self.dragged_tab_id != null) return;
+        const presentation = self.activePresentation();
+        const model = self.activeWorkspace();
+        const panel = presentation.backlog orelse created: {
+            const created = try self.allocator.create(backlog_view.Panel);
+            created.* = backlog_view.Panel.init(self.allocator, self.io, .{ .context = self, .wake_fn = backlogWake });
+            presentation.backlog = created;
+            break :created created;
+        };
+        if (self.search_visible) try self.closeSearch();
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        panel.open = true;
+        panel.detail = null;
+        panel.message_len = 0;
+        panel.state.follow = true;
+        self.backlog_hover_armed = false;
+        if (model.contextKind() != .local) {
+            panel.unload();
+            panel.problem = .remote;
+        } else {
+            var root_buffer: [Dir.max_path_bytes]u8 = undefined;
+            if (self.backlogRoot(&root_buffer)) |root| {
+                try panel.load(model.contextRef(), root);
+            } else {
+                panel.unload();
+                panel.problem = .unreadable;
+            }
+        }
+        // The detail's start-agent chooser lists what detection found.
+        self.ensureAgentDetection();
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    fn closeBacklog(self: *App) !void {
+        const panel = self.shownBacklog() orelse return;
+        panel.open = false;
+        panel.detail = null;
+        panel.unload();
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    fn backlogOpenAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        if (self.backlogShown()) return self.closeBacklog();
+        try self.openBacklog();
+    }
+
+    fn backlogActivateAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const origin = invocation.origin orelse return;
+        var id_storage: [backlog_id_capacity]u8 = undefined;
+        if (origin.value.len > id_storage.len) return;
+        @memcpy(id_storage[0..origin.value.len], origin.value);
+        try self.activateBacklogElement(id_storage[0..origin.value.len]);
+    }
+
+    /// The pane area the view covers: every visible pane of the active tab.
+    fn backlogBounds(self: *const App) ?ui.Rect {
+        if (!self.backlogShown()) return null;
+        var left: u32 = std.math.maxInt(u32);
+        var top: u32 = std.math.maxInt(u32);
+        var right: u32 = 0;
+        var bottom: u32 = 0;
+        for (self.pane_layouts[0..self.pane_layout_count]) |layout| {
+            if (layout.pane_id == connection_pane_id) continue;
+            left = @min(left, layout.rect.col);
+            top = @min(top, layout.rect.row);
+            right = @max(right, @as(u32, layout.rect.col) + layout.rect.cols);
+            bottom = @max(bottom, @as(u32, layout.rect.row) + layout.rect.rows);
+        }
+        if (right <= left or bottom <= top) return null;
+        if (right - left < 24 or bottom - top < 8) return null;
+        return .{ .x = left, .y = top, .width = right - left, .height = bottom - top };
+    }
+
+    /// The task detail, centred over the view.
+    fn backlogDetailBounds(view: ui.Rect) ?ui.Rect {
+        if (view.width < 24 or view.height < 10) return null;
+        const width = @min(view.width - 2, @as(u32, 78));
+        return .{ .x = view.x + (view.width - width) / 2, .y = view.y + 1, .width = width, .height = view.height - 2 };
+    }
+
+    /// What one agent working on a task shows, and its state's tag for the
+    /// semantic-only `.agent.<state>` element.
+    const BacklogAgent = struct { badge: backlog_view.AgentBadge, tag: []const u8 };
+
+    /// The agent started on task `task_id` of the project in `project_dir`:
+    /// a live one before an exited one, then the newest. Matching the
+    /// project directory keeps two projects' `TASK-1` apart.
+    fn backlogAgent(self: *App, project_dir: []const u8, task_id: []const u8) ?BacklogAgent {
+        var best: ?*const agent.Agent = null;
+        for (self.agents.runners.items) |runner| {
+            if (runner.closing) continue;
+            const id = runner.agent_id orelse continue;
+            const task = runner.taskId() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(task, task_id) or !std.mem.eql(u8, runner.cwd, project_dir)) continue;
+            const record = self.agents.registry.get(id) orelse continue;
+            if (best) |current| {
+                const better = (current.hasExited() and !record.hasExited()) or
+                    (current.hasExited() == record.hasExited() and @intFromEnum(record.id) > @intFromEnum(current.id));
+                if (!better) continue;
+            }
+            best = record;
+        }
+        const record = best orelse return null;
+        return .{
+            .badge = .{
+                .glyph = app_agents.stateGlyph(record.state),
+                .harness = self.agents.displayName(record),
+                .state = app_agents.managerStateWord(record),
+            },
+            .tag = if (record.hasExited()) "exited" else @tagName(record.state),
+        };
+    }
+
+    fn addBacklogText(self: *App, parent: ui.Id, id_text: []const u8, role: []const u8, text: []const u8, style: ui.TextStyle, bounds: ui.Rect) !void {
+        const runs = [_]ui.Run{.{ .text = text, .style = style }};
+        try self.ui_tree.addText(.{
+            .id = .{ .value = id_text },
+            .parent = parent,
+            .role = role,
+            .label = text,
+            .bounds = bounds,
+        }, .{ .runs = &runs });
+    }
+
+    /// One clickable row or control of the view. Hover shows only once the
+    /// pointer has moved over the view.
+    fn addBacklogInteractive(self: *App, parent: ui.Id, id_text: []const u8, role: []const u8, label: []const u8, selected: bool, normal: ui.TextStyle, bounds: ui.Rect) !void {
+        const id: ui.Id = .{ .value = id_text };
+        const highlighted: ui.TextStyle = .{ .foreground = .strong, .background = .selection };
+        const resting = if (selected) highlighted else normal;
+        var hovered = resting;
+        if (self.backlog_hover_armed) hovered.underline = .accent;
+        if (self.backlog_hover_armed and !selected) hovered.foreground = .strong;
+        try self.ui_tree.addInteractiveText(.{
+            .id = id,
+            .parent = parent,
+            .role = role,
+            .label = label,
+            .selected = selected,
+            .action = backlog_activate_action,
+            .bounds = bounds,
+        }, .{
+            .id = id,
+            .label = label,
+            .action = backlog_activate_action,
+            .normal = resting,
+            .hovered = hovered,
+            .focused = .{ .foreground = .on_accent, .background = .accent },
+        });
+    }
+
+    /// The view: a `Surface` over the pane area with the mode and close
+    /// controls, the board (a column per status) or the ordinal list, a
+    /// message line, a key hint, and the open task's detail above them.
+    /// Every id and label is copied into this frame's arena.
+    fn composeBacklog(self: *App) !void {
+        self.backlog_frame +%= 1;
+        const frame = &self.backlog_frames[self.backlog_frame];
+        _ = frame.reset(.retain_capacity);
+        const bounds = self.backlogBounds() orelse return;
+        const panel = self.shownBacklog() orelse return;
+        const arena = frame.allocator();
+        const view_id: ui.Id = .{ .value = "backlog.view" };
+        const name = if (panel.project) |*project| project.config().project_name else "";
+        const title = if (name.len != 0)
+            try std.fmt.allocPrint(arena, " Backlog · {s} ", .{try backlog_view.oneLine(arena, name)})
+        else
+            " Backlog ";
+        try self.ui_tree.addSurface(.{
+            .id = view_id,
+            .role = "backlog",
+            .label = "Backlog",
+            .bounds = bounds,
+        }, .{
+            .rect = bounds,
+            .erase_underlay = true,
+            .fill = .background,
+            .border = .single,
+            .border_style = .{ .foreground = .border, .background = .background },
+            .title = title,
+            .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
+        });
+        const x0 = bounds.x + 1;
+        const width = bounds.width - 2;
+        const y0 = bounds.y + 1;
+        const height = bounds.height - 2;
+        const muted: ui.TextStyle = .{ .foreground = .muted };
+        const control: ui.TextStyle = .{ .foreground = .accent };
+        try self.addBacklogInteractive(view_id, "backlog.mode.board", "mode", "board", panel.state.mode == .board, control, .{ .x = x0, .y = y0, .width = 5, .height = 1 });
+        try self.addBacklogInteractive(view_id, "backlog.mode.list", "mode", "list", panel.state.mode == .list, control, .{ .x = x0 + 6, .y = y0, .width = 4, .height = 1 });
+        try self.addBacklogInteractive(view_id, "backlog.close", "button", "close", false, muted, .{ .x = x0 + width - 5, .y = y0, .width = 5, .height = 1 });
+        if (panel.project != null and width > 30) {
+            const count = try std.fmt.allocPrint(arena, "{d} task{s}", .{ panel.board.list.len, if (panel.board.list.len == 1) "" else "s" });
+            try self.addBacklogText(view_id, "backlog.summary", "status", count, muted, .{ .x = x0 + 12, .y = y0, .width = @min(@as(u32, @intCast(count.len)), width -| 18), .height = 1 });
+        }
+
+        const content_top = y0 + 1;
+        const content_rows = height -| 3;
+        if (panel.project == null) {
+            const problem = if (panel.problem) |found| found.text() else "no backlog/ here";
+            try self.addBacklogText(view_id, "backlog.empty", "status", problem, muted, .{ .x = x0, .y = content_top + 1, .width = width, .height = 1 });
+        } else if (panel.board.isEmpty()) {
+            try self.addBacklogText(view_id, "backlog.empty", "status", "no tasks in backlog/tasks", muted, .{ .x = x0, .y = content_top + 1, .width = width, .height = 1 });
+        } else switch (panel.state.mode) {
+            .board => try self.composeBacklogBoard(panel, view_id, arena, x0, width, content_top, content_rows),
+            .list => try self.composeBacklogList(panel, view_id, arena, x0, width, content_top, content_rows),
+        }
+        if (panel.detail == null) {
+            if (panel.message()) |text| {
+                try self.addBacklogText(view_id, "backlog.message", "status", text, if (panel.message_failed) .{ .foreground = .attention } else muted, .{ .x = x0, .y = y0 + height - 2, .width = width, .height = 1 });
+            }
+        }
+        try self.addBacklogText(view_id, "backlog.hint", "status", backlog_hint, muted, .{ .x = x0, .y = y0 + height - 1, .width = width, .height = 1 });
+        if (panel.detail != null) try self.composeBacklogDetail(panel, bounds, arena);
+    }
+
+    /// A card's id, or null for a task whose id is not one (the parser keeps
+    /// any id a file names; only a task id may become an element id).
+    fn backlogCardId(arena: Allocator, task_id: []const u8, suffix: []const u8) !?[]const u8 {
+        if (!backlog.isTaskId(task_id)) return null;
+        return try std.fmt.allocPrint(arena, "backlog.task.{s}{s}", .{ task_id, suffix });
+    }
+
+    fn composeBacklogCardExtras(self: *App, panel: *backlog_view.Panel, arena: Allocator, parent: ui.Id, card: *const backlog_view.Card, meta_bounds: ?ui.Rect, x: u32, y: u32) !?BacklogAgent {
+        const dir = panel.projectDirectory() orelse "";
+        const linked = self.backlogAgent(dir, card.task.id);
+        if (meta_bounds) |row| {
+            const buffer = try arena.alloc(u8, card.meta.len + 160);
+            const meta = backlog_view.metaWithBadge(buffer, card.meta, if (linked) |found| found.badge else null);
+            if (meta.len != 0) {
+                const meta_id = (try backlogCardId(arena, card.task.id, ".meta")) orelse return linked;
+                try self.addBacklogText(parent, meta_id, "meta", meta, .{ .foreground = .muted, .small = true }, row);
+            }
+        }
+        if (linked) |found| {
+            const state_id = (try backlogCardId(arena, card.task.id, try std.fmt.allocPrint(arena, ".agent.{s}", .{found.tag}))) orelse return linked;
+            // Semantic only: the row painted over it shows the glyph.
+            try self.ui_tree.addText(.{
+                .id = .{ .value = state_id },
+                .parent = parent,
+                .role = "agent_state",
+                .label = found.badge.harness,
+                .bounds = .{ .x = x, .y = y, .width = 1, .height = 1 },
+            }, .{ .runs = &.{} });
+        }
+        return linked;
+    }
+
+    fn composeBacklogBoard(self: *App, panel: *backlog_view.Panel, view_id: ui.Id, arena: Allocator, x0: u32, width: u32, top: u32, rows: u32) !void {
+        const board = panel.board;
+        const columns: u32 = @intCast(board.columns.len);
+        if (columns == 0 or rows < 3) return;
+        const gap: u32 = 1;
+        const column_width = @max((width -| gap * (columns - 1)) / columns, 1);
+        const slots: usize = @max((rows - 1) / 2, 1);
+        self.backlog_layout = .{ .x0 = x0, .column_width = column_width, .gap = gap, .columns = columns, .page = slots };
+        const selected_id = panel.state.selected();
+        var budget = backlog_card_capacity;
+        for (board.columns, 0..) |column, column_index| {
+            const x = x0 + @as(u32, @intCast(column_index)) * (column_width + gap);
+            const heading = try std.fmt.allocPrint(arena, "{s} ({d})", .{ try backlog_view.oneLine(arena, column.title), column.cards.len });
+            try self.addBacklogText(view_id, try std.fmt.allocPrint(arena, "backlog.column.{d}", .{column_index}), "column", heading, .{ .foreground = .strong, .face_style = .bold, .underline = .border }, .{ .x = x, .y = top, .width = column_width, .height = 1 });
+            const scroll = &panel.state.scroll[@min(column_index, backlog_view.max_columns - 1)];
+            if (panel.state.follow and selected_id != null and panel.state.selected_column == column_index) {
+                backlog_view.keepVisible(scroll, panel.state.selected_row, column.cards.len, slots);
+            }
+            scroll.* = @min(scroll.*, column.cards.len -| slots);
+            const end = @min(column.cards.len, scroll.* + slots);
+            for (column.cards[scroll.*..end], 0..) |*card, slot| {
+                if (budget == 0) return;
+                budget -= 1;
+                const y = top + 1 + @as(u32, @intCast(slot)) * 2;
+                const selected = selected_id != null and std.ascii.eqlIgnoreCase(selected_id.?, card.task.id);
+                if (try backlogCardId(arena, card.task.id, "")) |id_text| {
+                    try self.addBacklogInteractive(view_id, id_text, "task", card.label, selected, .{ .foreground = .foreground }, .{ .x = x, .y = y, .width = column_width, .height = 1 });
+                } else {
+                    try self.addBacklogText(view_id, try std.fmt.allocPrint(arena, "backlog.card.{d}.{d}", .{ column_index, slot }), "task", card.label, .{ .foreground = .muted }, .{ .x = x, .y = y, .width = column_width, .height = 1 });
+                }
+                _ = try self.composeBacklogCardExtras(panel, arena, view_id, card, .{ .x = x, .y = y + 1, .width = column_width, .height = 1 }, x, y + 1);
+                // Semantic only: which column the card is in, so a driver
+                // can wait for a move by id.
+                if (try backlogCardId(arena, card.task.id, try std.fmt.allocPrint(arena, ".column.{d}", .{column_index}))) |column_id| {
+                    try self.ui_tree.addText(.{
+                        .id = .{ .value = column_id },
+                        .parent = view_id,
+                        .role = "column_state",
+                        .label = column.title,
+                        .bounds = .{ .x = x, .y = y, .width = 1, .height = 1 },
+                    }, .{ .runs = &.{} });
+                }
+            }
+        }
+    }
+
+    fn composeBacklogList(self: *App, panel: *backlog_view.Panel, view_id: ui.Id, arena: Allocator, x0: u32, width: u32, top: u32, rows: u32) !void {
+        const list = panel.board.list;
+        if (rows < 2) return;
+        const visible: usize = @min(rows - 1, backlog_card_capacity);
+        self.backlog_layout = .{ .x0 = x0, .column_width = width, .gap = 0, .columns = 1, .page = visible };
+        const status_width: u32 = @min(24, width / 3);
+        const label_width = width -| (status_width + 1);
+        try self.addBacklogText(view_id, "backlog.list.heading", "column", "Tasks by ordinal", .{ .foreground = .strong, .face_style = .bold, .underline = .border }, .{ .x = x0, .y = top, .width = width, .height = 1 });
+        const selected_id = panel.state.selected();
+        if (panel.state.follow) {
+            if (selected_id) |id| if (panel.board.listIndex(id)) |index| backlog_view.keepVisible(&panel.state.list_scroll, index, list.len, visible);
+        }
+        panel.state.list_scroll = @min(panel.state.list_scroll, list.len -| visible);
+        const end = @min(list.len, panel.state.list_scroll + visible);
+        for (list[panel.state.list_scroll..end], 0..) |*card, slot| {
+            const y = top + 1 + @as(u32, @intCast(slot));
+            const selected = selected_id != null and std.ascii.eqlIgnoreCase(selected_id.?, card.task.id);
+            const id_text = (try backlogCardId(arena, card.task.id, "")) orelse continue;
+            try self.addBacklogInteractive(view_id, id_text, "task", card.label, selected, .{ .foreground = .foreground }, .{ .x = x0, .y = y, .width = label_width, .height = 1 });
+            const linked = try self.composeBacklogCardExtras(panel, arena, view_id, card, null, x0 + label_width + 1, y);
+            const status = try backlog_view.oneLine(arena, card.task.status);
+            const word = if (linked) |found| try std.fmt.allocPrint(arena, "{s} {s}", .{ found.badge.glyph, status }) else status;
+            const status_id = (try backlogCardId(arena, card.task.id, ".status")) orelse continue;
+            try self.addBacklogText(view_id, status_id, "status", word, .{ .foreground = .muted }, .{ .x = x0 + label_width + 1, .y = y, .width = status_width, .height = 1 });
+        }
+    }
+
+    /// The element id a detail row's target is registered under.
+    fn backlogDetailTargetId(arena: Allocator, detail_id: []const u8, target: backlog_view.Target) ![]const u8 {
+        return switch (target) {
+            .none => unreachable, // Only actionable rows are asked for.
+            .status => std.fmt.allocPrint(arena, "{s}.status", .{detail_id}),
+            .criterion => |criterion| std.fmt.allocPrint(arena, "{s}.ac.{d}", .{ detail_id, criterion.index }),
+        };
+    }
+
+    /// The task detail: a modal `Surface` over the view with the task's
+    /// wrapped rows, its controls (status, each criterion, start agent, open
+    /// in vi), the write's message line and a hint; or, while choosing, the
+    /// harnesses an agent can start with.
+    fn composeBacklogDetail(self: *App, panel: *backlog_view.Panel, view: ui.Rect, arena: Allocator) !void {
+        const bounds = backlogDetailBounds(view) orelse return;
+        const detail = if (panel.detail) |*open| open else return;
+        const project = if (panel.project) |*loaded| loaded else return;
+        const task = project.findTask(detail.id()) orelse {
+            // The task went (its file was removed): nothing to detail.
+            panel.detail = null;
+            return;
+        };
+        const detail_text = try std.fmt.allocPrint(arena, "backlog.detail.{s}", .{detail.id()});
+        const detail_id: ui.Id = .{ .value = detail_text };
+        try self.ui_tree.addSurface(.{
+            .id = detail_id,
+            .parent = .{ .value = "backlog.view" },
+            .role = "dialog",
+            .label = try backlog_view.oneLine(arena, task.title),
+            .bounds = bounds,
+        }, .{
+            .rect = bounds,
+            .erase_underlay = true,
+            .fill = .background,
+            .border = .double,
+            .border_style = .{ .foreground = .border, .background = .background },
+            .title = try std.fmt.allocPrint(arena, " {s} ", .{detail.id()}),
+            .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
+        });
+        const muted: ui.TextStyle = .{ .foreground = .muted };
+        try self.addBacklogInteractive(detail_id, try std.fmt.allocPrint(arena, "{s}.close", .{detail_text}), "button", "close", false, muted, .{ .x = bounds.x + bounds.width - 8, .y = bounds.y, .width = 5, .height = 1 });
+        const inner_x = bounds.x + 2;
+        const inner_width = bounds.width - 4;
+        const top = bounds.y + 1;
+        const list_rows: usize = bounds.height -| 5;
+        const actions_y = bounds.y + bounds.height - 4;
+        const message_y = bounds.y + bounds.height - 3;
+        const hint_y = bounds.y + bounds.height - 2;
+
+        if (detail.choosing) {
+            const heading = try std.fmt.allocPrint(arena, "Start an agent on {s}: choose a harness", .{detail.id()});
+            try self.addBacklogText(detail_id, try std.fmt.allocPrint(arena, "{s}.chooser", .{detail_text}), "heading", heading, .{ .foreground = .strong, .face_style = .bold }, .{ .x = inner_x, .y = top, .width = inner_width -| 6, .height = 1 });
+            try self.addBacklogInteractive(detail_id, try std.fmt.allocPrint(arena, "{s}.back", .{detail_text}), "button", "back", false, muted, .{ .x = inner_x + inner_width - 4, .y = top, .width = 4, .height = 1 });
+            const count = self.backlog_harness_count;
+            detail.choice = @min(detail.choice, count -| 1);
+            for (0..@min(count, list_rows -| 1)) |index| {
+                const label = self.backlog_harness_labels[index][0..self.backlog_harness_label_lens[index]];
+                try self.addBacklogInteractive(detail_id, try std.fmt.allocPrint(arena, "{s}.harness.{d}", .{ detail_text, index }), "option", label, index == detail.choice, .{ .foreground = .foreground }, .{ .x = inner_x, .y = top + 2 + @as(u32, @intCast(index)), .width = inner_width, .height = 1 });
+            }
+            try self.addBacklogText(detail_id, "backlog.detail-hint", "status", backlog_chooser_hint, muted, .{ .x = inner_x, .y = hint_y, .width = inner_width, .height = 1 });
+            if (panel.message()) |text| try self.addBacklogText(detail_id, "backlog.message", "status", text, if (panel.message_failed) .{ .foreground = .attention } else muted, .{ .x = inner_x, .y = message_y, .width = inner_width, .height = 1 });
+            return;
+        }
+
+        const milestone_title = if (task.milestone) |key| if (project.findMilestone(key)) |found| found.title else null else null;
+        const linked = self.backlogAgent(panel.projectDirectory() orelse "", task.id);
+        const rows = try backlog_view.detailRows(arena, task, milestone_title, inner_width, if (linked) |found| found.badge else null);
+        var actionable: usize = 0;
+        for (rows) |row| actionable += @intFromBool(row.actionable());
+        detail.cursor = @min(detail.cursor, actionable -| 1);
+        var cursor_row: usize = 0;
+        var seen: usize = 0;
+        for (rows, 0..) |row, index| {
+            if (!row.actionable()) continue;
+            if (seen == detail.cursor) cursor_row = index;
+            seen += 1;
+        }
+        if (detail.follow) backlog_view.keepVisible(&detail.scroll, cursor_row, rows.len, list_rows);
+        detail.scroll = @min(detail.scroll, rows.len -| list_rows);
+        self.backlog_detail_page = list_rows;
+        var action_index: usize = 0;
+        for (rows[0..detail.scroll]) |row| action_index += @intFromBool(row.actionable());
+        const end = @min(rows.len, detail.scroll + @min(list_rows, backlog_detail_row_capacity));
+        for (rows[detail.scroll..end], 0..) |row, slot| {
+            const y = top + @as(u32, @intCast(slot));
+            const row_bounds: ui.Rect = .{ .x = inner_x, .y = y, .width = inner_width, .height = 1 };
+            if (row.actionable()) {
+                const is_cursor = action_index == detail.cursor;
+                action_index += 1;
+                const role = switch (row.target) {
+                    .criterion => "criterion",
+                    else => "button",
+                };
+                try self.addBacklogInteractive(detail_id, try backlogDetailTargetId(arena, detail_text, row.target), role, row.text, is_cursor, .{ .foreground = .foreground }, row_bounds);
+                continue;
+            }
+            if (row.kind == .blank) continue;
+            const style: ui.TextStyle = switch (row.kind) {
+                .title => .{ .foreground = .strong, .face_style = .bold },
+                .heading => .{ .foreground = .accent, .face_style = .bold },
+                .field => .{ .foreground = .foreground },
+                else => .{ .foreground = .foreground },
+            };
+            try self.addBacklogText(detail_id, try std.fmt.allocPrint(arena, "{s}.row.{d}", .{ detail_text, detail.scroll + slot }), @tagName(row.kind), row.text, style, row_bounds);
+        }
+        // The two actions stay put below the rows, whatever the scroll.
+        const start_label = "▶ start agent";
+        const raw_label = "▶ open in vi";
+        try self.addBacklogInteractive(detail_id, try std.fmt.allocPrint(arena, "{s}.agent", .{detail_text}), "button", start_label, false, .{ .foreground = .accent }, .{ .x = inner_x, .y = actions_y, .width = 13, .height = 1 });
+        try self.addBacklogInteractive(detail_id, try std.fmt.allocPrint(arena, "{s}.raw", .{detail_text}), "button", raw_label, false, .{ .foreground = .accent }, .{ .x = inner_x + 16, .y = actions_y, .width = 12, .height = 1 });
+        if (panel.message()) |text| {
+            try self.addBacklogText(detail_id, "backlog.message", "status", text, if (panel.message_failed) .{ .foreground = .attention } else muted, .{ .x = inner_x, .y = message_y, .width = inner_width, .height = 1 });
+        }
+        try self.addBacklogText(detail_id, "backlog.detail-hint", "status", backlog_detail_hint, muted, .{ .x = inner_x, .y = hint_y, .width = inner_width, .height = 1 });
+    }
+
+    /// The actionable target under the detail's keyboard cursor.
+    fn backlogCursorTarget(panel: *backlog_view.Panel) !?backlog_view.Target {
+        const detail = if (panel.detail) |*open| open else return null;
+        const project = if (panel.project) |*loaded| loaded else return null;
+        const task = project.findTask(detail.id()) orelse return null;
+        var arena_state: std.heap.ArenaAllocator = .init(panel.allocator);
+        defer arena_state.deinit();
+        // Targets do not depend on the width: only a row's first line has one.
+        const rows = try backlog_view.detailRows(arena_state.allocator(), task, null, 80, null);
+        var seen: usize = 0;
+        var last: ?backlog_view.Target = null;
+        for (rows) |row| {
+            if (!row.actionable()) continue;
+            last = row.target;
+            if (seen == detail.cursor) return row.target;
+            seen += 1;
+        }
+        return last;
+    }
+
+    /// The panel's task with id `id`.
+    fn backlogTask(panel: *backlog_view.Panel, id: []const u8) ?*const backlog.Task {
+        const project = if (panel.project) |*loaded| loaded else return null;
+        return project.findTask(id);
+    }
+
+    fn backlogOpenDetail(self: *App, panel: *backlog_view.Panel, id: []const u8) !void {
+        if (!backlog.isTaskId(id) or backlogTask(panel, id) == null) return;
+        panel.state.select(id);
+        if (panel.board.locate(id)) |cursor| {
+            panel.state.selected_column = cursor.column;
+            panel.state.selected_row = cursor.row;
+        }
+        panel.detail = backlog_view.Detail.of(id);
+        panel.message_len = 0;
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+    }
+
+    /// Ask the CLI to move the task to the next configured status.
+    fn backlogCycleStatus(self: *App, panel: *backlog_view.Panel, id: []const u8) !void {
+        const project = if (panel.project) |*loaded| loaded else return;
+        const task = project.findTask(id) orelse return;
+        const next = backlog_view.nextStatus(project.config(), task.status) orelse return;
+        const request = backlog_view.CliRequest.status(task.id, next) orelse return;
+        panel.enqueue(request, self.backlog_program) catch panel.setMessage(true, "backlog is busy: try again", .{});
+        try self.refreshActiveUi();
+    }
+
+    /// Ask the CLI to flip acceptance criterion `index`.
+    fn backlogToggleCriterion(self: *App, panel: *backlog_view.Panel, id: []const u8, index: u32) !void {
+        const task = backlogTask(panel, id) orelse return;
+        for (task.acceptance_criteria) |criterion| {
+            if (criterion.index != index) continue;
+            const request = backlog_view.CliRequest.criterion(task.id, index, !criterion.checked) orelse return;
+            panel.enqueue(request, self.backlog_program) catch panel.setMessage(true, "backlog is busy: try again", .{});
+            break;
+        }
+        try self.refreshActiveUi();
+    }
+
+    /// The start-agent chooser: the harnesses `agent.launch` offers here.
+    fn backlogOpenChooser(self: *App, panel: *backlog_view.Panel) !void {
+        const detail = if (panel.detail) |*open| open else return;
+        self.ensureAgentDetection();
+        const key = self.workspace_registry.activeKey() orelse return;
+        const choices = self.agents.launchChoices(key);
+        self.setAgentLaunchChoices();
+        var count: usize = 0;
+        for (choices) |choice| {
+            if (count == self.backlog_harness.len) break;
+            const parsed = app_agents.Choice.parse(choice.value) orelse continue;
+            self.backlog_harness[count] = parsed;
+            const len = @min(choice.label.len, self.backlog_harness_labels[count].len);
+            @memcpy(self.backlog_harness_labels[count][0..len], choice.label[0..len]);
+            self.backlog_harness_label_lens[count] = len;
+            count += 1;
+        }
+        self.backlog_harness_count = count;
+        if (count == 0) {
+            panel.setMessage(true, "no coding agent found here", .{});
+        } else {
+            detail.choosing = true;
+            detail.choice = 0;
+            panel.message_len = 0;
+        }
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+    }
+
+    /// Start harness `index` on the detailed task through `agent.launch`'s
+    /// own path, in the project directory, with the task as the initial
+    /// prompt (TASK-64). The new agent's tab opens beneath the view.
+    fn backlogLaunchAgent(self: *App, panel: *backlog_view.Panel, index: usize) !void {
+        const detail = if (panel.detail) |*open| open else return;
+        if (index >= self.backlog_harness_count) return;
+        const choice = self.backlog_harness[index];
+        if (choice == .fake and !self.agents.fake_enabled) return;
+        const task = backlogTask(panel, detail.id()) orelse return;
+        const dir = panel.projectDirectory() orelse return;
+        var id_buffer: [backlog_view.max_id_bytes]u8 = undefined;
+        if (task.id.len > id_buffer.len or !backlog.isTaskId(task.id)) return;
+        @memcpy(id_buffer[0..task.id.len], task.id);
+        const task_id = id_buffer[0..task.id.len];
+        var dir_buffer: [Dir.max_path_bytes]u8 = undefined;
+        if (dir.len > dir_buffer.len) return;
+        @memcpy(dir_buffer[0..dir.len], dir);
+        const prompt_buffer = try self.allocator.alloc(u8, backlog.max_task_prompt_bytes);
+        defer self.allocator.free(prompt_buffer);
+        const prompt = backlog.taskPrompt(prompt_buffer, task);
+        detail.choosing = false;
+        const before = self.agents.registry.next_ordinal;
+        try self.launchAgentWith(choice, prompt, .{ .cwd = dir_buffer[0..dir.len], .task_id = task_id });
+        if (self.agents.registry.next_ordinal != before) {
+            if (self.agents.registry.get(agent.AgentId.fromOrdinal(before))) |record| {
+                panel.setMessage(false, "started {s} on {s}", .{ self.agents.displayName(record), task_id });
+            }
+        } else if (self.workspace_status) |status| {
+            panel.setMessage(true, "{s}", .{status});
+        }
+        try self.refreshActiveUi();
+    }
+
+    /// Open the task's markdown in `vi` in a new tab, through the workspace
+    /// ExecutionContext as a file reference does, and close the view.
+    fn backlogOpenRaw(self: *App, panel: *backlog_view.Panel) !void {
+        const detail = if (panel.detail) |*open| open else return;
+        const task = backlogTask(panel, detail.id()) orelse return;
+        const dir = panel.projectDirectory() orelse return;
+        const cwd = try self.allocator.dupe(u8, dir);
+        var cwd_owned = true;
+        defer if (cwd_owned) self.allocator.free(cwd);
+        const argv = buildFileReferenceArgv(self.allocator, task.path, null, cwd) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsafePath, error.PathTooLong => {
+                panel.setMessage(true, "the task file cannot be opened", .{});
+                return self.refreshActiveUi();
+            },
+        };
+        cwd_owned = false;
+        // The label borrows the project; the view closes only afterwards.
+        if (!try self.openEditorTab(fileReferenceLabel(task.path), cwd, argv)) return;
+        try self.closeBacklog();
+    }
+
+    /// A click on (or the semantic activation of) one of the view's
+    /// elements. The id names what to do; no task text ever does.
+    fn activateBacklogElement(self: *App, id: []const u8) !void {
+        const panel = self.shownBacklog() orelse return;
+        const element = backlog_view.parseElement(id) orelse return;
+        switch (element) {
+            .mode => |mode| {
+                panel.state.mode = mode;
+                panel.state.follow = true;
+                try self.refreshActiveUi();
+            },
+            .close => try self.closeBacklog(),
+            .task => |task_id| try self.backlogOpenDetail(panel, task_id),
+            .detail => |target| {
+                const detail = if (panel.detail) |*open| open else return;
+                if (!std.ascii.eqlIgnoreCase(detail.id(), target.id)) return;
+                switch (target.part) {
+                    .close => {
+                        panel.detail = null;
+                        try self.refreshActiveUi();
+                    },
+                    .back => {
+                        detail.choosing = false;
+                        try self.refreshActiveUi();
+                    },
+                    .status => if (!detail.choosing) try self.backlogCycleStatus(panel, target.id),
+                    .criterion => |index| if (!detail.choosing) try self.backlogToggleCriterion(panel, target.id, index),
+                    .agent => if (!detail.choosing) try self.backlogOpenChooser(panel),
+                    .raw => if (!detail.choosing) try self.backlogOpenRaw(panel),
+                    .harness => |index| if (detail.choosing) try self.backlogLaunchAgent(panel, index),
+                }
+            },
+        }
+    }
+
+    /// Plain keys while the view is shown and nothing above it takes them;
+    /// chords still reach their bindings.
+    fn routeBacklogKey(self: *App, key: platform.KeyEvent) !bool {
+        if (self.paletteVisible() or self.contextMenuVisible() or self.notificationsVisible() or self.closeModalActive() or
+            self.scratchpadVisible() or self.search_visible) return false;
+        const panel = self.shownBacklog() orelse return false;
+        if (self.activeUiTree().focusedInput() != null) return false;
+        if (key.action != .press) return false;
+        if (key.mods.ctrl or key.mods.alt or key.mods.super) return false;
+        const identity = uiKeyIdentity(key) orelse return false;
+        // A key the view does not use goes on to the bindings (F2, Shift+F10);
+        // the terminal beneath never sees it (`onKey`).
+        if (!try self.backlogKey(panel, key)) return false;
+        _ = self.ui_key_state.claim(identity, .none);
+        return true;
+    }
+
+    fn backlogKey(self: *App, panel: *backlog_view.Panel, key: platform.KeyEvent) !bool {
+        const letter: u21 = if (key.mods.shift) 0 else if (key.unshifted_codepoint != 0) key.unshifted_codepoint else key.codepoint;
+        if (panel.detail) |*detail| {
+            if (detail.choosing) {
+                const last = self.backlog_harness_count -| 1;
+                switch (key.key) {
+                    .escape => detail.choosing = false,
+                    .up => detail.choice -|= 1,
+                    .down => detail.choice = @min(detail.choice + 1, last),
+                    .home => detail.choice = 0,
+                    .end => detail.choice = last,
+                    .enter => {
+                        try self.backlogLaunchAgent(panel, detail.choice);
+                        return true;
+                    },
+                    else => return false,
+                }
+                try self.refreshActiveUi();
+                return true;
+            }
+            const page = @max(self.backlog_detail_page, 2) - 1;
+            switch (key.key) {
+                .escape => panel.detail = null,
+                .up => detail.cursor -|= 1,
+                .down => detail.cursor +|= 1,
+                .tab => detail.cursor = if (key.mods.shift) detail.cursor -| 1 else detail.cursor +| 1,
+                .home => detail.cursor = 0,
+                .end => detail.cursor = std.math.maxInt(usize),
+                .page_up => detail.cursor -|= page,
+                .page_down => detail.cursor +|= page,
+                .enter => return self.backlogActivateCursor(panel),
+                else => switch (letter) {
+                    ' ' => return self.backlogActivateCursor(panel),
+                    's' => {
+                        var id_buffer: [backlog_view.max_id_bytes]u8 = undefined;
+                        const id = copyId(&id_buffer, detail.id());
+                        try self.backlogCycleStatus(panel, id);
+                        return true;
+                    },
+                    'a' => {
+                        try self.backlogOpenChooser(panel);
+                        return true;
+                    },
+                    'v' => {
+                        try self.backlogOpenRaw(panel);
+                        return true;
+                    },
+                    else => return false,
+                },
+            }
+            detail.follow = true;
+            try self.refreshActiveUi();
+            return true;
+        }
+        const motion: ?backlog_view.Motion = switch (key.key) {
+            .left => .left,
+            .right => .right,
+            .up => .up,
+            .down => .down,
+            .home => .first,
+            .end => .last,
+            .page_up => .page_up,
+            .page_down => .page_down,
+            else => null,
+        };
+        if (motion) |one| {
+            panel.state.move(panel.board, one, self.backlog_layout.page);
+            try self.refreshActiveUi();
+            return true;
+        }
+        switch (key.key) {
+            .escape => {
+                try self.closeBacklog();
+                return true;
+            },
+            .enter => {
+                const selected = panel.state.selected() orelse return true;
+                var id_buffer: [backlog_view.max_id_bytes]u8 = undefined;
+                try self.backlogOpenDetail(panel, copyId(&id_buffer, selected));
+                return true;
+            },
+            else => {},
+        }
+        switch (letter) {
+            'l', 'b' => {
+                panel.state.mode = if (letter == 'l') .list else .board;
+                panel.state.follow = true;
+                try self.refreshActiveUi();
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn copyId(buffer: []u8, id: []const u8) []const u8 {
+        const len = @min(buffer.len, id.len);
+        @memcpy(buffer[0..len], id[0..len]);
+        return buffer[0..len];
+    }
+
+    /// Enter or Space in the detail: what the cursor row does.
+    fn backlogActivateCursor(self: *App, panel: *backlog_view.Panel) !bool {
+        const target = (try backlogCursorTarget(panel)) orelse return true;
+        const detail = if (panel.detail) |*open| open else return true;
+        var id_buffer: [backlog_view.max_id_bytes]u8 = undefined;
+        const id = copyId(&id_buffer, detail.id());
+        switch (target) {
+            .none => {},
+            .status => try self.backlogCycleStatus(panel, id),
+            .criterion => |criterion| try self.backlogToggleCriterion(panel, id, criterion.index),
+        }
+        return true;
+    }
+
+    /// Pointer events over the view: hover once the pointer moved, a press
+    /// and release on a card, row or control activates it, a press outside
+    /// an open detail closes the detail, the wheel scrolls, and text typed
+    /// over the view reaches nobody. Null leaves the event to the ordinary
+    /// routes (the sidebar, outside the view).
+    fn handleBacklogUiEvent(self: *App, event: platform.Event) !?bool {
+        const view = self.backlogBounds() orelse return null;
+        const panel = self.shownBacklog() orelse return null;
+        const tree = self.activeUiTree();
+        switch (event) {
+            .mouse_motion => |motion| {
+                const point = devicePointerPoint(motion.x, motion.y, self.window.state.scale);
+                if (!self.pointInCellRect(point, view) and !self.backlog_pointer_owned) return null;
+                const was_armed = self.backlog_hover_armed;
+                self.backlog_hover_armed = true;
+                const before = uiInteractionState(tree);
+                tree.pointerMoved(point);
+                if (!was_armed or !std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                return true;
+            },
+            .mouse_button => |button| {
+                const point = devicePointerPoint(button.x, button.y, self.window.state.scale);
+                switch (button.action) {
+                    .press => {
+                        if (!self.pointInCellRect(point, view)) return null;
+                        self.backlog_pointer_owned = true;
+                        if (panel.detail != null) {
+                            const detail_bounds = backlogDetailBounds(view);
+                            if (detail_bounds == null or !self.pointInCellRect(point, detail_bounds.?)) {
+                                panel.detail = null;
+                                try self.refreshActiveUi();
+                                return true;
+                            }
+                        }
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        tree.pointerPressed(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        return true;
+                    },
+                    .repeat => return if (self.backlog_pointer_owned) true else null,
+                    .release => {
+                        if (!self.backlog_pointer_owned) return null;
+                        self.backlog_pointer_owned = false;
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        const activation = tree.pointerReleased(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        const requested = activation orelse return true;
+                        if (!std.mem.startsWith(u8, requested.id.value, "backlog.")) return true;
+                        var id_storage: [backlog_id_capacity]u8 = undefined;
+                        if (requested.id.value.len > id_storage.len) return true;
+                        @memcpy(id_storage[0..requested.id.value.len], requested.id.value);
+                        try self.activateBacklogElement(id_storage[0..requested.id.value.len]);
+                        return true;
+                    },
+                }
+            },
+            .wheel => |wheel| {
+                const point = devicePointerPoint(wheel.x, wheel.y, self.window.state.scale);
+                if (!self.pointInCellRect(point, view)) return null;
+                if (wheel.dy == 0) return true;
+                var up = wheel.dy > 0;
+                if (wheel.flipped) up = !up;
+                if (panel.detail) |*detail| {
+                    detail.follow = false;
+                    detail.scroll = if (up) detail.scroll -| 3 else detail.scroll + 3;
+                } else switch (panel.state.mode) {
+                    .list => {
+                        panel.state.follow = false;
+                        panel.state.list_scroll = if (up) panel.state.list_scroll -| 3 else panel.state.list_scroll + 3;
+                    },
+                    .board => {
+                        const layout = self.backlog_layout;
+                        const cell_width = self.fonts.metrics().cell.width_px;
+                        const col: u32 = if (point.x <= 0) 0 else @as(u32, @intCast(point.x)) / @max(cell_width, 1);
+                        if (col < layout.x0) return true;
+                        const column = @min((col - layout.x0) / @max(layout.column_width + layout.gap, 1), backlog_view.max_columns - 1);
+                        panel.state.follow = false;
+                        const scroll = &panel.state.scroll[column];
+                        scroll.* = if (up) scroll.* -| 1 else scroll.* + 1;
+                    },
+                }
+                try self.refreshActiveUi();
+                return true;
+            },
+            .text_input, .text_editing, .candidates => {
+                if (tree.focusedInput() != null) return null;
+                return true;
+            },
+            else => return null,
+        }
     }
 
     fn paletteBounds(self: *const App) ?ui.Rect {
@@ -11034,6 +12088,8 @@ const App = struct {
             });
         }
 
+        try self.composeBacklog();
+
         if (self.scratchpadBounds()) |scratchpad_bounds| {
             const scratchpad_id: ui.Id = .{ .value = try scratchpadSemanticId(
                 &self.scratchpad_semantic_storage[0],
@@ -11140,7 +12196,7 @@ const App = struct {
 
         const text = self.composition.preedit();
         if (!self.paletteVisible() and !self.settingsVisible() and !self.managerVisible() and !self.search_visible and self.presentedAgentView() == null and
-            text.len != 0 and std.unicode.utf8ValidateSlice(text))
+            !self.backlogShown() and text.len != 0 and std.unicode.utf8ValidateSlice(text))
         {
             if (self.presentedLive().terminal().cursor().position) |cursor| {
                 if (self.presentedCellRect()) |presented_rect| {
@@ -11824,6 +12880,7 @@ const App = struct {
             if (key.action == .press or !terminal_owned) return self.onManagerKey(key);
         }
         if (try self.routeSearchKey(key)) return;
+        if (try self.routeBacklogKey(key)) return;
         if (!self.paletteVisible() and self.scratchpad_escape_owned and key.key == .escape) {
             if (key.key == .escape and key.action == .release) self.scratchpad_escape_owned = false;
             return;
@@ -11873,6 +12930,8 @@ const App = struct {
                     !self.notificationsVisible() and !modal and try self.routeAgentViewKey(key)) return;
                 if (try self.routeFocusedUiKey(key, translated)) return;
                 if (self.paletteVisible() or self.search_visible or self.contextMenuVisible() or self.notificationsVisible()) return;
+                // The view covers the panes: their terminals get no keys.
+                if (self.backlogShown() and !self.scratchpadVisible()) return;
                 const presented = self.presentedLive();
                 switch (inputmod.clipboardKey(key, .{
                     .has_selection = presented.terminal().hasSelection(),
@@ -13077,6 +14136,8 @@ const App = struct {
             // Joins the host probe that borrows the context; the context's
             // own teardown then hangs the master up without waiting.
             self.releaseRemote(presentation);
+            // Joins a backlog write that borrows the context.
+            releaseBacklog(self.allocator, presentation);
             const result = self.workspace_registry.remove(presentation.key) catch {
                 log.err("a closing workspace disappeared before teardown", .{});
                 index += 1;
@@ -15718,6 +16779,10 @@ const App = struct {
             self.invalidateUi();
             changed = true;
         }
+        if (self.pollBacklog()) {
+            self.invalidateUi();
+            changed = true;
+        }
         if (self.workspace_registry.count() == 0) return changed;
         for (self.workspace_presentations.items) |presentation| {
             const model = self.workspace_registry.byKey(presentation.key) orelse continue;
@@ -16445,7 +17510,7 @@ const App = struct {
         }
         if (self.paletteVisible() or self.settingsVisible() or self.managerVisible() or self.search_visible) return;
         // A view is not a terminal: text typed over it reaches nobody.
-        if (self.presentedAgentView() != null) return;
+        if (self.presentedAgentView() != null or self.backlogShown()) return;
         self.presentedLive().terminal().userInput();
         queueCommittedText(&self.pending_committed_text, text);
         self.invalidateUi();
@@ -16789,6 +17854,14 @@ const App = struct {
             },
             else => {},
         };
+        if (!self.backlogShown() and self.backlog_pointer_owned) switch (event) {
+            .mouse_motion => return true,
+            .mouse_button => |button| {
+                if (button.action == .release) self.backlog_pointer_owned = false;
+                return true;
+            },
+            else => {},
+        };
         if (self.contextMenuVisible()) return self.handleContextMenuUiEvent(event);
         if (self.notificationsVisible()) return self.handleNotificationsUiEvent(event);
         if (self.managerVisible()) return self.handleManagerUiEvent(event);
@@ -16820,6 +17893,7 @@ const App = struct {
         }
         if (self.scratchpadVisible() and !self.closeModalActive()) return self.handleScratchpadUiEvent(event);
         if (!self.closeModalActive()) {
+            if (try self.handleBacklogUiEvent(event)) |consumed| return consumed;
             if (try self.handleAgentViewUiEvent(event)) |consumed| return consumed;
         }
         switch (event) {
@@ -17320,6 +18394,10 @@ const App = struct {
         if (has_load) {
             if (budget < 0) return idle_tick_ms;
             return @min(budget, idle_tick_ms);
+        }
+        if (self.backlogNeedsTick()) {
+            if (budget < 0) return backlog_tick_ms;
+            return @min(budget, backlog_tick_ms);
         }
         if (!has_attached_child and !self.cursorBlinks() and !self.searchNeedsWork()) return budget;
         if (budget < 0) return idle_tick_ms;
@@ -18870,7 +19948,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 79 and
+    failures += reportCheck(out, registered_actions.len == 81 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -18949,7 +20027,9 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[75].name, agent_view_open_ref_action) and
         std.mem.eql(u8, registered_actions[76].name, agents_open_action) and
         std.mem.eql(u8, registered_actions[77].name, agents_activate_action) and
-        std.mem.eql(u8, registered_actions[78].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[78].name, backlog_open_action) and
+        std.mem.eql(u8, registered_actions[79].name, backlog_activate_action) and
+        std.mem.eql(u8, registered_actions[80].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager, backlog and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -23149,6 +24229,401 @@ fn agentManagerTest(self: *App, io: Io, out: *Writer) !u8 {
     return if (failures == 0) 0 else 1;
 }
 
+// --backlog-test (TASK-63, TASK-64) ----------------------------------------------
+
+fn backlogCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("backlog-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// A stand-in for the `backlog` CLI that edits the fixture's markdown the way
+/// the real one does for the three writes the view makes, records each call,
+/// and fails with a message on stderr while a `fail` file sits beside it. The
+/// real CLI is never run by the check.
+const backlog_fake_cli =
+    \\#!/bin/sh
+    \\bin=$(dirname "$0")
+    \\printf '%s\n' "$*" >> "$bin/calls"
+    \\if [ -e "$bin/fail" ]; then echo "Error: simulated failure for $3" >&2; exit 1; fi
+    \\[ "$1" = task ] && [ "$2" = edit ] || { echo "unsupported command" >&2; exit 2; }
+    \\id=$(printf '%s' "$3" | tr 'A-Z' 'a-z')
+    \\file=$(ls backlog/tasks/"$id - "*.md 2>/dev/null | head -n 1)
+    \\[ -n "$file" ] || { echo "Error: Task $3 not found." >&2; exit 1; }
+    \\case "$4" in
+    \\  --status=*) sed -i "s/^status: .*/status: ${4#--status=}/" "$file" ;;
+    \\  --check-ac=*) n=${4#--check-ac=}; sed -i "s/^- \[ \] #$n /- [x] #$n /" "$file" ;;
+    \\  --uncheck-ac=*) n=${4#--uncheck-ac=}; sed -i "s/^- \[x\] #$n /- [ ] #$n /" "$file" ;;
+    \\  *) echo "unsupported option $4" >&2; exit 2 ;;
+    \\esac
+    \\echo "Updated task $3"
+    \\
+;
+
+const BacklogWait = union(enum) {
+    terminal_text: []const u8,
+    element: []const u8,
+    element_absent: []const u8,
+    /// An element `id` whose label contains `text`.
+    label: struct { id: []const u8, text: []const u8 },
+    /// Some element whose id starts with `prefix` and whose label contains `text`.
+    prefix_label: struct { prefix: []const u8, text: []const u8 },
+    /// The file at `path` contains `text`.
+    file: struct { path: []const u8, text: []const u8 },
+    /// No backlog write is running or queued.
+    idle,
+};
+
+fn backlogWaitMet(self: *App, condition: BacklogWait) bool {
+    return switch (condition) {
+        .terminal_text => |text| self.activeLive().terminal().visibleTextContains(text),
+        .element => |id| self.ui_tree.byId(.{ .value = id }) != null,
+        .element_absent => |id| self.ui_tree.byId(.{ .value = id }) == null,
+        .label => |want| if (self.ui_tree.byId(.{ .value = want.id })) |element| std.mem.indexOf(u8, element.label, want.text) != null else false,
+        .prefix_label => |want| viewElement(self, want.prefix, want.text) != null,
+        .file => |want| file: {
+            var buffer: [16 * 1024]u8 = undefined;
+            const text = Dir.cwd().readFile(self.io, want.path, &buffer) catch break :file false;
+            break :file std.mem.indexOf(u8, text, want.text) != null;
+        },
+        .idle => idle: {
+            const panel = self.activePresentation().backlog orelse break :idle true;
+            break :idle !panel.busy();
+        },
+    };
+}
+
+fn waitForBacklog(self: *App, io: Io, out: *Writer, condition: BacklogWait) !bool {
+    const deadline = Io.Clock.real.now(io).nanoseconds + agent_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        if (backlogWaitMet(self, condition)) return true;
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return false;
+        }
+        if (self.poll()) self.scheduler.invalidate();
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) {
+            if (self.scheduler.shouldDraw()) try self.drawFrame();
+            return backlogWaitMet(self, condition);
+        }
+    }
+}
+
+fn backlogChordKey(self: *App, io: Io, out: *Writer) !bool {
+    const mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .shift = true, .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    return postKey(self, io, out, 'k', mods);
+}
+
+/// Post one wheel notch (`notches` < 0 scrolls down) over element `id`.
+fn backlogWheel(self: *App, io: Io, out: *Writer, id: []const u8, notches: f32) !bool {
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return false;
+    const point = elementCenter(element, self.window.state.scale);
+    try self.window.postWheel(.{ .dy = notches, .x = point.x, .y = point.y });
+    return pumpUntil(self, io, out, .wheel, self_test_event_budget_ms);
+}
+
+fn backlogSelected(self: *App, id: []const u8) bool {
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return false;
+    return element.state.selected;
+}
+
+/// Whether element `id` starts in the same column as element `column`.
+fn backlogInColumn(self: *App, id: []const u8, column: []const u8) bool {
+    const card = self.ui_tree.byId(.{ .value = id }) orelse return false;
+    const heading = self.ui_tree.byId(.{ .value = column }) orelse return false;
+    return card.bounds.x == heading.bounds.x;
+}
+
+fn backlogScreenshot(self: *App, io: Io, out: *Writer, name: []const u8) !void {
+    try self.drawFrame();
+    const pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(pixels);
+    var path_buffer: [path_capacity]u8 = undefined;
+    var id_buffer: [path_capacity]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}{c}backlog-test-{s}-{s}.png", .{ fallback_log_dir, std.fs.path.sep, name, try generateRunId(io, &id_buffer) });
+    try writePngOffThread(self.allocator, io, path, pixels, self.size);
+    out.print("backlog-test: screenshot {s} {s}\n", .{ name, path }) catch {};
+}
+
+/// Exercise TASK-63 and TASK-64 through real PTYs, SDL events and a fake
+/// `backlog` CLI: the fixture project in a second workspace's directory, the
+/// view by chord and by palette, board and list by key and by click, the
+/// detail by Enter and by click, criteria and status written through the CLI
+/// and read back through the watch, a CLI failure in the message line, an
+/// external edit, and a fake agent started on a task whose card, detail and
+/// manager row then name it.
+fn backlogTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    var os_trace: AgentOsTrace = .{};
+    self.agents.notifier = .{ .context = &os_trace, .notify_fn = AgentOsTrace.record };
+    defer self.agents.notifier = .{ .notify_fn = App.discardOsNotification };
+    self.focus_override = true;
+    defer self.focus_override = null;
+    defer self.backlog_program = "backlog";
+
+    try self.drawFrame();
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .terminal_text = "AGENT-TEST-READY" }), "the first tab's real PTY peer became ready", .{});
+    const dir = self.agentTestDir() orelse return 1;
+
+    // The fixture project, copied into a private project directory.
+    var project_buffer: [path_capacity:0]u8 = undefined;
+    const project_dir = try std.fmt.bufPrintZ(&project_buffer, "{s}/project", .{dir});
+    var root_buffer: [path_capacity]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, "{s}/backlog", .{project_dir});
+    _ = try Dir.cwd().createDirPathStatus(io, project_dir, .default_dir);
+    var copy = workspace.runLocalProcess(self.allocator, io, .{ .argv = &.{ "cp", "-R", "test/fixtures/backlog/valid", root }, .cwd = "" }) catch |err| {
+        out.print("backlog-test: FAIL could not copy the fixture: {s}\n", .{@errorName(err)}) catch {};
+        return 1;
+    };
+    const copied = copy.succeeded();
+    copy.deinit(self.allocator);
+    backlogCheck(out, &failures, copied, "the valid fixture was copied into the project directory (run from the repository root)", .{});
+    if (!copied) return 1;
+
+    // The fake CLI, which the view runs instead of `backlog`.
+    var bin_buffer: [path_capacity]u8 = undefined;
+    const bin = try std.fmt.bufPrint(&bin_buffer, "{s}/bin", .{dir});
+    _ = try Dir.cwd().createDirPathStatus(io, bin, .default_dir);
+    var program_buffer: [path_capacity]u8 = undefined;
+    const program = try std.fmt.bufPrint(&program_buffer, "{s}/backlog", .{bin});
+    try Dir.cwd().writeFile(io, .{ .sub_path = program, .data = backlog_fake_cli, .flags = .{ .permissions = .fromMode(0o700) } });
+    var fail_buffer: [path_capacity]u8 = undefined;
+    const fail_path = try std.fmt.bufPrint(&fail_buffer, "{s}/fail", .{bin});
+    self.backlog_program = program;
+    var task_one_buffer: [path_capacity]u8 = undefined;
+    const task_one = try std.fmt.bufPrint(&task_one_buffer, "{s}/tasks/task-1 - First-task.md", .{root});
+    var task_two_buffer: [path_capacity]u8 = undefined;
+    const task_two = try std.fmt.bufPrint(&task_two_buffer, "{s}/tasks/task-2 - A-long-folded-title.md", .{root});
+
+    // A workspace in the project directory, created from the palette.
+    const first_key = self.workspace_registry.activeKey() orelse return 1;
+    _ = try runPaletteCommandByKeyboard(self, io, out, "Create workspace");
+    _ = try agentTypeLine(self, io, out, project_dir);
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "workspace.2" }) and
+        self.workspace_registry.activeKey() != first_key and
+        std.mem.eql(u8, self.activeWorkspace().workingDirectory(), project_dir), "a second workspace opened in the project directory", .{});
+    const project_key = self.workspace_registry.activeKey() orelse return 1;
+
+    // The view by chord: a column per configured status, cards in them.
+    const routes_before = self.terminal_key_route_count;
+    _ = try backlogChordKey(self, io, out);
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.view" }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1", .text = "TASK-1 First task: parse the model" } }), "the chord opened the view on the workspace's backlog", .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.column.0", .text = "To Do (1)" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.column.1", .text = "In Progress (1)" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.column.2", .text = "Review (1)" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.column.3", .text = "Done (0)" } }), "the board has the four configured status columns", .{});
+    backlogCheck(out, &failures, backlogInColumn(self, "backlog.task.TASK-1", "backlog.column.0") and
+        backlogInColumn(self, "backlog.task.TASK-2", "backlog.column.1") and
+        backlogInColumn(self, "backlog.task.TASK-2.1", "backlog.column.2") and
+        self.ui_tree.byId(.{ .value = "backlog.task.TASK-3" }) == null and self.ui_tree.byId(.{ .value = "backlog.task.DRAFT-1" }) == null, "each active task sits in its status column; completed and draft tasks are not cards", .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1.meta", .text = "#backlog #architecture  @codex @claude" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-2", .text = "folded across two lines" } }), "cards show labels, assignees and folded titles", .{});
+    backlogCheck(out, &failures, backlogSelected(self, "backlog.task.TASK-1"), "the first card is selected on open", .{});
+
+    // Keys stay in the view: an unused key reaches no terminal.
+    _ = try postKey(self, io, out, 'x', .{});
+    backlogCheck(out, &failures, self.terminal_key_route_count == routes_before and self.backlogShown(), "an unused key did not reach the terminal beneath", .{});
+
+    // Arrows across columns.
+    _ = try postNamedKey(self, io, out, .right, .{});
+    backlogCheck(out, &failures, backlogSelected(self, "backlog.task.TASK-2"), "Right selected the In Progress card", .{});
+    _ = try postNamedKey(self, io, out, .right, .{});
+    _ = try postNamedKey(self, io, out, .right, .{});
+    backlogCheck(out, &failures, backlogSelected(self, "backlog.task.TASK-2.1"), "Right stopped at the last non-empty column", .{});
+    _ = try postNamedKey(self, io, out, .home, .{});
+    _ = try postNamedKey(self, io, out, .left, .{});
+    _ = try postNamedKey(self, io, out, .left, .{});
+    backlogCheck(out, &failures, backlogSelected(self, "backlog.task.TASK-1"), "Left returned to the To Do card", .{});
+
+    // List mode by key and by click; board again by key and by click.
+    _ = try postKey(self, io, out, 'l', .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.list.heading" }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-2.status", .text = "In Progress" } }) and
+        backlogSelected(self, "backlog.mode.list"), "l showed the ordinal list with status words", .{});
+    const list_first = self.ui_tree.byId(.{ .value = "backlog.task.TASK-1" });
+    const list_middle = self.ui_tree.byId(.{ .value = "backlog.task.TASK-2" });
+    const list_last = self.ui_tree.byId(.{ .value = "backlog.task.TASK-2.1" });
+    backlogCheck(out, &failures, list_first != null and list_middle != null and list_last != null and
+        list_first.?.bounds.y < list_middle.?.bounds.y and list_middle.?.bounds.y < list_last.?.bounds.y, "the list is in ordinal order", .{});
+    _ = try postKey(self, io, out, 'b', .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.column.3" }), "b showed the board again", .{});
+    _ = try clickTabsElement(self, io, out, "backlog.mode.list");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.list.heading" }), "a click on list showed the list", .{});
+    _ = try clickTabsElement(self, io, out, "backlog.mode.board");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.column.0" }) and
+        try waitForBacklog(self, io, out, .{ .element_absent = "backlog.list.heading" }), "a click on board showed the board", .{});
+
+    // The detail by Enter.
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.detail.TASK-1" }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.status", .text = "To Do" } }) and
+        backlogSelected(self, "backlog.detail.TASK-1.status"), "Enter opened TASK-1's detail with the cursor on its status", .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .prefix_label = .{ .prefix = "backlog.detail.TASK-1.row.", .text = "Read the project into a typed model." } }) and
+        try waitForBacklog(self, io, out, .{ .prefix_label = .{ .prefix = "backlog.detail.TASK-1.row.", .text = "M1 - First" } }) and
+        try waitForBacklog(self, io, out, .{ .prefix_label = .{ .prefix = "backlog.detail.TASK-1.row.", .text = "TASK-2, TASK-3" } }) and
+        try waitForBacklog(self, io, out, .{ .element = "backlog.detail.TASK-1.agent" }) and
+        try waitForBacklog(self, io, out, .{ .element = "backlog.detail.TASK-1.raw" }), "the detail shows description, milestone, dependencies and its two actions", .{});
+    // End scrolls to the last criterion; the wheel shows the notes below.
+    _ = try postNamedKey(self, io, out, .end, .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.ac.1", .text = "[ ] #1 Tasks are parsed" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.ac.2", .text = "[x] #2 Statuses are parsed" } }) and
+        backlogSelected(self, "backlog.detail.TASK-1.ac.3"), "End scrolled to the criteria with the cursor on the last", .{});
+    _ = try backlogWheel(self, io, out, "backlog.detail.TASK-1", -1);
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .prefix_label = .{ .prefix = "backlog.detail.TASK-1.row.", .text = "Notes go here." } }), "the wheel scrolled the detail to its notes", .{});
+    _ = try postNamedKey(self, io, out, .home, .{});
+
+    // A criterion checked by keyboard, through the CLI and back through the watch.
+    _ = try postNamedKey(self, io, out, .down, .{});
+    backlogCheck(out, &failures, backlogSelected(self, "backlog.detail.TASK-1.ac.1"), "Down moved the detail cursor to criterion #1", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .file = .{ .path = task_one, .text = "- [x] #1 Tasks are parsed" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.ac.1", .text = "[x] #1" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.message", .text = "TASK-1 #1 checked" } }), "Enter checked #1: the CLI wrote the file and the view reloaded it", .{});
+    // And by click, both ways.
+    _ = try postNamedKey(self, io, out, .end, .{});
+    _ = try clickTabsElement(self, io, out, "backlog.detail.TASK-1.ac.3");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .file = .{ .path = task_one, .text = "- [x] #3 Criteria keep their numbers" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.ac.3", .text = "[x] #3" } }), "a click checked #3", .{});
+    _ = try waitForBacklog(self, io, out, .idle);
+    _ = try clickTabsElement(self, io, out, "backlog.detail.TASK-1.ac.1");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .file = .{ .path = task_one, .text = "- [ ] #1 Tasks are parsed" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.ac.1", .text = "[ ] #1" } }), "a second click unchecked #1", .{});
+    _ = try waitForBacklog(self, io, out, .idle);
+
+    // The status: s, then a click on the status row (Home scrolls it back).
+    _ = try postNamedKey(self, io, out, .home, .{});
+    _ = try postKey(self, io, out, 's', .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .file = .{ .path = task_one, .text = "status: In Progress" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.status", .text = "In Progress" } }), "s moved TASK-1 to In Progress", .{});
+    _ = try waitForBacklog(self, io, out, .idle);
+    _ = try clickTabsElement(self, io, out, "backlog.detail.TASK-1.status");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .file = .{ .path = task_one, .text = "status: Review" } }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.status", .text = "Review" } }), "a click on the status moved TASK-1 to Review", .{});
+    _ = try waitForBacklog(self, io, out, .idle);
+
+    // A failing CLI is reported in the detail and changes nothing.
+    try Dir.cwd().writeFile(io, .{ .sub_path = fail_path, .data = "" });
+    _ = try postNamedKey(self, io, out, .end, .{});
+    _ = try clickTabsElement(self, io, out, "backlog.detail.TASK-1.ac.2");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.message", .text = "backlog failed (1): Error: simulated failure for TASK-1" } }) and
+        try waitForBacklog(self, io, out, .idle) and
+        try waitForBacklog(self, io, out, .{ .file = .{ .path = task_one, .text = "- [x] #2 Statuses are parsed" } }) and
+        self.backlogShown(), "a CLI failure showed its stderr in the message line and left the task alone", .{});
+    try Dir.cwd().deleteFile(io, fail_path);
+
+    // Escape closes the detail; the card moved column.
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element_absent = "backlog.detail.TASK-1" }) and
+        self.backlogShown() and backlogInColumn(self, "backlog.task.TASK-1", "backlog.column.2") and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.column.2", .text = "Review (2)" } }) and
+        try waitForBacklog(self, io, out, .{ .element = "backlog.task.TASK-1.column.2" }) and
+        try waitForBacklog(self, io, out, .{ .element_absent = "backlog.task.TASK-1.column.0" }), "Escape closed the detail and TASK-1's card is in Review", .{});
+
+    // The detail by click, closed by its close control.
+    _ = try clickTabsElement(self, io, out, "backlog.task.TASK-2");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.detail.TASK-2" }), "a click on a card opened its detail", .{});
+    _ = try clickTabsElement(self, io, out, "backlog.detail.TASK-2.close");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element_absent = "backlog.detail.TASK-2" }), "the close control closed the detail", .{});
+
+    // An agent started on TASK-1 from its detail (TASK-64).
+    _ = try clickTabsElement(self, io, out, "backlog.task.TASK-1");
+    _ = try waitForBacklog(self, io, out, .{ .element = "backlog.detail.TASK-1.agent" });
+    _ = try clickTabsElement(self, io, out, "backlog.detail.TASK-1.agent");
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.detail.TASK-1.harness.0", .text = app_agents.fake_choice_label } }), "start agent offered the fake harness first", .{});
+    const before_ordinal = self.agents.registry.next_ordinal;
+    _ = try clickTabsElement(self, io, out, "backlog.detail.TASK-1.harness.0");
+    const started = agent.AgentId.fromOrdinal(before_ordinal);
+    const runner = self.agents.runnerForAgent(started);
+    backlogCheck(out, &failures, runner != null and runner.?.taskId() != null and std.mem.eql(u8, runner.?.taskId().?, "TASK-1") and
+        std.mem.eql(u8, runner.?.cwd, project_dir), "the agent was started on TASK-1 in the project directory", .{});
+    backlogCheck(out, &failures, runner != null and runner.?.prompt != null and
+        std.mem.startsWith(u8, runner.?.prompt.?, "TASK-1: First task: parse the model\n\nRead the project into a typed model.") and
+        std.mem.indexOf(u8, runner.?.prompt.?, "Acceptance criteria:\n- [ ] #1 Tasks are parsed\n- [x] #2") != null, "the agent's initial prompt is the task's id, title, description and criteria", .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .terminal_text = "FAKE-AGENT-READY" }), "the fake agent's real process is running in its own tab", .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.task.TASK-1.agent.idle" }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1.meta", .text = "· Fake agent idle" } }) and
+        try waitForBacklog(self, io, out, .{ .prefix_label = .{ .prefix = "backlog.detail.TASK-1.row.", .text = "Agent      · Fake agent idle" } }), "the card and the detail show the agent and its state", .{});
+    try backlogScreenshot(self, io, out, "detail");
+
+    // The card follows the agent's state live.
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try waitForBacklog(self, io, out, .{ .element_absent = "backlog.detail.TASK-1" });
+    if (runner) |linked| {
+        var steps_buffer: [path_capacity]u8 = undefined;
+        const steps_path = try std.fmt.bufPrint(&steps_buffer, "{s}/steps", .{linked.sink_dir});
+        try Dir.cwd().writeFile(io, .{ .sub_path = steps_path, .data = "x" });
+    }
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.task.TASK-1.agent.working" }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1.meta", .text = "▸ Fake agent working" } }), "the card's agent badge changed to working live", .{});
+    try backlogScreenshot(self, io, out, "board");
+
+    // The agent manager names the task.
+    const manager_mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .shift = true, .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    _ = try postKey(self, io, out, 'g', manager_mods);
+    var row_buffer: [manager_id_capacity]u8 = undefined;
+    const manager_row = managerRowId(&row_buffer, started, null);
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "agents.dialog" }) and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = manager_row, .text = "  TASK-1  " } }), "the agent manager's row shows the agent's task", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try waitForBacklog(self, io, out, .{ .element_absent = "agents.dialog" });
+
+    // An external edit appears without any gesture.
+    var task_two_text: [4096]u8 = undefined;
+    const original = try Dir.cwd().readFile(io, task_two, &task_two_text);
+    const title_start = std.mem.indexOf(u8, original, "title: >-") orelse 0;
+    const title_end = std.mem.indexOf(u8, original, "status:") orelse 0;
+    var rewritten: std.ArrayList(u8) = .empty;
+    defer rewritten.deinit(self.allocator);
+    try rewritten.appendSlice(self.allocator, original[0..title_start]);
+    try rewritten.appendSlice(self.allocator, "title: Renamed outside Conduit\n");
+    try rewritten.appendSlice(self.allocator, original[title_end..]);
+    try Dir.cwd().writeFile(io, .{ .sub_path = task_two, .data = rewritten.items });
+    backlogCheck(out, &failures, title_start != 0 and title_end > title_start and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-2", .text = "TASK-2 Renamed outside Conduit" } }), "an external edit of TASK-2 appeared live", .{});
+
+    // Escape closes the view; the palette opens it again; the chord closes it.
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element_absent = "backlog.view" }) and !self.backlogShown(), "Escape closed the view", .{});
+    backlogCheck(out, &failures, try clickPaletteCommand(self, io, out, backlog_open_action, null) and
+        try waitForBacklog(self, io, out, .{ .element = "backlog.view" }) and
+        try waitForBacklog(self, io, out, .{ .element = "backlog.task.TASK-1.agent.working" }), "the palette opened the view by mouse with the agent still linked", .{});
+    _ = try backlogChordKey(self, io, out);
+    backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element_absent = "backlog.view" }), "the chord closed the view", .{});
+
+    // A workspace without a backlog says so.
+    var plain_buffer: [path_capacity:0]u8 = undefined;
+    const plain_dir = try std.fmt.bufPrintZ(&plain_buffer, "{s}/plain", .{dir});
+    _ = try Dir.cwd().createDirPathStatus(io, plain_dir, .default_dir);
+    _ = try runPaletteCommandByKeyboard(self, io, out, "Create workspace");
+    _ = try agentTypeLine(self, io, out, plain_dir);
+    _ = try waitForBacklog(self, io, out, .{ .element = "workspace.3" });
+    _ = try backlogChordKey(self, io, out);
+    backlogCheck(out, &failures, self.workspace_registry.activeKey() != project_key and self.workspace_registry.activeKey() != first_key and
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.empty", .text = "no backlog/ here" } }), "a workspace without backlog/ shows the empty state", .{});
+    _ = try backlogChordKey(self, io, out);
+    _ = try waitForBacklog(self, io, out, .{ .element_absent = "backlog.view" });
+
+    var calls_buffer: [path_capacity]u8 = undefined;
+    const calls_path = try std.fmt.bufPrint(&calls_buffer, "{s}/calls", .{bin});
+    var calls_text: [4096]u8 = undefined;
+    const calls = Dir.cwd().readFile(io, calls_path, &calls_text) catch "";
+    backlogCheck(out, &failures, std.mem.indexOf(u8, calls, "task edit TASK-1 --check-ac=1 --plain") != null and
+        std.mem.indexOf(u8, calls, "task edit TASK-1 --uncheck-ac=1 --plain") != null and
+        std.mem.indexOf(u8, calls, "task edit TASK-1 --status=In Progress --plain") != null, "the CLI was called with validated single-argument options", .{});
+
+    out.print("backlog-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
 // --agent-view-test (TASK-57) --------------------------------------------------
 
 fn viewCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
@@ -25668,6 +27143,9 @@ const usage =
     \\  --agent-manager-test               drive the agent manager over two workspaces:
     \\                                    live rows, focus, message, stop, restart and
     \\                                    a new agent by keyboard and mouse, then exit
+    \\  --backlog-test                     drive the backlog view over a fixture project
+    \\                                    and a fake backlog CLI: board, list, detail,
+    \\                                    writes, live reloads and a task's agent
     \\  --ssh-test                         drive SSH workspaces against a throwaway sshd
     \\                                    container: connect, prompts, remote panes and
     \\                                    scratchpad, loss and reconnect, then exit
@@ -25997,6 +27475,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try agentViewTest(app, init.io, out);
     } else if (options.run.agent_manager_test) {
         check_status = try agentManagerTest(app, init.io, out);
+    } else if (options.run.backlog_test) {
+        check_status = try backlogTest(app, init.io, out);
     } else if (options.run.agent_test) {
         check_status = try agentTest(app, init.io, out);
     } else if (options.run.ssh_test) {
@@ -26493,6 +27973,15 @@ test "--agent-test owns a fixed real-child viewport and its own deterministic ch
     // The sink root sits in the check's private directory.
     var buffer: [path_capacity]u8 = undefined;
     try std.testing.expectEqualStrings("/tmp/conduit-agent-test-x/agents", agentSinkRoot(std.testing.io, env.source(), options, &buffer).?);
+}
+
+test "--backlog-test runs in --agent-test's environment" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--backlog-test" }, env.source());
+    try std.testing.expect(parsed.run.agent_test and parsed.run.backlog_test and !parsed.run.agent_manager_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--backlog-test") != null);
+    const options = optionsForRun(parsed);
+    try std.testing.expect(options.run.hidden and wantsChild(options) and usesDeterministicScratchpad(options));
 }
 
 test "--agent-manager-test runs in --agent-test's environment" {
@@ -28123,6 +29612,7 @@ const inheriting_env = test_env{ .vars = &.{
     .{ "CONDUIT_AGENT_SINK", "/outer/sink" },
     .{ "CONDUIT_AGENT_GATE", "1" },
     .{ "CONDUIT_TEST_FAKE_AGENT", "1" },
+    .{ "CONDUIT_TEST_BACKLOG_CLI", "./fake-backlog" },
     .{ "HOME", "" },
     .{ "SHELL", "/bin/sh" },
 } };

@@ -429,8 +429,52 @@ nothing else is a legal dependency.
   status when the record lacks the `send_input` capability). New is an in-manager chooser:
   `agents.new.harness.<n>` (from `launchChoices`), `agents.new.workspace.<n>` (sidebar order) and
   a prompt `Input` with `agents.new.launch`, which activates the workspace and runs
-  `launchAgent`, `agent.launch`'s own path. TASK-64 fills `ManagerColumns.task` for the task
-  column.
+  `launchAgent`, `agent.launch`'s own path. The task column is `Runner.taskId` (TASK-64).
+- **Backlog view (TASK-63, TASK-64).** `src/backlog_view.zig` (a file of `app`, no semantic-tree
+  code) is the view's model: `build` turns a `backlog.Project` into a `Board` (a `Column` per
+  configured status, then one per unconfigured status a task carries, up to 16; active tasks only,
+  sorted by ordinal then natural id) and its ordinal `list`, with sanitised one-line `Card` labels
+  and meta rows; `State` (mode, a selection that follows a task id, per-column and list scroll, a
+  `follow` flag the wheel clears) moves by `Motion`; `detailRows` wraps a task into rows whose
+  status row and criterion rows carry a `Target`; `parseElement` reads the view's element ids back
+  (only `backlog.isTaskId` ids, so no suffix can be smuggled); `CliRequest`/`CliJob` run one
+  `backlog.Cli` write on a short-lived worker that wakes the loop (`postDriverWake`) when done; and
+  `Panel` is one workspace's view: open flag, project, board arena, state, open `Detail`, message
+  line and a bounded queue (4) of writes run one at a time. Each `WorkspacePresentation` owns its
+  `Panel` (created on first open, released with its write joined before the workspace and its
+  context go). In `main.zig`, `backlog.open` (Ctrl+Shift+K / Cmd+Shift+K, an app default; palette
+  "Backlog") toggles the active workspace's panel: it resolves `<dir>/backlog` from the focused
+  session's OSC 7 cwd, else the workspace directory, else (an unnamed Local workspace) the
+  process's own, and `Panel.load`s it through the workspace ExecutionContext with watches. Loads
+  and polls run on the owner thread for Local contexts only; any other context shows a
+  `remote` problem row instead, because a remote read blocks on its connection. `poll` calls
+  `pollBacklog` every iteration (`waitBudget` ticks every 250 ms while a panel is open or busy),
+  which collects finished writes and `Project.poll`s, rebuilding the board on any change.
+  `composeBacklog` registers, after the panes and before the scratchpad and the modals, an opaque
+  `Surface` `backlog.view` over the union of the active tab's pane rects with controls
+  `backlog.mode.board`/`.list`/`backlog.close`, `backlog.summary`, headings `backlog.column.<n>`,
+  per card an `InteractiveText` `backlog.task.<id>` (action `backlog.activate`), a small muted
+  `backlog.task.<id>.meta`, semantic-only `backlog.task.<id>.agent.<state>` and
+  `backlog.task.<id>.column.<n>` elements, the list's `backlog.list.heading` and
+  `backlog.task.<id>.status`, `backlog.message`, `backlog.hint` and, for an open detail, a modal
+  `Surface` `backlog.detail.<id>` with `.status`, `.ac.<n>`, `.row.<n>` texts, the fixed `.agent`
+  and `.raw` controls, `.close`, the chooser's `.harness.<n>`/`.back`, and `backlog.detail-hint`.
+  Ids and labels live in two alternating frame arenas (reset, not freed), like the manager's
+  two-generation ids. The view is not modal for chords: `routeBacklogKey` takes only plain and
+  Shift keys it uses (claimed through `ui_key_state`), every other key reaches the bindings, and
+  the `.terminal` branch drops what is left, so no key or text reaches a hidden terminal.
+  `handleBacklogUiEvent` owns pointer gestures inside the view (hover only after real motion, a
+  press outside an open detail closes it, the wheel scrolls); the sidebar keeps working. Writes:
+  status cycles through `nextStatus`, criteria flip through `checkAcceptance`, queued with
+  `Panel.enqueue`; the view never edits markdown and never acts on task text. `.raw` opens
+  `vi -- <task path>` through `openEditorTab`. TASK-64: `.agent` lists `launchChoices`, and a
+  choice runs `launchAgentWith(choice, backlog.taskPrompt(task), .{ .cwd = project dir, .task_id
+  })`, `agent.launch`'s own path; `LaunchRequest.task_id` is copied into `Runner.task_id_bytes`
+  and carried by `relaunchRequest`, so a restart keeps it. A card, list row and detail show the
+  live badge of the agent whose runner has that task id and the project directory as cwd (a live
+  one before an exited one, then the newest); the manager's task column reads the same field.
+  Test seam: `backlog_program` (the CLI name; `--backlog-test` points it at a fake, and a driven
+  run takes `CONDUIT_TEST_BACKLOG_CLI`, which children never inherit).
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
@@ -450,7 +494,7 @@ nothing else is a legal dependency.
   commands and family picker), TASK-41 (settings view and keybinding editor); TASK-76 (git branch
   rows and the secondary small face), TASK-77 (sidebar workspace gap); M6 — TASK-56 (agent runtime,
   sidebar glyphs and notifications), TASK-57 (the structured agent view), TASK-58 (the agent
-  manager).
+  manager); M7 — TASK-63 (the backlog view), TASK-64 (agents started on tasks).
 
 ### `platform`
 
@@ -1119,6 +1163,9 @@ nothing else is a legal dependency.
 - **Lands** M6 — TASK-51 – TASK-61. Explicitly a v0.1 non-goal. decision-7 (from TASK-51's
   `doc-3`) fixes the strategy: the harness TUI always runs in a Conduit PTY, each adapter adds
   the harness's structured side channel, and PTY heuristics are the baseline every agent gets.
+- **Backlog link (TASK-64).** No `agent/` type changed: which backlog task an agent works on is
+  app state, `app_agents.Runner.taskId()`, set from `LaunchRequest.task_id` and kept across a
+  restart; the registry's `Agent` record stays harness- and backlog-neutral.
 - **Today (TASK-52)** the core is in place, split under `src/agent/` and re-exported from
   `agent.zig`; the harness adapters land beside it (Codex below).
   - `state.zig`: `State` (`idle`, `working`, `waiting_input`, `waiting_permission`, `done`,
@@ -1302,9 +1349,16 @@ nothing else is a legal dependency.
   the CLI's file changes return through `poll`.
 - **Threads.** A `Project` belongs to the thread that loaded it and blocks on the context's IO;
   `Cli` calls wait for the child. Both therefore run on a worker for a remote context, and `Cli`
-  on a worker always; TASK-63 decides the hand-over to `ui`.
-- **Lands** M7 — TASK-62 provides the data layer; TASK-63 and TASK-64 the views and agent
-  linking. Explicitly a v0.1 non-goal.
+  on a worker always. TASK-63's view loads and polls a Local project on the owner thread (a local
+  file read) and runs every `Cli` write on a `backlog_view.CliJob` worker; remote projects are not
+  read yet.
+- **Agent prompt (TASK-64).** `taskPrompt(buffer, task)` writes an agent's initial prompt:
+  `<id>: <title>`, the description and `Acceptance criteria:` with `- [ ] #N` items, controls
+  neutralised, at most `max_task_prompt_bytes` (16 KiB) and cut on a character boundary with
+  `task_prompt_truncated`. The link itself lives on the app's agent runner (`Runner.taskId`), not
+  in the files.
+- **Lands** M7 — TASK-62 provides the data layer; TASK-63 the board, list and task-detail view
+  and TASK-64 the agent linking (both in `app`). Explicitly a v0.1 non-goal.
 
 ### `testdriver`
 
@@ -1991,15 +2045,15 @@ Which level proves what, by concern:
 
 Rules that apply to all levels:
 
-- The twenty-six verified Linux headless app checks are `--grid-test`, `--self-test`,
+- The twenty-seven verified Linux headless app checks are `--grid-test`, `--self-test`,
   `--scroll-test`, `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`,
   `--sidebar-test`, `--tabs-test`, `--panes-test`, `--palette-test`, `--scratchpad-test`,
   `--workspaces-test`, `--links-test`, `--search-test`, `--menu-test`, `--config-test`,
   `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`,
-  `--agent-view-test`, `--agent-manager-test`, `--ssh-test` and `--driver-test`; the scripted
-  `zig build e2e` runner has seventeen scenarios, the latest being `font-coverage`,
-  `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch`, `agent-notifications`,
-  `agent-view` and `agent-manager`. Real-window checks use
+  `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--ssh-test` and
+  `--driver-test`; the scripted `zig build e2e` runner has eighteen scenarios, the latest being
+  `font-coverage`, `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch`,
+  `agent-notifications`, `agent-view`, `agent-manager` and `backlog-board`. Real-window checks use
   Xvfb locally; `--clipboard-test` deliberately uses SDL's offscreen driver.
   TASK-28's `--sidebar-test` uses the production sidebar and real SDL events to switch provisioned
   tabs by click and through an independently entered keyboard focus path, hide and reveal the

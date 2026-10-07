@@ -591,6 +591,49 @@ const agent_manager_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-63: a fixture project written into the run's private TMPDIR, whose
+// directory the child claims with OSC 7 so the view opens on it. The stand-in
+// CLI the launch names makes the status edit the real `backlog` makes, and
+// the child prints MOVED_DONE once the file says so: the move is proved in
+// the file and then on the board, never by app state.
+const backlog_board_cli = "./.conduit-e2e-backlog";
+
+const backlog_board_env = [_]EnvVar{
+    .{ .name = "CONDUIT_TEST_BACKLOG_CLI", .value = backlog_board_cli },
+};
+
+const backlog_board_command =
+    "stty -echo; d=\"${TMPDIR:-/tmp}/conduit-e2e-backlog\"; " ++
+    "mkdir -p \"$d/backlog/tasks\" && cd \"$d\" || exit 1; " ++
+    "printf '%s\\n' 'project_name: \"E2E\"' 'statuses: [\"To Do\", \"In Progress\", \"Done\"]' > backlog/config.yml; " ++
+    "printf '%s\\n' '---' 'id: TASK-1' 'title: Board scenario' 'status: To Do' 'ordinal: 1000' '---' '' " ++
+    "'## Acceptance Criteria' '<!-- AC:BEGIN -->' '- [ ] #1 The board opens' '<!-- AC:END -->' " ++
+    "> 'backlog/tasks/task-1 - Board-scenario.md'; " ++
+    "printf '%s\\n' '#!/bin/sh' 'sed -i \"s/^status: .*/status: ${4#--status=}/\" backlog/tasks/*.md' > " ++ backlog_board_cli ++ "; " ++
+    "chmod 700 " ++ backlog_board_cli ++ "; " ++
+    "printf '\\033]7;file://localhost%s\\007' \"$PWD\"; printf 'BACKLOG_%s\\n' READY; " ++
+    "until grep -q '^status: In Progress' backlog/tasks/*.md; do sleep 0.2; done; printf 'MOVED_%s\\n' DONE; " ++
+    "while :; do sleep 60; done";
+
+const backlog_board_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "BACKLOG_READY" } },
+    .{ .key = "CTRL+SHIFT+k" },
+    .{ .wait_element = .{ .id = "backlog.view", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "backlog.task.TASK-1.column.0", .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .click = "backlog.task.TASK-1" },
+    .{ .wait_element = .{ .id = "backlog.detail.TASK-1", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "backlog.detail.TASK-1.ac.1", .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .key = "s" },
+    .{ .wait_terminal_text = .{ .contains = "MOVED_DONE" } },
+    .{ .key = "ESCAPE" },
+    .{ .wait_element = .{ .id = "backlog.detail.TASK-1", .state = "exists", .equals = false } },
+    .{ .wait_element = .{ .id = "backlog.task.TASK-1.column.1", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "backlog.task.TASK-1.column.0", .state = "exists", .equals = false } },
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -681,12 +724,43 @@ pub const all = [_]Scenario{
         .command = deterministic_shell,
         .steps = &agent_manager_steps,
     },
+    .{
+        .name = "backlog-board",
+        .launch_env = &backlog_board_env,
+        .command = backlog_board_command,
+        .steps = &backlog_board_steps,
+    },
 };
+
+test "the backlog scenario opens the view by chord, a card by click, and moves the task" {
+    const scenario = all[17];
+    try std.testing.expectEqualStrings("backlog-board", scenario.name);
+    try std.testing.expectEqual(@as(usize, 18), all.len);
+    try std.testing.expectEqualStrings("CONDUIT_TEST_BACKLOG_CLI", scenario.launch_env[0].name);
+    var chord = false;
+    var clicked = false;
+    var moved = false;
+    for (scenario.steps) |step| switch (step) {
+        .key => |key| if (std.mem.eql(u8, key, "CTRL+SHIFT+k")) {
+            chord = true;
+        },
+        .click => |id| if (std.mem.eql(u8, id, "backlog.task.TASK-1")) {
+            clicked = true;
+        },
+        .wait_element => |wait| if (std.mem.eql(u8, wait.id, "backlog.task.TASK-1.column.1") and wait.equals) {
+            moved = true;
+        },
+        // The asserted marker is never typed or spelled whole in the command.
+        .wait_terminal_text => |wait| try std.testing.expect(std.mem.indexOf(u8, backlog_board_command, wait.contains) == null),
+        else => {},
+    };
+    try std.testing.expect(chord and clicked and moved);
+}
 
 test "the agent manager scenario opens the manager by chord and focuses by a click" {
     const scenario = all[16];
     try std.testing.expectEqualStrings("agent-manager", scenario.name);
-    try std.testing.expectEqual(@as(usize, 17), all.len);
+    try std.testing.expectEqual(@as(usize, 18), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -709,7 +783,7 @@ test "the agent manager scenario opens the manager by chord and focuses by a cli
 test "the agent view scenario opens the view by chord and answers by a click" {
     const scenario = all[15];
     try std.testing.expectEqualStrings("agent-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 17), all.len);
+    try std.testing.expectEqual(@as(usize, 18), all.len);
     var chords: usize = 0;
     var clicked = false;
     var outcome = false;
@@ -977,7 +1051,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 17), all.len);
+    try std.testing.expectEqual(@as(usize, 18), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;
