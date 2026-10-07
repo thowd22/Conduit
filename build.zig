@@ -12,6 +12,7 @@
 //! not there would be a broken build rather than a pending one.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// One Conduit module: the file its root is declared in, and the Conduit
 /// modules it may import.
@@ -94,7 +95,7 @@ const oniguruma_c_header =
 ;
 
 pub fn build(b: *std.Build) !void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{ .default_target = defaultTargetQuery() });
     const optimize = b.standardOptimizeOption(.{});
 
     const wired = wireConduitModules(b, target, optimize);
@@ -166,6 +167,27 @@ pub fn build(b: *std.Build) !void {
     addTests(b, wired, conduit_test, e2e);
 
     if (font_wiring) |wiring| addFontCheck(b, target, optimize, wired[moduleIndex("font")].?, wiring);
+}
+
+/// The target `zig build` uses when no `-Dtarget` is given: the host, as usual,
+/// except on a Windows host (TASK-5).
+///
+/// There a fully native target query makes Zig 0.16 compile every C and C++
+/// source in the tree (Ghostty's wuffs and SIMD code, zlib, libpng, FreeType,
+/// Oniguruma) into errors such as "argument unused during compilation:
+/// '-fno-rtlib-defaultlib'" and vector types collapsing to scalars in
+/// `mmintrin.h`. The same build succeeds on the same runner once the OS and ABI
+/// are named, even with `-Dcpu=native` and the host's exact Windows version, so
+/// only the native OS/ABI detection is avoided: the architecture and CPU stay
+/// the host's, and the ABI is GNU, which is what native resolves to anyway.
+fn defaultTargetQuery() std.Target.Query {
+    if (builtin.os.tag != .windows) return .{};
+    return .{
+        .cpu_arch = builtin.cpu.arch,
+        .cpu_model = .native,
+        .os_tag = .windows,
+        .abi = .gnu,
+    };
 }
 
 /// Options for every `b.dependency("ghostty", ...)` call, so both resolve to one instance.
