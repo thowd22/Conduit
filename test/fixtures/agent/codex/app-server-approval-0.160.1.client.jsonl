@@ -1,0 +1,5 @@
+{"id":1,"method":"initialize","params":{"clientInfo":{"name":"conduit","version":"0.0.0"}}}
+{"method":"initialized"}
+{"id":2,"method":"thread/start","params":{"cwd":"/work/proj","approvalPolicy":"untrusted","sandbox":"read-only"}}
+{"id":3,"method":"turn/start","params":{"threadId":"01a11809-508c-7502-b819-337bc182556d","input":[{"type":"text","text":"RUNTOOL"}]}}
+{"id":0,"result":{"decision":"accept"}}
