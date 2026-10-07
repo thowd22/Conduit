@@ -259,6 +259,10 @@ fn installLinuxPayload(
         .{ .source = b.path("assets/THIRD-PARTY-LICENSES/FreeType-LICENSE.TXT"), .destination = "share/licenses/conduit/FreeType-LICENSE.TXT" },
         .{ .source = b.path("assets/THIRD-PARTY-LICENSES/HarfBuzz-COPYING.txt"), .destination = "share/licenses/conduit/HarfBuzz-COPYING.txt" },
         .{ .source = b.path("assets/THIRD-PARTY-LICENSES/Oniguruma-COPYING.txt"), .destination = "share/licenses/conduit/Oniguruma-COPYING.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/zlib-LICENSE.txt"), .destination = "share/licenses/conduit/zlib-LICENSE.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/libpng-LICENSE.txt"), .destination = "share/licenses/conduit/libpng-LICENSE.txt" },
+        .{ .source = b.path("assets/fonts/LICENSE-NerdFonts.txt"), .destination = "share/licenses/conduit/NerdFonts-LICENSE.txt" },
+        .{ .source = b.path("assets/fonts/NerdFonts-license-audit.md"), .destination = "share/licenses/conduit/NerdFonts-license-audit.md" },
         .{ .source = b.path("LICENSE"), .destination = "share/licenses/conduit/LICENSE" },
         .{ .source = b.dependency("ghostty", ghosttyDependencyOptions(target, optimize)).path("LICENSE"), .destination = "share/licenses/conduit/Ghostty-LICENSE" },
         .{ .source = b.dependency("sdl", .{ .target = target, .optimize = optimize }).path("LICENSE.txt"), .destination = "share/licenses/conduit/SDL-LICENSE.txt" },
@@ -485,6 +489,19 @@ fn wireFontSeams(
         ),
     });
 
+    // The bundled Nerd Font symbols face (TASK-39): the last font-backed link
+    // of every fallback chain, so private-use icons draw without a patched
+    // font installed. Embedded for the same reason as the face above.
+    if (!sourceExists(b, bundled_symbols_asset)) {
+        fail("the bundled symbols font {s} is missing from the repository", .{bundled_symbols_asset});
+    }
+    _ = generated.addCopyFile(b.path(bundled_symbols_asset), bundled_symbols_name);
+    font.addAnonymousImport("bundled-symbols", .{
+        .root_source_file = generated.add("bundled_symbols.zig",
+            \\pub const data: []const u8 = @embedFile("SymbolsNerdFontMono-Regular.ttf");
+        ),
+    });
+
     // FreeType is C and HarfBuzz is C++, so anything that links them links
     // both runtimes. They are set on the module rather than left to the
     // compilation because `font` is imported by `ui`, `app` and the test
@@ -508,6 +525,11 @@ const window_icon_asset = "assets/linux/io.github.thowd22.Conduit-64.rgba";
 /// its version and licence.
 const bundled_face_asset = "assets/fonts/JetBrainsMono-Regular.ttf";
 const bundled_face_name = "JetBrainsMono-Regular.ttf";
+
+/// The bundled Nerd Fonts "Symbols Nerd Font Mono" face, embedded like the
+/// face above. See `assets/fonts/README.md` for its version and licences.
+const bundled_symbols_asset = "assets/fonts/SymbolsNerdFontMono-Regular.ttf";
+const bundled_symbols_name = "SymbolsNerdFontMono-Regular.ttf";
 
 /// The shell-integration scripts the app embeds: where each lives in the
 /// repository, and the flat name it is copied to beside the generated Zig file
@@ -643,11 +665,121 @@ const oniguruma_srcs: []const []const u8 = &.{
     "src/unicode_fold3_key.c",
 };
 
+/// The pinned zlib, built from source for libpng. The source list and flags
+/// are the pinned Ghostty tree's `pkg/zlib/build.zig`.
+fn zlibLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) !*std.Build.Step.Compile {
+    const upstream = b.dependency("zlib", .{});
+    const lib = b.addLibrary(.{
+        .name = "z",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .linkage = .static,
+    });
+    var flags: std.ArrayList([]const u8) = .empty;
+    defer flags.deinit(b.allocator);
+    try flags.appendSlice(b.allocator, &.{
+        "-DHAVE_SYS_TYPES_H",
+        "-DHAVE_STDINT_H",
+        "-DHAVE_STDDEF_H",
+    });
+    if (target.result.os.tag != .windows) try flags.append(b.allocator, "-DZ_HAVE_UNISTD_H");
+    if (target.result.abi == .msvc) {
+        try flags.appendSlice(b.allocator, &.{
+            "-fno-sanitize=undefined",
+            "-fno-sanitize-trap=undefined",
+            "-D_CRT_SECURE_NO_DEPRECATE",
+            "-D_CRT_NONSTDC_NO_DEPRECATE",
+        });
+    }
+    lib.root_module.addIncludePath(upstream.path(""));
+    lib.root_module.addCSourceFiles(.{ .root = upstream.path(""), .files = zlib_srcs, .flags = flags.items });
+    return lib;
+}
+
+const zlib_srcs: []const []const u8 = &.{
+    "adler32.c",  "compress.c", "crc32.c",   "deflate.c", "gzclose.c",
+    "gzlib.c",    "gzread.c",   "gzwrite.c", "inflate.c", "infback.c",
+    "inftrees.c", "inffast.c",  "trees.c",   "uncompr.c", "zutil.c",
+};
+
+/// The pinned libpng, built from source so FreeType can decode the PNG strikes
+/// of colour emoji fonts. Its configuration header is upstream's own
+/// `scripts/pnglibconf.h.prebuilt`, copied under the name libpng includes; the
+/// architecture-specific SIMD paths are off, exactly as in the pinned Ghostty
+/// tree's `pkg/libpng/build.zig`, so one source list builds on every target.
+const LibPng = struct {
+    lib: *std.Build.Step.Compile,
+    /// png.h and pngconf.h.
+    include: std.Build.LazyPath,
+    /// The generated directory holding pnglibconf.h.
+    config: std.Build.LazyPath,
+};
+
+fn libpngLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zlib: *std.Build.Step.Compile,
+) !LibPng {
+    const upstream = b.dependency("libpng", .{});
+    const zlib_upstream = b.dependency("zlib", .{});
+    const config = b.addWriteFiles();
+    _ = config.addCopyFile(upstream.path("scripts/pnglibconf.h.prebuilt"), "pnglibconf.h");
+
+    const lib = b.addLibrary(.{
+        .name = "png",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .linkage = .static,
+    });
+    lib.root_module.linkLibrary(zlib);
+    if (target.result.os.tag == .linux) lib.root_module.linkSystemLibrary("m", .{});
+
+    var flags: std.ArrayList([]const u8) = .empty;
+    defer flags.deinit(b.allocator);
+    try flags.appendSlice(b.allocator, &.{
+        "-DPNG_ARM_NEON_OPT=0",
+        "-DPNG_POWERPC_VSX_OPT=0",
+        "-DPNG_INTEL_SSE_OPT=0",
+        "-DPNG_MIPS_MSA_OPT=0",
+        "-DPNG_MIPS_MMI_OPT=0",
+        "-DPNG_LOONGARCH_LSX_OPT=0",
+    });
+    if (target.result.abi == .msvc) {
+        try flags.appendSlice(b.allocator, &.{
+            "-fno-sanitize=undefined",
+            "-fno-sanitize-trap=undefined",
+        });
+    }
+    lib.root_module.addIncludePath(config.getDirectory());
+    lib.root_module.addIncludePath(upstream.path(""));
+    lib.root_module.addIncludePath(zlib_upstream.path(""));
+    lib.root_module.addCSourceFiles(.{ .root = upstream.path(""), .files = libpng_srcs, .flags = flags.items });
+    return .{ .lib = lib, .include = upstream.path(""), .config = config.getDirectory() };
+}
+
+const libpng_srcs: []const []const u8 = &.{
+    "png.c",      "pngerror.c", "pngget.c",   "pngmem.c",   "pngpread.c",
+    "pngread.c",  "pngrio.c",   "pngrtran.c", "pngrutil.c", "pngset.c",
+    "pngtrans.c", "pngwio.c",   "pngwrite.c", "pngwtran.c", "pngwutil.c",
+};
+
 /// The pinned FreeType, built from source. The source list and the flags are
-/// the ones the pinned Ghostty tree's `pkg/freetype/build.zig` uses, minus the
-/// two things Conduit does not need and CI could not supply: libpng (colour
-/// bitmap glyphs) and system zlib (compressed fonts, which no font on a
-/// developer's machine needs to draw a terminal).
+/// the ones the pinned Ghostty tree's `pkg/freetype/build.zig` uses with its
+/// `enable-libpng` option on: libpng (and the zlib it needs) is built from the
+/// same pinned sources, because colour emoji fonts store their glyphs as PNG
+/// strikes (TASK-39). FreeType keeps its own internal zlib copy for gzip-
+/// compressed fonts rather than the system one.
 fn freetypeLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -669,6 +801,7 @@ fn freetypeLib(
     try flags.appendSlice(b.allocator, &.{
         "-DFT2_BUILD_LIBRARY",
         "-fno-sanitize=undefined",
+        "-DFT_CONFIG_OPTION_USE_PNG=1",
     });
     if (target.result.os.tag != .windows) {
         try flags.appendSlice(b.allocator, &.{
@@ -677,6 +810,14 @@ fn freetypeLib(
         });
     }
 
+    const zlib = try zlibLib(b, target, optimize);
+    const png = try libpngLib(b, target, optimize, zlib);
+    lib.root_module.linkLibrary(png.lib);
+    lib.root_module.linkLibrary(zlib);
+    lib.root_module.addIncludePath(png.config);
+    lib.root_module.addIncludePath(png.include);
+    lib.root_module.addIncludePath(b.dependency("zlib", .{}).path(""));
+
     lib.root_module.addIncludePath(upstream.path("include"));
     lib.root_module.addCSourceFiles(.{
         .root = upstream.path(""),
@@ -684,7 +825,7 @@ fn freetypeLib(
         .flags = flags.items,
     });
 
-    // `src/svg/svg.c` compiles to nothing without libpng, but `ftinit.c` still
+    // `src/svg/svg.c` compiles to nothing without `FT_CONFIG_OPTION_SVG`, but `ftinit.c` still
     // refers to the SVG renderer class, so leaving it out is a link error.
     lib.root_module.addCSourceFile(.{
         .file = upstream.path("src/svg/svg.c"),
@@ -833,6 +974,10 @@ fn fontSeam(
 const font_c_header =
     \\#include <ft2build.h>
     \\#include FT_FREETYPE_H
+    \\#include FT_OUTLINE_H
+    \\#include FT_BITMAP_H
+    \\#include FT_SYNTHESIS_H
+    \\#include FT_TRUETYPE_TABLES_H
     \\#include <hb.h>
     \\#include <hb-ft.h>
 ;
