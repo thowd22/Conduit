@@ -855,6 +855,29 @@ nothing else is a legal dependency.
     under `src/agent/pi/testdata/`; two integration tests run the real `pi --mode rpc` with the
     extension against a loopback mock model (`testdata/mock_chat.py`) and skip when `pi` or
     `python3` is absent.
+  - `claude_code.zig` (TASK-53): `ClaudeCodeAdapter` (`init(allocator, io, Options)`, `deinit`,
+    `adapter()`). Options name the per-agent *sink* directory (inside the run's private state
+    dir), Claude's config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`, read only) and the probe
+    environment. `detect` runs `claude --version` through the ExecutionContext. `launch` writes
+    the sink — `settings.json` with one command hook per event (SessionStart,
+    InstructionsLoaded, UserPromptSubmit, PreToolUse, PermissionRequest, PostToolUse,
+    PostToolUseFailure, Notification, SubagentStart/Stop, Stop, StopFailure, SessionEnd) and the
+    POSIX `hook.sh` relay — and returns `claude --settings <sink>/settings.json --session-id
+    <uuid from the token> [-- <prompt>]` plus `CONDUIT_AGENT_TOKEN`. The relay appends each hook
+    input as one wrapped line to `<sink>/events.jsonl`; for PermissionRequest it waits (≤ 580 s)
+    for `<sink>/decisions/<request>`, which `respondPermission` writes atomically, prints Claude's
+    `hookSpecificOutput.decision.behavior` `allow`/`deny` reply and appends a synthetic
+    `PermissionEnd`. `poll` tails that file (bounded lines, bytes and line length; a full queue
+    resumes at the same event), then the session transcript (`TranscriptReader`: messages, and
+    tool uses with file references when no hooks report them), then — for an observed session —
+    the undocumented `<config>/sessions/<pid>.json` status. `findRunningSession` matches that
+    registry by pid, cwd or session id so a `claude` started by hand in a terminal can be
+    attached by its session id. `Stop` maps to `done`; an owned agent's exit comes from its PTY
+    child, an observed one's from `SessionEnd`. `send_input`, `read_prompt`/`update_prompt`
+    (TASK-59), `stop` and headless launch are unsupported. The interim sink is replaced by the
+    TASK-60 control endpoint; sink, transcript and registry reads are local until TASK-61.
+    Fixtures live in `src/agent/claude_code/fixtures/` because `@embedFile` cannot leave the
+    module's directory.
 
 ### `backlog`
 
