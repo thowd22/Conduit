@@ -162,6 +162,7 @@ jobs:
             --search-test
             --menu-test
             --config-test
+            --theme-test
             --driver-test
           )
           for check in "${checks[@]}"; do

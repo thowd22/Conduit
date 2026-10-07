@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its eighteen Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its nineteen Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -372,6 +372,32 @@ gap noted under TASK-50 is closed wherever a CJK font is installed. The `font.li
 `font.nerd_symbols` and style-family settings TASK-37 already parses are wired to these `Request`
 fields by TASK-40.
 
+TASK-38 is complete. `theme` owns a `Scheme` (16 ANSI colours, foreground, background, cursor,
+selection, optional cursor-text and selection-foreground) and `derive`, which maps it onto every
+`Role`: the terminal roles are the scheme's own, and the chrome roles (`strong`, `muted`, `accent`,
+`border`, `attention`, `danger`, `on_accent`, `field`, `selection`) prefer the conventional ANSI
+slot and fall back rule by rule to keep WCAG contrast (4.5:1 text, 3:1 chrome), so light schemes
+stay readable; `conduit-dark` derives exactly the palette Conduit shipped before. Fourteen schemes
+are bundled as compile-time data in `src/theme_schemes.zig`, copied from the Ghostty theme files of
+iTerm2-Color-Schemes with a source URL each and licences in `assets/themes/README.md`: Conduit
+Dark, Gruvbox Dark/Light, Catppuccin Mocha/Latte, Dracula, Nord, Tokyo Night, Solarized Dark/Light,
+One Dark, Kanagawa Wave, Everforest Dark and Rosé Pine. `theme = <name>` names a bundled scheme or
+a Ghostty-format file in `<config dir>/conduit/themes/` (user files win; names ignore case, spaces,
+hyphens and underscores); `auto:<dark>,<light>` follows `platform.systemTheme` and SDL's
+system-theme event, dark when unknown; an unknown name is a `config.error` line and the previous
+theme stays. Themes resolve at startup and on every settings reload (theme files are re-read then,
+not watched on their own). The active palette feeds every pane and scratchpad grid, the overlay and
+the surface clear, and all chrome uses the derived roles. The palette command `Theme: choose`
+(`theme.pick`) lists every theme with the active one first, previews the keyboard-highlighted or
+hovered theme live across the whole window, reverts on Escape or an outside click, and on Enter or
+click writes `theme = <name>` with `config.writeDocumentValue`, which replaces or appends one key
+while preserving every other line. Cursor-text and selection-foreground are parsed but not drawn
+yet, so `derive` tones down a selection colour that sits near the foreground. The deterministic
+Linux `--theme-test` drives a bundled theme, a dropped user file, keyboard preview and revert,
+hover preview, a mouse commit saved to the file, an unknown-name error and the `auto:` pair through
+real SDL events and frame readback; its picker frame was visually inspected. Native macOS and
+Windows dark-mode reporting is unverified, and under Xvfb SDL reports the preference as unknown.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -547,7 +573,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:

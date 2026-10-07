@@ -1,11 +1,11 @@
 ---
 id: TASK-38
 title: Theme engine and popular color schemes
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 17:43'
+updated_date: '2026-10-07 18:09'
 labels:
   - theme
 milestone: m-4
@@ -24,10 +24,10 @@ Theme model (16 ANSI colors, foreground, background, cursor, selection, plus UI 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 At least ten popular schemes are bundled and selectable
-- [ ] #2 Themes in the Ghostty theme file format can be dropped into a user directory and used
-- [ ] #3 Palette theme picker previews the highlighted theme live and reverts on cancel
-- [ ] #4 UI chrome colors derive from the active theme
+- [x] #1 At least ten popular schemes are bundled and selectable
+- [x] #2 Themes in the Ghostty theme file format can be dropped into a user directory and used
+- [x] #3 Palette theme picker previews the highlighted theme live and reverts on cancel
+- [x] #4 UI chrome colors derive from the active theme
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -40,3 +40,17 @@ Theme model (16 ANSI colors, foreground, background, cursor, selection, plus UI 
 5. Palette action theme.pick with a live-preview chooser (highlight previews, Enter commits and writes the key to the config file, Escape reverts).
 6. Deterministic Linux --theme-test (bundled selection, user theme file, preview/revert, chrome colours) with inspected screenshots; docs updated.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Agent: 14 bundled schemes from iTerm2-Color-Schemes Ghostty files (licences in assets/themes/README.md); derive() keeps WCAG contrast for chrome roles; Ghostty theme parser bounded and non-fatal; theme.pick live preview follows keyboard highlight or hover, Escape/outside click reverts, Enter/click commits via config.writeDocumentValue; --theme-test 24 checks; --ui-test registry order now expects 52 actions. Cursor-text/selection-foreground parsed but not drawn; selection toned down for schemes whose selection is near the foreground. Under Xvfb SDL reports system theme unknown, so only the dark branch of auto: ran live.
+
+Coordinator verification 2026-10-07: rebased onto main (acbf42a..b6ae3b8), full local gate green: 614/622 unit tests (8 skipped), all 19 headless checks including --theme-test, ten e2e scenarios. Picker screenshot inspected (Catppuccin Latte previewed across terminal, sidebar and dialog). --theme-test added to the Linux CI gate. Suggested theme-picker e2e scenario handed to TASK-40.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Theme engine: Scheme model with contrast-preserving derivation of every UI role, 14 bundled schemes as compile-time data, Ghostty theme-file import from the user themes directory, theme/auto: settings with hot reload and system-theme following, palette applied to every grid and all chrome, and a Theme: choose picker with live preview, revert and persisted commit. Verified by 18 theme unit tests, the deterministic --theme-test with frame readback, an inspected screenshot and the full local gate.
+<!-- SECTION:FINAL_SUMMARY:END -->
