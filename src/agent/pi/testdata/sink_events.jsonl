@@ -1,0 +1,18 @@
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"session_start","reason":"startup","sessionId":"01a11808-5bb8-7752-8dc7-a8449dd128a6","sessionFile":"/home/user/.pi/agent/sessions/--home-user-proj--/2026-10-07T20-22-43-384Z_01a11808-5bb8-7752-8dc7-a8449dd128a6.jsonl","cwd":"/home/user/proj"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"agent_start"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"message_end","role":"user","text":"RUNTOOL"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"message_end","role":"assistant","text":"","stopReason":"toolUse"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_start","toolCallId":"call_probe","toolName":"bash","summary":"touch probe_file"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"permission_request","id":"c2398549-1","toolName":"bash","toolCallId":"call_probe","title":"Allow bash?","summary":"touch probe_file"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"permission_resolved","id":"c2398549-1","outcome":"allowed","by":"conduit"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_end","toolCallId":"call_probe","toolName":"bash","isError":false}
+{"v":1,"token":"ffffffffffffffffffffffffffffffff","type":"agent_end","stopReason":"stop"}
+{"v":2,"token":"0123456789abcdef0123456789abcdef","type":"agent_end","stopReason":"stop"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_start","toolCallId":"call_edit","toolName":"edit","summary":"src/main.zig","path":"src/main.zig"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"permission_request","id":"c2398549-2","toolName":"edit","toolCallId":"call_edit","title":"Allow edit?","summary":"src/main.zig"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"permission_resolved","id":"c2398549-2","outcome":"rejected","by":"harness"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"message_end","role":"assistant","text":"MOCK_OK","stopReason":"stop"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"agent_end","stopReason":"stop"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"agent_start"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"agent_end","stopReason":"error","errorMessage":"429 rate limited"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"session_shutdown","reason":"quit"}
