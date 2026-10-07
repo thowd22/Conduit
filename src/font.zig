@@ -11,15 +11,33 @@
 //! its atlas and every string it reports; `deinit` releases all of it. Nothing here reaches for a
 //! global allocator.
 //!
-//! ## What v1 resolves, and what it does not
+//! ## How a codepoint finds a glyph (v2, TASK-39)
 //!
-//! v1 resolves the configured family's four styles, falling back to its primary face for any style
-//! that is absent. When no installed family matches, the bundled JetBrains Mono regular face backs
-//! every style. All distinct faces rasterise into one atlas, and the primary regular resolution is
-//! the sole source of cell metrics. Deliberately absent, and belonging to TASK-39 (font manager
-//! v2): fallback *chains* across families, colour emoji, symbol/block/Nerd Font coverage and
-//! ligature toggling. `CONDUIT.md` §5 puts font manager v2 after v0.1, so a glyph v1 cannot resolve
-//! is a known v0.1 gap rather than a promise.
+//! The configured family's four styles are resolved as in v1: an absent style uses the primary
+//! regular face with a *synthetic* style (FreeType emboldening and a 12-degree shear), so bold and
+//! italic text stay distinct even when only the bundled regular face exists. The primary regular
+//! face is the sole source of cell metrics.
+//!
+//! `Manager.resolve` then walks a per-codepoint fallback chain, first hit wins:
+//!
+//! 1. built-in sprites (`font_sprite.zig`: box drawing, blocks, braille, Powerline separators),
+//!    drawn at the cell size so they tile; only while `Request.builtin_symbols` is on, so a user's
+//!    own Nerd Font can draw them instead;
+//! 2. the primary family's face for the requested style, then its regular face;
+//! 3. the configured `Request.fallbacks` families, in order;
+//! 4. every installed system face whose recorded coverage holds the codepoint, monospaced regular
+//!    faces first and colour faces last (first for emoji presentation); private-use codepoints try
+//!    the bundled symbols face before this step because their meaning is font-specific and the
+//!    Nerd Fonts assignment is the one terminals mean;
+//! 5. the bundled Symbols Nerd Font Mono face;
+//! 6. the bundled JetBrains Mono regular face, when the primary is something else.
+//!
+//! Every face beyond the primary styles is a numbered *extra* face, opened lazily and cached, and
+//! its glyphs are scaled down and recentred into the cell box (one or two cells wide) when they
+//! would not fit, so a fallback never changes the grid. Colour bitmap glyphs (CBDT/sbix, through
+//! FreeType's libpng support) go into a separate RGBA atlas and are scaled to the cell box. Face
+//! indices carry the synthetic-style and two-cell flags (`face_flag_*`) in their high bits, which
+//! is what makes each variant a distinct atlas key.
 //!
 //! ## Grapheme clustering and widths
 //!
@@ -40,7 +58,9 @@ const builtin = @import("builtin");
 /// is known by. `hb-ft.h` takes an `FT_Face` and returns a HarfBuzz font built
 /// from it, so both libraries have to come from the *same* translation: two
 /// seams would give Conduit two unrelated Zig types for the same C struct and
-/// handing a face from one to the other would not compile.
+/// handing a face from one to the other would not compile. Since TASK-39 the
+/// shaper deliberately does not use `hb-ft` (see `harfBuzzFont`), but the seam
+/// stays one translation so the two libraries' headers cannot drift apart.
 const seam = @import("font-c");
 const ft = seam;
 const hb = seam;
@@ -65,6 +85,37 @@ pub const bundled_face = @import("bundled-face").data;
 /// The repository path of the bundled face, as reported in logs and to callers. It is a label, not
 /// something the font manager opens: the bytes are `bundled_face`.
 pub const bundled_path = "assets/fonts/JetBrainsMono-Regular.ttf";
+
+/// The bundled Nerd Fonts "Symbols Nerd Font Mono" face, compiled into the binary so private-use
+/// icons draw without a patched font installed. Nerd Fonts v3.5.1; its licences and provenance are
+/// in `assets/fonts/README.md`.
+pub const bundled_symbols = @import("bundled-symbols").data;
+
+/// The repository path of the bundled symbols face, as a label.
+pub const bundled_symbols_path = "assets/fonts/SymbolsNerdFontMono-Regular.ttf";
+
+/// Procedural box drawing, block elements, braille and Powerline separators.
+pub const sprite = @import("font_sprite.zig");
+
+/// The face index of built-in sprite glyphs. Their glyph index is the codepoint itself.
+pub const sprite_face: u32 = face_style_count;
+
+/// Extra (fallback) faces are numbered from here, in the order they were opened.
+const extra_base: u32 = sprite_face + 1;
+
+/// Render the glyph with FreeType emboldening: the style asked for bold and its face is not bold.
+pub const face_flag_bold: u32 = 1 << 31;
+/// Render the glyph sheared: the style asked for italic and its face is upright.
+pub const face_flag_oblique: u32 = 1 << 30;
+/// The glyph occupies two cells, which widens the box a fallback glyph is fitted into.
+pub const face_flag_wide: u32 = 1 << 29;
+/// The face number without its flags.
+pub const face_id_mask: u32 = face_flag_wide - 1;
+
+/// The face index a renderer passes for a glyph drawn in a two-cell (wide) cell.
+pub fn wideFace(face_index: u32) u32 {
+    return face_index | face_flag_wide;
+}
 
 /// The file name extensions discovery accepts. Everything else in a font directory — bitmaps,
 /// metadata, `dir` caches — is skipped without being opened.
@@ -173,31 +224,59 @@ const Library = struct {
 /// One open face at one size. Owns the `FT_Face` it wraps.
 const Face = struct {
     handle: ft.FT_Face,
+    /// Where the face's bytes are, borrowed: the shaper opens its own view of the same font from
+    /// here (see `harfBuzzFont`). A path is owned by the catalog that found it; memory is one of
+    /// the bundled faces compiled into the binary.
+    origin: Origin,
+
+    const Origin = union(enum) {
+        path: [:0]const u8,
+        memory: []const u8,
+    };
 
     /// Open a face from a file. Every failure here is a font file that is not the face it claims to
-    /// be, which is external input: it is returned, never asserted.
+    /// be, which is external input: it is returned, never asserted. `path` must outlive the face.
     fn open(library: ft.FT_Library, path: [:0]const u8, size_px: u32) !Face {
         var handle: ft.FT_Face = undefined;
         if (ft.FT_New_Face(library, path.ptr, 0, &handle) != 0) return error.FontFileUnreadable;
         errdefer _ = ft.FT_Done_Face(handle);
-        return sized(handle, size_px);
+        return sized(handle, .{ .path = path }, size_px);
     }
 
     /// Open a face from bytes already in memory: how the bundled fallback is loaded, and how a
-    /// caller that fetched a font itself would load one.
+    /// caller that fetched a font itself would load one. `bytes` must outlive the face.
     fn openMemory(library: ft.FT_Library, bytes: []const u8, size_px: u32) !Face {
         var handle: ft.FT_Face = undefined;
         if (ft.FT_New_Memory_Face(library, bytes.ptr, @intCast(bytes.len), 0, &handle) != 0) {
             return error.FontFileUnreadable;
         }
         errdefer _ = ft.FT_Done_Face(handle);
-        return sized(handle, size_px);
+        return sized(handle, .{ .memory = bytes }, size_px);
     }
 
-    fn sized(handle: ft.FT_Face, size_px: u32) !Face {
+    fn sized(handle: ft.FT_Face, origin: Origin, size_px: u32) !Face {
+        const flags = handle.*.face_flags;
+        if (flags & ft.FT_FACE_FLAG_SCALABLE == 0 and handle.*.num_fixed_sizes > 0) {
+            // A bitmap-only face (Noto Color Emoji's CBDT strikes) has a fixed set of sizes and
+            // refuses any other. The strike closest to the wanted size is selected and the glyph
+            // is scaled to the cell when it is rasterised.
+            const strikes = handle.*.available_sizes[0..@intCast(handle.*.num_fixed_sizes)];
+            var best: usize = 0;
+            for (strikes, 0..) |strike, index| {
+                const distance = @abs(@as(i64, strike.height) - @as(i64, size_px));
+                const best_distance = @abs(@as(i64, strikes[best].height) - @as(i64, size_px));
+                if (distance < best_distance) best = index;
+            }
+            if (ft.FT_Select_Size(handle, @intCast(best)) != 0) return error.UnsupportedPixelSize;
+            return .{ .handle = handle, .origin = origin };
+        }
         // Zero width means "same as the height", which is what a monospaced face wants.
         if (ft.FT_Set_Pixel_Sizes(handle, 0, size_px) != 0) return error.UnsupportedPixelSize;
-        return .{ .handle = handle };
+        return .{ .handle = handle, .origin = origin };
+    }
+
+    fn isColor(self: Face) bool {
+        return self.handle.*.face_flags & ft.FT_FACE_FLAG_COLOR != 0;
     }
 
     fn deinit(self: *Face) void {
@@ -313,7 +392,62 @@ pub const FontFile = struct {
     style: []u8,
     /// Style classification from FreeType's `style_flags`, not a guess from the file or style name.
     face_style: FaceStyle,
+    /// The codepoints the face maps, as sorted, disjoint, inclusive ranges, owned by the `Catalog`.
+    /// Read once at scan time so the fallback chain can ask "who has U+XXXX" without opening a
+    /// file on the render thread.
+    coverage: []const CodepointRange = &.{},
+    /// FreeType says every glyph has the same advance.
+    fixed_width: bool = false,
+    /// The face carries colour glyphs (CBDT, sbix, COLR).
+    color: bool = false,
+
+    /// Whether the face maps `codepoint`.
+    pub fn covers(self: FontFile, codepoint: u21) bool {
+        return rangesContain(self.coverage, codepoint);
+    }
 };
+
+/// An inclusive run of codepoints.
+pub const CodepointRange = struct {
+    first: u21,
+    last: u21,
+};
+
+fn rangesContain(ranges: []const CodepointRange, codepoint: u21) bool {
+    var low: usize = 0;
+    var high: usize = ranges.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const range = ranges[mid];
+        if (codepoint < range.first) {
+            high = mid;
+        } else if (codepoint > range.last) {
+            low = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Read a face's Unicode character map into sorted inclusive ranges. FreeType walks its cmap in
+/// ascending order, so consecutive codepoints extend the last range rather than adding one.
+fn readCoverage(gpa: Allocator, handle: ft.FT_Face) ![]CodepointRange {
+    var ranges: std.ArrayList(CodepointRange) = .empty;
+    errdefer ranges.deinit(gpa);
+    var glyph_index: ft.FT_UInt = 0;
+    var code = ft.FT_Get_First_Char(handle, &glyph_index);
+    while (glyph_index != 0) : (code = ft.FT_Get_Next_Char(handle, code, &glyph_index)) {
+        if (code > 0x10FFFF) break;
+        const cp: u21 = @intCast(code);
+        if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].last + 1 == cp) {
+            ranges.items[ranges.items.len - 1].last = cp;
+        } else {
+            try ranges.append(gpa, .{ .first = cp, .last = cp });
+        }
+    }
+    return ranges.toOwnedSlice(gpa);
+}
 
 /// The best exact-style file found for each face of one family.
 pub const FamilyFaces = struct {
@@ -407,11 +541,17 @@ pub const Catalog = struct {
         errdefer self.gpa.free(owned_family);
         const owned_style = try self.gpa.dupe(u8, std.mem.span(handle.*.style_name));
         errdefer self.gpa.free(owned_style);
+        const coverage = try readCoverage(self.gpa, handle);
+        errdefer self.gpa.free(coverage);
+        const flags = handle.*.face_flags;
         try self.files.append(self.gpa, .{
             .path = owned_path,
             .family = owned_family,
             .style = owned_style,
             .face_style = classifyStyle(handle.*.style_flags),
+            .coverage = coverage,
+            .fixed_width = flags & ft.FT_FACE_FLAG_FIXED_WIDTH != 0,
+            .color = flags & ft.FT_FACE_FLAG_COLOR != 0,
         });
     }
 
@@ -460,6 +600,7 @@ pub const Catalog = struct {
             self.gpa.free(file.path);
             self.gpa.free(file.family);
             self.gpa.free(file.style);
+            self.gpa.free(file.coverage);
         }
         self.files.deinit(self.gpa);
         self.* = undefined;
@@ -588,6 +729,8 @@ pub const Entry = struct {
     advance_px: u32,
     /// The atlas slot this entry reads from, which is what `isLive` checks.
     slot: u32,
+    /// Whether the entry lives in the RGBA colour atlas rather than the coverage atlas.
+    color: bool = false,
 };
 
 const Slot = struct {
@@ -619,8 +762,11 @@ pub const Atlas = struct {
     gpa: Allocator,
     width_px: u32,
     height_px: u32,
-    /// One byte of coverage per pixel, row-major, `width_px * height_px` long.
+    /// `depth` bytes per pixel, row-major, `width_px * height_px * depth` long: one byte of
+    /// coverage for the glyph atlas, four bytes of premultiplied RGBA for the colour atlas.
     pixels: []u8,
+    /// Bytes per pixel: 1 for coverage, 4 for colour.
+    depth: u32 = 1,
     /// Every entry ever inserted, live or not. A dead slot is reused rather than removed so an
     /// `Entry` handed to a caller keeps addressing the same slot until that slot is reused.
     slots: std.ArrayList(Slot) = .empty,
@@ -637,8 +783,14 @@ pub const Atlas = struct {
     /// atlas would hand out entries no renderer could sample, and one whose byte count overflowed
     /// would allocate the wrong number of bytes.
     pub fn init(gpa: Allocator, width_px: u32, height_px: u32) Error!Atlas {
-        if (width_px == 0 or height_px == 0) return error.AtlasSizeOutOfRange;
-        const count = std.math.mul(usize, width_px, height_px) catch return error.AtlasSizeOutOfRange;
+        return initDepth(gpa, width_px, height_px, 1);
+    }
+
+    /// Allocate a zeroed atlas of `depth` bytes per pixel, under the same rules as `init`.
+    pub fn initDepth(gpa: Allocator, width_px: u32, height_px: u32, depth: u32) Error!Atlas {
+        if (width_px == 0 or height_px == 0 or depth == 0) return error.AtlasSizeOutOfRange;
+        const area = std.math.mul(usize, width_px, height_px) catch return error.AtlasSizeOutOfRange;
+        const count = std.math.mul(usize, area, depth) catch return error.AtlasSizeOutOfRange;
         const pixels = try gpa.alloc(u8, count);
         @memset(pixels, 0);
 
@@ -647,6 +799,7 @@ pub const Atlas = struct {
             .width_px = width_px,
             .height_px = height_px,
             .pixels = pixels,
+            .depth = depth,
         };
         errdefer self.deinit();
 
@@ -670,8 +823,8 @@ pub const Atlas = struct {
     pub fn row(self: Atlas, entry: Entry, index: u32) []const u8 {
         if (!self.isLive(entry)) return &.{};
         if (index >= entry.rect.height) return &.{};
-        const start = (@as(usize, entry.rect.y + index) * self.width_px) + entry.rect.x;
-        return self.pixels[start..][0..entry.rect.width];
+        const start = ((@as(usize, entry.rect.y + index) * self.width_px) + entry.rect.x) * self.depth;
+        return self.pixels[start..][0 .. @as(usize, entry.rect.width) * self.depth];
     }
 
     /// Copy a live entry's coverage mask into `dest`, row by row and without the gaps between the
@@ -683,11 +836,11 @@ pub const Atlas = struct {
     /// it happens to span, which for a glyph narrower than the atlas is the wrong pixels entirely.
     pub fn copyInto(self: Atlas, entry: Entry, dest: []u8) usize {
         if (!self.isLive(entry) or entry.rect.isEmpty()) return 0;
-        const count = @as(usize, entry.rect.width) * entry.rect.height;
+        const row_len = @as(usize, entry.rect.width) * self.depth;
+        const count = row_len * entry.rect.height;
         if (dest.len < count) return 0;
         for (0..entry.rect.height) |index| {
-            const row_len = entry.rect.width;
-            const from = (@as(usize, entry.rect.y + index) * self.width_px) + entry.rect.x;
+            const from = ((@as(usize, entry.rect.y + index) * self.width_px) + entry.rect.x) * self.depth;
             @memcpy(dest[@as(usize, index) * row_len ..][0..row_len], self.pixels[from..][0..row_len]);
         }
         return count;
@@ -728,7 +881,7 @@ pub const Atlas = struct {
     /// it is worth caching because the renderer asks for it on every space of every line, and it
     /// costs nothing to answer.
     pub fn insert(self: *Atlas, key: Key, bitmap: Bitmap, bearing_x_px: i32, bearing_y_px: i32, advance_px: u32) Error!Entry {
-        if (bitmap.pitch < bitmap.width_px) return error.BitmapSizeMismatch;
+        if (bitmap.pitch < @as(u64, bitmap.width_px) * self.depth) return error.BitmapSizeMismatch;
         if (bitmap.data.len != 0 and bitmap.data.len < @as(usize, bitmap.pitch) * bitmap.height_px) {
             return error.BitmapSizeMismatch;
         }
@@ -869,17 +1022,19 @@ pub const Atlas = struct {
     }
 
     fn blit(self: *Atlas, rect: Rect, bitmap: Bitmap) void {
+        const row_len = @as(usize, rect.width) * self.depth;
         for (0..rect.height) |line| {
             const from = @as(usize, line) * bitmap.pitch;
-            const to = (@as(usize, rect.y + line) * self.width_px) + rect.x;
-            @memcpy(self.pixels[to..][0..rect.width], bitmap.data[from..][0..rect.width]);
+            const to = ((@as(usize, rect.y + line) * self.width_px) + rect.x) * self.depth;
+            @memcpy(self.pixels[to..][0..row_len], bitmap.data[from..][0..row_len]);
         }
     }
 
     fn clear(self: *Atlas, rect: Rect) void {
+        const row_len = @as(usize, rect.width) * self.depth;
         for (0..rect.height) |line| {
-            const to = (@as(usize, rect.y + line) * self.width_px) + rect.x;
-            @memset(self.pixels[to..][0..rect.width], 0);
+            const to = ((@as(usize, rect.y + line) * self.width_px) + rect.x) * self.depth;
+            @memset(self.pixels[to..][0..row_len], 0);
         }
     }
 };
@@ -902,6 +1057,9 @@ pub const ShapedGlyph = struct {
 };
 
 /// What to load, and how big an atlas to give it.
+///
+/// Every field added after v1 has a default, so a caller that only names a family and a size gets
+/// the full v2 chain: built-in sprites, ligatures, the system fallback and the bundled symbols face.
 pub const Request = struct {
     /// The configured family. Empty means the bundled face, which is also what a family that is not
     /// installed gets.
@@ -911,14 +1069,108 @@ pub const Request = struct {
     home_dir: ?[]const u8 = null,
     atlas_width_px: u32 = 1024,
     atlas_height_px: u32 = 1024,
+    /// Families consulted, in order, for a codepoint the configured family lacks, before any system
+    /// face. Borrowed only for the duration of `Manager.init`. A family that is not installed is
+    /// skipped with a log line rather than failing the load.
+    fallbacks: []const []const u8 = &.{},
+    /// Whether HarfBuzz may form ligatures. Off disables `liga`, `calt` and `dlig`. See
+    /// `Manager.setLigatures` for the runtime toggle.
+    ligatures: bool = true,
+    /// Whether box drawing, block elements, braille and the Powerline separators are drawn by
+    /// `font_sprite` at the cell size rather than taken from a font. Turning it off lets a user's
+    /// own Nerd Font draw them.
+    builtin_symbols: bool = true,
+    /// Whether installed system faces are searched for codepoints the configured faces lack.
+    system_fallback: bool = true,
+    /// The RGBA atlas colour glyphs are packed into.
+    color_atlas_width_px: u32 = 512,
+    color_atlas_height_px: u32 = 512,
 
     pub const Error = error{AtlasSizeOutOfRange};
 };
 
-/// The font manager: up to four distinct style faces and shapers, one shared buffer and one atlas.
+/// A glyph resolved for a codepoint: the face (with its `face_flag_*` bits) and the glyph in it.
+pub const GlyphRef = struct {
+    face_index: u32,
+    glyph_index: u32,
+};
+
+/// How a codepoint asked to be presented. An emoji variation selector (U+FE0F) asks for colour
+/// faces first; a text selector (U+FE0E) keeps them last.
+pub const Presentation = enum(u2) { default, text, emoji };
+
+/// Where an extra face came from.
+const ExtraKind = enum { configured, system, symbols, bundled };
+
+/// A face beyond the primary styles: a fallback family, a system face, or a bundled face. Owns its
+/// FreeType face and the HarfBuzz font that reads it.
+const Extra = struct {
+    kind: ExtraKind,
+    face: Face,
+    font: *hb.hb_font_t,
+    color: bool,
+    /// The catalog file a system face was opened from.
+    catalog_index: ?u32 = null,
+};
+
+/// The face index stored in the resolution cache for "no face has this codepoint".
+const no_face: u32 = face_id_mask;
+
+/// The resolution cache is cleared rather than grown past this many codepoints, so a program that
+/// prints every codepoint in Unicode cannot make the render thread hold memory in proportion.
+const max_resolved = 65536;
+
+/// The shear FreeType's own `FT_GlyphSlot_Oblique` applies: about 12 degrees, in 16.16.
+const oblique_shear: ft.FT_Fixed = 0x0366A;
+
+/// HarfBuzz's tag for an OpenType feature name.
+fn featureTag(comptime name: *const [4]u8) u32 {
+    return (@as(u32, name[0]) << 24) | (@as(u32, name[1]) << 16) | (@as(u32, name[2]) << 8) | name[3];
+}
+
+/// The features that turn every kind of ligature off, applied to the whole buffer.
+const ligatures_off = [_]hb.hb_feature_t{
+    .{ .tag = featureTag("liga"), .value = 0, .start = 0, .end = std.math.maxInt(c_uint) },
+    .{ .tag = featureTag("calt"), .value = 0, .start = 0, .end = std.math.maxInt(c_uint) },
+    .{ .tag = featureTag("dlig"), .value = 0, .start = 0, .end = std.math.maxInt(c_uint) },
+};
+
+/// Codepoints whose default presentation is emoji, approximately: the pictographic planes. Text
+/// default symbols such as U+2764 only prefer colour when followed by U+FE0F.
+fn defaultEmoji(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x1F000...0x1F0FF, 0x1F300...0x1F64F, 0x1F680...0x1F6FF, 0x1F900...0x1FAFF => true,
+        else => false,
+    };
+}
+
+/// The private use areas, whose glyphs mean whatever a font says they mean.
+fn privateUse(codepoint: u21) bool {
+    return switch (codepoint) {
+        0xE000...0xF8FF, 0xF0000...0x10FFFF => true,
+        else => false,
+    };
+}
+
+/// The synthetic flags a regular face needs to stand in for `style`.
+fn syntheticFlags(style: FaceStyle) u32 {
+    return switch (style) {
+        .regular => 0,
+        .bold => face_flag_bold,
+        .italic => face_flag_oblique,
+        .bold_italic => face_flag_bold | face_flag_oblique,
+    };
+}
+
+/// The font manager: up to four distinct style faces and shapers, the extra faces of the fallback
+/// chain, one shared buffer, a coverage atlas and a colour atlas.
 ///
 /// A `Manager` owns everything it reports. `deinit` must run before the allocator that built it goes
 /// away; every other module holds it behind a pointer rather than by value.
+///
+/// Threads: built on a loader thread, then used only by the render thread. Resolving a codepoint no
+/// loaded face covers may open one system font file (once per file, never per frame); the file's
+/// coverage was already read on the loader thread, so the search itself does no IO.
 pub const Manager = struct {
     gpa: Allocator,
     library: Library,
@@ -930,6 +1182,8 @@ pub const Manager = struct {
     /// Reused across every style's shape calls so shaping a frame's text allocates nothing.
     buffer: *hb.hb_buffer_t,
     atlas: Atlas,
+    /// Premultiplied RGBA colour glyphs: emoji and other bitmap colour faces.
+    color_atlas: Atlas,
     face_metrics: Metrics,
     /// The resolved size in device pixels: what HarfBuzz's font units are scaled by.
     size_px: u32,
@@ -939,6 +1193,21 @@ pub const Manager = struct {
     source_path: []u8,
     /// Whether the configured family was missing and the bundled face is standing in for it.
     used_fallback: bool,
+    /// Faces numbered from `extra_base`, in the order they were opened.
+    extras: std.ArrayList(Extra) = .empty,
+    /// Every system font file and its coverage, kept for the fallback search.
+    catalog: Catalog,
+    /// Catalog indices in fallback preference order.
+    system_order: []u32 = &.{},
+    /// Catalog indices that failed to open, so they are not retried for every codepoint.
+    failed_system: std.ArrayList(u32) = .empty,
+    /// Codepoint and style to resolved glyph, including misses.
+    resolved: std.AutoHashMapUnmanaged(u32, GlyphRef) = .empty,
+    /// Rasterisation scratch for sprites and scaled colour glyphs; grows, never shrinks.
+    scratch: std.ArrayList(u8) = .empty,
+    ligatures_enabled: bool = true,
+    builtin_symbols: bool = true,
+    system_fallback: bool = true,
 
     pub const Error = error{
         FreeTypeInitFailed,
@@ -951,13 +1220,26 @@ pub const Manager = struct {
         InvalidFaceIndex,
     } || Request.Error || Atlas.Error;
 
-    /// Resolve a family, open it, and build an atlas for it.
+    /// Resolve a family, open it, and build the atlases for it.
     ///
     /// Resolution never fails for want of a font: a family that is not installed falls back to the
     /// bundled face and logs it, because a terminal full of boxes because a family name was
     /// misspelled is worse than a terminal in the wrong font. Everything else — a face FreeType will
     /// not open, an atlas that will not allocate, running out of memory — is returned to the caller.
+    ///
+    /// A new `Size` (a font size change, or a window moved to a display of another scale) is a new
+    /// `Manager`: every face is re-opened at the new pixel size, both atlases start empty and every
+    /// glyph, sprite and emoji is rasterised again at that size rather than scaled from the old one.
     pub fn init(gpa: Allocator, io: Io, request: Request) Error!Manager {
+        var manager = try initPrimary(gpa, io, request);
+        // From here the manager owns every resource, and `deinit` releases all of it.
+        errdefer manager.deinit();
+        try manager.openFixedExtras(request);
+        return manager;
+    }
+
+    /// Everything but the extra faces: the primary resolution, both atlases and the catalog.
+    fn initPrimary(gpa: Allocator, io: Io, request: Request) Error!Manager {
         const size_px = request.size.pixels();
 
         var library = try Library.init();
@@ -967,7 +1249,7 @@ pub const Manager = struct {
         defer freeAll(gpa, directories);
 
         var catalog = try Catalog.scan(io, gpa, directories);
-        defer catalog.deinit();
+        errdefer catalog.deinit();
 
         var resolution = try resolveFaces(gpa, library.handle, &catalog, request, size_px);
         errdefer resolution.deinit(gpa);
@@ -980,23 +1262,23 @@ pub const Manager = struct {
         }
         for (resolution.faces, 0..) |maybe_face, index| {
             const face = maybe_face orelse continue;
-            // HarfBuzz allocates and can fail doing so. An allocation failure is a real outcome on
-            // a loaded machine, not a programmer invariant to unwrap.
-            const font: *hb.hb_font_t = hb.hb_ft_font_create_referenced(face.handle) orelse
-                return error.OutOfMemory;
-            fonts[index] = font;
-
-            // HarfBuzz reports positions in whatever scale its font carries. Using the face's own
-            // em size makes the conversion to pixels below identical for every style.
-            const upem: i32 = @intCast(face.unitsPerEm());
-            hb.hb_font_set_scale(font, upem, upem);
-            hb.hb_font_set_ppem(font, @intCast(size_px), @intCast(size_px));
+            fonts[index] = try harfBuzzFont(face, size_px);
         }
 
         const buffer: *hb.hb_buffer_t = hb.hb_buffer_create() orelse return error.OutOfMemory;
         errdefer hb.hb_buffer_destroy(buffer);
 
-        const atlas = try Atlas.init(gpa, request.atlas_width_px, request.atlas_height_px);
+        var atlas = try Atlas.init(gpa, request.atlas_width_px, request.atlas_height_px);
+        errdefer atlas.deinit();
+        var color_atlas = try Atlas.initDepth(
+            gpa,
+            request.color_atlas_width_px,
+            request.color_atlas_height_px,
+            4,
+        );
+        errdefer color_atlas.deinit();
+        const system_order = try systemOrder(gpa, &catalog);
+        errdefer gpa.free(system_order);
         const face_metrics = resolution.faces[styleIndex(.regular)].?.metrics();
 
         return .{
@@ -1006,17 +1288,24 @@ pub const Manager = struct {
             .fonts = fonts,
             .buffer = buffer,
             .atlas = atlas,
+            .color_atlas = color_atlas,
             .face_metrics = face_metrics,
             .size_px = size_px,
             .family = resolution.family,
             .source_path = resolution.source_path,
             .used_fallback = resolution.used_fallback,
+            .catalog = catalog,
+            .system_order = system_order,
+            .ligatures_enabled = request.ligatures,
+            .builtin_symbols = request.builtin_symbols,
+            .system_fallback = request.system_fallback,
         };
     }
 
-    /// Release the atlas, shared buffer, every HarfBuzz font and face, the library and all strings.
+    /// Release the atlases, shared buffer, every HarfBuzz font and face, the library and all strings.
     pub fn deinit(self: *Manager) void {
         self.atlas.deinit();
+        self.color_atlas.deinit();
         hb.hb_buffer_destroy(self.buffer);
         for (&self.fonts) |*maybe_font| {
             if (maybe_font.*) |font| hb.hb_font_destroy(font);
@@ -1024,10 +1313,67 @@ pub const Manager = struct {
         for (&self.faces) |*maybe_face| {
             if (maybe_face.*) |*face| face.deinit();
         }
+        for (self.extras.items) |*extra| {
+            hb.hb_font_destroy(extra.font);
+            extra.face.deinit();
+        }
+        self.extras.deinit(self.gpa);
         self.library.deinit();
+        self.catalog.deinit();
+        self.gpa.free(self.system_order);
+        self.failed_system.deinit(self.gpa);
+        self.resolved.deinit(self.gpa);
+        self.scratch.deinit(self.gpa);
         self.gpa.free(self.family);
         self.gpa.free(self.source_path);
         self.* = undefined;
+    }
+
+    /// Open the configured fallback families and the bundled faces, which are always in the chain.
+    /// Done at load time, on the loader thread, so the render thread never opens these files.
+    fn openFixedExtras(self: *Manager, request: Request) Error!void {
+        for (request.fallbacks) |family| {
+            const file = self.catalog.findFamily(family) orelse {
+                log.warn("fallback font family '{s}' is not installed; skipped", .{family});
+                continue;
+            };
+            const face = Face.open(self.library.handle, file.path, self.size_px) catch |err| {
+                log.warn("fallback font {s} could not be opened ({s}); skipped", .{ file.path, @errorName(err) });
+                continue;
+            };
+            _ = try self.addExtra(.configured, face, null);
+        }
+        _ = try self.addExtra(
+            .symbols,
+            try Face.openMemory(self.library.handle, bundled_symbols, self.size_px),
+            null,
+        );
+        if (!self.used_fallback) {
+            _ = try self.addExtra(
+                .bundled,
+                try Face.openMemory(self.library.handle, bundled_face, self.size_px),
+                null,
+            );
+        }
+    }
+
+    /// Take ownership of `face` as the next extra face and return its face index. The face is
+    /// released on failure.
+    fn addExtra(self: *Manager, kind: ExtraKind, face: Face, catalog_index: ?u32) Error!u32 {
+        var owned = face;
+        errdefer owned.deinit();
+        const font = try harfBuzzFont(owned, self.size_px);
+        errdefer hb.hb_font_destroy(font);
+        const index: u32 = @intCast(self.extras.items.len);
+        if (extra_base + index >= face_id_mask) return error.InvalidFaceIndex;
+        try self.extras.append(self.gpa, .{
+            .kind = kind,
+            .face = owned,
+            .font = font,
+            .color = owned.isColor(),
+            .catalog_index = catalog_index,
+        });
+        return extra_base + index;
     }
 
     /// The family actually loaded, which is not the configured one when the fallback was used.
@@ -1050,20 +1396,175 @@ pub const Manager = struct {
         return self.face_metrics;
     }
 
-    /// The glyph index for a codepoint, or 0 when the face has no glyph for it.
+    /// Whether shaping forms ligatures.
+    pub fn ligatures(self: Manager) bool {
+        return self.ligatures_enabled;
+    }
+
+    /// Turn ligatures on or off at runtime. Shaping is not cached, so the next shaped run follows
+    /// the new setting; the caller must invalidate any grid that already drew text with the old one.
+    pub fn setLigatures(self: *Manager, enabled: bool) void {
+        self.ligatures_enabled = enabled;
+    }
+
+    /// The glyph index for a codepoint in the primary regular face, or 0 when it has none. This is
+    /// the primary face only; `resolve` walks the fallback chain.
     pub fn glyphIndex(self: Manager, codepoint: u21) u32 {
         return self.glyphIndexForStyle(.regular, codepoint);
     }
 
-    /// The glyph index for a codepoint in a requested style, or 0 when its resolved face has none.
+    /// The glyph index for a codepoint in a requested style's primary face, or 0 when it has none.
     pub fn glyphIndexForStyle(self: Manager, style: FaceStyle, codepoint: u21) u32 {
         const face_index = self.faceIndexForStyle(style);
         return ft.FT_Get_Char_Index(self.faces[face_index].?.handle, codepoint);
     }
 
-    /// The atlas coverage mask, for the renderer to upload as a texture.
+    /// The coverage atlas, for the renderer to upload as a single-channel texture.
     pub fn atlasPixels(self: Manager) []const u8 {
         return self.atlas.pixels;
+    }
+
+    /// The colour atlas, premultiplied RGBA8, for the renderer to upload as a four-channel texture.
+    pub fn colorAtlasPixels(self: Manager) []const u8 {
+        return self.color_atlas.pixels;
+    }
+
+    /// Resolve a codepoint through the fallback chain (see the module comment) with its default
+    /// presentation. Null when no face in the chain has it.
+    pub fn resolve(self: *Manager, style: FaceStyle, codepoint: u21) ?GlyphRef {
+        return self.resolveWith(style, codepoint, .default);
+    }
+
+    /// Resolve a codepoint with an explicit presentation.
+    pub fn resolveWith(self: *Manager, style: FaceStyle, codepoint: u21, presentation: Presentation) ?GlyphRef {
+        if (self.builtin_symbols and sprite.covers(codepoint)) {
+            return .{ .face_index = sprite_face, .glyph_index = codepoint };
+        }
+        const key: u32 = @as(u32, codepoint) |
+            (@as(u32, @intFromEnum(style)) << 21) |
+            (@as(u32, @intFromEnum(presentation)) << 23);
+        if (self.resolved.get(key)) |hit| {
+            return if (hit.face_index == no_face) null else hit;
+        }
+        const found = self.search(style, codepoint, presentation);
+        if (self.resolved.count() >= max_resolved) self.resolved.clearRetainingCapacity();
+        // The cache only saves repeating the search; failing to grow it costs time, not
+        // correctness, so the answer is returned either way.
+        self.resolved.put(self.gpa, key, found orelse .{ .face_index = no_face, .glyph_index = 0 }) catch {};
+        return found;
+    }
+
+    fn search(self: *Manager, style: FaceStyle, codepoint: u21, presentation: Presentation) ?GlyphRef {
+        const want_color = presentation == .emoji or (presentation == .default and defaultEmoji(codepoint));
+        const synthetic = syntheticFlags(style);
+
+        if (want_color) {
+            if (self.searchExtras(.configured, codepoint, synthetic, .color_only)) |hit| return hit;
+            if (self.searchSystem(codepoint, synthetic, .color_only)) |hit| return hit;
+        }
+
+        const slot = self.faceIndexForStyle(style);
+        const in_slot = ft.FT_Get_Char_Index(self.faces[slot].?.handle, codepoint);
+        if (in_slot != 0) {
+            return .{ .face_index = @as(u32, @intCast(slot)) | (if (slot == 0) synthetic else 0), .glyph_index = in_slot };
+        }
+        if (slot != 0) {
+            const regular = ft.FT_Get_Char_Index(self.faces[0].?.handle, codepoint);
+            if (regular != 0) return .{ .face_index = synthetic, .glyph_index = regular };
+        }
+
+        if (self.searchExtras(.configured, codepoint, synthetic, .any)) |hit| return hit;
+        if (privateUse(codepoint)) {
+            if (self.searchExtras(.symbols, codepoint, synthetic, .any)) |hit| return hit;
+        }
+        if (self.system_fallback) {
+            if (self.searchSystem(codepoint, synthetic, if (want_color) .any else .color_last)) |hit| return hit;
+        }
+        if (self.searchExtras(.symbols, codepoint, synthetic, .any)) |hit| return hit;
+        if (self.searchExtras(.bundled, codepoint, synthetic, .any)) |hit| return hit;
+        return null;
+    }
+
+    const ColorFilter = enum { any, color_only, color_last };
+
+    fn searchExtras(self: *Manager, kind: ExtraKind, codepoint: u21, synthetic: u32, filter: ColorFilter) ?GlyphRef {
+        for (self.extras.items, 0..) |extra, index| {
+            if (extra.kind != kind) continue;
+            if (filter == .color_only and !extra.color) continue;
+            const glyph_index = ft.FT_Get_Char_Index(extra.face.handle, codepoint);
+            if (glyph_index == 0) continue;
+            const flags: u32 = if (extra.color) 0 else synthetic;
+            return .{ .face_index = (extra_base + @as(u32, @intCast(index))) | flags, .glyph_index = glyph_index };
+        }
+        return null;
+    }
+
+    fn searchSystem(self: *Manager, codepoint: u21, synthetic: u32, filter: ColorFilter) ?GlyphRef {
+        if (!self.system_fallback) return null;
+        // `color_last` is the preference order itself: `systemOrder` already sorts colour faces
+        // after every other face.
+        for (self.system_order) |catalog_index| {
+            const file = self.catalog.files.items[catalog_index];
+            if (filter == .color_only and !file.color) continue;
+            if (!file.covers(codepoint)) continue;
+            const face_index = self.systemFace(catalog_index) orelse continue;
+            const extra = self.extras.items[face_index - extra_base];
+            const glyph_index = ft.FT_Get_Char_Index(extra.face.handle, codepoint);
+            if (glyph_index == 0) continue;
+            const flags: u32 = if (extra.color) 0 else synthetic;
+            return .{ .face_index = face_index | flags, .glyph_index = glyph_index };
+        }
+        return null;
+    }
+
+    /// The extra face for a catalog file, opening it on first use. Null when it cannot be opened,
+    /// which is remembered.
+    fn systemFace(self: *Manager, catalog_index: u32) ?u32 {
+        for (self.extras.items, 0..) |extra, index| {
+            if (extra.catalog_index == catalog_index) return extra_base + @as(u32, @intCast(index));
+        }
+        for (self.failed_system.items) |failed| {
+            if (failed == catalog_index) return null;
+        }
+        const file = self.catalog.files.items[catalog_index];
+        const opened = blk: {
+            const face = Face.open(self.library.handle, file.path, self.size_px) catch |err| break :blk err;
+            break :blk self.addExtra(.system, face, catalog_index);
+        };
+        return opened catch |err| {
+            log.debug("fallback font {s} could not be opened: {s}", .{ file.path, @errorName(err) });
+            // Failing to record the failure only means it is retried later.
+            self.failed_system.append(self.gpa, catalog_index) catch {};
+            return null;
+        };
+    }
+
+    /// The face and HarfBuzz font for a face number (no flags), or null when there is none.
+    fn faceById(self: *Manager, id: u32) ?Face {
+        if (id < face_style_count) return self.faces[id];
+        if (id < extra_base) return null;
+        const index = id - extra_base;
+        if (index >= self.extras.items.len) return null;
+        return self.extras.items[index].face;
+    }
+
+    fn fontById(self: *Manager, id: u32) ?*hb.hb_font_t {
+        if (id < face_style_count) return self.fonts[id];
+        if (id < extra_base) return null;
+        const index = id - extra_base;
+        if (index >= self.extras.items.len) return null;
+        return self.extras.items[index].font;
+    }
+
+    fn isColorFace(self: *Manager, id: u32) bool {
+        if (id < extra_base) return false;
+        const index = id - extra_base;
+        return index < self.extras.items.len and self.extras.items[index].color;
+    }
+
+    /// Whether `face_index` (with or without flags) draws into the colour atlas.
+    pub fn isColor(self: *Manager, face_index: u32) bool {
+        return self.isColorFace(face_index & face_id_mask);
     }
 
     /// Shape a run of text into glyphs, appending them to `out`.
@@ -1074,7 +1575,10 @@ pub const Manager = struct {
         return self.shapeForStyle(.regular, text, out);
     }
 
-    /// Shape with a requested style, falling back to the primary face when that style is absent.
+    /// Shape with a requested style. The face is the one the fallback chain resolves for the run's
+    /// first codepoint (a cell's base character), so a combining mark or an emoji sequence is
+    /// shaped by the face that draws its base. Glyphs that face has no outline for (glyph 0) are
+    /// dropped rather than drawn as a missing-glyph box.
     pub fn shapeForStyle(
         self: *Manager,
         style: FaceStyle,
@@ -1084,14 +1588,37 @@ pub const Manager = struct {
         out.clearRetainingCapacity();
         if (text.len == 0) return;
 
-        const face_index = self.faceIndexForStyle(style);
-        const face = self.faces[face_index].?;
-        const font = self.fonts[face_index].?;
+        const first = firstCodepoint(text);
+        const fallback_target: GlyphRef = .{
+            .face_index = @as(u32, @intCast(self.faceIndexForStyle(style))) |
+                (if (self.faces[styleIndex(style)] == null) syntheticFlags(style) else 0),
+            .glyph_index = 0,
+        };
+        const target = if (first) |cp| self.resolveWith(style, cp, presentationOf(text)) orelse fallback_target else fallback_target;
+        const id = target.face_index & face_id_mask;
+        if (id == sprite_face) {
+            try out.append(self.gpa, .{
+                .glyph_index = target.glyph_index,
+                .face_index = sprite_face,
+                .cluster = 0,
+                .x_advance_px = @floatFromInt(self.face_metrics.cell.width_px),
+                .y_advance_px = 0,
+                .x_offset_px = 0,
+                .y_offset_px = 0,
+            });
+            return;
+        }
+        const face = self.faceById(id) orelse return error.InvalidFaceIndex;
+        const font = self.fontById(id) orelse return error.InvalidFaceIndex;
 
         hb.hb_buffer_clear_contents(self.buffer);
         _ = hb.hb_buffer_add_utf8(self.buffer, text.ptr, @intCast(text.len), 0, @intCast(text.len));
         hb.hb_buffer_guess_segment_properties(self.buffer);
-        hb.hb_shape(font, self.buffer, null, 0);
+        if (self.ligatures_enabled) {
+            hb.hb_shape(font, self.buffer, null, 0);
+        } else {
+            hb.hb_shape(font, self.buffer, &ligatures_off, ligatures_off.len);
+        }
 
         const count = hb.hb_buffer_get_length(self.buffer);
         if (count == 0) return;
@@ -1104,9 +1631,10 @@ pub const Manager = struct {
         const scale = @as(f32, @floatFromInt(self.size_px)) /
             @as(f32, @floatFromInt(face.unitsPerEm()));
         for (0..@as(usize, @intCast(count))) |index| {
+            if (infos[index].codepoint == 0) continue;
             try out.append(self.gpa, .{
                 .glyph_index = infos[index].codepoint,
-                .face_index = @intCast(face_index),
+                .face_index = target.face_index,
                 .cluster = infos[index].cluster,
                 .x_advance_px = @as(f32, @floatFromInt(positions[index].x_advance)) * scale,
                 .y_advance_px = @as(f32, @floatFromInt(positions[index].y_advance)) * scale,
@@ -1124,48 +1652,241 @@ pub const Manager = struct {
         return self.glyphForStyle(.regular, glyph_index);
     }
 
-    /// Rasterise a glyph in a requested style, falling back to the primary face when unavailable.
+    /// Rasterise a primary-face glyph in a requested style: the style's own face when it has one,
+    /// otherwise the regular face with a synthetic style.
     pub fn glyphForStyle(self: *Manager, style: FaceStyle, glyph_index: u32) Error!Entry {
-        return self.glyphForFace(@intCast(self.faceIndexForStyle(style)), glyph_index);
+        const slot = self.faceIndexForStyle(style);
+        const flags: u32 = if (slot == 0) syntheticFlags(style) else 0;
+        return self.glyphForFace(@as(u32, @intCast(slot)) | flags, glyph_index);
     }
 
-    /// Rasterise a glyph from the actual face slot reported by `ShapedGlyph.face_index`.
+    /// Rasterise a glyph from the face reported by `ShapedGlyph.face_index` or `GlyphRef`, flags
+    /// included. A colour glyph comes back with `Entry.color` set and lives in `color_atlas`.
     pub fn glyphForFace(self: *Manager, face_index: u32, glyph_index: u32) Error!Entry {
-        if (face_index >= face_style_count or self.faces[face_index] == null) {
-            return error.InvalidFaceIndex;
-        }
-        const key: Key = .{ .glyph_index = glyph_index, .face_index = face_index };
-        if (self.atlas.find(key)) |entry| return entry;
+        const id = face_index & face_id_mask;
+        if (id == sprite_face) return self.spriteGlyph(glyph_index);
+        const face = self.faceById(id) orelse return error.InvalidFaceIndex;
+        const color = self.isColorFace(id);
+        var flags = face_index & ~face_id_mask;
+        // The primary faces are drawn exactly as the font made them; only fallback glyphs are
+        // fitted to a one- or two-cell box. Bitmaps cannot be emboldened or sheared.
+        if (id < face_style_count) flags &= ~face_flag_wide;
+        if (color) flags &= face_flag_wide;
+        const key: Key = .{ .glyph_index = glyph_index, .face_index = id | flags };
+        const target = if (color) &self.color_atlas else &self.atlas;
+        if (target.find(key)) |entry| return withColor(entry, color);
+        return withColor(try self.rasterise(face, id, flags, key), color);
+    }
 
-        const face = self.faces[face_index].?;
-        if (ft.FT_Load_Glyph(face.handle, glyph_index, ft.FT_LOAD_RENDER) != 0) {
-            return error.GlyphLoadFailed;
-        }
-        const slot = face.handle.*.glyph.*;
-        const bitmap = slot.bitmap;
-        // A colour glyph (CBDT, sbix, COLR) rasterises as something other than coverage, and v1 has
-        // no renderer for it. Reported rather than drawn as garbage; TASK-39 replaces this with real
-        // colour rendering.
-        if (bitmap.pixel_mode != ft.FT_PIXEL_MODE_GRAY) return error.UnsupportedPixelFormat;
+    fn withColor(entry: Entry, color: bool) Entry {
+        var marked = entry;
+        marked.color = color;
+        return marked;
+    }
 
-        const width_px: u32 = if (bitmap.width < 0) 0 else @intCast(bitmap.width);
-        const height_px: u32 = if (bitmap.rows < 0) 0 else @intCast(bitmap.rows);
+    fn rasterise(self: *Manager, face: Face, id: u32, flags: u32, key: Key) Error!Entry {
+        const color = self.isColorFace(id);
+        const load_flags: i32 = if (color) @intCast(ft.FT_LOAD_COLOR) else ft.FT_LOAD_DEFAULT;
+        if (ft.FT_Load_Glyph(face.handle, key.glyph_index, load_flags) != 0) return error.GlyphLoadFailed;
+        const slot = face.handle.*.glyph;
+        const cells: u32 = if (flags & face_flag_wide != 0) 2 else 1;
+
+        if (slot.*.format == ft.FT_GLYPH_FORMAT_OUTLINE) {
+            const outline = &slot.*.outline;
+            if (flags & face_flag_bold != 0) {
+                // FreeType's own synthetic-bold strength: a 24th of the em, in 26.6.
+                const strength: ft.FT_Pos = @intCast(@max(@as(u32, 1), self.size_px * 64 / 24));
+                if (ft.FT_Outline_Embolden(outline, strength) != 0) return error.GlyphLoadFailed;
+            }
+            if (flags & face_flag_oblique != 0) {
+                var shear: ft.FT_Matrix = .{ .xx = 0x10000, .xy = oblique_shear, .yx = 0, .yy = 0x10000 };
+                ft.FT_Outline_Transform(outline, &shear);
+            }
+            if (id >= extra_base) self.fitOutline(outline, cells);
+            if (ft.FT_Render_Glyph(slot, ft.FT_RENDER_MODE_NORMAL) != 0) return error.GlyphLoadFailed;
+        }
+
+        const bitmap = slot.*.bitmap;
+        const width_px: u32 = bitmap.width;
+        const height_px: u32 = bitmap.rows;
         const pitch: u32 = if (bitmap.pitch < 0) 0 else @intCast(bitmap.pitch);
-        const advance_px: u32 = @intCast(@max(@divTrunc(slot.advance.x, 64), 0));
-
-        // FreeType's own buffer is the source, pitch and all: copying it out per glyph would be an
-        // allocation on the hot path, and the atlas copy below is the one that persists.
+        const advance_px: u32 = @intCast(@max(@divTrunc(slot.*.advance.x, 64), 0));
         const source: []const u8 = if (bitmap.buffer == null)
             &.{}
         else
             @as([*]const u8, @ptrCast(bitmap.buffer))[0 .. @as(usize, pitch) * height_px];
 
-        return self.atlas.insert(key, .{
-            .data = source,
+        switch (bitmap.pixel_mode) {
+            ft.FT_PIXEL_MODE_GRAY => {
+                if (color) return self.insertColorFromGray(key, source, width_px, height_px, pitch, slot.*.bitmap_left, slot.*.bitmap_top, advance_px);
+                // FreeType's own buffer is the source, pitch and all: copying it out per glyph
+                // would be an allocation on the hot path, and the atlas copy is the one that
+                // persists.
+                return self.atlas.insert(key, .{
+                    .data = source,
+                    .width_px = width_px,
+                    .height_px = height_px,
+                    .pitch = pitch,
+                }, slot.*.bitmap_left, slot.*.bitmap_top, advance_px);
+            },
+            ft.FT_PIXEL_MODE_MONO => {
+                // A one-bit bitmap font: expand to coverage.
+                const count = @as(usize, width_px) * height_px;
+                try self.scratch.resize(self.gpa, count);
+                for (0..height_px) |y| for (0..width_px) |x| {
+                    const byte = source[y * pitch + x / 8];
+                    const bit = (byte >> @intCast(7 - (x % 8))) & 1;
+                    self.scratch.items[y * width_px + x] = if (bit != 0) 255 else 0;
+                };
+                if (color) return self.insertColorFromGray(key, self.scratch.items, width_px, height_px, width_px, slot.*.bitmap_left, slot.*.bitmap_top, advance_px);
+                return self.atlas.insert(key, .{
+                    .data = self.scratch.items,
+                    .width_px = width_px,
+                    .height_px = height_px,
+                    .pitch = width_px,
+                }, slot.*.bitmap_left, slot.*.bitmap_top, advance_px);
+            },
+            ft.FT_PIXEL_MODE_BGRA => {
+                if (!color) return error.UnsupportedPixelFormat;
+                return self.insertColorBitmap(key, source, width_px, height_px, pitch, cells);
+            },
+            else => return error.UnsupportedPixelFormat,
+        }
+    }
+
+    /// Scale a fallback outline down to the cell box when it does not fit, and recentre it in the
+    /// box when it would spill out of it. Shifts are whole pixels so the rasterised edges stay as
+    /// crisp as the font's own.
+    fn fitOutline(self: *Manager, outline: *ft.FT_Outline, cells: u32) void {
+        const cell = self.face_metrics.cell;
+        const box_w: f64 = @floatFromInt(@as(u64, cells) * cell.width_px * 64);
+        const box_h: f64 = @floatFromInt(@as(u64, cell.height_px) * 64);
+        const top: f64 = @floatFromInt(@as(u64, self.face_metrics.baseline_px) * 64);
+        const bottom: f64 = top - box_h;
+
+        var cbox: ft.FT_BBox = undefined;
+        ft.FT_Outline_Get_CBox(outline, &cbox);
+        var width: f64 = @floatFromInt(cbox.xMax - cbox.xMin);
+        var height: f64 = @floatFromInt(cbox.yMax - cbox.yMin);
+        if (width <= 0 or height <= 0) return;
+
+        var scaled = false;
+        if (width > box_w or height > box_h) {
+            const factor = @min(box_w / width, box_h / height);
+            const fixed: ft.FT_Fixed = @intFromFloat(@floor(factor * 65536.0));
+            var matrix: ft.FT_Matrix = .{ .xx = fixed, .xy = 0, .yx = 0, .yy = fixed };
+            ft.FT_Outline_Transform(outline, &matrix);
+            ft.FT_Outline_Get_CBox(outline, &cbox);
+            width = @floatFromInt(cbox.xMax - cbox.xMin);
+            height = @floatFromInt(cbox.yMax - cbox.yMin);
+            scaled = true;
+        }
+        const x_min: f64 = @floatFromInt(cbox.xMin);
+        const x_max: f64 = @floatFromInt(cbox.xMax);
+        const y_min: f64 = @floatFromInt(cbox.yMin);
+        const y_max: f64 = @floatFromInt(cbox.yMax);
+        // A moved glyph's left and bottom edges are snapped onto pixel boundaries (never outside
+        // the box), so a glyph no wider or taller than the box rasterises to a bitmap that is not
+        // either: an edge left between two pixels would spill one partial pixel past the cell.
+        var dx: f64 = 0;
+        var dy: f64 = 0;
+        if (scaled or x_min < 0 or x_max > box_w) {
+            dx = @max(0, @floor((box_w - width) / 2 / 64.0) * 64.0) - x_min;
+        }
+        if (scaled or y_max > top or y_min < bottom) {
+            dy = @max(bottom, bottom + @floor((box_h - height) / 2 / 64.0) * 64.0) - y_min;
+        }
+        const shift_x: ft.FT_Pos = @intFromFloat(dx);
+        const shift_y: ft.FT_Pos = @intFromFloat(dy);
+        if (shift_x != 0 or shift_y != 0) ft.FT_Outline_Translate(outline, shift_x, shift_y);
+    }
+
+    /// Scale a premultiplied BGRA bitmap glyph to fit its cell box (box-filtered, never enlarged),
+    /// convert it to RGBA and centre it in the box.
+    fn insertColorBitmap(self: *Manager, key: Key, source: []const u8, width_px: u32, height_px: u32, pitch: u32, cells: u32) Error!Entry {
+        const cell = self.face_metrics.cell;
+        const box_w = cells * cell.width_px;
+        const box_h = cell.height_px;
+        if (width_px == 0 or height_px == 0) {
+            return self.color_atlas.insert(key, .{ .data = &.{}, .width_px = 0, .height_px = 0, .pitch = 0 }, 0, 0, box_w);
+        }
+        const factor = @min(
+            1.0,
+            @min(
+                @as(f64, @floatFromInt(box_w)) / @as(f64, @floatFromInt(width_px)),
+                @as(f64, @floatFromInt(box_h)) / @as(f64, @floatFromInt(height_px)),
+            ),
+        );
+        const out_w: u32 = @max(1, @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(width_px)) * factor))));
+        const out_h: u32 = @max(1, @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(height_px)) * factor))));
+        try self.scratch.resize(self.gpa, @as(usize, out_w) * out_h * 4);
+        for (0..out_h) |oy| for (0..out_w) |ox| {
+            const x0 = ox * width_px / out_w;
+            const x1 = @max(x0 + 1, (ox + 1) * width_px / out_w);
+            const y0 = oy * height_px / out_h;
+            const y1 = @max(y0 + 1, (oy + 1) * height_px / out_h);
+            var sum: [4]u32 = .{ 0, 0, 0, 0 };
+            var y = y0;
+            while (y < y1) : (y += 1) {
+                var x = x0;
+                while (x < x1) : (x += 1) {
+                    const pixel = source[y * pitch + x * 4 ..][0..4];
+                    for (0..4) |channel| sum[channel] += pixel[channel];
+                }
+            }
+            const samples: u32 = @intCast((x1 - x0) * (y1 - y0));
+            const out = self.scratch.items[(oy * out_w + ox) * 4 ..][0..4];
+            // BGRA in, RGBA out, both premultiplied.
+            out[0] = @intCast(sum[2] / samples);
+            out[1] = @intCast(sum[1] / samples);
+            out[2] = @intCast(sum[0] / samples);
+            out[3] = @intCast(sum[3] / samples);
+        };
+        const bearing_x: i32 = @intCast((box_w -| out_w) / 2);
+        const top_offset: i32 = @intCast((box_h -| out_h) / 2);
+        const bearing_y: i32 = @as(i32, @intCast(self.face_metrics.baseline_px)) - top_offset;
+        return self.color_atlas.insert(key, .{
+            .data = self.scratch.items,
+            .width_px = out_w,
+            .height_px = out_h,
+            .pitch = out_w * 4,
+        }, bearing_x, bearing_y, box_w);
+    }
+
+    /// A coverage glyph from a colour face (an outline glyph in a COLR font without a colour
+    /// layer): stored as white ink so it still draws.
+    fn insertColorFromGray(self: *Manager, key: Key, source: []const u8, width_px: u32, height_px: u32, pitch: u32, bearing_x: i32, bearing_y: i32, advance_px: u32) Error!Entry {
+        const count = @as(usize, width_px) * height_px * 4;
+        var expanded = try self.gpa.alloc(u8, count);
+        defer self.gpa.free(expanded);
+        for (0..height_px) |y| for (0..width_px) |x| {
+            const coverage = source[y * pitch + x];
+            @memset(expanded[(y * width_px + x) * 4 ..][0..4], coverage);
+        };
+        return self.color_atlas.insert(key, .{
+            .data = expanded,
             .width_px = width_px,
             .height_px = height_px,
-            .pitch = pitch,
-        }, slot.bitmap_left, slot.bitmap_top, advance_px);
+            .pitch = width_px * 4,
+        }, bearing_x, bearing_y, advance_px);
+    }
+
+    /// A built-in sprite, drawn at exactly one cell and anchored to the cell's top-left corner.
+    fn spriteGlyph(self: *Manager, codepoint: u32) Error!Entry {
+        const key: Key = .{ .glyph_index = codepoint, .face_index = sprite_face };
+        if (self.atlas.find(key)) |entry| return entry;
+        if (codepoint > std.math.maxInt(u21)) return error.GlyphLoadFailed;
+        const cell = self.face_metrics.cell;
+        try self.scratch.resize(self.gpa, @as(usize, cell.width_px) * cell.height_px);
+        if (!sprite.render(@intCast(codepoint), cell.width_px, cell.height_px, self.scratch.items)) {
+            return error.GlyphLoadFailed;
+        }
+        return self.atlas.insert(key, .{
+            .data = self.scratch.items,
+            .width_px = cell.width_px,
+            .height_px = cell.height_px,
+            .pitch = cell.width_px,
+        }, 0, @intCast(self.face_metrics.baseline_px), cell.width_px);
     }
 
     fn faceIndexForStyle(self: Manager, style: FaceStyle) usize {
@@ -1173,6 +1894,74 @@ pub const Manager = struct {
         return if (self.faces[requested] != null) requested else styleIndex(.regular);
     }
 };
+
+/// A HarfBuzz font over the same font bytes as `face`, scaled in font units so positions convert to
+/// pixels the same way for every face.
+///
+/// HarfBuzz reads the font through its own OpenType functions rather than through `hb-ft` and the
+/// shared `FT_Face`. `hb-ft` resizes the `FT_Face` it is given to its own scale on the first shape
+/// (`FT_Set_Char_Size(upem)` in HarfBuzz 11), which silently re-sized every glyph rasterised after
+/// the first shaped cluster to `upem / 64` pixels: about 15.6px for JetBrains Mono whatever the
+/// configured size or display scale, so text at 2x drew at half size in 2x cells. Keeping the
+/// shaper off the rasteriser's face makes `FT_Set_Pixel_Sizes` the only size that face ever has.
+/// The glyph indices are the same because both read the same cmap.
+///
+/// HarfBuzz allocates and can fail doing so, which is a real outcome rather than an invariant.
+fn harfBuzzFont(face: Face, size_px: u32) error{ OutOfMemory, FontFileUnreadable }!*hb.hb_font_t {
+    const blob: *hb.hb_blob_t = switch (face.origin) {
+        .memory => |bytes| hb.hb_blob_create(
+            bytes.ptr,
+            @intCast(bytes.len),
+            hb.HB_MEMORY_MODE_READONLY,
+            null,
+            null,
+        ) orelse return error.OutOfMemory,
+        .path => |path| hb.hb_blob_create_from_file_or_fail(path.ptr) orelse
+            return error.FontFileUnreadable,
+    };
+    defer hb.hb_blob_destroy(blob);
+    const hb_face: *hb.hb_face_t = hb.hb_face_create(blob, 0) orelse return error.OutOfMemory;
+    defer hb.hb_face_destroy(hb_face);
+    const font: *hb.hb_font_t = hb.hb_font_create(hb_face) orelse return error.OutOfMemory;
+    const upem: i32 = @intCast(face.unitsPerEm());
+    hb.hb_font_set_scale(font, upem, upem);
+    hb.hb_font_set_ppem(font, @intCast(size_px), @intCast(size_px));
+    return font;
+}
+
+/// The first codepoint of `text`, or null for malformed UTF-8.
+fn firstCodepoint(text: []const u8) ?u21 {
+    const length = std.unicode.utf8ByteSequenceLength(text[0]) catch return null;
+    if (length > text.len) return null;
+    return std.unicode.utf8Decode(text[0..length]) catch null;
+}
+
+/// What the variation selectors in a cluster ask for.
+fn presentationOf(text: []const u8) Presentation {
+    if (std.mem.indexOf(u8, text, "\u{FE0F}") != null) return .emoji;
+    if (std.mem.indexOf(u8, text, "\u{FE0E}") != null) return .text;
+    return .default;
+}
+
+/// Catalog indices in fallback preference order: colour faces last, then monospaced before
+/// proportional, regular style first, and path order so the choice is stable between launches.
+fn systemOrder(gpa: Allocator, catalog: *const Catalog) ![]u32 {
+    const order = try gpa.alloc(u32, catalog.files.items.len);
+    for (order, 0..) |*slot, index| slot.* = @intCast(index);
+    std.mem.sort(u32, order, catalog, struct {
+        fn lessThan(context: *const Catalog, a: u32, b: u32) bool {
+            const fa = context.files.items[a];
+            const fb = context.files.items[b];
+            if (fa.color != fb.color) return !fa.color;
+            if (fa.fixed_width != fb.fixed_width) return fa.fixed_width;
+            const ra = fa.face_style == .regular;
+            const rb = fb.face_style == .regular;
+            if (ra != rb) return ra;
+            return std.mem.order(u8, fa.path, fb.path) == .lt;
+        }
+    }.lessThan);
+    return order;
+}
 
 const Resolution = struct {
     /// Slot zero is the primary resolution. Other slots are distinct exact-style files only.
@@ -1675,14 +2464,18 @@ test "a missing style uses the regular face without another owned slot" {
     for ([_]FaceStyle{ .bold, .italic, .bold_italic }) |style| {
         try testing.expectEqual(regular_index, manager.glyphIndexForStyle(style, 'A'));
         const entry = try manager.glyphForStyle(style, regular_index);
-        try testing.expectEqual(@as(u32, 0), entry.key.face_index);
+        // No other face is owned: the regular face stands in, with the synthetic style the request
+        // asked for carried in the flag bits so bold and italic still look different (TASK-39).
+        try testing.expectEqual(@as(u32, 0), entry.key.face_index & face_id_mask);
+        try testing.expectEqual(syntheticFlags(style), entry.key.face_index & ~face_id_mask);
     }
 
     var run: std.ArrayList(ShapedGlyph) = .empty;
     defer run.deinit(testing.allocator);
     try manager.shapeForStyle(.bold_italic, "A", &run);
     try testing.expectEqual(@as(usize, 1), run.items.len);
-    try testing.expectEqual(@as(u32, 0), run.items[0].face_index);
+    try testing.expectEqual(@as(u32, 0), run.items[0].face_index & face_id_mask);
+    try testing.expectEqual(face_flag_bold | face_flag_oblique, run.items[0].face_index & ~face_id_mask);
     _ = try manager.glyphForFace(run.items[0].face_index, run.items[0].glyph_index);
     try testing.expectError(error.InvalidFaceIndex, manager.glyphForFace(1, regular_index));
 }
@@ -1883,4 +2676,424 @@ test "an installed family resolves from the system, and says so" {
         const entry = try manager.glyphForFace(run.items[0].face_index, run.items[0].glyph_index);
         try testing.expectEqual(expected_face_index, entry.key.face_index);
     }
+}
+
+test "coverage ranges merge consecutive codepoints and answer lookups" {
+    const ranges = [_]CodepointRange{
+        .{ .first = 'A', .last = 'Z' },
+        .{ .first = 0x2500, .last = 0x257F },
+        .{ .first = 0x4E00, .last = 0x4E00 },
+    };
+    try testing.expect(rangesContain(&ranges, 'A'));
+    try testing.expect(rangesContain(&ranges, 'M'));
+    try testing.expect(!rangesContain(&ranges, 'a'));
+    try testing.expect(rangesContain(&ranges, 0x2550));
+    try testing.expect(rangesContain(&ranges, 0x4E00));
+    try testing.expect(!rangesContain(&ranges, 0x4E01));
+    try testing.expect(!rangesContain(&.{}, 'A'));
+
+    // The bundled face's own cmap, read the way the catalog reads every system file.
+    var library = try Library.init();
+    defer library.deinit();
+    var face = try Face.openMemory(library.handle, bundled_face, 14);
+    defer face.deinit();
+    const coverage = try readCoverage(testing.allocator, face.handle);
+    defer testing.allocator.free(coverage);
+    try testing.expect(coverage.len > 1);
+    for (coverage[1..], coverage[0 .. coverage.len - 1]) |range, previous| {
+        // Sorted, disjoint and maximal: two ranges never touch.
+        try testing.expect(range.first > previous.last + 1);
+    }
+    try testing.expect(rangesContain(coverage, 'A'));
+    try testing.expect(rangesContain(coverage, 0x2500));
+    try testing.expect(!rangesContain(coverage, 0x4E2D));
+}
+
+test "a colour atlas stores four bytes per pixel" {
+    var atlas = try Atlas.initDepth(testing.allocator, 8, 8, 4);
+    defer atlas.deinit();
+    try testing.expectEqual(@as(usize, 8 * 8 * 4), atlas.pixels.len);
+    // Two RGBA pixels per row, padded to a pitch of twelve bytes.
+    const data = [_]u8{
+        1, 2,  3,  4,  5,  6,  7,  8,  0, 0, 0, 0,
+        9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0,
+    };
+    const entry = try atlas.insert(.{ .glyph_index = 1 }, .{ .data = &data, .width_px = 2, .height_px = 2, .pitch = 12 }, 0, 0, 2);
+    var out: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 16), atlas.copyInto(entry, &out));
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 9, 10, 11, 12, 13, 14, 15, 16 }, atlas.row(entry, 1));
+    // A pitch narrower than a row of four-byte pixels is refused.
+    try testing.expectError(
+        error.BitmapSizeMismatch,
+        atlas.insert(.{ .glyph_index = 2 }, .{ .data = &data, .width_px = 2, .height_px = 2, .pitch = 4 }, 0, 0, 2),
+    );
+}
+
+test "the fallback chain resolves sprites, the primary, the symbols face and then nothing" {
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .system_fallback = false,
+    });
+    defer manager.deinit();
+
+    // Box drawing, blocks, braille and Powerline are sprites while built-in symbols are on.
+    for ([_]u21{ 0x2500, 0x2588, 0x28FF, 0xE0B0 }) |cp| {
+        const hit = manager.resolve(.regular, cp).?;
+        try testing.expectEqual(sprite_face, hit.face_index);
+        try testing.expectEqual(@as(u32, cp), hit.glyph_index);
+    }
+    // Ordinary text comes from the primary face, unflagged.
+    const letter = manager.resolve(.regular, 'A').?;
+    try testing.expectEqual(@as(u32, 0), letter.face_index);
+    try testing.expectEqual(manager.glyphIndex('A'), letter.glyph_index);
+    // A bold request on a regular-only family keeps the face and carries the synthetic flag.
+    try testing.expectEqual(face_flag_bold, manager.resolve(.bold, 'A').?.face_index);
+
+    // A Nerd Font icon comes from the bundled symbols face, which is always in the chain.
+    const icon = manager.resolve(.regular, 0xF126).?;
+    const icon_extra = manager.extras.items[(icon.face_index & face_id_mask) - extra_base];
+    try testing.expectEqual(ExtraKind.symbols, icon_extra.kind);
+    // So are the flames, which the sprites deliberately leave to it.
+    const flame = manager.resolve(.regular, 0xE0C0).?;
+    try testing.expectEqual(ExtraKind.symbols, manager.extras.items[(flame.face_index & face_id_mask) - extra_base].kind);
+
+    // With the system search off, nothing in the chain has a CJK ideograph, and the miss is
+    // cached: the second lookup answers from the cache.
+    try testing.expect(manager.resolve(.regular, 0x4E2D) == null);
+    const cached = manager.resolved.count();
+    try testing.expect(manager.resolve(.regular, 0x4E2D) == null);
+    try testing.expectEqual(cached, manager.resolved.count());
+    // The bundled face is the primary here, so it is not opened a second time as a fallback.
+    for (manager.extras.items) |extra| try testing.expect(extra.kind != .bundled);
+
+    // Turning built-in symbols off hands box drawing back to the font, so a user's own Nerd Font
+    // can draw it.
+    var plain = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .system_fallback = false,
+        .builtin_symbols = false,
+    });
+    defer plain.deinit();
+    const line = plain.resolve(.regular, 0x2500).?;
+    try testing.expectEqual(@as(u32, 0), line.face_index);
+    try testing.expectEqual(plain.glyphIndex(0x2500), line.glyph_index);
+}
+
+test "configured fallbacks come before system faces, and system faces are found by coverage" {
+    const directories = try systemFontDirectories(testing.allocator, null);
+    defer freeAll(testing.allocator, directories);
+    var catalog = try Catalog.scan(testing.io, testing.allocator, directories);
+    defer catalog.deinit();
+
+    // U+273B, Claude Code's spinner glyph, is not in JetBrains Mono.
+    const star: u21 = 0x273B;
+    var coverer: ?FontFile = null;
+    for (catalog.files.items) |file| {
+        if (file.covers(star) and !file.color) coverer = file;
+    }
+    if (coverer == null) {
+        log.info("no installed font covers U+273B here; skipping the system half", .{});
+        return;
+    }
+
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+    });
+    defer manager.deinit();
+    const hit = manager.resolve(.regular, star).?;
+    const extra = manager.extras.items[(hit.face_index & face_id_mask) - extra_base];
+    try testing.expectEqual(ExtraKind.system, extra.kind);
+    // The face chosen is the first file in preference order whose coverage holds the codepoint.
+    var expected: ?u32 = null;
+    for (manager.system_order) |index| {
+        if (manager.catalog.files.items[index].covers(star)) {
+            expected = index;
+            break;
+        }
+    }
+    try testing.expectEqual(expected, extra.catalog_index);
+    const entry = try manager.glyphForFace(hit.face_index, hit.glyph_index);
+    try testing.expect(entry.rect.width > 0 and entry.rect.height > 0);
+    // Fitted to one cell: a fallback never changes the grid.
+    try testing.expect(entry.rect.width <= manager.metrics().cell.width_px);
+    try testing.expect(entry.rect.height <= manager.metrics().cell.height_px);
+
+    // A configured fallback family that covers it wins over the system search.
+    var configured = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .fallbacks = &.{ "Conduit Family That Does Not Exist", coverer.?.family },
+    });
+    defer configured.deinit();
+    const preferred = configured.resolve(.regular, star).?;
+    try testing.expectEqual(
+        ExtraKind.configured,
+        configured.extras.items[(preferred.face_index & face_id_mask) - extra_base].kind,
+    );
+    try testing.expectEqual(extra_base, preferred.face_index & face_id_mask);
+}
+
+test "a CJK ideograph falls back to a system face and fits two cells" {
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+    });
+    defer manager.deinit();
+    const hit = manager.resolve(.regular, 0x4E2D) orelse {
+        log.info("no installed font covers U+4E2D here; skipping", .{});
+        return;
+    };
+    try testing.expect(hit.face_index & face_id_mask >= extra_base);
+    const entry = try manager.glyphForFace(wideFace(hit.face_index), hit.glyph_index);
+    try testing.expect(!entry.color);
+    try testing.expect(entry.rect.width > manager.metrics().cell.width_px / 2);
+    try testing.expect(entry.rect.width <= 2 * manager.metrics().cell.width_px);
+    try testing.expect(entry.rect.height <= manager.metrics().cell.height_px);
+}
+
+test "colour emoji resolve to a colour face and rasterise into the colour atlas" {
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+    });
+    defer manager.deinit();
+    const hit = manager.resolve(.regular, 0x1F600) orelse {
+        log.info("no installed font covers U+1F600 here; skipping", .{});
+        return;
+    };
+    if (!manager.isColor(hit.face_index)) {
+        log.info("U+1F600 resolved to a monochrome face here; skipping the colour half", .{});
+        return;
+    }
+    // Colour glyphs never take synthetic styles: a bitmap cannot be emboldened.
+    try testing.expectEqual(@as(u32, 0), manager.resolve(.bold, 0x1F600).?.face_index & ~face_id_mask);
+
+    const entry = try manager.glyphForFace(wideFace(hit.face_index), hit.glyph_index);
+    try testing.expect(entry.color);
+    const cell = manager.metrics().cell;
+    // Scaled from the font's 109px strike into the two-cell box, centred in it.
+    try testing.expect(entry.rect.width > cell.width_px and entry.rect.width <= 2 * cell.width_px);
+    try testing.expect(entry.rect.height > cell.height_px / 2 and entry.rect.height <= cell.height_px);
+    try testing.expect(entry.bearing_x_px >= 0);
+
+    const pixels = try testing.allocator.alloc(u8, @as(usize, entry.rect.width) * entry.rect.height * 4);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqual(pixels.len, manager.color_atlas.copyInto(entry, pixels));
+    // Real colour: some opaque pixel whose channels differ (a yellow face is not grey).
+    var coloured = false;
+    var index: usize = 0;
+    while (index < pixels.len) : (index += 4) {
+        const p = pixels[index..][0..4];
+        if (p[3] > 200 and (p[0] != p[1] or p[1] != p[2])) coloured = true;
+        // Premultiplied: no channel exceeds its alpha.
+        try testing.expect(p[0] <= p[3] and p[1] <= p[3] and p[2] <= p[3]);
+    }
+    try testing.expect(coloured);
+    // The coverage atlas did not receive it.
+    try testing.expectEqual(@as(u64, 0), manager.atlas.stats.insertions);
+
+    // An emoji variation selector picks the colour face for a text-default symbol too.
+    if (manager.resolveWith(.regular, 0x2764, .emoji)) |heart| {
+        try testing.expect(manager.isColor(heart.face_index));
+    }
+}
+
+test "ligatures shape differently on and off, and can be toggled at runtime" {
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .system_fallback = false,
+    });
+    defer manager.deinit();
+    try testing.expect(manager.ligatures());
+
+    var on: std.ArrayList(ShapedGlyph) = .empty;
+    defer on.deinit(testing.allocator);
+    var off: std.ArrayList(ShapedGlyph) = .empty;
+    defer off.deinit(testing.allocator);
+
+    for ([_][]const u8{ "=>", "->", "!=" }) |text| {
+        manager.setLigatures(true);
+        try manager.shapeForStyle(.regular, text, &on);
+        manager.setLigatures(false);
+        try manager.shapeForStyle(.regular, text, &off);
+
+        // Off: exactly the two plain glyphs a cell-by-cell renderer would draw.
+        try testing.expectEqual(@as(usize, 2), off.items.len);
+        try testing.expectEqual(manager.glyphIndex(text[0]), off.items[0].glyph_index);
+        try testing.expectEqual(manager.glyphIndex(text[1]), off.items[1].glyph_index);
+        // On: JetBrains Mono's contextual alternates replace the pair with its ligature, which it
+        // draws as a spacer plus one glyph spanning both cells, so the advances still tile the
+        // grid while the glyphs are not the plain ones.
+        try testing.expect(on.items.len >= 1 and on.items.len <= 2);
+        var same = on.items.len == off.items.len;
+        if (same) {
+            for (on.items, off.items) |a, b| {
+                if (a.glyph_index != b.glyph_index) same = false;
+            }
+        }
+        try testing.expect(!same);
+        var advance: f32 = 0;
+        for (on.items) |g| advance += g.x_advance_px;
+        try testing.expectApproxEqAbs(@as(f32, 16.8), advance, 0.01);
+    }
+}
+
+test "a missing bold or italic face is synthesised, visibly distinct from regular" {
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(20, 1.0),
+        .system_fallback = false,
+    });
+    defer manager.deinit();
+    // A vertical bar: shearing it can only lean it, so any extra width is the slant itself.
+    const index = manager.glyphIndex('|');
+    const regular = try manager.glyphForStyle(.regular, index);
+    const bold = try manager.glyphForStyle(.bold, index);
+    const italic = try manager.glyphForStyle(.italic, index);
+    try testing.expect(manager.atlas.isLive(regular) and manager.atlas.isLive(bold) and manager.atlas.isLive(italic));
+
+    const ink = struct {
+        fn sum(atlas: Atlas, entry: Entry) u64 {
+            var total: u64 = 0;
+            var row: u32 = 0;
+            while (row < entry.rect.height) : (row += 1) {
+                for (atlas.row(entry, row)) |p| total += p;
+            }
+            return total;
+        }
+    }.sum;
+    // Emboldening adds ink; shearing leans the stem, so the glyph gets wider at the same height.
+    try testing.expect(ink(manager.atlas, bold) > ink(manager.atlas, regular) * 11 / 10);
+    try testing.expect(italic.rect.width > regular.rect.width);
+    try testing.expect(italic.rect.height + 1 >= regular.rect.height);
+    // The three are distinct atlas entries.
+    try testing.expect(bold.slot != regular.slot and italic.slot != regular.slot and italic.slot != bold.slot);
+}
+
+test "sprites are drawn at exactly one cell, anchored at the cell's top" {
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .system_fallback = false,
+    });
+    defer manager.deinit();
+    const cell = manager.metrics().cell;
+    const entry = try manager.glyphForFace(sprite_face, 0x2502);
+    try testing.expectEqual(cell.width_px, entry.rect.width);
+    try testing.expectEqual(cell.height_px, entry.rect.height);
+    try testing.expectEqual(@as(i32, 0), entry.bearing_x_px);
+    // A renderer places a glyph's top at baseline - bearing_y, which is the cell's own top.
+    try testing.expectEqual(@as(i32, @intCast(manager.metrics().baseline_px)), entry.bearing_y_px);
+    // The vertical line reaches the first and last rows of the cell.
+    const x = (cell.width_px - sprite.lineThickness(cell.height_px)) / 2;
+    try testing.expectEqual(@as(u8, 255), manager.atlas.row(entry, 0)[x]);
+    try testing.expectEqual(@as(u8, 255), manager.atlas.row(entry, cell.height_px - 1)[x]);
+    // Shaping a box-drawing cluster reports the sprite face too.
+    var run: std.ArrayList(ShapedGlyph) = .empty;
+    defer run.deinit(testing.allocator);
+    try manager.shapeForStyle(.bold, "\u{2502}", &run);
+    try testing.expectEqual(@as(usize, 1), run.items.len);
+    try testing.expectEqual(sprite_face, run.items[0].face_index);
+}
+
+test "a size or scale change re-rasterises glyphs and sprites at the new pixel size" {
+    var at_1x = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .system_fallback = false,
+    });
+    defer at_1x.deinit();
+    var at_2x = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 2.0),
+        .system_fallback = false,
+    });
+    defer at_2x.deinit();
+
+    // Metrics are derived again from the face at the new size, not doubled.
+    try testing.expectEqual(@as(u32, 28), at_2x.size_px);
+    try testing.expect(at_2x.metrics().cell.height_px + 2 >= 2 * at_1x.metrics().cell.height_px);
+
+    const small = try at_1x.glyph(at_1x.glyphIndex('g'));
+    const large = try at_2x.glyph(at_2x.glyphIndex('g'));
+    // Roughly twice the bitmap in each dimension...
+    try testing.expect(large.rect.width + 2 >= 2 * small.rect.width and large.rect.width <= 2 * small.rect.width + 2);
+    try testing.expect(large.rect.height + 2 >= 2 * small.rect.height and large.rect.height <= 2 * small.rect.height + 2);
+    // ...but rasterised from the outline at 28px rather than a pixel-doubled copy of the 14px
+    // glyph: a doubled copy would have every 2x2 block uniform, and a real rasterisation has
+    // anti-aliased edges that land on single pixels.
+    var non_uniform_blocks: u32 = 0;
+    var y: u32 = 0;
+    while (y + 1 < large.rect.height) : (y += 2) {
+        const top = at_2x.atlas.row(large, y);
+        const bottom = at_2x.atlas.row(large, y + 1);
+        var x: usize = 0;
+        while (x + 1 < top.len) : (x += 2) {
+            if (top[x] != top[x + 1] or top[x] != bottom[x] or top[x] != bottom[x + 1]) non_uniform_blocks += 1;
+        }
+    }
+    try testing.expect(non_uniform_blocks > 4);
+
+    // Sprites follow the new cell exactly, with a stroke drawn for that cell.
+    const line_1x = try at_1x.glyphForFace(sprite_face, 0x2500);
+    const line_2x = try at_2x.glyphForFace(sprite_face, 0x2500);
+    try testing.expectEqual(at_2x.metrics().cell.width_px, line_2x.rect.width);
+    try testing.expectEqual(at_2x.metrics().cell.height_px, line_2x.rect.height);
+    try testing.expectEqual(at_1x.metrics().cell.width_px, line_1x.rect.width);
+    try testing.expect(sprite.lineThickness(line_2x.rect.height) >= sprite.lineThickness(line_1x.rect.height));
+}
+
+test "a private-use icon from the bundled symbols face is fitted to one cell" {
+    var manager = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 1.0),
+        .system_fallback = false,
+    });
+    defer manager.deinit();
+    const cell = manager.metrics().cell;
+    for ([_]u21{ 0xF126, 0xF0068, 0xE0C0 }) |cp| {
+        const hit = manager.resolve(.regular, cp).?;
+        const entry = try manager.glyphForFace(hit.face_index, hit.glyph_index);
+        try testing.expect(entry.rect.width > 0);
+        // Inside the cell box: from the cell's left edge to its right, top to bottom.
+        try testing.expect(entry.bearing_x_px >= 0);
+        try testing.expect(@as(i64, entry.bearing_x_px) + entry.rect.width <= cell.width_px);
+        try testing.expect(entry.bearing_y_px <= @as(i32, @intCast(manager.metrics().baseline_px)));
+        try testing.expect(@as(i64, manager.metrics().baseline_px) - entry.bearing_y_px + entry.rect.height <= cell.height_px);
+    }
+}
+
+test "shaping never resizes the face glyphs are rasterised from" {
+    // Regression: HarfBuzz's FreeType bridge set the shared face's size to its own scale on the
+    // first shape, so every glyph rasterised after any shaped cluster came out at upem/64 pixels
+    // (15.6px for JetBrains Mono) instead of the configured size.
+    var fresh = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 2.0),
+        .system_fallback = false,
+    });
+    defer fresh.deinit();
+    const unshaped = try fresh.glyph(fresh.glyphIndex('M'));
+
+    var shaped = try Manager.init(testing.allocator, testing.io, .{
+        .family = "",
+        .size = try Size.init(14, 2.0),
+        .system_fallback = false,
+    });
+    defer shaped.deinit();
+    var run: std.ArrayList(ShapedGlyph) = .empty;
+    defer run.deinit(testing.allocator);
+    try shaped.shape("a => b", &run);
+    try shaped.shapeForStyle(.bold, "x", &run);
+    const after = try shaped.glyph(shaped.glyphIndex('M'));
+    try testing.expectEqual(unshaped.rect.width, after.rect.width);
+    try testing.expectEqual(unshaped.rect.height, after.rect.height);
+    // And the size is the configured one: JetBrains Mono's cap height is 730 of 1000 units, so a
+    // 28px 'M' stands about 20px tall.
+    try testing.expect(after.rect.height >= 19 and after.rect.height <= 22);
 }
