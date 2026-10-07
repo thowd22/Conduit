@@ -93,10 +93,15 @@ const git = @import("git.zig");
 /// The agent runtime, notification list and OS notification seam (TASK-56).
 const app_agents = @import("app_agents.zig");
 const agent = @import("agent");
+/// SSH workspaces' pure helpers: the connection manager's host list and
+/// choice values and how a connection state is shown (TASK-43, TASK-44).
+const remote = @import("remote.zig");
+const ssh = workspace.ssh;
 
 test {
     _ = git;
     _ = app_agents;
+    _ = remote;
 }
 /// The input module, imported under a name that does not collide with the app's
 /// `input` buffer field. A module shadowed by a local reads as "the buffer"
@@ -336,6 +341,18 @@ pub const Run = struct {
     /// The private directory `--agent-test` keeps its agent sinks and its
     /// background-tab trigger in. Not a command-line flag: `runApp` sets it.
     agent_test_dir: ?[]const u8 = null,
+    /// Exercise SSH workspaces (TASK-43/44/45) against a throwaway sshd
+    /// container: the connection manager, OpenSSH's prompts in the connection
+    /// view, remote tabs, panes and scratchpad in the originating cwd, loss
+    /// and reconnect, through real SDL events, then exit. Skipped (exit 0)
+    /// without Docker.
+    ssh_test: bool = false,
+    /// The private directory `--ssh-test` keeps its isolated home, keys,
+    /// settings file and control sockets in. Not a command-line flag:
+    /// `runApp` sets it. With it the app reads `<dir>/home/.ssh/config`
+    /// instead of `~/.ssh/config`, passes it to `ssh -F`, and keeps control
+    /// sockets under `<dir>/run`.
+    ssh_test_dir: ?[]const u8 = null,
     /// The settings file to load and watch instead of the platform location.
     /// Not a command-line flag: `runApp` sets it for `--config-test`,
     /// `--theme-test`, `--font-test` and `--settings-test`, which
@@ -436,7 +453,7 @@ fn optionsForRun(options: Options) Options {
         !options.run.workspaces_test and !options.run.links_test and
         !options.run.search_test and !options.run.menu_test and !options.run.config_test and
         !options.run.theme_test and !options.run.font_test and !options.run.settings_test and
-        !options.run.git_test and !options.run.agent_test) return options;
+        !options.run.git_test and !options.run.agent_test and !options.run.ssh_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -447,7 +464,7 @@ fn optionsForRun(options: Options) Options {
     resolved.run.command = null;
     resolved.run.font_family = "";
     resolved.run.no_child = options.run.ui_test or options.run.driver_test or options.run.sidebar_test or
-        options.run.scratchpad_test;
+        options.run.scratchpad_test or options.run.ssh_test;
     return resolved;
 }
 
@@ -584,6 +601,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.git_test = true;
         } else if (std.mem.eql(u8, arg, "--agent-test")) {
             run.agent_test = true;
+        } else if (std.mem.eql(u8, arg, "--ssh-test")) {
+            run.ssh_test = true;
         } else if (std.mem.eql(u8, arg, "--font-test")) {
             run.font_test = true;
         } else if (namesValue(arg, "--right-click")) {
@@ -1292,6 +1311,9 @@ const Load = struct {
     /// This job spawned a transactional scratchpad replacement rather than a
     /// child for a starting session.
     scratchpad_replacement: bool = false,
+    /// This job restarts a session whose child ended (an SSH reconnect,
+    /// TASK-43): the result replaces that child under the same id.
+    respawn: bool = false,
     /// The launched agent whose adapter describes this spawn (TASK-56). Its
     /// `prepare` runs here, before the spawn, and fills argv and env; the
     /// runtime keeps the runner alive until this job is reported finished.
@@ -1619,10 +1641,40 @@ const ChildSpec = struct {
         try variables.put("TERM", "xterm-256color");
         try variables.put("COLORTERM", "truecolor");
         try variables.put("TERM_PROGRAM", "conduit");
-        try variables.put("PATH", env.get("PATH") orelse fallback_path);
-        try variables.put("HOME", env.get("HOME") orelse "/");
+        // An SSH session's PATH and HOME are the remote host's own: this
+        // machine's would name directories that do not exist there
+        // (decision-8: the curated set is the *remote* overlay).
+        if (context != .ssh) {
+            try variables.put("PATH", env.get("PATH") orelse fallback_path);
+            try variables.put("HOME", env.get("HOME") orelse "/");
+        }
         try variables.put("LANG", env.get("LANG") orelse "C.UTF-8");
         return variables;
+    }
+
+    /// The remote overlay every SSH session starts with (decision-8): the
+    /// terminal identity and a LANG fallback, rendered by the context into
+    /// the remote `/bin/sh` script, and an empty argv, which is the remote
+    /// user's own login shell. Remote shell integration is the context's
+    /// concern (`ssh.ShellIntegration`), so no local handshake variable is
+    /// set here.
+    fn buildRemote(allocator: Allocator, env: EnvSource) !ChildSpec {
+        var argv: std.ArrayList([]const u8) = .empty;
+        var variables = try baseEnvironment(allocator, env, .ssh);
+        defer variables.deinit();
+        return finish(allocator, &argv, &variables);
+    }
+
+    /// The environment the local `ssh` client of an SSH workspace runs with:
+    /// it is a Local child, so it inherits Conduit's environment exactly as a
+    /// local shell does (`SSH_AUTH_SOCK`, `SSH_ASKPASS`, `DISPLAY`,
+    /// `KRB5CCNAME`, proxies), minus `inherited_exclusions`, with the terminal
+    /// identity on top so `TERM` reaches the remote side in the PTY request.
+    fn buildSshClient(allocator: Allocator, env: EnvSource) !ChildSpec {
+        var argv: std.ArrayList([]const u8) = .empty;
+        var variables = try baseEnvironment(allocator, env, .local);
+        defer variables.deinit();
+        return finish(allocator, &argv, &variables);
     }
 
     fn isExcluded(key: []const u8) bool {
@@ -1828,7 +1880,7 @@ const idle_tick_ms: i32 = 16;
 /// not moving under them ask for none; PTY-facing checks ask for their own,
 /// because terminal input is only proved by what a program reads.
 fn wantsChild(options: Options) bool {
-    if (options.run.ui_test or options.run.sidebar_test) return false;
+    if (options.run.ui_test or options.run.sidebar_test or options.run.ssh_test) return false;
     if (options.run.clipboard_test or options.run.ime_test or options.run.tabs_test or
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
         options.run.links_test or options.run.search_test or options.run.menu_test or
@@ -1850,7 +1902,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
         run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test or run.git_test or
-        run.agent_test;
+        run.agent_test or run.ssh_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -1913,6 +1965,22 @@ const agent_focus_action = "agent.focus";
 const notifications_open_action = "notifications.open";
 const notifications_clear_action = "notifications.clear";
 const notifications_activate_action = "notifications.activate";
+const remote_connect_action = "remote.connect";
+const remote_connect_address_action = "remote.connect-address";
+const remote_save_profile_action = "remote.save-profile";
+const remote_reconnect_action = "remote.reconnect";
+const remote_disconnect_action = "remote.disconnect";
+const remote_show_connection_action = "remote.show-connection";
+/// The connection manager's list: hosts, profiles, recent destinations and
+/// the `user@host` row.
+const remote_choice_capacity: usize = remote.max_hosts + config.max_remote_profiles + config.max_remote_recent + 1;
+const remote_choice_value_capacity: usize = config.max_string_bytes + 16;
+const remote_save_choices = [_]inputmod.PaletteChoice{
+    .{ .label = "Save as profile", .value = "yes" },
+    .{ .label = "Do not save", .value = "no" },
+};
+/// The `remote.connect` list before the palette first opens.
+const no_remote_choices = [_]inputmod.PaletteChoice{.{ .label = "Enter user@host…", .value = "address" }};
 /// Offers the scripted fake harness (TASK-56) to a run that also has the test
 /// driver, which is how the `agent-notifications` E2E scenario reaches it.
 const fake_agent_env = "CONDUIT_TEST_FAKE_AGENT";
@@ -1959,7 +2027,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 67;
+const action_capacity_base: usize = 73;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 const settings_open_action = "settings.open";
@@ -3104,6 +3172,116 @@ const WorkspacePresentation = struct {
     load: ?*Load = null,
     scratchpad_load: ?*Load = null,
     closing: bool = false,
+    /// The SSH half of an SSH workspace (TASK-43), or null for a Local one.
+    /// Owned; released with the presentation.
+    remote: ?*RemotePresentation = null,
+};
+
+/// The app's state for one SSH workspace (TASK-43 part two, decision-8).
+///
+/// Thread ownership: the main thread. `context` is borrowed from the
+/// workspace that owns it and outlives this record (the record is released
+/// before the workspace is removed). The only worker is `host_probe`, which
+/// borrows the context's capability and is joined before release.
+///
+/// The connection terminal (`connection_id`, a `connection` session whose
+/// PTY is the master's view) is presented over the workspace's panes while
+/// the master is not connected, so OpenSSH's own host-key, passphrase,
+/// password and 2FA prompts are what the person sees and answers; and on
+/// request (`remote.show-connection`) once connected. Its renderer lives in
+/// the presentation's `pane_renderers` beside the panes', so fonts, colours
+/// and invalidation reach it the same way.
+const RemotePresentation = struct {
+    context: *ssh.SshContext,
+    connection_id: session.SessionId,
+    /// The state the app last acted on; `context.poll` reports the next.
+    state: ssh.State = .disconnected,
+    /// Show the connection terminal while connected.
+    view_requested: bool = false,
+    /// The first `connected` spawns the first tab and the scratchpad; every
+    /// later one respawns what the lost connection ended.
+    ever_connected: bool = false,
+    /// Sessions to respawn in place after a reconnect, one at a time through
+    /// the presentation's spawn slots. Each cwd is owned.
+    respawn: std.ArrayList(RespawnItem) = .empty,
+    /// The remote host's own name, learned with one exec once connected; the
+    /// OSC 7 host remote shells report (`term.Terminal.setWorkingDirectoryHost`).
+    remote_host: [remote.max_host_bytes]u8 = undefined,
+    remote_host_len: usize = 0,
+    host_probe: ?*HostProbe = null,
+    /// The connection view's header, `ssh <destination> ─ <state>`.
+    header_storage: [palette_label_capacity]u8 = undefined,
+
+    fn remoteHost(self: *const RemotePresentation) ?[]const u8 {
+        if (self.remote_host_len == 0) return null;
+        return self.remote_host[0..self.remote_host_len];
+    }
+
+    /// Whether new remote sessions may start now: connected, and the host
+    /// probe that names OSC 7's host has answered.
+    fn ready(self: *const RemotePresentation) bool {
+        return self.state == .connected and self.host_probe == null;
+    }
+};
+
+/// One session to start again after a reconnect.
+const RespawnItem = struct {
+    id: session.SessionId,
+    /// The remote cwd it last reported, owned, or empty for the remote home.
+    cwd: []u8,
+    scratchpad: bool,
+};
+
+/// Asks the remote host its name (`uname -n`) over an exec channel, once per
+/// connection, on a worker: the name OSC 7 reports from remote shells carry.
+///
+/// Ownership: the main thread creates, polls and destroys it; the worker
+/// writes `name` and then publishes `state` with a release store.
+const HostProbe = struct {
+    allocator: Allocator,
+    io: Io,
+    context: workspace.ExecutionContext.Ref,
+    state: std.atomic.Value(u32) = .init(0),
+    thread: ?std.Thread = null,
+    name: [remote.max_host_bytes]u8 = undefined,
+    name_len: usize = 0,
+
+    fn start(allocator: Allocator, io: Io, context: workspace.ExecutionContext.Ref) !*HostProbe {
+        const self = try allocator.create(HostProbe);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .io = io, .context = context };
+        self.thread = try std.Thread.spawn(.{}, work, .{self});
+        return self;
+    }
+
+    fn finished(self: *const HostProbe) bool {
+        return self.state.load(.acquire) != 0;
+    }
+
+    fn work(self: *HostProbe) void {
+        defer self.state.store(1, .release);
+        var result = self.context.run(self.allocator, self.io, .{
+            .argv = &.{ "uname", "-n" },
+            .cwd = "",
+            .max_output = 256,
+            .timeout_ms = 15_000,
+        }) catch |err| {
+            log.debug("the remote host name probe failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer result.deinit(self.allocator);
+        if (!result.succeeded()) return;
+        const name = std.mem.trim(u8, result.stdout, " \t\r\n");
+        if (!remote.concreteAlias(name)) return;
+        @memcpy(self.name[0..name.len], name);
+        self.name_len = name.len;
+    }
+
+    /// Join the worker and release the probe.
+    fn destroy(self: *HostProbe) void {
+        if (self.thread) |thread| thread.join();
+        self.allocator.destroy(self);
+    }
 };
 
 const WorkspaceEventContext = struct {
@@ -4128,6 +4306,44 @@ const App = struct {
     agent_prompt_index: usize = 0,
     agent_stop_index: usize = 0,
     agent_focus_index: usize = 0,
+    /// TASK-44: the connection manager's registry indices, choice list and
+    /// the destination an ad hoc connection may be saved as. Main thread.
+    remote_connect_index: usize = 0,
+    remote_address_index: usize = 0,
+    remote_save_index: usize = 0,
+    remote_choices: [remote_choice_capacity]inputmod.PaletteChoice = undefined,
+    remote_choice_labels: [remote_choice_capacity][palette_label_capacity]u8 = undefined,
+    remote_choice_values: [remote_choice_capacity][remote_choice_value_capacity]u8 = undefined,
+    remote_choice_count: usize = 0,
+    /// The choice step's fuzzy filter (TASK-44 AC1): indices into the
+    /// current choice list, best match first.
+    choice_filter: [remote_choice_capacity]usize = undefined,
+    choice_filter_len: usize = 0,
+    remote_pending_profile: [config.max_string_bytes]u8 = undefined,
+    remote_pending_profile_len: usize = 0,
+    /// The remote overlay SSH sessions start with, and the local `ssh`
+    /// client's inherited environment (TASK-43 part two).
+    remote_spec: ChildSpec,
+    ssh_client_spec: ChildSpec,
+    /// `$XDG_RUNTIME_DIR` for control sockets, borrowed from the process
+    /// environment, or `--ssh-test`'s private directory (owned).
+    ssh_runtime_dir: ?[]const u8 = null,
+    /// `--ssh-test`'s isolated ssh configuration, owned; null in a real run,
+    /// which reads `~/.ssh/config` and passes no `-F`.
+    ssh_config_override: ?[]const u8 = null,
+    /// `--ssh-test`'s owned runtime directory, freed with the app.
+    ssh_runtime_owned: ?[]u8 = null,
+    /// A Local context for reading the user's ssh configuration when the
+    /// active workspace may be remote. Owned.
+    local_files: workspace.ExecutionContext,
+    /// The connection status line's storage (`workspace.status` borrows it).
+    remote_status_storage: [palette_label_capacity]u8 = undefined,
+    /// Sidebar labels with a connection glyph and the state ids of the glyph
+    /// elements; the ids alternate per frame like the agent glyph ids.
+    remote_workspace_labels: [sidebar_element_capacity][tab_name_capacity + 8]u8 = undefined,
+    remote_state_ids: [2][sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
+    remote_state_id_generation: usize = 0,
+    connection_semantic_storage: [4][workspace_semantic_capacity]u8 = undefined,
     /// The harness `agent.launch` chose, waiting for its optional prompt.
     agent_launch_pending: ?app_agents.Choice = null,
     /// The harness last launched, which `agent.launch-prompt` reuses.
@@ -4880,6 +5096,56 @@ const App = struct {
             .handler = notificationsActivateAction,
             .palette = null,
         });
+        // TASK-43/44. `remote.connect`'s list starts with only the address
+        // row and is rebuilt from ssh configuration, profiles and recent
+        // destinations each time the palette opens.
+        const remote_connect_index = actions.definitions().len;
+        try actions.register(.{
+            .name = remote_connect_action,
+            .label = "Remote: connect",
+            .handler = remoteConnectAction,
+            .palette = .{ .argument = .{ .choices = .{
+                .name = "target",
+                .prompt = "Connect to",
+                .values = &no_remote_choices,
+            } } },
+        });
+        const remote_address_index = actions.definitions().len;
+        try actions.register(.{
+            .name = remote_connect_address_action,
+            .label = "Remote: connect to user@host",
+            .handler = remoteConnectAddressAction,
+            .palette = .{ .argument = .{ .input = .{
+                .name = "destination",
+                .prompt = "user@host[:port]",
+            } } },
+        });
+        const remote_save_index = actions.definitions().len;
+        try actions.register(.{
+            .name = remote_save_profile_action,
+            .label = "Remote: save connection as profile",
+            .handler = remoteSaveProfileAction,
+            .palette = .{ .argument = .{ .choices = .{
+                .name = "save",
+                .prompt = "Save as profile?",
+                .values = &remote_save_choices,
+            } } },
+        });
+        try actions.register(.{
+            .name = remote_reconnect_action,
+            .label = "Remote: reconnect",
+            .handler = remoteReconnectAction,
+        });
+        try actions.register(.{
+            .name = remote_disconnect_action,
+            .label = "Remote: disconnect",
+            .handler = remoteDisconnectAction,
+        });
+        try actions.register(.{
+            .name = remote_show_connection_action,
+            .label = "Remote: show connection",
+            .handler = remoteShowConnectionAction,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -4944,6 +5210,20 @@ const App = struct {
 
         var agent_spec = try ChildSpec.buildInteractive(allocator, io, env, .local, true, "/bin/sh");
         errdefer agent_spec.deinit();
+        var remote_spec = try ChildSpec.buildRemote(allocator, env);
+        errdefer remote_spec.deinit();
+        var ssh_client_spec = try ChildSpec.buildSshClient(allocator, env);
+        errdefer ssh_client_spec.deinit();
+        var local_files = try workspace.ExecutionContext.local(allocator);
+        errdefer local_files.deinit();
+        var ssh_config_override: ?[]u8 = null;
+        errdefer if (ssh_config_override) |path| allocator.free(path);
+        var ssh_runtime_owned: ?[]u8 = null;
+        errdefer if (ssh_runtime_owned) |path| allocator.free(path);
+        if (options.run.ssh_test_dir) |dir| {
+            ssh_config_override = try std.fmt.allocPrint(allocator, "{s}/home/.ssh/config", .{dir});
+            ssh_runtime_owned = try std.fmt.allocPrint(allocator, "{s}/run", .{dir});
+        }
         var sink_root_buffer: [path_capacity]u8 = undefined;
         var agents = try app_agents.Runtime.init(allocator, io, .{
             .sink_root = agentSinkRoot(io, env, options, &sink_root_buffer),
@@ -4964,6 +5244,15 @@ const App = struct {
             .agent_prompt_index = agent_prompt_index,
             .agent_stop_index = agent_stop_index,
             .agent_focus_index = agent_focus_index,
+            .remote_connect_index = remote_connect_index,
+            .remote_address_index = remote_address_index,
+            .remote_save_index = remote_save_index,
+            .remote_spec = remote_spec,
+            .ssh_client_spec = ssh_client_spec,
+            .ssh_runtime_dir = if (ssh_runtime_owned) |dir| dir else env.get("XDG_RUNTIME_DIR"),
+            .ssh_config_override = ssh_config_override,
+            .ssh_runtime_owned = ssh_runtime_owned,
+            .local_files = local_files,
             .window_focused = window.hasInputFocus(),
             .allocator = allocator,
             .io = io,
@@ -5062,6 +5351,795 @@ const App = struct {
         return app;
     }
 
+    // SSH workspaces (TASK-43 part two, TASK-44, TASK-45) -------------------
+
+    /// The context's wake hook: a worker found the connection gone. Post an
+    /// event so a blocked loop iterates and `pollRemote` applies it.
+    fn sshWake(context: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(context));
+        self.window.postDriverWake() catch |err| {
+            log.debug("could not wake the event loop for an ssh connection change: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Release a presentation's SSH record: join its host probe and free the
+    /// respawn queue. Its workspace, whose context the probe borrows, must
+    /// still exist.
+    fn releaseRemote(self: *App, presentation: *WorkspacePresentation) void {
+        const record = presentation.remote orelse return;
+        if (record.host_probe) |probe| probe.destroy();
+        for (record.respawn.items) |item| self.allocator.free(item.cwd);
+        record.respawn.deinit(self.allocator);
+        self.allocator.destroy(record);
+        presentation.remote = null;
+    }
+
+    fn activeRemote(self: *const App) ?*RemotePresentation {
+        if (self.workspace_registry.count() == 0) return null;
+        return self.activePresentationConst().remote;
+    }
+
+    /// Whether the active workspace shows its connection terminal over its
+    /// panes: always while the master is not connected, so every OpenSSH
+    /// prompt is in front of the person, and on request once it is.
+    fn connectionVisible(self: *const App) bool {
+        const record = self.activeRemote() orelse return false;
+        return record.state != .connected or record.view_requested;
+    }
+
+    fn setRemoteStatus(self: *App, comptime format: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&self.remote_status_storage, format, args) catch "ssh: status";
+        self.setWorkspaceStatus(text);
+    }
+
+    /// Refuse to start a remote session before the connection is ready: a
+    /// client with no master would open a second, separately authenticated
+    /// connection (decision-8). Says why on the status line.
+    fn remoteNotReady(self: *App) bool {
+        const record = self.activePresentation().remote orelse return false;
+        if (record.ready()) return false;
+        self.setRemoteStatus("ssh: {s}", .{remote.stateWords(record.state)});
+        return true;
+    }
+
+    /// What a new terminal in `model` runs: the remote user's login shell
+    /// with the remote overlay in an SSH workspace, otherwise `local`.
+    fn processFor(self: *const App, model: *const workspace.Workspace, local: *const ChildSpec) workspace.ProcessSpec {
+        const spec = if (model.contextKind() == .ssh) &self.remote_spec else local;
+        return .{ .argv = spec.argv, .env = spec.env };
+    }
+
+    /// Let a session's terminal believe OSC 7 from the remote host, once that
+    /// host's name is known. Called when a child attaches, before it can have
+    /// printed anything.
+    fn applyRemoteHost(presentation: *WorkspacePresentation, model: *workspace.Workspace, id: session.SessionId) void {
+        const record = presentation.remote orelse return;
+        const host = record.remoteHost() orelse return;
+        const live = model.sessionById(id) orelse return;
+        live.terminal().setWorkingDirectoryHost(host) catch |err| {
+            log.debug("the remote host name was not usable for OSC 7: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Build an SSH workspace: its context, a `Terminal 1` tab whose shell
+    /// starts once connected, the connection session presenting the master,
+    /// and their renderers. Starts the master; nothing remote spawns yet.
+    fn createRemotePresentation(
+        self: *App,
+        name: []const u8,
+        destination: []const u8,
+        port: ?u16,
+    ) !*WorkspacePresentation {
+        // Elsewhere the context is not built (decision-8); nothing below is
+        // analysed for those targets.
+        if (comptime !ssh.supported) return error.Unsupported;
+        const grid_size = self.activeLive().terminal().gridSize();
+        const context = try ssh.SshContext.create(self.allocator, self.io, .{
+            .target = .{ .destination = destination, .port = port, .config_file = self.ssh_config_override },
+            .local_env = self.ssh_client_spec.env,
+            .runtime_dir = self.ssh_runtime_dir,
+            .wake = .{ .context = self, .wake_fn = sshWake },
+        });
+        // The implementation is heap-stable; the workspace owns it from here.
+        // `create` just made an SSH context, so the downcast cannot fail.
+        const ssh_context = ssh.SshContext.fromContext(&context) orelse unreachable;
+        var candidate = try workspace.Workspace.init(self.io, self.allocator, name, "", context, grid_size);
+        var candidate_owned = true;
+        errdefer if (candidate_owned) candidate.deinit() catch |err| log.warn(
+            "could not release a refused ssh workspace: {s}",
+            .{@errorName(err)},
+        );
+        const session_id = try candidate.createSession(.human_terminal, grid_size);
+        _ = try candidate.registerTab("Terminal 1", session_id);
+        const live = candidate.sessionById(session_id) orelse return error.SessionNotFound;
+        live.terminal().setClipboardAccess(.{
+            .read_fn = readNativeClipboard,
+            .write_fn = writeNativeClipboard,
+        });
+        const connection_id = try candidate.createSession(.connection, grid_size);
+        // The view's `destroy` only lets go; the context keeps the master.
+        try candidate.attachChild(connection_id, ssh_context.masterTerminal());
+
+        var pane_renderers: std.ArrayList(PaneRenderer) = .empty;
+        errdefer {
+            for (pane_renderers.items) |*pane_renderer| pane_renderer.deinit();
+            pane_renderers.deinit(self.allocator);
+        }
+        try pane_renderers.ensureUnusedCapacity(self.allocator, 2);
+        pane_renderers.appendAssumeCapacity(try self.newPaneRenderer(session_id));
+        pane_renderers.appendAssumeCapacity(try self.newPaneRenderer(connection_id));
+
+        var scratchpad_grid = try render.Grid.init(self.allocator, gridColors(self.palette));
+        var scratchpad_grid_owned = true;
+        errdefer if (scratchpad_grid_owned) scratchpad_grid.deinit();
+        try scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), .{
+            .width_px = atlas_width_px,
+            .height_px = atlas_height_px,
+        });
+
+        const record = try self.allocator.create(RemotePresentation);
+        errdefer self.allocator.destroy(record);
+        record.* = .{ .context = ssh_context, .connection_id = connection_id };
+
+        try self.workspace_presentations.ensureUnusedCapacity(self.allocator, 1);
+        const presentation = try self.allocator.create(WorkspacePresentation);
+        errdefer self.allocator.destroy(presentation);
+        const key = try self.workspace_registry.insert(&candidate);
+        candidate_owned = false;
+        presentation.* = .{
+            .key = key,
+            .active_session_id = session_id,
+            .pane_renderers = pane_renderers,
+            .scratchpad_grid = scratchpad_grid,
+            .remote = record,
+        };
+        scratchpad_grid_owned = false;
+        self.workspace_presentations.appendAssumeCapacity(presentation);
+
+        ssh_context.connect(pty.WindowSize.init(grid_size.rows, grid_size.cols)) catch |err| {
+            log.warn("the ssh client could not be started: {s}", .{@errorName(err)});
+        };
+        record.state = ssh_context.state();
+        return presentation;
+    }
+
+    /// Open an SSH workspace named after `base_name` connecting to
+    /// `destination`, switch to it, and remember `recent_text` as the newest
+    /// recent destination. Refusals are status lines.
+    fn openRemoteWorkspace(
+        self: *App,
+        base_name: []const u8,
+        destination: []const u8,
+        port: ?u16,
+        recent_text: []const u8,
+    ) !bool {
+        if (!ssh.supported) {
+            self.setWorkspaceStatus("ssh workspaces are not supported here yet");
+            return false;
+        }
+        if (self.closeModalActive() or self.paletteVisible() or !try self.prepareWorkspaceTransition()) return false;
+        const name = try self.uniqueWorkspaceName(base_name);
+        defer self.allocator.free(name);
+        const presentation = self.createRemotePresentation(name, destination, port) catch |err| {
+            log.warn("the ssh workspace could not be created: {s}", .{@errorName(err)});
+            self.setRemoteStatus("ssh: could not start ({s})", .{@errorName(err)});
+            return false;
+        };
+        try self.commitWorkspaceActivation(presentation.key, false);
+        self.recordRecent(recent_text);
+        const model = self.workspace_registry.byKey(presentation.key) orelse return true;
+        const record = presentation.remote orelse return true;
+        self.setRemoteStatus("ssh {s}: {s}", .{ model.name(), remote.stateWords(record.state) });
+        return true;
+    }
+
+    /// Put `destination` first in `remote.recent`, dropping the oldest
+    /// entries that no longer fit one settings value.
+    fn recordRecent(self: *App, destination: []const u8) void {
+        const path = self.config_path orelse return;
+        _ = config.parseDestination(destination) catch return;
+        var buffer: [config.max_string_bytes]u8 = undefined;
+        const existing = self.config_current.settings.remote_recent;
+        var keep = existing.len;
+        const value = while (true) {
+            break config.formatRecent(&buffer, destination, existing[0..keep]) catch {
+                if (keep == 0) return;
+                keep -= 1;
+                continue;
+            };
+        };
+        config.writeDocumentValue(self.io, self.allocator, path, .remote_recent, value) catch |err| {
+            log.warn("the recent connection could not be saved: {s}", .{@errorName(err)});
+            return;
+        };
+        self.reloadConfig();
+    }
+
+    /// Advance every SSH workspace: apply connection state changes, collect
+    /// host probes and start owed respawns. Non-blocking; runs on the loop's
+    /// poll and after the context's wake hook.
+    fn pollRemote(self: *App) bool {
+        if (comptime !ssh.supported) return false;
+        var changed = false;
+        for (self.workspace_presentations.items) |presentation| {
+            const record = presentation.remote orelse continue;
+            if (presentation.closing) continue;
+            const model = self.workspace_registry.byKey(presentation.key) orelse continue;
+            const next = record.context.poll();
+            if (next != record.state) {
+                record.state = next;
+                self.remoteTransition(presentation, model, record);
+                changed = true;
+            }
+            if (record.host_probe) |probe| {
+                if (probe.finished()) {
+                    if (probe.name_len != 0) {
+                        @memcpy(record.remote_host[0..probe.name_len], probe.name[0..probe.name_len]);
+                        record.remote_host_len = probe.name_len;
+                    }
+                    probe.destroy();
+                    record.host_probe = null;
+                    if (record.state == .connected) self.startRemoteSessions(presentation, model, record);
+                    changed = true;
+                }
+            }
+            if (record.ready() and self.driveRespawn(presentation, model, record)) changed = true;
+        }
+        return changed;
+    }
+
+    /// React to a new connection state: on `connected` hide the connection
+    /// view and start (or restart) the remote sessions; otherwise the view is
+    /// shown by `connectionVisible`. The active workspace's status line names
+    /// every transition.
+    fn remoteTransition(self: *App, presentation: *WorkspacePresentation, model: *workspace.Workspace, record: *RemotePresentation) void {
+        if (record.state == .connected) {
+            record.view_requested = false;
+            if (record.host_probe == null and record.remote_host_len == 0) {
+                record.host_probe = HostProbe.start(self.allocator, self.io, model.contextRef()) catch |err| probe: {
+                    log.warn("could not ask the remote host its name: {s}", .{@errorName(err)});
+                    break :probe null;
+                };
+            }
+            if (record.host_probe == null) self.startRemoteSessions(presentation, model, record);
+        }
+        if (self.workspace_registry.activeKey() == presentation.key) {
+            // The presented terminal changes: what was drawn under the
+            // connection view (or over the panes) must be drawn again.
+            self.composition.cancel();
+            self.needs_present = true;
+            self.setRemoteStatus("ssh {s}: {s}", .{ model.name(), remote.stateWords(record.state) });
+        }
+    }
+
+    /// Start the sessions a ready connection owes: the first tab's shell and
+    /// the scratchpad the first time, a respawn of every session the lost
+    /// connection ended afterwards (decision-8: same id, last OSC 7 cwd).
+    fn startRemoteSessions(self: *App, presentation: *WorkspacePresentation, model: *workspace.Workspace, record: *RemotePresentation) void {
+        if (!record.ever_connected) {
+            record.ever_connected = true;
+            if (model.tabAt(0)) |first| {
+                const first_session = model.focusedPaneSessionId(first.id()) orelse first.sessionId();
+                if (model.sessionById(first_session)) |live| {
+                    if (live.child() == null) self.startPresentationChild(presentation, first_session, self.processFor(model, &self.spec));
+                }
+            }
+            self.startScratchpadFor(presentation, false);
+            return;
+        }
+        var ordinal: u32 = 0;
+        while (ordinal < model.registeredSessionCount()) : (ordinal += 1) {
+            const id = session.SessionId.fromOrdinal(ordinal);
+            const kind = model.sessionKind(id) orelse continue;
+            if (kind == .connection) continue;
+            const live = model.sessionById(id) orelse continue;
+            const child = live.child() orelse continue;
+            const status = switch (child.state()) {
+                .exited => |value| value,
+                .running => continue,
+            };
+            // A session whose client ended with the connection is restarted;
+            // one whose remote program ended by itself is left as it is.
+            if (ssh.sessionEnd(status, false, false) != .disconnected) continue;
+            const cwd = self.allocator.dupe(u8, live.workingDirectory() orelse "") catch |err| {
+                log.warn("a session was not queued for reconnect: {s}", .{@errorName(err)});
+                continue;
+            };
+            record.respawn.append(self.allocator, .{ .id = id, .cwd = cwd, .scratchpad = kind == .scratchpad }) catch |err| {
+                self.allocator.free(cwd);
+                log.warn("a session was not queued for reconnect: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    /// Start queued respawns while the presentation's spawn slots are free.
+    fn driveRespawn(self: *App, presentation: *WorkspacePresentation, model: *workspace.Workspace, record: *RemotePresentation) bool {
+        var changed = false;
+        var index: usize = 0;
+        while (index < record.respawn.items.len) {
+            const item = record.respawn.items[index];
+            const busy = if (item.scratchpad) presentation.scratchpad_load != null else presentation.load != null;
+            if (busy) {
+                index += 1;
+                continue;
+            }
+            _ = record.respawn.orderedRemove(index);
+            self.startRespawn(presentation, model, item);
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// Spawn a fresh child for one ended session on a worker. Ownership of
+    /// `item.cwd` transfers on entry.
+    fn startRespawn(self: *App, presentation: *WorkspacePresentation, model: *workspace.Workspace, item: RespawnItem) void {
+        var request = if (item.scratchpad)
+            model.scratchpadRestartRequest(self.processFor(model, &self.scratchpad_spec)) catch |err| {
+                log.warn("the scratchpad could not be restored: {s}", .{@errorName(err)});
+                self.allocator.free(item.cwd);
+                return;
+            }
+        else
+            model.respawnRequest(item.id, self.processFor(model, &self.spec), item.cwd) catch |err| {
+                log.warn("a session could not be restored: {s}", .{@errorName(err)});
+                self.allocator.free(item.cwd);
+                return;
+            };
+        request.cwd = item.cwd;
+        const job = self.allocator.create(Load) catch |err| {
+            log.warn("no memory to restore a session: {s}", .{@errorName(err)});
+            self.allocator.free(item.cwd);
+            return;
+        };
+        job.* = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .spawn = request,
+            .spawn_cwd = item.cwd,
+            .spawn_session_id = item.id,
+            .workspace_key = presentation.key,
+            .scratchpad_replacement = item.scratchpad,
+            .respawn = !item.scratchpad,
+            .execution_context = model.contextRef(),
+        };
+        job.start() catch |err| {
+            log.warn("could not start the worker that restores a session: {s}", .{@errorName(err)});
+            job.freeSpawnInputs();
+            self.allocator.destroy(job);
+            return;
+        };
+        if (item.scratchpad) presentation.scratchpad_load = job else presentation.load = job;
+    }
+
+    // The connection manager (TASK-44) --------------------------------------
+
+    /// Read concrete `Host` aliases from the user's ssh configuration
+    /// through the Local context: `~/.ssh/config` (or `--ssh-test`'s file)
+    /// and the files its `Include` lines name, one level deep. Key and
+    /// known-hosts files are never read, whatever an `Include` says.
+    fn readSshHosts(self: *App, hosts: *remote.Hosts) void {
+        var path_buffer: [path_capacity]u8 = undefined;
+        const main_path = self.ssh_config_override orelse path: {
+            const home = self.home_dir orelse return;
+            break :path std.fmt.bufPrint(&path_buffer, "{s}/.ssh/config", .{home}) catch return;
+        };
+        const buffer = self.allocator.alloc(u8, remote.max_config_bytes) catch return;
+        defer self.allocator.free(buffer);
+        const files = self.local_files.borrow();
+        const text = files.readFile(self.io, main_path, buffer) catch |err| {
+            if (err != error.NotFound) log.debug("the ssh configuration could not be read: {s}", .{@errorName(err)});
+            return;
+        };
+        var includes: remote.Includes = .{};
+        remote.parseHosts(text, hosts, &includes);
+        const base_dir = std.fs.path.dirnamePosix(main_path) orelse return;
+        var read_files: usize = 0;
+        for (0..includes.count) |include_index| {
+            var resolved_buffer: [path_capacity]u8 = undefined;
+            const resolved = remote.resolveInclude(&resolved_buffer, includes.at(include_index), base_dir, self.home_dir) orelse continue;
+            const dir = std.fs.path.dirnamePosix(resolved) orelse continue;
+            const pattern = std.fs.path.basenamePosix(resolved);
+            var matches: IncludeMatches = .{ .pattern = pattern };
+            if (std.mem.indexOfAny(u8, pattern, "*?") != null) {
+                files.listDir(self.io, dir, .{ .context = &matches, .visit_fn = IncludeMatches.visit }) catch continue;
+                matches.sort();
+            } else {
+                matches.add(pattern);
+            }
+            for (0..matches.count) |match_index| {
+                if (read_files == remote.max_include_files) return;
+                const file_name = matches.at(match_index);
+                if (!remote.mayReadConfigFile(file_name)) continue;
+                var file_buffer: [path_capacity]u8 = undefined;
+                const file_path = std.fmt.bufPrint(&file_buffer, "{s}/{s}", .{ dir, file_name }) catch continue;
+                read_files += 1;
+                const included = files.readFile(self.io, file_path, buffer) catch continue;
+                remote.parseHosts(included, hosts, null);
+            }
+        }
+    }
+
+    /// Relist `remote.connect`'s choices: ssh-config hosts, saved profiles,
+    /// recent destinations and the `user@host` row. Only while the palette is
+    /// closed: an open chooser's rows are indices into this list.
+    fn rebuildRemoteChoices(self: *App) void {
+        if (self.paletteVisible()) return;
+        var count: usize = 0;
+        var hosts: remote.Hosts = .{};
+        self.readSshHosts(&hosts);
+        for (0..hosts.count) |index| {
+            const alias = hosts.at(index);
+            self.addRemoteChoice(&count, .{ .host = alias }, "{s}  ssh config", .{alias});
+        }
+        for (self.config_current.settings.remote_profiles) |profile| {
+            self.addRemoteChoice(&count, .{ .profile = profile.name }, "{s}  {s}  profile", .{ profile.name, profile.destination });
+        }
+        for (self.config_current.settings.remote_recent) |destination| {
+            self.addRemoteChoice(&count, .{ .recent = destination }, "{s}  recent", .{destination});
+        }
+        self.addRemoteChoice(&count, .address, "Enter user@host…", .{});
+        self.remote_choice_count = count;
+        self.action_definitions[self.remote_connect_index].palette = .{ .argument = .{ .choices = .{
+            .name = "target",
+            .prompt = "Connect to",
+            .values = self.remote_choices[0..count],
+        } } };
+    }
+
+    fn addRemoteChoice(self: *App, count: *usize, choice: remote.Choice, comptime format: []const u8, args: anytype) void {
+        if (count.* == remote_choice_capacity) return;
+        const value = choice.format(&self.remote_choice_values[count.*]) catch return;
+        const label = std.fmt.bufPrint(&self.remote_choice_labels[count.*], format, args) catch return;
+        self.remote_choices[count.*] = .{ .label = label, .value = value };
+        count.* += 1;
+    }
+
+    fn findProfile(self: *const App, name: []const u8) ?config.Profile {
+        for (self.config_current.settings.remote_profiles) |profile| {
+            if (std.mem.eql(u8, profile.name, name)) return profile;
+        }
+        return null;
+    }
+
+    /// Open the palette straight at one command's argument step.
+    fn openPaletteAt(self: *App, definition_index: usize) !void {
+        if (!self.paletteVisible()) try self.openPalette();
+        if (!self.paletteVisible()) return;
+        try self.beginPaletteArgument(definition_index);
+    }
+
+    fn remoteConnectAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const value = argument(invocation, "target") orelse return self.openPaletteAt(self.remote_connect_index);
+        // Every slice below is copied first: saving a recent destination
+        // reloads the settings that own profile and recent strings.
+        var copy: [remote_choice_value_capacity]u8 = undefined;
+        if (value.len > copy.len) return;
+        @memcpy(copy[0..value.len], value);
+        const choice = remote.Choice.parse(copy[0..value.len]) orelse {
+            self.setWorkspaceStatus("ssh: unknown connection");
+            return;
+        };
+        switch (choice) {
+            .address => {
+                if (invocation.source == .palette) {
+                    try self.showPalette();
+                    try self.beginPaletteArgument(self.remote_address_index);
+                } else try self.openPaletteAt(self.remote_address_index);
+            },
+            .host => |alias| {
+                if (!remote.concreteAlias(alias)) {
+                    self.setWorkspaceStatus("ssh: not a host alias");
+                    return;
+                }
+                _ = try self.openRemoteWorkspace(alias, alias, null, alias);
+            },
+            .profile => |name| {
+                const profile = self.findProfile(name) orelse {
+                    self.setWorkspaceStatus("ssh: no such profile");
+                    return;
+                };
+                var destination_buffer: [config.max_string_bytes]u8 = undefined;
+                const text = destination_buffer[0..profile.destination.len];
+                @memcpy(text, profile.destination);
+                const destination = config.parseDestination(text) catch {
+                    self.setWorkspaceStatus("ssh: the profile's destination is not valid");
+                    return;
+                };
+                _ = try self.openRemoteWorkspace(name, destination.target, destination.port, text);
+            },
+            .recent => |text| {
+                const destination = config.parseDestination(text) catch {
+                    self.setWorkspaceStatus("ssh: expected [user@]host[:port]");
+                    return;
+                };
+                _ = try self.openRemoteWorkspace(config.destinationHost(destination), destination.target, destination.port, text);
+            },
+        }
+    }
+
+    fn remoteConnectAddressAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const supplied = argument(invocation, "destination") orelse return self.openPaletteAt(self.remote_address_index);
+        const trimmed = std.mem.trim(u8, supplied, std.ascii.whitespace[0..]);
+        if (trimmed.len > self.remote_pending_profile.len) {
+            self.setWorkspaceStatus("ssh: expected [user@]host[:port]");
+            return;
+        }
+        var copy: [config.max_string_bytes]u8 = undefined;
+        const text = copy[0..trimmed.len];
+        @memcpy(text, trimmed);
+        const destination = config.parseDestination(text) catch {
+            self.setWorkspaceStatus("ssh: expected [user@]host[:port]");
+            return;
+        };
+        if (!try self.openRemoteWorkspace(config.destinationHost(destination), destination.target, destination.port, text)) return;
+        // Offer to keep it: the same modal asks next (TASK-44 AC2).
+        @memcpy(self.remote_pending_profile[0..text.len], text);
+        self.remote_pending_profile_len = text.len;
+        if (invocation.source == .palette) {
+            try self.showPalette();
+            try self.beginPaletteArgument(self.remote_save_index);
+        }
+    }
+
+    fn remoteSaveProfileAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const answer = argument(invocation, "save") orelse return self.openPaletteAt(self.remote_save_index);
+        defer self.remote_pending_profile_len = 0;
+        if (!std.mem.eql(u8, answer, "yes")) return;
+        var buffer: [config.max_string_bytes]u8 = undefined;
+        const text = if (self.remote_pending_profile_len != 0)
+            self.remote_pending_profile[0..self.remote_pending_profile_len]
+        else active: {
+            const record = self.activePresentation().remote orelse {
+                self.setWorkspaceStatus("ssh: not an ssh workspace");
+                return;
+            };
+            const target = record.context.destinationText();
+            break :active if (record.context.portNumber()) |port|
+                std.fmt.bufPrint(&buffer, "{s}:{d}", .{ target, port }) catch return
+            else
+                target;
+        };
+        const destination = config.parseDestination(text) catch {
+            self.setWorkspaceStatus("ssh: expected [user@]host[:port]");
+            return;
+        };
+        const name = config.destinationHost(destination);
+        if (!config.validProfileName(name)) {
+            self.setWorkspaceStatus("ssh: no usable profile name");
+            return;
+        }
+        const path = self.config_path orelse {
+            self.setWorkspaceStatus("ssh: no settings file for this run");
+            return;
+        };
+        config.writeDocumentProfile(self.io, self.allocator, path, name, text) catch |err| {
+            log.warn("the connection profile could not be saved: {s}", .{@errorName(err)});
+            self.setWorkspaceStatus("ssh: the profile could not be saved");
+            return;
+        };
+        self.reloadConfig();
+        self.setRemoteStatus("ssh: saved profile {s}", .{name});
+    }
+
+    fn remoteReconnectAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        if (comptime !ssh.supported) return;
+        const self: *App = @ptrCast(@alignCast(context));
+        const presentation = self.activePresentation();
+        const record = presentation.remote orelse {
+            self.setWorkspaceStatus("ssh: not an ssh workspace");
+            return;
+        };
+        switch (record.context.state()) {
+            .connecting, .connected => {
+                self.setRemoteStatus("ssh: {s}", .{remote.stateWords(record.context.state())});
+                return;
+            },
+            .disconnected, .lost, .failed => {},
+        }
+        if (!try self.prepareToLeaveActiveSession()) return;
+        const model = self.activeWorkspace();
+        if (model.sessionById(record.connection_id)) |live| {
+            // A clean screen, so the new master's prompts are the only ones.
+            live.terminal().feed("\x1b[H\x1b[2J\x1b[3J");
+            live.rearmChildOutput();
+        }
+        record.context.reconnect() catch |err| {
+            log.warn("the ssh client could not be restarted: {s}", .{@errorName(err)});
+            self.setRemoteStatus("ssh: could not reconnect ({s})", .{@errorName(err)});
+            return;
+        };
+        record.state = record.context.state();
+        // A pointer activation focused the control; the next Enter belongs
+        // to the prompt in the connection terminal.
+        self.ui_tree.clearFocus();
+        self.needs_present = true;
+        self.setRemoteStatus("ssh {s}: {s}", .{ model.name(), remote.stateWords(record.state) });
+        try self.refreshActiveUi();
+    }
+
+    fn remoteDisconnectAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        const record = self.activePresentation().remote orelse {
+            self.setWorkspaceStatus("ssh: not an ssh workspace");
+            return;
+        };
+        if (!try self.prepareToLeaveActiveSession()) return;
+        record.context.hangUp();
+        record.state = record.context.state();
+        self.needs_present = true;
+        self.setRemoteStatus("ssh {s}: {s}", .{ self.activeWorkspace().name(), remote.stateWords(record.state) });
+        try self.refreshActiveUi();
+    }
+
+    fn remoteShowConnectionAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        const record = self.activePresentation().remote orelse {
+            self.setWorkspaceStatus("ssh: not an ssh workspace");
+            return;
+        };
+        if (record.state != .connected) return;
+        if (!try self.prepareToLeaveActiveSession()) return;
+        record.view_requested = !record.view_requested;
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        self.ui_tree.clearFocus();
+        self.needs_present = true;
+        try self.syncGrid();
+        try self.syncTextInput();
+        try self.composeUi();
+        self.invalidateUi();
+    }
+
+    /// Compose the connection view over the terminal area: the header row
+    /// (`workspace.<k>.connection`), the master's terminal surface, and the
+    /// clickable `reconnect` or `hide` control on the header row.
+    fn composeConnectionView(self: *App, layout: workspace.PaneLayout) !void {
+        const presentation = self.activePresentation();
+        const record = presentation.remote orelse return;
+        const key = presentation.key;
+        const header_y: u32 = layout.rect.row -| 1;
+        const destination = record.context.destinationText();
+        var port_text: [8]u8 = undefined;
+        const port_suffix = if (record.context.portNumber()) |port|
+            std.fmt.bufPrint(&port_text, ":{d}", .{port}) catch ""
+        else
+            "";
+        const header = std.fmt.bufPrint(&record.header_storage, "ssh {s}{s} ─ {s}", .{
+            destination,
+            port_suffix,
+            remote.stateWords(record.state),
+        }) catch "ssh";
+        const header_id: ui.Id = .{ .value = try connectionSemanticId(&self.connection_semantic_storage[0], key, "") };
+        const header_runs = [_]ui.Run{.{
+            .text = header,
+            .style = .{
+                .foreground = switch (record.state) {
+                    .lost, .failed => .danger,
+                    .connecting => .accent,
+                    .connected, .disconnected => .strong,
+                },
+                .background = .background,
+            },
+        }};
+        try self.ui_tree.addText(.{
+            .id = header_id,
+            .role = "connection",
+            .label = header,
+            .bounds = .{ .x = layout.rect.col, .y = header_y, .width = layout.rect.cols, .height = 1 },
+        }, .{ .runs = &header_runs });
+        const terminal_bounds: ui.Rect = .{
+            .x = layout.rect.col,
+            .y = layout.rect.row,
+            .width = layout.rect.cols,
+            .height = layout.rect.rows,
+        };
+        try self.ui_tree.addSurface(.{
+            .id = .{ .value = try connectionSemanticId(&self.connection_semantic_storage[1], key, "terminal") },
+            .parent = header_id,
+            .role = "terminal",
+            .label = "Connection terminal",
+            .bounds = terminal_bounds,
+        }, .{ .rect = terminal_bounds, .fill = null });
+        const control: ?struct { suffix: []const u8, label: []const u8, action: []const u8 } = switch (record.state) {
+            .connecting => null,
+            .connected => .{ .suffix = "hide", .label = "hide", .action = remote_show_connection_action },
+            .lost, .failed, .disconnected => .{ .suffix = "reconnect", .label = "reconnect", .action = remote_reconnect_action },
+        };
+        if (control) |value| {
+            const width: u32 = @intCast(value.label.len);
+            if (layout.rect.cols > width + 2) {
+                const id: ui.Id = .{ .value = try connectionSemanticId(&self.connection_semantic_storage[2], key, value.suffix) };
+                try self.ui_tree.addInteractiveText(.{
+                    .id = id,
+                    .parent = header_id,
+                    .role = "action",
+                    .label = value.label,
+                    .action = value.action,
+                    .bounds = .{
+                        .x = layout.rect.col + layout.rect.cols - width - 1,
+                        .y = header_y,
+                        .width = width,
+                        .height = 1,
+                    },
+                }, .{
+                    .id = id,
+                    .label = value.label,
+                    .action = value.action,
+                    .normal = .{ .foreground = .accent, .background = .background },
+                    .hovered = .{ .foreground = .strong, .background = .selection },
+                    .focused = .{ .foreground = .on_accent, .background = .accent },
+                });
+            }
+        }
+    }
+
+    // The choice step's filter (TASK-44 AC1) ---------------------------------
+
+    /// Whether `definition_index`'s choice step filters as the person types.
+    /// Only the connection manager does: its list can be long, and it is the
+    /// one chooser whose rows a person searches by name.
+    fn choiceStepFiltered(self: *const App, definition_index: usize) bool {
+        return definition_index == self.remote_connect_index;
+    }
+
+    fn choiceFilterActive(self: *const App) bool {
+        return switch (self.palette_step) {
+            .choices => |step| self.choiceStepFiltered(step.definition_index),
+            else => false,
+        };
+    }
+
+    fn choiceValues(self: *const App, definition_index: usize) []const inputmod.PaletteChoice {
+        const definition = self.actions.definitions()[definition_index];
+        return switch (definition.palette.?.argument) {
+            .choices => |choice_argument| choice_argument.values,
+            else => &.{},
+        };
+    }
+
+    /// Refilter the open choice step by `palette_argument`, best fuzzy match
+    /// first (registration order among equals), and select the best match.
+    fn refreshChoiceFilter(self: *App) void {
+        const step = switch (self.palette_step) {
+            .choices => |value| value,
+            else => return,
+        };
+        const values = self.choiceValues(step.definition_index);
+        const query = self.palette_argument.text();
+        var scores: [remote_choice_capacity]i64 = undefined;
+        var len: usize = 0;
+        for (values, 0..) |choice, index| {
+            if (index == remote_choice_capacity) break;
+            const score: i64 = if (query.len == 0) 0 else palette_mod.fuzzyScore(query, choice.label) orelse continue;
+            var at = len;
+            while (at != 0 and scores[at - 1] < score) : (at -= 1) {
+                scores[at] = scores[at - 1];
+                self.choice_filter[at] = self.choice_filter[at - 1];
+            }
+            scores[at] = score;
+            self.choice_filter[at] = index;
+            len += 1;
+        }
+        self.choice_filter_len = len;
+        self.palette_step = .{ .choices = .{
+            .definition_index = step.definition_index,
+            .selected = if (len != 0) self.choice_filter[0] else 0,
+        } };
+    }
+
+    fn choiceFilterPosition(self: *const App, choice_index: usize) ?usize {
+        for (self.choice_filter[0..self.choice_filter_len], 0..) |candidate, position| {
+            if (candidate == choice_index) return position;
+        }
+        return null;
+    }
+
     fn presentationByKey(self: *App, key: workspace.WorkspaceKey) ?*WorkspacePresentation {
         for (self.workspace_presentations.items) |presentation| {
             if (presentation.key == key) return presentation;
@@ -5155,6 +6233,14 @@ const App = struct {
         // workspaces whose contexts its detections borrow.
         self.agents.deinit();
         self.agent_spec.deinit();
+        // Host probes borrow their workspaces' contexts: joined before the
+        // registry releases them below.
+        for (self.workspace_presentations.items) |presentation| self.releaseRemote(presentation);
+        self.remote_spec.deinit();
+        self.ssh_client_spec.deinit();
+        self.local_files.deinit();
+        if (self.ssh_config_override) |path| self.allocator.free(path);
+        if (self.ssh_runtime_owned) |path| self.allocator.free(path);
         self.stopSearchEngine();
         if (self.rename_input) |*field| field.deinit();
         self.search_query.deinit();
@@ -5269,10 +6355,7 @@ const App = struct {
             return;
         }
         const model = self.workspace_registry.byKey(presentation.key) orelse unreachable;
-        const process: workspace.ProcessSpec = .{
-            .argv = self.scratchpad_spec.argv,
-            .env = self.scratchpad_spec.env,
-        };
+        const process = self.processFor(model, &self.scratchpad_spec);
         const request = if (replacement)
             model.scratchpadRestartRequest(process) catch |err| {
                 log.warn("could not prepare the scratchpad restart: {s}", .{@errorName(err)});
@@ -5371,6 +6454,7 @@ const App = struct {
                     .write_fn = writeNativeClipboard,
                 });
             }
+            applyRemoteHost(presentation, model, model.scratchpadId());
             presentation.scratchpad_grid.invalidate();
             changed = true;
         }
@@ -5419,8 +6503,9 @@ const App = struct {
         var index: usize = 0;
         while (index < self.activePresentation().pane_renderers.items.len) {
             const record = &self.activePresentation().pane_renderers.items[index];
-            if (self.activeWorkspace().paneForSession(record.session_id) != null and
-                self.activeWorkspace().sessionById(record.session_id) != null)
+            const connection = if (self.activePresentation().remote) |remote_record| remote_record.connection_id == record.session_id else false;
+            if (connection or (self.activeWorkspace().paneForSession(record.session_id) != null and
+                self.activeWorkspace().sessionById(record.session_id) != null))
             {
                 index += 1;
                 continue;
@@ -5442,23 +6527,26 @@ const App = struct {
     /// of `cwd` and `argv` transfers on entry and remains with the Load until
     /// its worker has joined, including every failure path.
     fn startTabChildWith(self: *App, session_id: session.SessionId, cwd: []u8, argv: ?[][]const u8) void {
-        const program = argv orelse self.spec.argv;
-        if (program.len == 0) {
+        const presentation = self.activePresentation();
+        const model = self.workspace_registry.byKey(presentation.key) orelse unreachable;
+        const process = self.processFor(model, &self.spec);
+        const program = argv orelse process.argv;
+        // An empty program is "no child" locally and the remote login shell
+        // in an SSH workspace.
+        if (program.len == 0 and model.contextKind() != .ssh) {
             self.allocator.free(cwd);
             if (argv) |owned| freeEntries(self.allocator, owned);
             return;
         }
-        const presentation = self.activePresentation();
         if (presentation.load != null) {
             log.warn("a tab child was not started because another load is still in flight", .{});
             self.allocator.free(cwd);
             if (argv) |owned| freeEntries(self.allocator, owned);
             return;
         }
-        const model = self.workspace_registry.byKey(presentation.key) orelse unreachable;
         var request = model.spawnRequest(session_id, .{
             .argv = program,
-            .env = self.spec.env,
+            .env = process.env,
         }) catch |err| {
             log.warn("could not prepare the new tab child: {s}", .{@errorName(err)});
             self.allocator.free(cwd);
@@ -5592,6 +6680,20 @@ const App = struct {
                     else => log.warn("could not signal the canceled child: {s}", .{@errorName(kill_err)}),
                 };
                 child.destroy();
+            } else if (job.respawn) {
+                // A reconnect's restart: a fresh terminal and this child under
+                // the session's existing id. On refusal the child is ours.
+                if (model.replaceSessionChild(target_id, child)) |replaced| {
+                    if (replaced.old_child_deinit_error) |err| log.debug("the ended child could not be signalled: {s}", .{@errorName(err)});
+                    // A search over the old terminal must not outlive it.
+                    if (self.search_engine_live and self.search_session_id == target_id and
+                        self.workspace_registry.activeKey() == presentation.key) self.stopSearchEngine();
+                    for (presentation.pane_renderers.items) |*pane_renderer| pane_renderer.grid.invalidate();
+                    if (self.workspace_registry.activeKey() == presentation.key) self.needs_present = true;
+                } else |err| {
+                    log.warn("a restored session did not take its new child: {s}", .{@errorName(err)});
+                    destroyUnattachedChild(child);
+                }
             } else {
                 model.attachChild(target_id, child) catch |err| {
                     // A spawn job exists only while this session has no child, so
@@ -5606,6 +6708,7 @@ const App = struct {
                     child.destroy();
                 };
             }
+            applyRemoteHost(presentation, model, target_id);
             job.child = null;
             if (model.sessionById(target_id)) |target| if (target.child() != null) {
                 // The grid may have changed while the worker was spawning; the
@@ -5771,6 +6874,29 @@ const App = struct {
         }
         self.pane_layout_count = 0;
         self.divider_layout_count = 0;
+        if (self.connectionVisible()) {
+            // The connection view: one terminal below a header row, in place
+            // of every pane, until the master is connected (TASK-43).
+            const record = self.activeRemote().?;
+            const connection_cols = canvas_size.cols -| origin;
+            if (connection_cols == 0 or canvas_size.rows < 2) return;
+            const rect = workspace.CellRect.init(origin, 1, connection_cols, canvas_size.rows - 1) catch return;
+            self.pane_layouts[0] = .{
+                .pane_id = connection_pane_id,
+                .session_id = record.connection_id,
+                .rect = rect,
+                .focused = true,
+            };
+            self.pane_layout_count = 1;
+            const live = self.activeWorkspace().sessionById(record.connection_id) orelse return;
+            const wanted = try term.GridSize.init(rect.cols, rect.rows);
+            const current = live.terminal().gridSize();
+            if (wanted.cols != current.cols or wanted.rows != current.rows) {
+                try live.resize(wanted);
+                self.noteSearchTerminalChange(record.connection_id);
+            }
+            return;
+        }
         const tab_id = self.activeWorkspace().activeTabId() orelse return;
         const terminal_cols = canvas_size.cols -| origin;
         if (terminal_cols == 0 or canvas_size.rows == 0) return;
@@ -5813,8 +6939,12 @@ const App = struct {
     }
 
     fn focusedPaneLayout(self: *const App) ?workspace.PaneLayout {
+        const target = if (self.connectionVisible())
+            self.activeRemote().?.connection_id
+        else
+            self.activePresentationConst().active_session_id;
         for (self.pane_layouts[0..self.pane_layout_count]) |layout| {
-            if (layout.session_id == self.activePresentationConst().active_session_id) return layout;
+            if (layout.session_id == target) return layout;
         }
         return null;
     }
@@ -6253,6 +7383,7 @@ const App = struct {
             self.setWorkspaceStatus("agent launch deferred: a start is in progress");
             return;
         }
+        if (self.remoteNotReady()) return;
         if (!try self.prepareToLeaveActiveSession()) return;
         const key = presentation.key;
         const model = self.activeWorkspace();
@@ -6762,6 +7893,10 @@ const App = struct {
                 };
                 // The font picker adds its `palette.preview` line.
                 const preview_rows: usize = if (step.definition_index == self.font_pick_index) 1 else 0;
+                if (self.choiceStepFiltered(step.definition_index)) {
+                    // A filter field, and at least one row for "no match".
+                    break :blk @intCast(@max(@min(self.choice_filter_len, palette_visible_rows), 1) + 5);
+                }
                 break :blk @intCast(@min(values.len, palette_visible_rows) + 4 + preview_rows);
             },
         };
@@ -6999,6 +8134,10 @@ const App = struct {
                     .label = palette_argument_meta.prompt,
                     .bounds = .{ .x = inner_x, .y = bounds.y + 1, .width = inner_width, .height = 1 },
                 }, .{ .runs = &runs });
+                if (self.choiceStepFiltered(step.definition_index)) {
+                    try self.composeFilteredChoices(dialog_id, bounds, step.definition_index, step.selected, palette_argument_meta.values);
+                    return;
+                }
                 const visible_count = @min(palette_argument_meta.values.len, palette_visible_rows);
                 const start = if (step.selected < visible_count) 0 else step.selected - visible_count + 1;
                 for (palette_argument_meta.values[start .. start + visible_count], 0..) |choice, row| {
@@ -7061,17 +8200,106 @@ const App = struct {
         }
     }
 
+    /// A filtered choice step (the connection manager): the filter field
+    /// under the prompt, then the matching rows, best first. Row ids keep
+    /// each choice's own index, so a click names the same choice whatever
+    /// the filter shows.
+    fn composeFilteredChoices(
+        self: *App,
+        dialog_id: ui.Id,
+        bounds: ui.Rect,
+        definition_index: usize,
+        selected: usize,
+        values: []const inputmod.PaletteChoice,
+    ) !void {
+        const inner_x = bounds.x + 2;
+        const inner_width = bounds.width - 4;
+        const field_bounds: ui.Rect = .{ .x = inner_x, .y = bounds.y + 2, .width = inner_width, .height = 1 };
+        try self.ui_tree.addInput(.{
+            .id = .{ .value = "palette.filter" },
+            .parent = dialog_id,
+            .role = "input",
+            .label = "Filter",
+            .action = palette_activate_action,
+            .bounds = field_bounds,
+        }, &self.palette_argument, .{
+            .text = .{ .foreground = .strong, .background = .field },
+            .selection_background = .selection,
+            .cursor_background = .accent,
+            .cursor_foreground = .background,
+        });
+        try self.composePalettePreedit(dialog_id, field_bounds, &self.palette_argument);
+        if (self.choice_filter_len == 0) {
+            const empty_runs = [_]ui.Run{.{ .text = "No match", .style = .{ .foreground = .muted } }};
+            try self.ui_tree.addText(.{
+                .id = .{ .value = "palette.empty" },
+                .parent = dialog_id,
+                .role = "status",
+                .label = "No match",
+                .bounds = .{ .x = inner_x, .y = bounds.y + 3, .width = inner_width, .height = 1 },
+            }, .{ .runs = &empty_runs });
+            return;
+        }
+        const room: usize = if (bounds.height > 5) bounds.height - 5 else 1;
+        const visible_count = @min(@min(self.choice_filter_len, palette_visible_rows), room);
+        const position = self.choiceFilterPosition(selected) orelse 0;
+        const start = if (position < visible_count) 0 else position - visible_count + 1;
+        for (self.choice_filter[start .. start + visible_count], 0..) |choice_index, row| {
+            if (row >= self.palette_choice_ids.len or choice_index >= values.len) break;
+            const choice = values[choice_index];
+            const id_text = try std.fmt.bufPrint(
+                &self.palette_choice_ids[row],
+                "palette.choice.{d}.{d}",
+                .{ definition_index, choice_index },
+            );
+            const is_selected = choice_index == selected;
+            const id: ui.Id = .{ .value = id_text };
+            try self.ui_tree.addInteractiveText(.{
+                .id = id,
+                .parent = dialog_id,
+                .role = "choice",
+                .label = choice.label,
+                .selected = is_selected,
+                .action = palette_activate_action,
+                .bounds = .{
+                    .x = inner_x,
+                    .y = bounds.y + 3 + @as(u32, @intCast(row)),
+                    .width = inner_width,
+                    .height = 1,
+                },
+            }, .{
+                .id = id,
+                .label = choice.label,
+                .action = palette_activate_action,
+                .normal = if (is_selected)
+                    .{ .foreground = .strong, .background = .selection }
+                else
+                    .{ .foreground = .foreground },
+                .hovered = .{ .foreground = .strong, .underline = .accent },
+                .focused = .{ .foreground = .on_accent, .background = .accent },
+            });
+        }
+    }
+
     fn presentedSessionId(self: *const App) session.SessionId {
-        return if (self.scratchpadVisible()) self.activeWorkspaceConst().scratchpadId() else self.activePresentationConst().active_session_id;
+        if (self.scratchpadVisible()) return self.activeWorkspaceConst().scratchpadId();
+        if (self.connectionVisible()) return self.activeRemote().?.connection_id;
+        return self.activePresentationConst().active_session_id;
     }
 
     fn presentedLive(self: *App) *session.Session {
         if (self.scratchpadVisible()) return self.scratchpadLive() orelse self.activeLive();
+        if (self.connectionVisible()) {
+            return self.activeWorkspace().sessionById(self.activeRemote().?.connection_id) orelse self.activeLive();
+        }
         return self.activeLive();
     }
 
     fn presentedLiveConst(self: *const App) *const session.Session {
         if (self.scratchpadVisible()) return self.scratchpadLiveConst() orelse self.activeLiveConst();
+        if (self.connectionVisible()) {
+            return @constCast(self.activeWorkspaceConst()).sessionById(self.activeRemote().?.connection_id) orelse self.activeLiveConst();
+        }
         return self.activeLiveConst();
     }
 
@@ -7689,6 +8917,8 @@ const App = struct {
                 var tab_storage_index: usize = 0;
                 var agent_state_slot: usize = 0;
                 self.agent_state_id_generation = (self.agent_state_id_generation + 1) % self.agent_state_ids.len;
+                var remote_state_slot: usize = 0;
+                self.remote_state_id_generation = (self.remote_state_id_generation + 1) % self.remote_state_ids.len;
                 var row: u32 = 1;
                 var workspace_index: usize = 0;
                 // Every workspace after the first listed one sits a few
@@ -7712,11 +8942,32 @@ const App = struct {
                     workspace_storage_index += 1;
                     const workspace_id: ui.Id = .{ .value = semantic };
                     const selected = active_key != null and active_key.? == key;
+                    // An SSH workspace's connection state leads its row
+                    // (TASK-43): a glyph unless connected, and always a
+                    // semantic `connection_state` element naming the state.
+                    var workspace_label = model.name();
+                    if (presentation.remote) |remote_record| {
+                        const glyph = remote.stateGlyph(remote_record.state);
+                        if (glyph.len != 0) {
+                            workspace_label = std.fmt.bufPrint(&self.remote_workspace_labels[workspace_slot], "{s} {s}", .{ glyph, model.name() }) catch model.name();
+                        }
+                        if (remote_state_slot < sidebar_element_capacity) {
+                            const state_id = try std.fmt.bufPrint(&self.remote_state_ids[self.remote_state_id_generation][remote_state_slot], "{s}.ssh.{s}", .{ semantic, @tagName(remote_record.state) });
+                            remote_state_slot += 1;
+                            try self.ui_tree.addText(.{
+                                .id = .{ .value = state_id },
+                                .parent = .{ .value = "sidebar" },
+                                .role = "connection_state",
+                                .label = @tagName(remote_record.state),
+                                .bounds = .{ .x = 1, .y = row, .width = 1, .height = 1 },
+                                .offset_px = group_offset_px,
+                            }, .{ .runs = &.{} });
+                        }
+                    }
                     // The most urgent agent state in the workspace leads its
                     // row (TASK-56); the glyph element's id carries the state.
-                    var workspace_label = model.name();
                     if (self.agents.workspaceState(key)) |state| {
-                        workspace_label = std.fmt.bufPrint(&self.agent_workspace_labels[workspace_slot], "{s} {s}", .{ app_agents.stateGlyph(state), model.name() }) catch model.name();
+                        workspace_label = std.fmt.bufPrint(&self.agent_workspace_labels[workspace_slot], "{s} {s}", .{ app_agents.stateGlyph(state), workspace_label }) catch workspace_label;
                         if (agent_state_slot < sidebar_element_capacity) {
                             const state_id = try std.fmt.bufPrint(&self.agent_state_ids[self.agent_state_id_generation][agent_state_slot], "{s}.agent.{s}", .{ semantic, @tagName(state) });
                             agent_state_slot += 1;
@@ -7972,6 +9223,10 @@ const App = struct {
         }
 
         for (self.pane_layouts[0..self.pane_layout_count], 0..) |layout, index| {
+            if (layout.pane_id == connection_pane_id) {
+                try self.composeConnectionView(layout);
+                continue;
+            }
             const semantic_id = try paneSemanticId(
                 &self.pane_semantic_storage[index],
                 self.activePresentation().key,
@@ -8969,6 +10224,7 @@ const App = struct {
             log.debug("file reference ignored while another load is in flight", .{});
             return false;
         }
+        if (self.remoteNotReady()) return false;
         const source = self.activeWorkspace().sessionById(source_id) orelse return false;
         const inherited = source.workingDirectory() orelse self.activeWorkspace().workingDirectory();
         const cwd = try self.allocator.dupe(u8, inherited);
@@ -9656,6 +10912,7 @@ const App = struct {
             if (field == &self.palette_query and self.palette_step == .commands) {
                 self.palette_model.refresh(field.text());
             }
+            if (field == &self.palette_argument and self.choiceFilterActive()) self.refreshChoiceFilter();
             if (field == &self.search_query and self.search_visible) self.restartSearch();
             try self.refreshActiveUi();
             return;
@@ -9763,6 +11020,8 @@ const App = struct {
             const presentation = self.presentationByKey(key) orelse continue;
             if (presentation.closing) continue;
             const model = self.workspace_registry.byKey(key) orelse continue;
+            // A remote directory is not this machine's, whatever its name.
+            if (model.contextKind() != .local) continue;
             if (std.mem.eql(
                 u8,
                 normalizedWorkspaceDirectory(model.workingDirectory()),
@@ -10067,6 +11326,9 @@ const App = struct {
             // context; its agents and notifications go with it.
             self.dropGitTracks(presentation.key);
             self.agents.removeWorkspace(presentation.key);
+            // Joins the host probe that borrows the context; the context's
+            // own teardown then hangs the master up without waiting.
+            self.releaseRemote(presentation);
             const result = self.workspace_registry.remove(presentation.key) catch {
                 log.err("a closing workspace disappeared before teardown", .{});
                 index += 1;
@@ -10232,6 +11494,7 @@ const App = struct {
             log.warn("new tab deferred while another load is in flight", .{});
             return;
         }
+        if (self.remoteNotReady()) return;
         if (!try self.prepareToLeaveActiveSession()) return;
 
         const inherited = self.activeLive().workingDirectory() orelse self.activeWorkspace().workingDirectory();
@@ -10520,6 +11783,7 @@ const App = struct {
             log.warn("pane split deferred while another load is in flight", .{});
             return;
         }
+        if (self.remoteNotReady()) return;
         if (!try self.prepareToLeaveActiveSession()) return;
         const tab_id = self.activeWorkspace().activeTabId() orelse return;
         const tab = self.activeWorkspace().tab(tab_id) orelse return;
@@ -10702,6 +11966,7 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(context));
         if (!try self.scratchpadActionTargetsActive(invocation, "restart")) return;
         if (self.activePresentation().scratchpad_load != null) return;
+        if (self.remoteNotReady()) return;
         if (self.scratchpadVisible() and !try self.prepareToLeaveActiveSession()) return;
         self.composition.cancel();
         _ = takeCommittedText(&self.pending_committed_text);
@@ -11920,6 +13185,9 @@ const App = struct {
         if (!self.agents.fake_enabled) self.ensureAgentDetection();
         self.setAgentLaunchChoices();
         self.rebuildAgentChoices();
+        // Hosts, profiles and recent destinations can change between
+        // openings (TASK-44); the list is fixed while the palette is open.
+        self.rebuildRemoteChoices();
         self.palette_content_width = self.paletteContentWidth();
         self.palette_step = .commands;
         self.ui_tree.clearFocus();
@@ -12001,7 +13269,17 @@ const App = struct {
                     .selected = 0,
                 } };
                 self.ui_tree.clearFocus();
-                try self.composeUi();
+                if (self.choiceStepFiltered(definition_index)) {
+                    // Typing filters the list (TASK-44 AC1): the field is
+                    // focused, and arrows and Enter still drive the rows.
+                    clearPaletteInput(&self.palette_argument);
+                    self.refreshChoiceFilter();
+                    try self.composeUi();
+                    if (self.ui_tree.focus(.{ .value = "palette.filter" })) try self.composeUi();
+                    try self.syncTextInput();
+                } else {
+                    try self.composeUi();
+                }
                 self.invalidateUi();
             },
         }
@@ -12079,6 +13357,7 @@ const App = struct {
                 else
                     step.selected;
                 if (choice_index >= values.len) return;
+                if (self.choiceStepFiltered(step.definition_index) and self.choiceFilterPosition(choice_index) == null) return;
                 try self.runPaletteAction(step.definition_index, values[choice_index].value);
             },
         }
@@ -12097,7 +13376,13 @@ const App = struct {
                     else => return,
                 };
                 if (values.len == 0) return;
-                const selected = if (next)
+                const selected = if (self.choiceStepFiltered(step.definition_index)) filtered: {
+                    const count = self.choice_filter_len;
+                    if (count == 0) return;
+                    const position = self.choiceFilterPosition(step.selected) orelse 0;
+                    const moved = if (next) (position + 1) % count else if (position == 0) count - 1 else position - 1;
+                    break :filtered self.choice_filter[moved];
+                } else if (next)
                     (step.selected + 1) % values.len
                 else if (step.selected == 0)
                     values.len - 1
@@ -12506,6 +13791,7 @@ const App = struct {
             if (field == &self.palette_query and self.palette_step == .commands) {
                 self.palette_model.refresh(field.text());
             }
+            if (field == &self.palette_argument and self.choiceFilterActive()) self.refreshChoiceFilter();
             if (field == &self.search_query and self.search_visible) self.restartSearch();
             try self.refreshActiveUi();
         }
@@ -12652,6 +13938,10 @@ const App = struct {
         changed = self.advanceSearch() or changed;
         changed = self.pollScratchpadLoad() or changed;
         changed = self.finalizeClosingPresentations() or changed;
+        if (self.pollRemote()) {
+            self.invalidateUi();
+            changed = true;
+        }
         if (self.pollGit()) {
             self.invalidateUi();
             changed = true;
@@ -13380,6 +14670,7 @@ const App = struct {
             if (field == &self.palette_query and self.palette_step == .commands) {
                 self.palette_model.refresh(field.text());
             }
+            if (field == &self.palette_argument and self.choiceFilterActive()) self.refreshChoiceFilter();
             if (field == &self.search_query and self.search_visible) self.restartSearch();
             try self.refreshActiveUi();
             return;
@@ -13503,7 +14794,8 @@ const App = struct {
                         if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
                         if (activation) |requested| {
                             if (std.mem.eql(u8, requested.id.value, "palette.query") or
-                                std.mem.eql(u8, requested.id.value, "palette.argument")) return true;
+                                std.mem.eql(u8, requested.id.value, "palette.argument") or
+                                std.mem.eql(u8, requested.id.value, "palette.filter")) return true;
                             if (std.mem.eql(u8, requested.action, palette_activate_action)) {
                                 try self.dispatchAction(palette_activate_action, .{
                                     .source = .mouse,
@@ -13519,7 +14811,8 @@ const App = struct {
             .text_input, .key => return false,
             .text_editing, .candidates => return switch (self.palette_step) {
                 .commands, .input => false,
-                .closed, .choices => true,
+                .closed => true,
+                .choices => !self.choiceFilterActive(),
             },
             else => return false,
         }
@@ -14234,6 +15527,10 @@ const App = struct {
         var has_attached_child = false;
         for (self.workspace_presentations.items) |presentation| {
             has_load = has_load or presentation.load != null or presentation.scratchpad_load != null;
+            if (presentation.remote) |record| {
+                has_load = has_load or record.host_probe != null or record.respawn.items.len != 0 or
+                    record.state == .connecting;
+            }
             if (self.workspace_registry.byKey(presentation.key)) |model| {
                 has_attached_child = has_attached_child or model.hasAttachedChild();
             }
@@ -15791,7 +17088,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 68 and
+    failures += reportCheck(out, registered_actions.len == 74 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -15859,7 +17156,13 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[64].name, notifications_open_action) and
         std.mem.eql(u8, registered_actions[65].name, notifications_clear_action) and
         std.mem.eql(u8, registered_actions[66].name, notifications_activate_action) and
-        std.mem.eql(u8, registered_actions[67].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[67].name, remote_connect_action) and
+        std.mem.eql(u8, registered_actions[68].name, remote_connect_address_action) and
+        std.mem.eql(u8, registered_actions[69].name, remote_save_profile_action) and
+        std.mem.eql(u8, registered_actions[70].name, remote_reconnect_action) and
+        std.mem.eql(u8, registered_actions[71].name, remote_disconnect_action) and
+        std.mem.eql(u8, registered_actions[72].name, remote_show_connection_action) and
+        std.mem.eql(u8, registered_actions[73].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -16993,6 +18296,54 @@ fn tabSemanticId(buffer: []u8, key: workspace.WorkspaceKey, tab_id: workspace.Ta
     return std.fmt.bufPrint(buffer, "workspace.{d}.tab.{d}", .{ @intFromEnum(key), @intFromEnum(tab_id) });
 }
 
+/// `workspace.<k>.connection` and its children: the SSH connection view.
+fn connectionSemanticId(buffer: []u8, key: workspace.WorkspaceKey, suffix: []const u8) ![]const u8 {
+    if (suffix.len == 0) return std.fmt.bufPrint(buffer, "workspace.{d}.connection", .{@intFromEnum(key)});
+    return std.fmt.bufPrint(buffer, "workspace.{d}.connection.{s}", .{ @intFromEnum(key), suffix });
+}
+
+/// The pane id the connection view's layout carries. No pane has it: pane
+/// ids are monotonic from one and a workspace never makes four billion.
+const connection_pane_id: workspace.PaneId = @enumFromInt(std.math.maxInt(u32));
+
+/// The files one `Include` glob names in its directory, bounded and sorted
+/// as OpenSSH's own glob expansion is.
+const IncludeMatches = struct {
+    pattern: []const u8,
+    names: [remote.max_include_files][256]u8 = undefined,
+    lens: [remote.max_include_files]usize = undefined,
+    count: usize = 0,
+
+    fn at(self: *const IncludeMatches, index: usize) []const u8 {
+        return self.names[index][0..self.lens[index]];
+    }
+
+    fn add(self: *IncludeMatches, name: []const u8) void {
+        if (self.count == remote.max_include_files or name.len > self.names[0].len) return;
+        @memcpy(self.names[self.count][0..name.len], name);
+        self.lens[self.count] = name.len;
+        self.count += 1;
+    }
+
+    fn visit(context: *anyopaque, entry: workspace.DirEntry) bool {
+        const self: *IncludeMatches = @ptrCast(@alignCast(context));
+        if (entry.kind == .directory) return true;
+        if (remote.globMatch(self.pattern, entry.name)) self.add(entry.name);
+        return self.count < remote.max_include_files;
+    }
+
+    fn sort(self: *IncludeMatches) void {
+        var index: usize = 1;
+        while (index < self.count) : (index += 1) {
+            var at_index = index;
+            while (at_index != 0 and std.mem.order(u8, self.at(at_index), self.at(at_index - 1)) == .lt) : (at_index -= 1) {
+                std.mem.swap([256]u8, &self.names[at_index], &self.names[at_index - 1]);
+                std.mem.swap(usize, &self.lens[at_index], &self.lens[at_index - 1]);
+            }
+        }
+    }
+};
+
 /// `text` cut to at most `cells` codepoints, the last one replaced by `…`
 /// when anything was cut. Each codepoint is counted as one cell; a wider one
 /// is still clipped safely by `ui.Text`. `text` must be valid UTF-8 no longer
@@ -17495,7 +18846,8 @@ fn paletteTest(self: *App, io: Io, out: *Writer) !u8 {
     paletteCheck(out, &failures, paletteContainsDefinition(self, tab_new_action) and
         paletteContainsDefinition(self, pane_split_action) and paletteContainsDefinition(self, settings_open_action) and
         self.actions.lookup("theme.select") == null and
-        self.actions.lookup("font.select") == null and self.actions.lookup("remote.connect") == null, "New tab, Split pane and Settings are present while unshipped commands are absent", .{});
+        paletteContainsDefinition(self, remote_connect_action) and
+        self.actions.lookup("font.select") == null and self.actions.lookup("workspace.reconnect") == null, "New tab, Split pane, Settings and Remote: connect are present while unshipped commands are absent", .{});
 
     paletteCheck(out, &failures, try postPaletteText(self, io, out, "newtab"), "fuzzy query text travelled through SDL", .{});
     const selected_new = self.palette_model.selectedDefinition();
@@ -18988,6 +20340,491 @@ fn removeAgentTestDir(io: Io, dir: []const u8) void {
     Dir.cwd().deleteTree(io, dir) catch |err| {
         log.warn("could not remove the agent-test directory: {s}", .{@errorName(err)});
     };
+}
+
+// ---------------------------------------------------------------------------
+// --ssh-test (TASK-43 part two, TASK-44, TASK-45)
+// ---------------------------------------------------------------------------
+
+const ssh_test_budget_ms: i64 = 30_000;
+/// The throwaway sshd image `src/ssh.zig`'s integration test builds from
+/// `test/fixtures/ssh`.
+const ssh_test_image = "conduit-ssh-test:latest";
+/// The prompt hook appended to the container user's `.bashrc`. The fixture
+/// has no Conduit remote shell integration (decision-8's install is not
+/// built yet), so this stands in for it: the OSC 7 report a shell with
+/// integration sends, naming the remote host.
+const ssh_test_osc7_hook =
+    "PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"'\n";
+
+/// `--ssh-test`'s private directory: under `/tmp` rather than `$TMPDIR`
+/// because the control socket below it must fit `sockaddr_un`.
+fn sshTestDir(io: Io, buffer: []u8) ![]const u8 {
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = try generateRunId(io, &id_buffer);
+    return std.fmt.bufPrint(buffer, "/tmp/conduit-ssh-test-{s}", .{id});
+}
+
+fn removeSshTestDir(io: Io, dir: []const u8) void {
+    if (std.mem.indexOf(u8, dir, "conduit-ssh-test-") == null) return;
+    Dir.cwd().deleteTree(io, dir) catch |err| {
+        log.warn("could not remove the ssh-test directory: {s}", .{@errorName(err)});
+    };
+}
+
+fn sshCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("ssh-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    out.flush() catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// Run one local helper (docker, ssh-keygen) to completion.
+fn sshHost(self: *App, io: Io, argv: []const []const u8, timeout_ms: u32) !workspace.RunResult {
+    return workspace.runLocalProcess(self.allocator, io, .{
+        .argv = argv,
+        .cwd = "",
+        .timeout_ms = timeout_ms,
+        .max_output = 4 * 1024 * 1024,
+    });
+}
+
+/// Run a helper and say whether it succeeded, releasing its output.
+fn sshHostOk(self: *App, io: Io, argv: []const []const u8, timeout_ms: u32) bool {
+    var result = sshHost(self, io, argv, timeout_ms) catch return false;
+    defer result.deinit(self.allocator);
+    return result.succeeded();
+}
+
+const SshWait = union(enum) {
+    presented_text: []const u8,
+    session_text: struct { key: workspace.WorkspaceKey, id: session.SessionId, text: []const u8 },
+    element: []const u8,
+    element_absent: []const u8,
+    cwd: struct { key: workspace.WorkspaceKey, id: session.SessionId, cwd: []const u8 },
+    /// A new running child behind `id` whose shell reported `cwd`.
+    replaced: struct { key: workspace.WorkspaceKey, id: session.SessionId, old: *anyopaque, cwd: []const u8 },
+    ended: struct { key: workspace.WorkspaceKey, id: session.SessionId },
+    child: struct { key: workspace.WorkspaceKey, id: session.SessionId },
+};
+
+fn sshSession(self: *App, key: workspace.WorkspaceKey, id: session.SessionId) ?*session.Session {
+    const model = self.workspace_registry.byKey(key) orelse return null;
+    return model.sessionById(id);
+}
+
+fn sshWaitMet(self: *App, condition: SshWait) !bool {
+    switch (condition) {
+        .presented_text => |text| {
+            const live = self.presentedLive();
+            try live.terminal().refresh(self.allocator);
+            return live.terminal().visibleTextContains(text);
+        },
+        .session_text => |wanted| {
+            const live = sshSession(self, wanted.key, wanted.id) orelse return false;
+            try live.terminal().refresh(self.allocator);
+            return live.terminal().visibleTextContains(wanted.text);
+        },
+        .element => |id| return self.ui_tree.byId(.{ .value = id }) != null,
+        .element_absent => |id| return self.ui_tree.byId(.{ .value = id }) == null,
+        .cwd => |wanted| {
+            const live = sshSession(self, wanted.key, wanted.id) orelse return false;
+            const actual = live.workingDirectory() orelse return false;
+            return std.mem.eql(u8, actual, wanted.cwd);
+        },
+        .replaced => |wanted| {
+            const live = sshSession(self, wanted.key, wanted.id) orelse return false;
+            const child = live.child() orelse return false;
+            if (child.ptr == wanted.old or child.state() != .running) return false;
+            const actual = live.workingDirectory() orelse return false;
+            return std.mem.eql(u8, actual, wanted.cwd);
+        },
+        .ended => |wanted| {
+            const live = sshSession(self, wanted.key, wanted.id) orelse return false;
+            const child = live.child() orelse return false;
+            return child.state() == .exited and !live.needsPump();
+        },
+        .child => |wanted| {
+            const live = sshSession(self, wanted.key, wanted.id) orelse return false;
+            return live.child() != null;
+        },
+    }
+}
+
+fn waitForSsh(self: *App, io: Io, out: *Writer, condition: SshWait) !bool {
+    const deadline = Io.Clock.real.now(io).nanoseconds + ssh_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (try sshWaitMet(self, condition)) return true;
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return false;
+        }
+        if (self.outputReadable()) {
+            if (try self.drainChildren(io) != 0) self.scheduler.invalidate();
+        }
+        if (self.poll()) self.scheduler.invalidate();
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) return try sshWaitMet(self, condition);
+    }
+}
+
+/// Type one line into whatever terminal is presented, through SDL.
+fn sshType(self: *App, io: Io, out: *Writer, comptime format: []const u8, args: anytype) !bool {
+    var buffer: [512]u8 = undefined;
+    const text = try std.fmt.bufPrintZ(&buffer, format, args);
+    try self.window.postTextInput(text);
+    if (!try pumpUntil(self, io, out, .text_input, self_test_event_budget_ms)) return false;
+    return postNamedKey(self, io, out, .enter, .{});
+}
+
+/// Write the current frame beside `--screenshot` as `<stem>-<name>.png`.
+fn sshScreenshot(self: *App, io: Io, out: *Writer, name: []const u8) !void {
+    const base = self.screenshot orelse return;
+    try self.drawFrame();
+    const pixels = try self.capture();
+    var path_buffer: [path_capacity]u8 = undefined;
+    const stem = if (std.mem.endsWith(u8, base, ".png")) base[0 .. base.len - 4] else base;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}-{s}.png", .{ stem, name });
+    try writePngOffThread(self.allocator, io, path, pixels, self.size);
+    out.print("ssh-test: screenshot {s}\n", .{path}) catch {};
+}
+
+fn choiceIndexByValue(self: *const App, value: []const u8) ?usize {
+    for (self.remote_choices[0..self.remote_choice_count], 0..) |choice, index| {
+        if (std.mem.eql(u8, choice.value, value)) return index;
+    }
+    return null;
+}
+
+fn choiceRowId(buffer: []u8, definition_index: usize, choice_index: usize) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "palette.choice.{d}.{d}", .{ definition_index, choice_index });
+}
+
+/// Open `Remote: connect` from the palette: its chord, a query, then Enter
+/// or a click on the command's row.
+fn openRemoteConnect(self: *App, io: Io, out: *Writer) !bool {
+    if (!try paletteChord(self, io, out)) return false;
+    if (!try postPaletteText(self, io, out, "remote connect")) return false;
+    const selected = self.palette_model.selectedDefinition() orelse return false;
+    if (std.mem.eql(u8, selected.name, remote_connect_action)) {
+        if (!try postNamedKey(self, io, out, .enter, .{})) return false;
+    } else {
+        // The palette keeps a still-matching recent command selected
+        // (`Remote: reconnect` matches too), so take the row by mouse.
+        var row_buffer: [palette_semantic_capacity]u8 = undefined;
+        const row = try std.fmt.bufPrint(&row_buffer, "palette.action.{d}", .{self.remote_connect_index});
+        if (!try clickTabsElement(self, io, out, row)) return false;
+    }
+    return switch (self.palette_step) {
+        .choices => |step| step.definition_index == self.remote_connect_index,
+        else => false,
+    };
+}
+
+fn sshTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    const run_dir = self.ssh_runtime_owned orelse return 1;
+    const dir = std.fs.path.dirnamePosix(run_dir) orelse return 1;
+
+    // Docker and the fixture image are prerequisites, as for the ssh.zig
+    // integration test: without them the check is skipped, not failed.
+    const docker_ready = sshHostOk(self, io, &.{ "docker", "info" }, 30_000) and
+        sshHostOk(self, io, &.{ "docker", "build", "-q", "-t", ssh_test_image, "test/fixtures/ssh" }, 900_000);
+    if (!docker_ready) {
+        out.print("ssh-test: skipped: docker or the test/fixtures/ssh image is unavailable (run from the repository root)\n", .{}) catch {};
+        out.flush() catch {};
+        return 0;
+    }
+
+    var paths: [8][path_capacity]u8 = undefined;
+    const ssh_dir = try std.fmt.bufPrint(&paths[0], "{s}/home/.ssh", .{dir});
+    const include_dir = try std.fmt.bufPrint(&paths[1], "{s}/conf.d", .{ssh_dir});
+    const key_path = try std.fmt.bufPrint(&paths[2], "{s}/id_ed25519", .{ssh_dir});
+    const config_path = self.ssh_config_override orelse return 1;
+    const hook_path = try std.fmt.bufPrint(&paths[3], "{s}/osc7.sh", .{dir});
+    try Dir.cwd().createDirPath(io, include_dir);
+    try Dir.cwd().createDirPath(io, run_dir);
+
+    // A throwaway key with a throwaway passphrase, so the master must show
+    // OpenSSH's own passphrase prompt. Never the user's ~/.ssh or agent.
+    var id_buffer: [path_capacity]u8 = undefined;
+    const run_id = try generateRunId(io, &id_buffer);
+    var passphrase_buffer: [96]u8 = undefined;
+    const passphrase = try std.fmt.bufPrint(&passphrase_buffer, "conduit-pass-{s}", .{run_id});
+    sshCheck(out, &failures, sshHostOk(self, io, &.{ "ssh-keygen", "-q", "-t", "ed25519", "-N", passphrase, "-C", "conduit-ssh-test", "-f", key_path }, 30_000), "a throwaway passphrase key was generated", .{});
+
+    var name_buffer: [path_capacity]u8 = undefined;
+    const container = try std.fmt.bufPrint(&name_buffer, "conduit-ssh-app-test-{s}", .{run_id});
+    var mount_buffer: [path_capacity]u8 = undefined;
+    const mount = try std.fmt.bufPrint(&mount_buffer, "{s}.pub:/conduit-key.pub:ro", .{key_path});
+    const started = sshHostOk(self, io, &.{ "docker", "run", "-d", "--name", container, "-p", "127.0.0.1::22", "-v", mount, ssh_test_image }, 120_000);
+    defer {
+        var removed = sshHost(self, io, &.{ "docker", "rm", "-f", container }, 60_000) catch null;
+        if (removed) |*result| result.deinit(self.allocator);
+    }
+    sshCheck(out, &failures, started, "the sshd container started", .{});
+    if (!started) return 1;
+
+    var port_result = try sshHost(self, io, &.{ "docker", "port", container, "22/tcp" }, 30_000);
+    defer port_result.deinit(self.allocator);
+    const first_line = std.mem.sliceTo(port_result.stdout, '\n');
+    const colon = std.mem.lastIndexOfScalar(u8, first_line, ':') orelse return 1;
+    const port = std.fmt.parseInt(u16, std.mem.trim(u8, first_line[colon + 1 ..], " \r"), 10) catch return 1;
+    {
+        const deadline = Io.Clock.real.now(io).nanoseconds + 30 * std.time.ns_per_s;
+        while (true) {
+            var logs = try sshHost(self, io, &.{ "docker", "logs", container }, 30_000);
+            defer logs.deinit(self.allocator);
+            if (std.mem.indexOf(u8, logs.stderr, "Server listening") != null or
+                std.mem.indexOf(u8, logs.stdout, "Server listening") != null) break;
+            if (Io.Clock.real.now(io).nanoseconds > deadline) {
+                sshCheck(out, &failures, false, "sshd started listening", .{});
+                return 1;
+            }
+        }
+    }
+    var host_result = try sshHost(self, io, &.{ "docker", "exec", container, "uname", "-n" }, 30_000);
+    defer host_result.deinit(self.allocator);
+    const remote_name = std.mem.trim(u8, host_result.stdout, " \r\n");
+
+    try Dir.cwd().writeFile(io, .{ .sub_path = hook_path, .data = ssh_test_osc7_hook });
+    var copy_target: [path_capacity]u8 = undefined;
+    const hook_target = try std.fmt.bufPrint(&copy_target, "{s}:/tmp/conduit-osc7.sh", .{container});
+    sshCheck(out, &failures, sshHostOk(self, io, &.{ "docker", "cp", hook_path, hook_target }, 30_000) and
+        sshHostOk(self, io, &.{ "docker", "exec", container, "sh", "-c", "cat /tmp/conduit-osc7.sh >> /home/conduit/.bashrc" }, 30_000), "the remote shell reports its cwd with OSC 7 (a stand-in for remote shell integration)", .{});
+
+    // A private client configuration: the alias, an Include, the identity,
+    // a private known_hosts with OpenSSH's default `ask` policy, no agent.
+    var config_text: [4096]u8 = undefined;
+    const config_body = try std.fmt.bufPrint(&config_text,
+        \\Host conduit-test-host
+        \\  HostName 127.0.0.1
+        \\  Port {d}
+        \\  User conduit
+        \\Include {s}/*
+        \\Host *
+        \\  IdentityFile {s}
+        \\  IdentitiesOnly yes
+        \\  IdentityAgent none
+        \\  UserKnownHostsFile {s}/known_hosts
+        \\  GlobalKnownHostsFile /dev/null
+        \\  StrictHostKeyChecking ask
+        \\  UpdateHostKeys no
+        \\
+    , .{ port, include_dir, key_path, dir });
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_body });
+    var include_file: [path_capacity]u8 = undefined;
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fmt.bufPrint(&include_file, "{s}/extra.conf", .{include_dir}),
+        .data = "Host conduit-included\n  HostName 127.0.0.1\n",
+    });
+
+    try self.drawFrame();
+    const local_key = self.activePresentation().key;
+
+    // TASK-44 AC1: the palette lists ssh-config hosts (Include followed)
+    // and the address row, and typing filters them fuzzily.
+    sshCheck(out, &failures, try openRemoteConnect(self, io, out) and
+        self.ui_tree.byId(.{ .value = "palette.filter" }) != null and
+        self.ui_tree.focusedElement() != null and
+        std.mem.eql(u8, self.ui_tree.focusedElement().?.id.value, "palette.filter"), "Remote: connect opened its host list with the filter focused", .{});
+    const alias_index = choiceIndexByValue(self, "host:conduit-test-host");
+    const included_index = choiceIndexByValue(self, "host:conduit-included");
+    const address_index = choiceIndexByValue(self, "address");
+    var row_ids: [3][palette_semantic_capacity]u8 = undefined;
+    const alias_row = if (alias_index) |index| try choiceRowId(&row_ids[0], self.remote_connect_index, index) else "";
+    const included_row = if (included_index) |index| try choiceRowId(&row_ids[1], self.remote_connect_index, index) else "";
+    sshCheck(out, &failures, alias_index != null and included_index != null and address_index != null and
+        self.ui_tree.byId(.{ .value = alias_row }) != null and
+        self.ui_tree.byId(.{ .value = included_row }) != null, "the list shows the config alias, the included host and the user@host row", .{});
+    _ = try postPaletteText(self, io, out, "conduit-test");
+    const filtered_selected = switch (self.palette_step) {
+        .choices => |step| step.selected,
+        else => std.math.maxInt(usize),
+    };
+    sshCheck(out, &failures, alias_index != null and filtered_selected == alias_index.? and
+        self.ui_tree.byId(.{ .value = alias_row }) != null and
+        self.ui_tree.byId(.{ .value = included_row }) == null, "typing filtered the list fuzzily to the alias", .{});
+
+    // TASK-44 AC3 and TASK-43 AC3: connecting creates the SSH workspace in
+    // the sidebar, and OpenSSH's own host-key prompt is in its connection
+    // terminal, answered by typing.
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    const key = self.workspace_registry.activeKey() orelse return 1;
+    var ids: [8][workspace_semantic_capacity]u8 = undefined;
+    const row_id = try workspaceSemanticId(&ids[0], key);
+    const connection_header = try connectionSemanticId(&ids[1], key, "");
+    const connected_id = try std.fmt.bufPrint(&ids[2], "{s}.ssh.connected", .{row_id});
+    const lost_id = try std.fmt.bufPrint(&ids[3], "{s}.ssh.lost", .{row_id});
+    const reconnect_id = try connectionSemanticId(&ids[4], key, "reconnect");
+    sshCheck(out, &failures, key != local_key and self.presentationByKey(key).?.remote != null and
+        self.workspace_registry.count() == 2, "connecting created and switched to an SSH workspace", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = "(yes/no" }) and
+        self.ui_tree.byId(.{ .value = connection_header }) != null, "the connection view shows OpenSSH's host-key prompt", .{});
+    const row_label = if (self.ui_tree.byId(.{ .value = row_id })) |element| element.label else "";
+    sshCheck(out, &failures, std.mem.startsWith(u8, row_label, "↕ conduit-test-host"), "the sidebar row shows the connecting glyph ({s})", .{row_label});
+    try sshScreenshot(self, io, out, "prompt");
+    _ = try sshType(self, io, out, "yes", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = "Enter passphrase" }), "the passphrase prompt followed in the same terminal", .{});
+    _ = try sshType(self, io, out, "{s}", .{passphrase});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .element = connected_id }) and
+        try waitForSsh(self, io, out, .{ .element_absent = connection_header }), "the workspace reached connected and the connection view stepped aside", .{});
+    const model = self.workspace_registry.byKey(key) orelse return 1;
+    const record = self.presentationByKey(key).?.remote.?;
+    if (model.sessionById(record.connection_id)) |connection| {
+        try connection.terminal().refresh(self.allocator);
+        sshCheck(out, &failures, !connection.terminal().visibleTextContains(passphrase), "the passphrase was never echoed", .{});
+    }
+
+    // TASK-43 AC1: the first tab is a remote shell.
+    const first_tab = model.activeTabId() orelse return 1;
+    const first_session = model.focusedPaneSessionId(first_tab) orelse return 1;
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = first_session, .text = "conduit@" } }), "the first tab started the remote login shell", .{});
+    _ = try sshType(self, io, out, "printf 'R%sE:%s\\n' EMOT \"$(uname -n)\"", .{});
+    var marker_buffer: [128]u8 = undefined;
+    const remote_marker = try std.fmt.bufPrint(&marker_buffer, "REMOTE:{s}", .{remote_name});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = first_session, .text = remote_marker } }), "the first tab runs on the remote host ({s})", .{remote_name});
+    _ = try sshType(self, io, out, "cd /home/conduit/project/sub", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .cwd = .{ .key = key, .id = first_session, .cwd = "/home/conduit/project/sub" } }), "the remote shell's OSC 7 naming the remote host became the tab's cwd", .{});
+
+    // TASK-45 AC2 and TASK-43 AC1: a split (keyboard) starts in the
+    // originating session's remote cwd over the same connection.
+    const split_mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    _ = try postKey(self, io, out, if (self.binding_profile == .macos) 'd' else 'e', split_mods);
+    const split_session = model.focusedPaneSessionId(first_tab) orelse return 1;
+    sshCheck(out, &failures, split_session != first_session and
+        try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = split_session, .text = "conduit@" } }), "split right started a second remote shell", .{});
+    // The pane is narrow, so its first prompt's OSC 7 is the evidence
+    // rather than a printed path that would wrap.
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .cwd = .{ .key = key, .id = split_session, .cwd = "/home/conduit/project/sub" } }), "the split pane started in the originating pane's remote cwd", .{});
+    _ = try sshType(self, io, out, "cd /tmp", .{});
+    _ = try waitForSsh(self, io, out, .{ .cwd = .{ .key = key, .id = split_session, .cwd = "/tmp" } });
+
+    // A new tab by mouse, from the split pane's cwd.
+    const tab_new_index = definitionIndex(self, tab_new_action) orelse return 1;
+    var tab_new_row: [palette_semantic_capacity]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, "sidebar.palette");
+    _ = try postPaletteText(self, io, out, "newtab");
+    _ = try clickTabsElement(self, io, out, try std.fmt.bufPrint(&tab_new_row, "palette.action.{d}", .{tab_new_index}));
+    const new_tab = model.activeTabId() orelse return 1;
+    const tab_session = model.focusedPaneSessionId(new_tab) orelse return 1;
+    sshCheck(out, &failures, new_tab != first_tab and
+        try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = tab_session, .text = "conduit@" } }), "a palette-clicked new tab started a remote shell", .{});
+    _ = try sshType(self, io, out, "printf 'P%sD:%s\\n' W \"$PWD\"", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = tab_session, .text = "PWD:/tmp" } }), "the new tab started in the originating session's remote cwd", .{});
+
+    // TASK-45 AC1 and AC3: the scratchpad is remote and survives hide/show.
+    const scratchpad_id = model.scratchpadId();
+    _ = try scratchpadChord(self, io, out, false);
+    sshCheck(out, &failures, self.activePresentation().scratchpad_presentation == .fifty and
+        try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = scratchpad_id, .text = "conduit@" } }), "the scratchpad shows a remote shell started when the workspace connected", .{});
+    _ = try sshType(self, io, out, "printf 'R%sE:%s\\n' EMOT \"$(uname -n)\"", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = scratchpad_id, .text = remote_marker } }), "the scratchpad runs on the remote host", .{});
+    _ = try sshType(self, io, out, "cd /home/conduit/project", .{});
+    _ = try waitForSsh(self, io, out, .{ .cwd = .{ .key = key, .id = scratchpad_id, .cwd = "/home/conduit/project" } });
+    const scratchpad_child = (model.sessionById(scratchpad_id) orelse return 1).child() orelse return 1;
+    _ = try scratchpadChord(self, io, out, false);
+    const hidden = self.activePresentation().scratchpad_presentation == .hidden;
+    _ = try scratchpadChord(self, io, out, false);
+    const shown_again = model.sessionById(scratchpad_id).?.child().?.ptr == scratchpad_child.ptr;
+    sshCheck(out, &failures, hidden and shown_again and
+        try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = scratchpad_id, .text = remote_marker } }), "the remote scratchpad kept its process and output across hide and show", .{});
+    _ = try scratchpadChord(self, io, out, false);
+
+    var tab_row_buffer: [workspace_semantic_capacity]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, try tabSemanticId(&tab_row_buffer, key, first_tab));
+    try sshScreenshot(self, io, out, "connected");
+
+    // TASK-43 AC4: losing the connection (sshd's per-connection processes
+    // killed; the listener stays, standing in for a server coming back) is
+    // shown in the sidebar and the connection view.
+    const first_child = (model.sessionById(first_session) orelse return 1).child() orelse return 1;
+    const split_child = (model.sessionById(split_session) orelse return 1).child() orelse return 1;
+    const tab_child = (model.sessionById(tab_session) orelse return 1).child() orelse return 1;
+    const scratch_child = (model.sessionById(scratchpad_id) orelse return 1).child() orelse return 1;
+    _ = sshHostOk(self, io, &.{ "docker", "exec", container, "pkill", "-KILL", "-f", "sshd: conduit" }, 30_000);
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .element = lost_id }) and
+        try waitForSsh(self, io, out, .{ .element = reconnect_id }), "the loss was detected and the connection view offers reconnect", .{});
+    const lost_label = if (self.ui_tree.byId(.{ .value = row_id })) |element| element.label else "";
+    const header_label = if (self.ui_tree.byId(.{ .value = connection_header })) |element| element.label else "";
+    sshCheck(out, &failures, std.mem.startsWith(u8, lost_label, "⚠ ") and
+        std.mem.indexOf(u8, header_label, "connection lost") != null, "the sidebar shows the lost glyph and the view names the loss", .{});
+    for ([_]session.SessionId{ first_session, split_session, tab_session, scratchpad_id }) |id| {
+        sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .ended = .{ .key = key, .id = id } }), "session {d} ended with the connection", .{@intFromEnum(id)});
+    }
+    try sshScreenshot(self, io, out, "lost");
+
+    // Reconnect by mouse; the new master prompts again in the same view, and
+    // every session comes back under its id in its last remote cwd.
+    sshCheck(out, &failures, try clickTabsElement(self, io, out, reconnect_id) and
+        try waitForSsh(self, io, out, .{ .presented_text = "Enter passphrase" }), "reconnect started a new master showing the passphrase prompt", .{});
+    _ = try sshType(self, io, out, "{s}", .{passphrase});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .element = connected_id }), "the workspace reconnected", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .replaced = .{ .key = key, .id = first_session, .old = first_child.ptr, .cwd = "/home/conduit/project/sub" } }), "the first pane was restored under its id in its remote cwd", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .replaced = .{ .key = key, .id = split_session, .old = split_child.ptr, .cwd = "/tmp" } }), "the split pane was restored in its remote cwd", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .replaced = .{ .key = key, .id = tab_session, .old = tab_child.ptr, .cwd = "/tmp" } }), "the second tab was restored in its remote cwd", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .replaced = .{ .key = key, .id = scratchpad_id, .old = scratch_child.ptr, .cwd = "/home/conduit/project" } }), "the scratchpad was restored in its remote cwd", .{});
+
+    // TASK-44 AC2: an ad hoc user@host connection, saved as a profile.
+    sshCheck(out, &failures, try openRemoteConnect(self, io, out), "Remote: connect reopened", .{});
+    _ = try postPaletteText(self, io, out, "enter user");
+    // The list grew a recent row since it was first read, so look again.
+    const address_now = choiceIndexByValue(self, "address");
+    const address_selected = switch (self.palette_step) {
+        .choices => |step| address_now != null and step.selected == address_now.?,
+        else => false,
+    };
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    const address_step = switch (self.palette_step) {
+        .input => |definition_index| definition_index == self.remote_address_index,
+        else => false,
+    };
+    sshCheck(out, &failures, address_selected and address_step, "the user@host row asked for a destination", .{});
+    _ = try sshType(self, io, out, "conduit@127.0.0.1:{d}", .{port});
+    const adhoc_key = self.workspace_registry.activeKey() orelse return 1;
+    const save_step = switch (self.palette_step) {
+        .choices => |step| step.definition_index == self.remote_save_index,
+        else => false,
+    };
+    sshCheck(out, &failures, adhoc_key != key and self.presentationByKey(adhoc_key).?.remote != null and save_step, "the ad hoc destination opened a workspace and offered to save it", .{});
+    var save_row: [palette_semantic_capacity]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, try choiceRowId(&save_row, self.remote_save_index, 0));
+    const settings_buffer = try self.allocator.alloc(u8, config.max_file_bytes);
+    defer self.allocator.free(settings_buffer);
+    const settings_text = self.local_files.borrow().readFile(io, self.config_path orelse "", settings_buffer) catch "";
+    var profile_line: [256]u8 = undefined;
+    const expected_profile = try std.fmt.bufPrint(&profile_line, "remote.profile = 127.0.0.1 = conduit@127.0.0.1:{d}", .{port});
+    sshCheck(out, &failures, std.mem.indexOf(u8, settings_text, expected_profile) != null and
+        std.mem.indexOf(u8, settings_text, "remote.recent = conduit@127.0.0.1:") != null and
+        std.mem.indexOf(u8, settings_text, ",conduit-test-host") != null, "the profile and both recent destinations were written to the settings file", .{});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = "Enter passphrase" }), "the ad hoc workspace prompted in its own connection view", .{});
+    _ = try sshType(self, io, out, "{s}", .{passphrase});
+    var adhoc_ids: [2][workspace_semantic_capacity]u8 = undefined;
+    const adhoc_row = try workspaceSemanticId(&adhoc_ids[0], adhoc_key);
+    const adhoc_connected = try std.fmt.bufPrint(&adhoc_ids[1], "{s}.ssh.connected", .{adhoc_row});
+    sshCheck(out, &failures, try waitForSsh(self, io, out, .{ .element = adhoc_connected }), "the ad hoc workspace connected", .{});
+
+    // The saved profile is listed next time.
+    sshCheck(out, &failures, try openRemoteConnect(self, io, out), "Remote: connect reopened after saving", .{});
+    _ = try postPaletteText(self, io, out, "127");
+    const profile_index = choiceIndexByValue(self, "profile:127.0.0.1");
+    var profile_row: [palette_semantic_capacity]u8 = undefined;
+    sshCheck(out, &failures, profile_index != null and self.choiceFilterPosition(profile_index.?) != null and
+        self.ui_tree.byId(.{ .value = try choiceRowId(&profile_row, self.remote_connect_index, profile_index orelse 0) }) != null, "the saved profile is listed and found by the filter", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+
+    // The final frame: the first SSH workspace's split tab.
+    _ = try clickTabsElement(self, io, out, row_id);
+    _ = try waitForSsh(self, io, out, .{ .element_absent = "palette.dialog" });
+    try self.drawFrame();
+    _ = try self.capture();
+
+    out.print("ssh-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
 }
 
 const AgentWait = union(enum) {
@@ -21441,6 +23278,7 @@ const usage =
     \\          [--ui-test] [--ime-test] [--sidebar-test] [--tabs-test]
     \\          [--panes-test] [--scratchpad-test] [--palette-test]
     \\          [--workspaces-test] [--links-test] [--search-test] [--git-test]
+    \\          [--ssh-test]
     \\          [--test-driver=<endpoint>]
     \\          [--test-artifact-dir=<dir>]
     \\          [--driver-test]
@@ -21532,6 +23370,10 @@ const usage =
     \\  --agent-test                       drive a scripted fake agent: live sidebar glyphs,
     \\                                    the notification list by chord, palette and
     \\                                    mouse, settings switches and OSC 777, then exit
+    \\  --ssh-test                         drive SSH workspaces against a throwaway sshd
+    \\                                    container: connect, prompts, remote panes and
+    \\                                    scratchpad, loss and reconnect, then exit
+    \\                                    (skipped without Docker)
     \\  --right-click=<menu|paste>        what a right click over a terminal does when
     \\                                    the program has not captured the mouse
     \\                                    (default: menu)
@@ -21699,6 +23541,14 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         try writeConfigTestFile(init.io, options.run.config_path.?, agent_test_initial_config);
     }
     defer if (options.run.agent_test) removeAgentTestDir(init.io, options.run.agent_test_dir.?);
+    var ssh_test_dir_buffer: [path_capacity]u8 = undefined;
+    if (options.run.ssh_test) {
+        const dir = try sshTestDir(init.io, &ssh_test_dir_buffer);
+        options.run.ssh_test_dir = dir;
+        options.run.config_path = try std.fmt.bufPrint(&config_path_buffer, "{s}/conduit/config", .{dir});
+        try writeConfigTestFile(init.io, options.run.config_path.?, "# --ssh-test\n");
+    }
+    defer if (options.run.ssh_test) removeSshTestDir(init.io, options.run.ssh_test_dir.?);
     try platform.setAppMetadata(.{
         .name = app_name,
         .version = version,
@@ -21729,7 +23579,7 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
                 options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
-                options.run.git_test or options.run.agent_test or options.run.driver_test) return err;
+                options.run.git_test or options.run.agent_test or options.run.ssh_test or options.run.driver_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
                 "no usable display ({s}): there is no window to draw in. Set DISPLAY, or run under xvfb-run",
@@ -21847,6 +23697,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try gitTest(app, init.io, out);
     } else if (options.run.agent_test) {
         check_status = try agentTest(app, init.io, out);
+    } else if (options.run.ssh_test) {
+        check_status = try sshTest(app, init.io, out);
     } else {
         try app.run(init.io, runDeadline(init.io, options.run.run_ms));
     }
@@ -22306,6 +24158,19 @@ test "--git-test owns a fixed real-child viewport and its own deterministic chil
     var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
     defer spec.deinit();
     try std.testing.expectEqualStrings(git_test_script, spec.argv[2]);
+}
+
+test "--ssh-test is documented, owns a fixed viewport and starts no local child" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--ssh-test" }, env.source());
+    const resolved = optionsForRun(parsed);
+    try std.testing.expect(parsed.run.ssh_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--ssh-test") != null);
+    try std.testing.expectEqual(ui_test_width, resolved.run.width);
+    try std.testing.expectEqual(ui_test_height, resolved.run.height);
+    try std.testing.expect(resolved.run.hidden);
+    try std.testing.expect(!wantsChild(resolved));
+    try std.testing.expect(usesDeterministicScratchpad(resolved));
 }
 
 test "--agent-test owns a fixed real-child viewport and its own deterministic child" {
@@ -24022,15 +25887,53 @@ test "a context that cannot forward this environment keeps the curated set" {
     for ([_]workspace.ExecutionContextKind{ .ssh, .wsl }) |context| {
         var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, inheriting_env.source(), context, options);
         defer spec.deinit();
-        try std.testing.expectEqual(@as(usize, 6), spec.env.len);
         try std.testing.expect(hasEntry(spec.env, "TERM=xterm-256color"));
         try std.testing.expect(hasEntry(spec.env, "COLORTERM=truecolor"));
         try std.testing.expect(hasEntry(spec.env, "TERM_PROGRAM=conduit"));
-        try std.testing.expect(hasEntry(spec.env, "PATH=" ++ ChildSpec.fallback_path));
-        try std.testing.expect(hasEntry(spec.env, "HOME=/"));
         try std.testing.expect(hasEntry(spec.env, "LANG=C.UTF-8"));
         try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, "CONDUIT_PROBE_VAR"));
         try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, "DISPLAY"));
+        switch (context) {
+            // The remote overlay: the remote host supplies its own PATH and
+            // HOME (decision-8), so this machine's never cross.
+            .ssh => {
+                try std.testing.expectEqual(@as(usize, 4), spec.env.len);
+                try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, "PATH"));
+                try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, "HOME"));
+            },
+            else => {
+                try std.testing.expectEqual(@as(usize, 6), spec.env.len);
+                try std.testing.expect(hasEntry(spec.env, "PATH=" ++ ChildSpec.fallback_path));
+                try std.testing.expect(hasEntry(spec.env, "HOME=/"));
+            },
+        }
+    }
+}
+
+test "an SSH session gets the remote overlay and the remote login shell; its local client inherits" {
+    var remote_spec = try ChildSpec.buildRemote(std.testing.allocator, inheriting_env.source());
+    defer remote_spec.deinit();
+    // An empty argv is the remote user's own login shell.
+    try std.testing.expectEqual(@as(usize, 0), remote_spec.argv.len);
+    try std.testing.expectEqual(@as(usize, 4), remote_spec.env.len);
+    for ([_][]const u8{ "TERM=xterm-256color", "COLORTERM=truecolor", "TERM_PROGRAM=conduit", "LANG=C.UTF-8" }) |wanted| {
+        try std.testing.expect(hasEntry(remote_spec.env, wanted));
+    }
+    // Nothing of this machine crosses: no socket, display or handshake.
+    for ([_][]const u8{ "PATH", "HOME", "SSH_AUTH_SOCK", "DISPLAY", "XDG_RUNTIME_DIR", "CONDUIT_PROBE_VAR", "ENV" }) |key| {
+        try std.testing.expectEqual(@as(usize, 0), countKey(remote_spec.env, key));
+    }
+
+    // The local `ssh` client is a Local child: the agent socket, display and
+    // the user's exports reach it, the exclusions do not.
+    var client = try ChildSpec.buildSshClient(std.testing.allocator, inheriting_env.source());
+    defer client.deinit();
+    try std.testing.expectEqual(@as(usize, 0), client.argv.len);
+    for ([_][]const u8{ "SSH_AUTH_SOCK=/run/user/1000/ssh", "DISPLAY=:99", "CONDUIT_PROBE_VAR=hello", "TERM=xterm-256color" }) |wanted| {
+        try std.testing.expect(hasEntry(client.env, wanted));
+    }
+    for (ChildSpec.inherited_exclusions) |key| {
+        try std.testing.expectEqual(@as(usize, 0), countKey(client.env, key));
     }
 }
 

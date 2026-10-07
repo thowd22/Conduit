@@ -136,8 +136,52 @@ nothing else is a legal dependency.
   `TERM_PROGRAM`). The driver endpoint and artifact directory reach the app only as flags, so the
   environment never names them; `conduit-test launch`'s isolated HOME/XDG_*/TMPDIR are the app's
   environment and therefore also the child's. SSH and WSL contexts cannot forward this machine's
-  environment, so they receive only the curated identity-plus-fallback set and their remote side
-  supplies the rest. The scratchpad and `--command`/check children use the same rule.
+  environment, so they receive only the curated set and their remote side supplies the rest. For
+  SSH that set is the *remote overlay* (`ChildSpec.buildRemote`): `TERM`, `COLORTERM`,
+  `TERM_PROGRAM` and the LANG fallback, never this machine's PATH or HOME, with an empty argv that
+  `ssh.sessionScript` turns into the remote user's login shell. The local `ssh` client itself is a
+  Local child: `ChildSpec.buildSshClient` gives it Conduit's inherited environment minus the
+  exclusions (`SSH_AUTH_SOCK`, `SSH_ASKPASS`, `DISPLAY`, `KRB5CCNAME` reach it). The scratchpad and
+  `--command`/check children use the same rule.
+- **SSH workspaces (TASK-43 part two, TASK-44, TASK-45).** `remote.connect` ("Remote: connect")
+  is a palette choice step whose list `rebuildRemoteChoices` rebuilds each time the palette opens:
+  concrete `Host` aliases of `~/.ssh/config` and of its `Include` files one level deep (read through
+  a Local `ExecutionContext`'s `readFile`, bounded, never a key or known-hosts file; parsing in
+  `src/remote.zig`), the `remote.profile` and `remote.recent` settings, and "Enter user@host…",
+  which chains to `remote.connect-address` (a free-text step validated by
+  `config.parseDestination`) and then `remote.save-profile` (`config.writeDocumentProfile`). This
+  is the one choice step that filters as the person types (a focused `palette.filter` `Input`
+  over `palette.fuzzyScore`; row ids keep each choice's own index). Connecting builds an
+  `ssh.SshContext` (local env from `buildSshClient`, control sockets under `$XDG_RUNTIME_DIR`, the
+  wake hook posting an SDL wake), a workspace named after the alias/profile/host with an empty
+  (remote home) cwd and a childless `Terminal 1`, plus a `connection` session whose PTY is
+  `masterTerminal()`, records the destination first in `remote.recent`, starts the master and
+  switches to it. Each `WorkspacePresentation` of an SSH workspace owns a `RemotePresentation`:
+  the borrowed context, the connection session id, the last applied state, the respawn queue, the
+  remote host name and its probe. `pollRemote` (every loop poll, and after the wake hook) calls
+  `SshContext.poll`. While the state is not `connected`, or on `remote.show-connection`, the
+  connection view replaces every pane: `syncGrid` lays out one layout entry for the connection
+  session below a header row (`workspace.<k>.connection`, `ssh <destination> ─ <state>`, with a
+  clickable `…connection.reconnect` or `…connection.hide`), keys and the pointer reach the
+  master's PTY exactly as for a pane, and the connection renderer lives in `pane_renderers` so
+  fonts, colours and invalidation reach it. OpenSSH's host-key, passphrase, password and 2FA
+  prompts are therefore what the person sees and answers; Conduit never reads them. The sidebar
+  row leads with `↕` (connecting), `⚠` (lost), `✗` (failed) or `○` (disconnected), nothing when
+  connected, and always registers a `workspace.<k>.ssh.<state>` `connection_state` element; the
+  `workspace.status` line names each transition. On `connected` a `HostProbe` worker runs
+  `uname -n` over an exec channel once, then the first tab's remote shell and the scratchpad's
+  start (`processFor` picks `remote_spec`); every attached child's terminal gets the host for OSC
+  7 (`term.Terminal.setWorkingDirectoryHost`), so remote shells' cwd reports are believed and
+  tabs, panes and file references snapshot them as for Local. On a later `connected` (after
+  `remote.reconnect`, which clears the connection terminal, rearms its output and calls
+  `SshContext.reconnect`), every session whose client ended as `ssh.sessionEnd(...) ==
+  .disconnected` is queued and respawned one at a time through the presentation's spawn slots at
+  its last OSC 7 cwd and under its own id (`Workspace.respawnRequest`/`replaceSessionChild`, and
+  `scratchpadRestartRequest`/`replaceScratchpad` for the scratchpad). Tab, pane, scratchpad
+  restart, file-reference and agent spawns are refused with a status line until the connection is
+  ready, because a client with no master would authenticate separately. `remote.disconnect` is
+  the non-blocking `SshContext.hangUp`; closing the workspace releases the record (joining the
+  probe) and the context's teardown hangs the master up without waiting.
 - **Tab actions.** User commands are `tab.new`, `tab.close`, `tab.rename`, `tab.previous`,
   `tab.next`, `tab.goto` and `tab.move`. Semantic pointer paths use `tab.activate` and
   `tab.reorder`; the overlays complete through `tab.rename.commit`/`tab.rename.cancel` and
@@ -754,8 +798,10 @@ nothing else is a legal dependency.
     directory, owned by the effective uid, mode exactly 0700, never a symlink. Socket names are
     `m<pid>-<serial>` (no hostnames or users), and the path must leave room in `sun_path` for
     OpenSSH's 17-byte temporary bind suffix.
-  - **Not yet.** Remote shell integration (`.auto` behaves as `.off`: no remote OSC 7 or prompt
-    marks) and the connection session kind, sidebar state and `--ssh-test` (part two). On macOS
+  - **Not yet.** Remote shell integration (`.auto` behaves as `.off`: Conduit installs no remote
+    script, so a remote OSC 7 comes only from the user's own shell configuration). The app half
+    (connection session, sidebar state, reconnect, `--ssh-test`) is described under `app`;
+    `hangUp()` is the non-blocking `disconnect()` the render thread uses. On macOS
     (the same design, but its control-directory checks are not written) and Windows (no
     ControlMaster) `create` reports `error.Unsupported`. Threads: the master PTY, `connect`, `poll`,
     `disconnect`, `reconnect`, `masterTerminal` and destruction are owner-thread only; `spawn`,
@@ -818,8 +864,11 @@ nothing else is a legal dependency.
 ### `session`
 
 - **Owns** one live terminal: its stable terminal allocation, optional attached PTY, explicit kind
-  (`human_terminal`, `scratchpad` or `agent_terminal`), and the rule that it outlives its view
-  (CONDUIT.md §13).
+  (`human_terminal`, `scratchpad`, `agent_terminal` or `connection`), and the rule that it
+  outlives its view (CONDUIT.md §13). A `connection` session presents an SSH workspace's master
+  (TASK-43): `workspace` reserves it like the scratchpad (never a tab, pane, agent or control
+  target, never restartable there), and `rearmChildOutput` services it again after the context
+  starts a new master behind the same PTY view.
 - **Never** stop the PTY because a tab, pane or the scratchpad is hidden; hiding is never
   termination (P8, invariant 6). Never spawn a process or own layout; `workspace` spawns through
   its context and transfers the returned PTY into a starting session on the owner thread.
@@ -1725,7 +1774,7 @@ inside the same event loop, so the main thread is that render/UI thread.
 | Font discovery and file loading | `font`, off-thread | discovered faces handed to the main thread **(d)** |
 | Agent harness IO | `agent` adapters, one IO worker per launched agent (`app_agents.Runner`) | the worker alone calls its adapter's `attach`/`poll` and pushes into that agent's `EventQueue`; the spawn worker runs `Runner.prepare` before the poll worker exists; `App.pollAgents` drains on the main thread and wakes the loop through the driver wake |
 | Harness detection, OS notifications | `app_agents`, short-lived workers | detection borrows the workspace context (joined before the workspace goes) and publishes versions behind an atomic `done`; an OS notification worker owns copies of its text and only runs `platform.notify` |
-| SSH transport | `workspace`'s ExecutionContext, off-thread | decision-8: the system OpenSSH client in Conduit-owned PTYs and pipes, one ControlMaster per SSH workspace on Linux/macOS; TASK-43 implements it |
+| SSH transport | `workspace`'s ExecutionContext, off-thread | decision-8: the system OpenSSH client in Conduit-owned PTYs and pipes, one ControlMaster per SSH workspace on Linux/macOS; the master PTY and `connect`/`poll`/`hangUp`/`reconnect` stay on the main thread, sessions spawn on the presentation's spawn workers, the one-shot `HostProbe` worker borrows the context's `run` and publishes the remote host name behind an atomic flag, and a worker that finds the master gone sets the context's flag and posts an SDL wake |
 | Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)**; a context `WatchHandle` has no thread and is polled by the `Project` owner |
 | Backlog CLI writes | `backlog.Cli`, worker thread | `ExecutionContext.run` waits for the bounded child; the CLI's file edits return through `Project.poll` |
 | Control API sockets, framing, token resolution | `control.Server`: one listener thread plus one thread per client connection (bounded) | each connection validates a request, submits it with its parse arena to the mutex-guarded `control.Queue`, wakes the owner through `Waker`, and waits for the reply with a deadline (`TimedOut` after it); the owner thread calls `service`, performs each request through the `Handler` vtable, and answers now or later through `complete`; a request the client gave up on is released by the owner's late answer |
@@ -1859,11 +1908,11 @@ Which level proves what, by concern:
 
 Rules that apply to all levels:
 
-- The twenty-three verified Linux headless app checks are `--grid-test`, `--self-test`,
+- The twenty-four verified Linux headless app checks are `--grid-test`, `--self-test`,
   `--scroll-test`, `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`,
   `--sidebar-test`, `--tabs-test`, `--panes-test`, `--palette-test`, `--scratchpad-test`,
   `--workspaces-test`, `--links-test`, `--search-test`, `--menu-test`, `--config-test`,
-  `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test` and
+  `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test` and
   `--driver-test`; the scripted `zig build e2e` runner has fifteen scenarios, the latest being
   `font-coverage`, `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch` and
   `agent-notifications`. Real-window checks use
@@ -1924,6 +1973,22 @@ Rules that apply to all levels:
   clicks both semantic controls. Its final frame captures the bordered 90-percent bottom dock with
   `scratchpad.restart` and `scratchpad.hide`. Native macOS and Windows scratchpad input and
   rendering remain runtime-unverified.
+- TASK-43/44/45's `--ssh-test` (skipped with exit 0 when Docker or the `test/fixtures/ssh` image
+  is unavailable) starts the throwaway sshd container, generates a passphrase key in a private
+  `/tmp/conduit-ssh-test-*` directory (an isolated `home/.ssh/config` with an alias, an `Include`
+  and a private `known_hosts`, passed to `ssh -F`; never the user's `~/.ssh`), and appends an OSC 7
+  prompt hook to the container user's `.bashrc` as a stand-in for the unbuilt remote shell
+  integration. Through real SDL input it opens Remote: connect, proves the alias and the included
+  host are listed and that typing filters fuzzily, connects, answers OpenSSH's host-key and
+  passphrase prompts in the connection view, waits for `workspace.<k>.ssh.connected`, proves the
+  first tab, a keyboard split, a mouse-made tab and the scratchpad are remote shells in the
+  originating session's remote cwd, that the scratchpad survives hide/show, kills sshd's
+  per-connection processes (the listener stays, standing in for a server coming back) and proves
+  the `⚠` glyph, `…ssh.lost` and the connection view's `reconnect`, clicks it, answers the new
+  passphrase prompt and proves all four sessions are respawned under their ids in their last cwds,
+  then connects ad hoc to `conduit@127.0.0.1:<port>`, saves it as a profile and finds the profile
+  in the list. With `--screenshot=<path>` it also writes `<stem>-prompt.png`, `-connected.png` and
+  `-lost.png`. No `zig build e2e` scenario exists for SSH: the runner has no sshd.
 - TASK-25's six checked-in `zig build e2e` scenarios create isolated `conduit-test` runs for
   prompt, command/output, Input-copy/terminal-paste, terminal-link, file-reference and context-menu
   paths, report each result,
