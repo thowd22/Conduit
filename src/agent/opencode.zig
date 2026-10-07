@@ -44,9 +44,10 @@
 //! those shapes, not recorded.
 //!
 //! Gaps (also in docs/architecture.md):
-//!   - `detect` is unsupported: `ExecutionContext` cannot yet run a probe
-//!     command and capture its output. TODO(TASK-78): run `opencode --version`
-//!     through the context once it gains a run/capture capability.
+//!   - `detect` runs `opencode --version` through the workspace's
+//!     ExecutionContext (so it works wherever the context can run commands)
+//!     and reads the version from stdout. The output format of `--version`
+//!     was not observed; the parser takes the last word of the first line.
 //!   - The server is reached at 127.0.0.1 only, so the structured channel is
 //!     Local-only. In SSH and WSL workspaces `launch` starts the plain TUI and
 //!     the agent stays on the PTY baseline until the ExecutionContext can
@@ -86,6 +87,7 @@ const agent_adapter = @import("adapter.zig");
 const event = @import("event.zig");
 const state_model = @import("state.zig");
 const Harness = @import("harness.zig").Harness;
+const workspace = @import("workspace");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -103,6 +105,12 @@ pub const max_response_bytes = 4 * 1024 * 1024;
 pub const max_pending_permissions = 16;
 /// How many child sessions (subagents) are tracked at once.
 pub const max_children = 16;
+
+/// Bounds on the `--version` probe.
+pub const detect_timeout_ms = 5000;
+pub const detect_max_output = 4096;
+/// The longest version string `detect` accepts.
+pub const max_version_bytes = 64;
 
 const io_buffer_bytes = 64 * 1024;
 const backlog_capacity = 64;
@@ -1166,9 +1174,7 @@ pub const OpenCodeAdapter = struct {
     const vtable: agent_adapter.Adapter.VTable = .{
         .harness = harnessOf,
         .capabilities = capabilitiesOf,
-        // TODO(TASK-78): detect through the ExecutionContext once it can run
-        // `opencode --version` and capture the output.
-        .detect = null,
+        .detect = detect,
         .launch = launch,
         .attach = attach,
         .poll = poll,
@@ -1188,11 +1194,42 @@ pub const OpenCodeAdapter = struct {
         return .opencode;
     }
 
+    /// `opencode --version` through the request's context, bounded to
+    /// `detect_timeout_ms` and `detect_max_output`. Not installed (the command
+    /// is missing, or a remote shell's 127) is null; a context that cannot run
+    /// commands is `Unsupported`.
+    fn detect(ptr: *anyopaque, request: agent_adapter.DetectRequest) agent_adapter.Error!?[]const u8 {
+        const self = cast(ptr);
+        var result = request.context.run(self.allocator, self.io, .{
+            .argv = &.{ self.options.executable, "--version" },
+            .cwd = self.directory orelse "/",
+            .max_output = detect_max_output,
+            .timeout_ms = detect_timeout_ms,
+        }) catch |err| switch (err) {
+            error.CommandNotFound => return null,
+            error.Unsupported => return error.Unsupported,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unavailable => return error.Disconnected,
+            error.AccessDenied, error.InvalidRequest, error.Timeout, error.OutputTooLarge, error.SpawnFailed => {
+                log.debug("version probe failed: {s}", .{@errorName(err)});
+                return error.Protocol;
+            },
+        };
+        defer result.deinit(self.allocator);
+        if (result.exit_code) |code| if (code == 127) return null;
+        if (!result.succeeded()) return error.Protocol;
+        const version = parseVersion(result.stdout) orelse return error.Protocol;
+        if (version.len > request.version_buffer.len) return error.NoSpaceLeft;
+        const out = request.version_buffer[0..version.len];
+        @memcpy(out, version);
+        return out;
+    }
+
     /// Launch, attach and poll always; everything structured only while the
     /// event stream is live, so a view shows the PTY baseline otherwise.
     fn capabilitiesOf(ptr: *const anyopaque) agent_adapter.Capabilities {
         const self: *const OpenCodeAdapter = @ptrCast(@alignCast(ptr));
-        var caps: agent_adapter.Capabilities = .{ .launch = true, .attach = true, .poll = true };
+        var caps: agent_adapter.Capabilities = .{ .detect = true, .launch = true, .attach = true, .poll = true };
         if (self.connected.load(.acquire)) {
             caps.send_input = true;
             caps.respond_permission = true;
@@ -1645,6 +1682,27 @@ pub const OpenCodeAdapter = struct {
     }
 };
 
+/// The version in `opencode --version` output: the last word of the first
+/// non-empty line (so both `1.18.35` and `opencode 1.18.35` work), without a
+/// leading `v`. Untrusted output: anything that is not a short run of
+/// version characters is null.
+pub fn parseVersion(stdout: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeAny(u8, stdout, "\r\n");
+    const line = std.mem.trim(u8, lines.next() orelse return null, " \t");
+    var words = std.mem.tokenizeAny(u8, line, " \t");
+    var last: ?[]const u8 = null;
+    while (words.next()) |word| last = word;
+    var version = last orelse return null;
+    if (version.len > 1 and version[0] == 'v') version = version[1..];
+    if (version.len == 0 or version.len > max_version_bytes) return null;
+    if (!std.ascii.isDigit(version[0])) return null;
+    for (version) |c| switch (c) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '.', '-', '+' => {},
+        else => return null,
+    };
+    return version;
+}
+
 fn checkStatus(status: u16) agent_adapter.Error!void {
     if (status >= 200 and status < 300) return;
     if (status == 404) return error.UnknownTarget;
@@ -2087,7 +2145,6 @@ test "an unreachable server leaves the PTY baseline and retries with backoff" {
     try testing.expect(!caps.structured_status and !caps.permission_requests and !caps.transcript);
     try testing.expectError(error.Unsupported, a.sendInput("hi"));
     try testing.expectError(error.Unsupported, a.stop());
-    try testing.expectError(error.Unsupported, a.detect(undefined));
     // Requests made anyway (a stale view) report the server as gone.
     try testing.expectError(error.Disconnected, OpenCodeAdapter.respondPermission(&oc, "per_1", "once"));
 }
@@ -2187,6 +2244,111 @@ test "history replays a session's messages as transcript events once" {
     try oc.mapHistory(arena_state.allocator(), body);
     try testing.expectEqual(@as(usize, 0), oc.backlog.len);
     try testing.expectError(error.Protocol, oc.mapHistory(arena_state.allocator(), "{\"nope\":1}"));
+}
+
+/// An ExecutionContext whose `run` returns one scripted outcome and records
+/// the request.
+const ScriptedRunContext = struct {
+    outcome: union(enum) {
+        result: struct { exit_code: ?u8, stdout: []const u8 = "" },
+        fail: workspace.RunError,
+    },
+    argv: [4][]const u8 = undefined,
+    argc: usize = 0,
+    cwd: []const u8 = "",
+    timeout_ms: u32 = 0,
+    runs: usize = 0,
+
+    const vtable: workspace.ExecutionContext.VTable = .{
+        .spawn = spawn,
+        .kind = kind,
+        .destroy = destroy,
+        .run = run,
+    };
+
+    fn ref(self: *ScriptedRunContext) workspace.ExecutionContext.Ref {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    // `agent` does not import `pty`; the spawn entry's types come from the
+    // vtable's own function type.
+    const spawn_fn = @typeInfo(@typeInfo(workspace.ExecutionContext.SpawnFn).pointer.child).@"fn";
+
+    fn spawn(_: *anyopaque, _: spawn_fn.params[1].type.?) spawn_fn.return_type.? {
+        return error.SystemError;
+    }
+
+    fn kind(_: *const anyopaque) workspace.ExecutionContextKind {
+        return .ssh;
+    }
+
+    fn destroy(_: *anyopaque) void {}
+
+    fn run(ptr: *anyopaque, allocator: Allocator, _: Io, request: workspace.RunRequest) workspace.RunError!workspace.RunResult {
+        const self: *ScriptedRunContext = @ptrCast(@alignCast(ptr));
+        self.runs += 1;
+        // The request's slices live for the call; the test reads only
+        // string literals the adapter passed.
+        self.argc = @min(request.argv.len, self.argv.len);
+        @memcpy(self.argv[0..self.argc], request.argv[0..self.argc]);
+        self.cwd = request.cwd;
+        self.timeout_ms = request.timeout_ms;
+        switch (self.outcome) {
+            .fail => |err| return err,
+            .result => |r| {
+                const stdout = try allocator.dupe(u8, r.stdout);
+                errdefer allocator.free(stdout);
+                return .{ .exit_code = r.exit_code, .stdout = stdout, .stderr = try allocator.dupe(u8, "") };
+            },
+        }
+    }
+};
+
+test "detect runs opencode --version through the context and parses the version" {
+    var scripted: ScriptedTransport = .{ .script = "" };
+    defer scripted.written.deinit(testing.allocator);
+    var oc = try OpenCodeAdapter.init(testing.allocator, testing.io, .{ .port = 4096, .transport = scripted.transport() });
+    defer oc.deinit();
+    const a = oc.adapter();
+    try testing.expect(a.capabilities().detect);
+    var version: [max_version_bytes]u8 = undefined;
+
+    var installed: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "1.18.35\n" } } };
+    try testing.expectEqualStrings("1.18.35", (try a.detect(.{ .context = installed.ref(), .version_buffer = &version })).?);
+    try testing.expectEqual(@as(usize, 2), installed.argc);
+    try testing.expectEqualStrings("opencode", installed.argv[0]);
+    try testing.expectEqualStrings("--version", installed.argv[1]);
+    try testing.expectEqualStrings("/", installed.cwd);
+    try testing.expectEqual(@as(u32, detect_timeout_ms), installed.timeout_ms);
+
+    var missing: ScriptedRunContext = .{ .outcome = .{ .fail = error.CommandNotFound } };
+    try testing.expect((try a.detect(.{ .context = missing.ref(), .version_buffer = &version })) == null);
+    var shell_missing: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 127 } } };
+    try testing.expect((try a.detect(.{ .context = shell_missing.ref(), .version_buffer = &version })) == null);
+
+    var cannot_run: ScriptedRunContext = .{ .outcome = .{ .fail = error.Unsupported } };
+    try testing.expectError(error.Unsupported, a.detect(.{ .context = cannot_run.ref(), .version_buffer = &version }));
+    var slow: ScriptedRunContext = .{ .outcome = .{ .fail = error.Timeout } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = slow.ref(), .version_buffer = &version }));
+    var failing: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 1, .stdout = "1.0.0\n" } } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = failing.ref(), .version_buffer = &version }));
+    var junk: ScriptedRunContext = .{ .outcome = .{ .result = .{ .exit_code = 0, .stdout = "\x1b[31m!!\n" } } };
+    try testing.expectError(error.Protocol, a.detect(.{ .context = junk.ref(), .version_buffer = &version }));
+    var tiny: [3]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, a.detect(.{ .context = installed.ref(), .version_buffer = &tiny }));
+
+    // Launch remembered the cwd; later probes run there.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    _ = try a.launch(arena_state.allocator(), .{ .context_kind = .local, .cwd = "/work", .token = agent_adapter.CorrelationToken.fromBytes(@splat(1)) });
+    _ = try a.detect(.{ .context = installed.ref(), .version_buffer = &version });
+    try testing.expectEqualStrings("/work", installed.cwd);
+
+    try testing.expectEqualStrings("1.18.35", parseVersion("opencode 1.18.35\nextra\n").?);
+    try testing.expectEqualStrings("0.3.0-beta.1+abc", parseVersion("\r\n  v0.3.0-beta.1+abc  \r\n").?);
+    for ([_][]const u8{ "", "\n\n", "opencode\n", "v\n", "1.0;rm\n", "1" ** (max_version_bytes + 1) }) |bad| {
+        try testing.expect(parseVersion(bad) == null);
+    }
 }
 
 // The fake OpenCode server: real TCP on 127.0.0.1, scripted from fixtures.
