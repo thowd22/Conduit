@@ -310,9 +310,13 @@ pub const Run = struct {
     /// metrics, ligatures, built-in symbols, fallbacks and the family picker's
     /// preview, revert and saved choice through real SDL events, then exit.
     font_test: bool = false,
+    /// Exercise the settings view: opened from the palette and by its chord,
+    /// every editor kind by keyboard and mouse with file readback, keybinding
+    /// capture and conflicts, the raw-file row and modal isolation, then exit.
+    settings_test: bool = false,
     /// The settings file to load and watch instead of the platform location.
     /// Not a command-line flag: `runApp` sets it for `--config-test`,
-    /// `--theme-test` and `--font-test`, which
+    /// `--theme-test`, `--font-test` and `--settings-test`, which
     /// writes into a private directory. Null means the platform location for
     /// an ordinary run and no file at all for every other built-in check, so
     /// a user's settings never change what a check measures.
@@ -409,7 +413,7 @@ fn optionsForRun(options: Options) Options {
         !options.run.scratchpad_test and !options.run.palette_test and
         !options.run.workspaces_test and !options.run.links_test and
         !options.run.search_test and !options.run.menu_test and !options.run.config_test and
-        !options.run.theme_test and !options.run.font_test) return options;
+        !options.run.theme_test and !options.run.font_test and !options.run.settings_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -551,6 +555,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.config_test = true;
         } else if (std.mem.eql(u8, arg, "--theme-test")) {
             run.theme_test = true;
+        } else if (std.mem.eql(u8, arg, "--settings-test")) {
+            run.settings_test = true;
         } else if (std.mem.eql(u8, arg, "--font-test")) {
             run.font_test = true;
         } else if (namesValue(arg, "--right-click")) {
@@ -1455,6 +1461,8 @@ const ChildSpec = struct {
             theme_test_script
         else if (options.run.font_test)
             font_test_script
+        else if (options.run.settings_test)
+            settings_test_script
         else
             options.run.command;
         const shell: ?[]const u8 = if (command) |line| blk: {
@@ -1718,7 +1726,7 @@ fn wantsChild(options: Options) bool {
     if (options.run.clipboard_test or options.run.ime_test or options.run.tabs_test or
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
         options.run.links_test or options.run.search_test or options.run.menu_test or
-        options.run.config_test or options.run.theme_test or options.run.font_test) return true;
+        options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test) return true;
     return !options.run.no_child and !options.run.self_test and !options.run.grid_test and
         !options.run.scroll_test and !options.run.mouse_test and !options.run.ui_test and
         !options.run.sidebar_test;
@@ -1734,7 +1742,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.clipboard_test or run.ui_test or run.ime_test or run.sidebar_test or
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
-        run.config_test or run.theme_test or run.font_test or run.driver_test;
+        run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -1821,9 +1829,93 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 58;
+const action_capacity_base: usize = 60;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
+const settings_open_action = "settings.open";
+const settings_activate_action = "settings.activate";
+
+/// How one setting row is edited (TASK-41).
+const SettingsEdit = enum {
+    /// `true`/`false`: Enter, a click, Left or Right flips it.
+    toggle,
+    /// A two-value enum: Enter, a click, Left or Right moves to the other value.
+    cycle,
+    /// A long fixed list: the existing palette chooser opens.
+    choose,
+    /// A bounded number: an inline Input, or Left/Right step by one.
+    number,
+    /// Free text: an inline Input.
+    text,
+};
+
+/// One editable `config.Key` row of the settings view. `id` is static so the
+/// semantic tree can borrow it for the run.
+const SettingsField = struct {
+    key: config.Key,
+    id: []const u8,
+    edit: SettingsEdit,
+};
+
+fn settingsField(comptime key: config.Key, edit: SettingsEdit) SettingsField {
+    return .{ .key = key, .id = "settings.row." ++ comptime key.name(), .edit = edit };
+}
+
+/// The settings view's groups, in display order. Keys are listed between
+/// Fonts and Scratchpad, one row per bindable command.
+const settings_appearance_fields = [_]SettingsField{settingsField(.theme, .choose)};
+const settings_font_fields = [_]SettingsField{
+    settingsField(.font_family, .choose),
+    settingsField(.font_bold, .text),
+    settingsField(.font_italic, .text),
+    settingsField(.font_bold_italic, .text),
+    settingsField(.font_size, .number),
+    settingsField(.font_ligatures, .toggle),
+    settingsField(.font_nerd_symbols, .toggle),
+    settingsField(.font_fallbacks, .text),
+};
+const settings_scratchpad_fields = [_]SettingsField{
+    settingsField(.scratchpad_size, .number),
+    settingsField(.scratchpad_large_size, .number),
+};
+const settings_mouse_fields = [_]SettingsField{settingsField(.mouse_right_click, .cycle)};
+
+/// One line of the settings list: a group heading (`Text`), a setting, a
+/// command's keybinding, or the raw-file row (each an `InteractiveText`).
+const SettingsRow = union(enum) {
+    heading: struct { id: []const u8, label: []const u8 },
+    field: SettingsField,
+    /// The registry index of the command whose chords the row edits, and the
+    /// row's id, formatted into `App.settings_row_ids` when the rows are built.
+    keybind: struct { definition: usize, id: []const u8 },
+    raw,
+};
+
+/// What keys mean in the settings view right now.
+const SettingsMode = enum {
+    /// Up/Down move the highlight; Enter or Left/Right edit the row.
+    browse,
+    /// The inline `settings.input` holds a value being typed.
+    edit,
+    /// The next real key press is the chord for the highlighted command.
+    capture,
+    /// The captured chord belongs to another command; Enter takes it.
+    conflict,
+};
+
+/// Every settings row: headings, the fields, every bindable command and the raw row.
+const settings_row_capacity: usize = 5 + settings_appearance_fields.len + settings_font_fields.len +
+    settings_scratchpad_fields.len + settings_mouse_fields.len + action_capacity_base + 1;
+/// The most list rows one frame registers; the list scrolls past this.
+const settings_visible_capacity: usize = 48;
+const settings_semantic_capacity: usize = 96;
+const settings_label_capacity: usize = 192;
+/// Value columns reserved when the dialog is measured, so a longer value
+/// (a theme or family name) does not resize the dialog under the pointer.
+const settings_value_cells: u32 = 26;
+const settings_raw_label = "Open config file";
+const settings_hint = "Enter edit  ←→ change  Esc close";
+const settings_capture_text = "press a chord…";
 
 const sidebar_default_width: u16 = 24;
 const sidebar_min_width: u16 = 12;
@@ -1842,7 +1934,7 @@ const search_scratch_capacity: usize = 1024 * 1024;
 const search_tick_budget: usize = 4;
 const search_candidate_budget: usize = 32;
 const semantic_element_capacity: usize = sidebar_element_capacity + terminal_link_capacity +
-    search_highlight_capacity + 13;
+    search_highlight_capacity + 13 + settings_visible_capacity + 4;
 const pane_ui_capacity: usize = 64;
 const tab_name_capacity: usize = 256;
 const palette_input_capacity: usize = 256;
@@ -3643,6 +3735,29 @@ const App = struct {
     /// palette opens so the dialog never clips a row the window can show.
     palette_content_width: u32 = 0,
     palette_pointer_owned: bool = false,
+    /// The settings view (TASK-41): a modal overlay like the palette. Its rows
+    /// are rebuilt from the registry each time it opens. Main thread.
+    settings_visible: bool = false,
+    settings_rows: [settings_row_capacity]SettingsRow = undefined,
+    settings_row_count: usize = 0,
+    /// The highlighted row; never a heading.
+    settings_selected: usize = 0,
+    /// The first list row on screen.
+    settings_scroll: usize = 0,
+    settings_mode: SettingsMode = .browse,
+    /// The inline value editor. Owned; its text is copied out on commit.
+    settings_input: ui.Input,
+    /// The chord a conflicting capture is waiting to take, while `.conflict`.
+    settings_pending_chord: ?inputmod.Chord = null,
+    /// A rejected value or chord, shown as `settings.error` until the next edit.
+    settings_error_storage: [config_error_capacity]u8 = undefined,
+    settings_error_len: usize = 0,
+    settings_content_width: u32 = 0,
+    settings_pointer_owned: bool = false,
+    /// Keybind row ids by row index: the rows are rebuilt identically on every
+    /// opening, so an id's bytes never change while the tree may hold them.
+    settings_row_ids: [settings_row_capacity][settings_semantic_capacity]u8 = undefined,
+    settings_row_labels: [settings_visible_capacity][settings_label_capacity]u8 = undefined,
     /// The `mouse.right_click` setting resolved through `config.Layer` at
     /// startup: the built-in `menu` unless `--right-click=` supplied a
     /// session value. Owned by the main thread with every other UI state.
@@ -4393,6 +4508,17 @@ const App = struct {
                 .prompt = "Fallback families, comma-separated (none clears)",
             } } },
         });
+        try actions.register(.{
+            .name = settings_open_action,
+            .label = "Settings",
+            .handler = settingsOpenAction,
+        });
+        try actions.register(.{
+            .name = settings_activate_action,
+            .label = "Activate settings row",
+            .handler = settingsActivateAction,
+            .palette = null,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -4418,6 +4544,8 @@ const App = struct {
         errdefer palette_argument.deinit();
         var search_query = try ui.Input.init(allocator, term.max_search_needle_bytes, "");
         errdefer search_query.deinit();
+        var settings_input = try ui.Input.init(allocator, config.max_string_bytes, "");
+        errdefer settings_input.deinit();
 
         var spec: ChildSpec = .{ .allocator = allocator, .argv = &.{}, .env = &.{} };
         errdefer spec.deinit();
@@ -4486,6 +4614,7 @@ const App = struct {
             .palette_query = palette_query,
             .palette_argument = palette_argument,
             .search_query = search_query,
+            .settings_input = settings_input,
             .right_click = config.Layer.resolve(config.RightClick, config.RightClick.built_in, loaded_config.settings.right_click, options.run.right_click),
             .session_right_click = options.run.right_click,
             .session_font_family = session_font_family,
@@ -4630,6 +4759,7 @@ const App = struct {
         self.stopSearchEngine();
         if (self.rename_input) |*field| field.deinit();
         self.search_query.deinit();
+        self.settings_input.deinit();
         self.palette_argument.deinit();
         self.palette_query.deinit();
         self.palette_model.deinit();
@@ -5374,7 +5504,7 @@ const App = struct {
     /// semantic frame and is copied before that frame is rebuilt. Nothing
     /// opens over another modal surface or while a gesture is in flight.
     fn openContextMenu(self: *App, col: u32, row: u32, link_id: ?[]const u8) !void {
-        if (self.contextMenuVisible() or self.paletteVisible() or self.closeModalActive() or
+        if (self.contextMenuVisible() or self.paletteVisible() or self.settingsVisible() or self.closeModalActive() or
             self.rename_tab_id != null or self.search_visible or self.scratchpadVisible() or
             self.ui_pointer_owned or self.sidebar_dragging or self.dragged_divider_id != null or
             self.dragged_tab_id != null) return;
@@ -6877,7 +7007,7 @@ const App = struct {
         try self.composeSearchBar();
 
         const text = self.composition.preedit();
-        if (!self.paletteVisible() and !self.search_visible and text.len != 0 and std.unicode.utf8ValidateSlice(text)) {
+        if (!self.paletteVisible() and !self.settingsVisible() and !self.search_visible and text.len != 0 and std.unicode.utf8ValidateSlice(text)) {
             if (self.presentedLive().terminal().cursor().position) |cursor| {
                 if (self.presentedCellRect()) |presented_rect| {
                     const presented_right = presented_rect.right();
@@ -6952,6 +7082,7 @@ const App = struct {
             });
         }
         if (self.paletteVisible()) try self.composePalette();
+        if (self.settingsVisible()) try self.composeSettings();
         if (self.contextMenuVisible()) try self.composeContextMenu();
         if (self.closeModalActive()) {
             const modal_width = @min(canvas_bounds.width, @as(u32, 42));
@@ -7420,6 +7551,13 @@ const App = struct {
         // the scratchpad must not let the scratchpad's Escape fast path steal
         // the matching release and strand an ownership record.
         if (try self.routeOwnedUiKey(key)) return;
+        // The settings view owns every key press before any binding sees it,
+        // so a chord being captured never runs its current action. A release
+        // of a key the terminal saw pressed still reaches the terminal.
+        if (self.settingsVisible()) {
+            const terminal_owned = if (uiKeyIdentity(key)) |identity| self.terminal_key_state.indexOf(identity) != null else false;
+            if (key.action == .press or !terminal_owned) return self.onSettingsKey(key);
+        }
         if (try self.routeSearchKey(key)) return;
         if (!self.paletteVisible() and self.scratchpad_escape_owned and key.key == .escape) {
             if (key.key == .escape and key.action == .release) self.scratchpad_escape_owned = false;
@@ -9644,12 +9782,817 @@ const App = struct {
         return std.fmt.parseUnsigned(usize, suffix[0..separator], 10) catch null;
     }
 
+    // -----------------------------------------------------------------
+    // The settings view (TASK-41)
+    // -----------------------------------------------------------------
+
+    fn settingsVisible(self: *const App) bool {
+        return self.settings_visible;
+    }
+
+    /// Whether `definition` gets a Keys row: the palette itself and every
+    /// palette command that takes no argument. A command with an argument is
+    /// bound in the file as `<chord>=<action>:<argument>`.
+    fn settingsBindable(definition: *const inputmod.ActionDefinition) bool {
+        if (std.mem.eql(u8, definition.name, palette_open_action)) return true;
+        const command = definition.palette orelse return false;
+        return command.argument == .none;
+    }
+
+    /// Rebuild the row list from the fixed groups and the registry. The same
+    /// registry yields the same rows and ids on every opening.
+    fn buildSettingsRows(self: *App) void {
+        var count: usize = 0;
+        const rows = &self.settings_rows;
+        rows[count] = .{ .heading = .{ .id = "settings.heading.appearance", .label = "Appearance" } };
+        count += 1;
+        for (settings_appearance_fields) |field| {
+            rows[count] = .{ .field = field };
+            count += 1;
+        }
+        rows[count] = .{ .heading = .{ .id = "settings.heading.fonts", .label = "Fonts" } };
+        count += 1;
+        for (settings_font_fields) |field| {
+            rows[count] = .{ .field = field };
+            count += 1;
+        }
+        rows[count] = .{ .heading = .{ .id = "settings.heading.keys", .label = "Keys" } };
+        count += 1;
+        const reserved = 4 + settings_scratchpad_fields.len + settings_mouse_fields.len;
+        for (self.actions.definitions(), 0..) |*definition, definition_index| {
+            if (!settingsBindable(definition)) continue;
+            if (count + reserved >= rows.len) break;
+            const id = std.fmt.bufPrint(&self.settings_row_ids[count], "settings.row.keybind.{s}", .{definition.name}) catch continue;
+            rows[count] = .{ .keybind = .{ .definition = definition_index, .id = id } };
+            count += 1;
+        }
+        rows[count] = .{ .heading = .{ .id = "settings.heading.scratchpad", .label = "Scratchpad" } };
+        count += 1;
+        for (settings_scratchpad_fields) |field| {
+            rows[count] = .{ .field = field };
+            count += 1;
+        }
+        rows[count] = .{ .heading = .{ .id = "settings.heading.mouse", .label = "Mouse" } };
+        count += 1;
+        for (settings_mouse_fields) |field| {
+            rows[count] = .{ .field = field };
+            count += 1;
+        }
+        rows[count] = .raw;
+        count += 1;
+        self.settings_row_count = count;
+    }
+
+    fn settingsRowId(self: *const App, index: usize) []const u8 {
+        return switch (self.settings_rows[index]) {
+            .heading => |heading| heading.id,
+            .field => |field| field.id,
+            .keybind => |keybind| keybind.id,
+            .raw => "settings.raw",
+        };
+    }
+
+    fn settingsRowIndex(self: *const App, id: []const u8) ?usize {
+        for (0..self.settings_row_count) |index| {
+            if (std.mem.eql(u8, self.settingsRowId(index), id)) return index;
+        }
+        return null;
+    }
+
+    fn settingsSelectedField(self: *const App) ?SettingsField {
+        if (self.settings_selected >= self.settings_row_count) return null;
+        return switch (self.settings_rows[self.settings_selected]) {
+            .field => |field| field,
+            else => null,
+        };
+    }
+
+    fn settingsSelectedKeybind(self: *const App) ?*const inputmod.ActionDefinition {
+        if (self.settings_selected >= self.settings_row_count) return null;
+        return switch (self.settings_rows[self.settings_selected]) {
+            .keybind => |keybind| &self.actions.definitions()[keybind.definition],
+            else => null,
+        };
+    }
+
+    /// What a setting row shows as its value: the value in effect, through
+    /// every layer, so the row agrees with the window.
+    fn settingsValueText(self: *const App, key: config.Key, buffer: []u8) []const u8 {
+        const values = self.font_settings.values;
+        return switch (key) {
+            .theme => self.activeThemeName(),
+            .font_family => if (values.family.len == 0) bundled_font_label else values.family,
+            .font_bold => if (values.bold.len == 0) "(derived)" else values.bold,
+            .font_italic => if (values.italic.len == 0) "(derived)" else values.italic,
+            .font_bold_italic => if (values.bold_italic.len == 0) "(derived)" else values.bold_italic,
+            .font_size => std.fmt.bufPrint(buffer, "{d}", .{values.points}) catch "",
+            .font_ligatures => if (values.ligatures) "true" else "false",
+            .font_nerd_symbols => if (values.builtin_symbols) "true" else "false",
+            .font_fallbacks => if (values.fallbacks.len == 0) "(none)" else config.formatFallbacks(buffer, values.fallbacks) catch "…",
+            .scratchpad_size => std.fmt.bufPrint(buffer, "{d}%", .{self.scratchpad_percent_small}) catch "",
+            .scratchpad_large_size => std.fmt.bufPrint(buffer, "{d}%", .{self.scratchpad_percent_large}) catch "",
+            .mouse_right_click => self.right_click.text(),
+            .keybind => "",
+        };
+    }
+
+    /// The text the inline Input starts with: the value as the file would
+    /// spell it, empty where the row shows a derived or absent value.
+    fn settingsEditText(self: *const App, key: config.Key, buffer: []u8) []const u8 {
+        const values = self.font_settings.values;
+        return switch (key) {
+            .font_bold => values.bold,
+            .font_italic => values.italic,
+            .font_bold_italic => values.bold_italic,
+            .font_fallbacks => config.formatFallbacks(buffer, values.fallbacks) catch "",
+            .font_size => std.fmt.bufPrint(buffer, "{d}", .{values.points}) catch "",
+            .scratchpad_size => std.fmt.bufPrint(buffer, "{d}", .{self.scratchpad_percent_small}) catch "",
+            .scratchpad_large_size => std.fmt.bufPrint(buffer, "{d}", .{self.scratchpad_percent_large}) catch "",
+            else => self.settingsValueText(key, buffer),
+        };
+    }
+
+    /// Whether the settings file sets the row: `config` records the line each
+    /// value came from, and 0 is the built-in layer.
+    fn settingsFromFile(self: *const App, row: SettingsRow) bool {
+        return switch (row) {
+            .field => |field| self.config_current.lines.get(field.key) != 0,
+            .keybind => |keybind| file: {
+                const name = self.actions.definitions()[keybind.definition].name;
+                for (self.config_current.keybinds.items) |line| {
+                    if (line.action) |action| if (std.mem.eql(u8, action, name)) break :file true;
+                }
+                break :file false;
+            },
+            else => false,
+        };
+    }
+
+    /// `<name>  <value> ·`: the value right-aligned to `width` cells, then a
+    /// two-cell source column that holds `·` when the settings file sets it.
+    fn settingsRowLabel(self: *const App, index: usize, width: u32, storage: []u8) []const u8 {
+        const row = self.settings_rows[index];
+        var value_buffer: [config.max_string_bytes]u8 = undefined;
+        const selected = index == self.settings_selected;
+        const name: []const u8, const value: []const u8 = switch (row) {
+            .heading => |heading| .{ heading.label, "" },
+            .raw => .{ settings_raw_label, "" },
+            .field => |field| .{ field.key.name(), self.settingsValueText(field.key, &value_buffer) },
+            .keybind => |keybind| blk: {
+                const definition = &self.actions.definitions()[keybind.definition];
+                if (selected and self.settings_mode == .capture) break :blk .{ definition.label, settings_capture_text };
+                if (selected and self.settings_mode == .conflict) {
+                    if (self.settings_pending_chord) |chord| {
+                        break :blk .{ definition.label, inputmod.formatChordSpelling(&value_buffer, chord) catch "" };
+                    }
+                }
+                const chords = palette_mod.formatActionBindings(&value_buffer, definition.name, self.bindings, self.binding_profile);
+                break :blk .{ definition.label, if (chords.text.len == 0) "unbound" else chords.text };
+            },
+        };
+        const marker = if (self.settingsFromFile(row)) " ·" else "  ";
+        var writer: std.Io.Writer = .fixed(storage);
+        writer.writeAll(name) catch return writer.buffered();
+        if (value.len != 0) {
+            const used = labelCellWidth(name) +| labelCellWidth(value) +| 2;
+            const padding = if (width > used + 2) width - used else 2;
+            writer.splatByteAll(' ', padding) catch return writer.buffered();
+            writer.writeAll(value) catch return writer.buffered();
+            writer.writeAll(marker) catch return writer.buffered();
+        }
+        var len = writer.end;
+        while (len != 0 and !std.unicode.utf8ValidateSlice(storage[0..len])) len -= 1;
+        return storage[0..len];
+    }
+
+    /// The widest row the dialog shows, with room for a long value, so the
+    /// dialog keeps one width while values change under it.
+    fn settingsContentWidth(self: *const App) u32 {
+        var widest = @max(labelCellWidth(" Settings "), labelCellWidth(settings_hint));
+        for (self.settings_rows[0..self.settings_row_count]) |row| {
+            const cells: u32 = switch (row) {
+                .heading => |heading| labelCellWidth(heading.label),
+                .raw => labelCellWidth(settings_raw_label),
+                .field => |field| labelCellWidth(field.key.name()) + 2 + settings_value_cells + 2,
+                .keybind => |keybind| cells: {
+                    const definition = &self.actions.definitions()[keybind.definition];
+                    var chord_buffer: [96]u8 = undefined;
+                    const chords = palette_mod.formatActionBindings(&chord_buffer, definition.name, self.bindings, self.binding_profile);
+                    break :cells labelCellWidth(definition.label) + 2 + @max(labelCellWidth(chords.text), labelCellWidth(settings_capture_text)) + 2;
+                },
+            };
+            widest = @max(widest, cells);
+        }
+        return widest;
+    }
+
+    fn settingsBounds(self: *const App) ?ui.Rect {
+        if (!self.settings_visible) return null;
+        const canvas = self.ui_canvas.bounds();
+        if (canvas.width < 20 or canvas.height < 6) return null;
+        const width = @min(canvas.width - 4, @max(@as(u32, 48), self.settings_content_width +| 4));
+        // Two borders and the status line around the list.
+        const wanted: u32 = @intCast(@min(self.settings_row_count, settings_visible_capacity) + 3);
+        const height = @min(wanted, canvas.height - 2);
+        if (width < 16 or height < 4) return null;
+        return .{
+            .x = (canvas.width - width) / 2,
+            .y = (canvas.height - height) / 2,
+            .width = width,
+            .height = height,
+        };
+    }
+
+    /// Scroll so the highlighted row, and the heading right above it, show.
+    fn settingsKeepVisible(self: *App, list_rows: usize) void {
+        if (list_rows == 0) return;
+        const selected = self.settings_selected;
+        var top = selected;
+        if (top > 0 and self.settings_rows[top - 1] == .heading) top -= 1;
+        if (top < self.settings_scroll) self.settings_scroll = top;
+        if (selected >= self.settings_scroll + list_rows) self.settings_scroll = selected + 1 - list_rows;
+        const last_start = self.settings_row_count -| list_rows;
+        if (self.settings_scroll > last_start) self.settings_scroll = last_start;
+    }
+
+    fn composeSettings(self: *App) !void {
+        const bounds = self.settingsBounds() orelse return;
+        const dialog_id: ui.Id = .{ .value = "settings.dialog" };
+        try self.ui_tree.addSurface(.{
+            .id = dialog_id,
+            .role = "dialog",
+            .label = "Settings",
+            .bounds = bounds,
+        }, .{
+            .rect = bounds,
+            .erase_underlay = true,
+            .fill = .background,
+            .border = .double,
+            .border_style = .{ .foreground = .border, .background = .background },
+            .title = " Settings ",
+            .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
+        });
+
+        const inner_x = bounds.x + 2;
+        const inner_width = bounds.width - 4;
+        const list_rows: usize = @min(bounds.height - 3, settings_visible_capacity);
+        self.settingsKeepVisible(list_rows);
+        const end = @min(self.settings_row_count, self.settings_scroll + list_rows);
+        for (self.settings_scroll..end, 0..) |index, slot| {
+            const y = bounds.y + 1 + @as(u32, @intCast(slot));
+            const id: ui.Id = .{ .value = self.settingsRowId(index) };
+            switch (self.settings_rows[index]) {
+                .heading => |heading| {
+                    const runs = [_]ui.Run{.{ .text = heading.label, .style = .{ .foreground = .muted } }};
+                    try self.ui_tree.addText(.{
+                        .id = id,
+                        .parent = dialog_id,
+                        .role = "heading",
+                        .label = heading.label,
+                        .bounds = .{ .x = inner_x, .y = y, .width = inner_width, .height = 1 },
+                    }, .{ .runs = &runs });
+                },
+                else => {
+                    const is_selected = index == self.settings_selected;
+                    const editing = is_selected and self.settings_mode == .edit;
+                    const full = self.settingsRowLabel(index, inner_width, &self.settings_row_labels[slot]);
+                    const name = switch (self.settings_rows[index]) {
+                        .field => |field| field.key.name(),
+                        else => full,
+                    };
+                    const label = if (editing) name else full;
+                    const name_width = @min(inner_width, labelCellWidth(name) + 2);
+                    const row_width = if (editing) name_width else inner_width;
+                    try self.ui_tree.addInteractiveText(.{
+                        .id = id,
+                        .parent = dialog_id,
+                        .role = "setting",
+                        .label = label,
+                        .selected = is_selected,
+                        .action = settings_activate_action,
+                        .bounds = .{ .x = inner_x, .y = y, .width = row_width, .height = 1 },
+                    }, .{
+                        .id = id,
+                        .label = label,
+                        .action = settings_activate_action,
+                        .normal = if (is_selected)
+                            .{ .foreground = .strong, .background = .selection }
+                        else
+                            .{ .foreground = .foreground },
+                        // The highlight stays visible under a resting pointer.
+                        .hovered = if (is_selected)
+                            .{ .foreground = .strong, .background = .selection, .underline = .accent }
+                        else
+                            .{ .foreground = .strong, .underline = .accent },
+                        .focused = .{ .foreground = .on_accent, .background = .accent },
+                    });
+                    if (editing and inner_width > name_width) {
+                        const field_bounds: ui.Rect = .{
+                            .x = inner_x + name_width,
+                            .y = y,
+                            .width = inner_width - name_width,
+                            .height = 1,
+                        };
+                        try self.ui_tree.addInput(.{
+                            .id = .{ .value = "settings.input" },
+                            .parent = dialog_id,
+                            .role = "input",
+                            .label = name,
+                            .action = settings_activate_action,
+                            .bounds = field_bounds,
+                        }, &self.settings_input, .{
+                            .text = .{ .foreground = .strong, .background = .field },
+                            .selection_background = .selection,
+                            .cursor_background = .accent,
+                            .cursor_foreground = .background,
+                        });
+                        try self.composePalettePreedit(dialog_id, field_bounds, &self.settings_input);
+                    }
+                },
+            }
+        }
+
+        const status_bounds: ui.Rect = .{ .x = inner_x, .y = bounds.y + bounds.height - 2, .width = inner_width, .height = 1 };
+        if (self.settingsErrorText()) |message| {
+            const runs = [_]ui.Run{.{ .text = message, .style = .{ .foreground = .danger } }};
+            try self.ui_tree.addText(.{
+                .id = .{ .value = "settings.error" },
+                .parent = dialog_id,
+                .role = "error",
+                .label = message,
+                .bounds = status_bounds,
+            }, .{ .runs = &runs });
+        } else {
+            const hint = switch (self.settings_mode) {
+                .browse => settings_hint,
+                .edit => "Enter save  Esc cancel",
+                .capture => "Esc cancel  Backspace unbind",
+                .conflict => "Enter take it  Esc keep",
+            };
+            const runs = [_]ui.Run{.{ .text = hint, .style = .{ .foreground = .muted } }};
+            try self.ui_tree.addText(.{
+                .id = .{ .value = "settings.hint" },
+                .parent = dialog_id,
+                .role = "status",
+                .label = hint,
+                .bounds = status_bounds,
+            }, .{ .runs = &runs });
+        }
+    }
+
+    fn settingsErrorText(self: *const App) ?[]const u8 {
+        if (self.settings_error_len == 0) return null;
+        return self.settings_error_storage[0..self.settings_error_len];
+    }
+
+    fn setSettingsError(self: *App, comptime format: []const u8, args: anytype) void {
+        var writer: std.Io.Writer = .fixed(&self.settings_error_storage);
+        writer.print(format, args) catch {
+            // A message cut by the fixed buffer is still the message's start.
+        };
+        var len = writer.end;
+        while (len != 0 and !std.unicode.utf8ValidateSlice(self.settings_error_storage[0..len])) len -= 1;
+        self.settings_error_len = len;
+    }
+
+    fn openSettings(self: *App) !void {
+        if (self.settingsVisible() or self.paletteVisible() or self.contextMenuVisible() or
+            self.closeModalActive() or self.rename_tab_id != null or self.sidebar_dragging or
+            self.dragged_divider_id != null or self.dragged_tab_id != null) return;
+        const canvas = self.ui_canvas.bounds();
+        if (canvas.width < 20 or canvas.height < 6) return;
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        try self.window.stopTextInput();
+        self.buildSettingsRows();
+        self.settings_selected = 1;
+        self.settings_scroll = 0;
+        self.settings_mode = .browse;
+        self.settings_pending_chord = null;
+        self.settings_error_len = 0;
+        clearPaletteInput(&self.settings_input);
+        self.settings_content_width = self.settingsContentWidth();
+        self.settings_visible = true;
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    fn closeSettings(self: *App) !void {
+        if (!self.settingsVisible()) return;
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        self.settings_visible = false;
+        self.settings_mode = .browse;
+        self.settings_pending_chord = null;
+        self.settings_error_len = 0;
+        clearPaletteInput(&self.settings_input);
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    const SettingsMove = enum { previous, next, first, last };
+
+    /// Move the highlight to the next row that is not a heading, wrapping.
+    fn moveSettingsSelection(self: *App, move: SettingsMove) !void {
+        const count = self.settings_row_count;
+        if (count == 0) return;
+        const forward = move == .next or move == .first;
+        var index: usize = switch (move) {
+            .first => 0,
+            .last => count - 1,
+            .next => (self.settings_selected + 1) % count,
+            .previous => (self.settings_selected + count - 1) % count,
+        };
+        for (0..count) |_| {
+            if (self.settings_rows[index] != .heading) break;
+            index = if (forward) (index + 1) % count else (index + count - 1) % count;
+        }
+        self.settings_selected = index;
+        self.settings_error_len = 0;
+        try self.refreshActiveUi();
+    }
+
+    /// Enter on, or a click of, row `index`: edit it the way its type says.
+    fn activateSettingsRow(self: *App, index: usize, source: inputmod.InvocationSource) !void {
+        if (index >= self.settings_row_count) return;
+        const row = self.settings_rows[index];
+        if (row == .heading) return;
+        if (self.settings_mode == .edit and index == self.settings_selected) {
+            // A click on the row being edited keeps the edit.
+            if (self.ui_tree.focus(.{ .value = "settings.input" })) try self.refreshActiveUi();
+            return;
+        }
+        self.settings_mode = .browse;
+        self.settings_pending_chord = null;
+        self.settings_error_len = 0;
+        self.settings_selected = index;
+        self.ui_tree.clearFocus();
+        switch (row) {
+            .heading => {},
+            .raw => {
+                try self.closeSettings();
+                try self.dispatchAction(config_open_action, .{ .source = source });
+                return;
+            },
+            .keybind => self.settings_mode = .capture,
+            .field => |field| switch (field.edit) {
+                .toggle, .cycle => {
+                    try self.stepSettingsRow(true);
+                    return;
+                },
+                .choose => {
+                    const chooser = if (field.key == .theme) self.theme_pick_index else self.font_pick_index;
+                    try self.closeSettings();
+                    try self.showPalette();
+                    if (self.paletteVisible()) try self.beginPaletteArgument(chooser);
+                    return;
+                },
+                .number, .text => {
+                    try self.beginSettingsEdit(field.key);
+                    return;
+                },
+            },
+        }
+        try self.refreshActiveUi();
+        try self.syncTextInput();
+    }
+
+    fn beginSettingsEdit(self: *App, key: config.Key) !void {
+        clearPaletteInput(&self.settings_input);
+        var buffer: [config.max_string_bytes]u8 = undefined;
+        self.settings_input.insert(self.settingsEditText(key, &buffer)) catch |err| {
+            log.warn("the current {s} value could not be edited: {s}", .{ key.name(), @errorName(err) });
+        };
+        self.settings_mode = .edit;
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        if (self.ui_tree.focus(.{ .value = "settings.input" })) try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    fn cancelSettingsEdit(self: *App) !void {
+        self.composition.cancel();
+        self.settings_mode = .browse;
+        self.settings_pending_chord = null;
+        self.settings_error_len = 0;
+        clearPaletteInput(&self.settings_input);
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+        try self.syncTextInput();
+    }
+
+    fn commitSettingsEdit(self: *App) !void {
+        const field = self.settingsSelectedField() orelse return self.cancelSettingsEdit();
+        var buffer: [config.max_string_bytes]u8 = undefined;
+        const typed = std.mem.trim(u8, self.settings_input.text(), " \t");
+        const value = buffer[0..@min(typed.len, buffer.len)];
+        @memcpy(value, typed[0..value.len]);
+        if (try self.commitSettingValue(field.key, value)) {
+            try self.cancelSettingsEdit();
+        } else {
+            try self.refreshActiveUi();
+        }
+    }
+
+    /// Validate `value` exactly as a file line would be, write it and apply it
+    /// through the reload path every other settings change takes. A rejected
+    /// value leaves the file and the setting as they were and says why.
+    fn commitSettingValue(self: *App, key: config.Key, value: []const u8) !bool {
+        if (config.checkValue(key, value)) |message| {
+            self.setSettingsError("{s}: {s}", .{ key.name(), message });
+            return false;
+        }
+        const path = self.config_path orelse {
+            self.setSettingsError("no settings file for this run", .{});
+            return false;
+        };
+        config.writeDocumentValue(self.io, self.allocator, path, key, value) catch |err| {
+            log.warn("the {s} setting could not be saved to the config file: {s}", .{ key.name(), @errorName(err) });
+            self.setSettingsError("the settings file could not be written", .{});
+            return false;
+        };
+        self.settings_error_len = 0;
+        // The watcher sees this write as well; its reload then finds nothing
+        // left to change, so nothing is applied or built twice.
+        self.reloadConfig();
+        return true;
+    }
+
+    /// Left/Right, or Enter on a toggle: flip a bool, swap a two-value enum,
+    /// or step a number by one within its bounds.
+    fn stepSettingsRow(self: *App, forward: bool) !void {
+        const field = self.settingsSelectedField() orelse return;
+        var buffer: [16]u8 = undefined;
+        const value: []const u8 = switch (field.key) {
+            .font_ligatures => if (self.font_settings.values.ligatures) "false" else "true",
+            .font_nerd_symbols => if (self.font_settings.values.builtin_symbols) "false" else "true",
+            .mouse_right_click => switch (self.config_current.settings.right_click orelse config.RightClick.built_in) {
+                .menu => config.RightClick.paste.text(),
+                .paste => config.RightClick.menu.text(),
+            },
+            .font_size => size: {
+                const points = self.font_settings.values.points;
+                const next = config.stepFontPoints(points, if (forward) .increase else .decrease);
+                if (next == points) return;
+                break :size try std.fmt.bufPrint(&buffer, "{d}", .{next});
+            },
+            .scratchpad_size, .scratchpad_large_size => percent: {
+                const current: u8 = if (field.key == .scratchpad_size) self.scratchpad_percent_small else self.scratchpad_percent_large;
+                const next = if (forward)
+                    @min(config.max_scratchpad_percent, current + 1)
+                else
+                    @max(config.min_scratchpad_percent, current - 1);
+                if (next == current) return;
+                break :percent try std.fmt.bufPrint(&buffer, "{d}", .{next});
+            },
+            else => return,
+        };
+        _ = try self.commitSettingValue(field.key, value);
+        try self.refreshActiveUi();
+    }
+
+    /// A chord that would type into the terminal or break its basic editing
+    /// keys if bound: refused, with the reason in `settings.error`.
+    fn settingsChordRefused(chord: inputmod.Chord) bool {
+        if (inputmod.chordTypesText(chord)) return true;
+        if (chord.modifiers.isCommand()) return false;
+        return switch (chord.key) {
+            .named => |named| named == .enter or named == .tab or named == .backspace or named == .escape,
+            .character => true,
+        };
+    }
+
+    /// The next real key press while capturing: Escape cancels, Backspace
+    /// unbinds the command, a chord another command holds asks first, and
+    /// anything else is written at once.
+    fn captureSettingsChord(self: *App, key: platform.KeyEvent, chord: inputmod.Chord) !void {
+        const bare = !key.mods.ctrl and !key.mods.alt and !key.mods.super and !key.mods.shift;
+        if (bare and key.key == .escape) {
+            self.settings_mode = .browse;
+            self.settings_error_len = 0;
+            return self.refreshActiveUi();
+        }
+        if (bare and key.key == .backspace) return self.commitSettingsKeybind(null);
+        if (settingsChordRefused(chord)) {
+            self.setSettingsError("a bare key types text; add Ctrl, Alt or Super", .{});
+            return self.refreshActiveUi();
+        }
+        const definition = self.settingsSelectedKeybind() orelse return;
+        if (inputmod.findBinding(self.bindings, chord)) |bound| {
+            if (!std.mem.eql(u8, bound.action, definition.name)) {
+                const other = if (self.actions.lookup(bound.action)) |found| found.label else bound.action;
+                self.settings_pending_chord = chord;
+                self.settings_mode = .conflict;
+                if (bound.arguments.len != 0) {
+                    self.setSettingsError("conflict: {s} ({s})", .{ other, bound.arguments[0].value });
+                } else {
+                    self.setSettingsError("conflict: {s}", .{other});
+                }
+                return self.refreshActiveUi();
+            }
+        }
+        try self.commitSettingsKeybind(chord);
+    }
+
+    /// Bind the highlighted command to `chord` alone (or to nothing): its own
+    /// keybind lines are replaced, and each shipped chord it still holds is
+    /// unbound, so the command ends with exactly the chord chosen. Taking a
+    /// chord from another command is the file's normal rule: a later line
+    /// for a chord replaces whatever it was bound to.
+    fn commitSettingsKeybind(self: *App, chord: ?inputmod.Chord) !void {
+        const definition = self.settingsSelectedKeybind() orelse return;
+        self.settings_mode = .browse;
+        self.settings_pending_chord = null;
+        const path = self.config_path orelse {
+            self.setSettingsError("no settings file for this run", .{});
+            return self.refreshActiveUi();
+        };
+        var unbind_storage: [8][64]u8 = undefined;
+        var unbind: [8][]const u8 = undefined;
+        var unbind_count: usize = 0;
+        for (inputmod.defaultBindings(self.binding_profile)) |binding| {
+            if (!std.mem.eql(u8, binding.action, definition.name) or binding.arguments.len != 0) continue;
+            if (chord) |wanted| if (inputmod.chordEql(binding.chord, wanted)) continue;
+            const live = inputmod.findBinding(self.bindings, binding.chord) orelse continue;
+            if (!std.mem.eql(u8, live.action, definition.name)) continue;
+            if (unbind_count == unbind.len) break;
+            unbind[unbind_count] = inputmod.formatChordSpelling(&unbind_storage[unbind_count], binding.chord) catch continue;
+            unbind_count += 1;
+        }
+        var chord_storage: [64]u8 = undefined;
+        const spelled: ?[]const u8 = if (chord) |wanted| try inputmod.formatChordSpelling(&chord_storage, wanted) else null;
+        config.writeActionKeybinds(self.io, self.allocator, path, definition.name, unbind[0..unbind_count], spelled) catch |err| {
+            log.warn("the keybinding could not be saved to the config file: {s}", .{@errorName(err)});
+            self.setSettingsError("the settings file could not be written", .{});
+            return self.refreshActiveUi();
+        };
+        self.settings_error_len = 0;
+        self.reloadConfig();
+        try self.refreshActiveUi();
+    }
+
+    /// Every key while the view is open. A press is the view's (the terminal
+    /// and every binding beneath it never see it); a release or repeat only
+    /// settles the binding state a press before the view opened left behind.
+    fn onSettingsKey(self: *App, key: platform.KeyEvent) !void {
+        var scratch: inputmod.TextScratch = .{};
+        const translated = translateAppKey(&self.composition, &scratch, key);
+        if (key.action != .press) {
+            _ = inputmod.resolve(&self.binding_state, key, translated, self.bindings);
+            return;
+        }
+        const identity = uiKeyIdentity(key) orelse return;
+        const plain = !key.mods.ctrl and !key.mods.alt and !key.mods.super;
+        switch (self.settings_mode) {
+            .capture => {
+                // A modifier pressed on its own is not a chord yet.
+                const chord = inputmod.chordOf(key) orelse return;
+                _ = self.ui_key_state.claim(identity, .none);
+                try self.captureSettingsChord(key, chord);
+            },
+            .conflict => {
+                _ = self.ui_key_state.claim(identity, .none);
+                if (!plain or key.mods.shift) return;
+                switch (key.key) {
+                    .enter => try self.commitSettingsKeybind(self.settings_pending_chord),
+                    .escape => {
+                        self.settings_mode = .browse;
+                        self.settings_pending_chord = null;
+                        self.settings_error_len = 0;
+                        try self.refreshActiveUi();
+                    },
+                    else => {},
+                }
+            },
+            .edit => {
+                if (plain) switch (key.key) {
+                    .enter => {
+                        _ = self.ui_key_state.claim(identity, .none);
+                        return self.commitSettingsEdit();
+                    },
+                    .escape => {
+                        _ = self.ui_key_state.claim(identity, .none);
+                        return self.cancelSettingsEdit();
+                    },
+                    .tab, .up, .down => {
+                        _ = self.ui_key_state.claim(identity, .none);
+                        return;
+                    },
+                    else => {},
+                };
+                if (try self.routeFocusedUiKey(key, translated)) return;
+                _ = self.ui_key_state.claim(identity, .none);
+            },
+            .browse => {
+                _ = self.ui_key_state.claim(identity, .none);
+                if (!plain) return;
+                switch (key.key) {
+                    .escape => try self.closeSettings(),
+                    .up => try self.moveSettingsSelection(.previous),
+                    .down => try self.moveSettingsSelection(.next),
+                    .tab => try self.moveSettingsSelection(if (key.mods.shift) .previous else .next),
+                    .home => try self.moveSettingsSelection(.first),
+                    .end => try self.moveSettingsSelection(.last),
+                    .enter => try self.activateSettingsRow(self.settings_selected, .keybinding),
+                    .left => try self.stepSettingsRow(false),
+                    .right => try self.stepSettingsRow(true),
+                    else => {},
+                }
+            },
+        }
+    }
+
+    /// The settings view is modal like the palette: pointer gestures inside
+    /// it highlight and activate its rows, a press outside closes it, and
+    /// every gesture is owned through release so nothing beneath fires.
+    fn handleSettingsUiEvent(self: *App, event: platform.Event) !bool {
+        const tree = self.activeUiTree();
+        switch (event) {
+            .mouse_motion => |motion| {
+                const point = devicePointerPoint(motion.x, motion.y, self.window.state.scale);
+                const before = uiInteractionState(tree);
+                tree.pointerMoved(point);
+                if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                return true;
+            },
+            .mouse_button => |button| {
+                const point = devicePointerPoint(button.x, button.y, self.window.state.scale);
+                switch (button.action) {
+                    .press => {
+                        self.settings_pointer_owned = true;
+                        const bounds = self.settingsBounds();
+                        if (bounds == null or !self.pointInCellRect(point, bounds.?)) {
+                            try self.closeSettings();
+                            return true;
+                        }
+                        if (button.button != .left) return true;
+                        // Pressing anywhere but the field being edited ends the edit.
+                        if (self.settings_mode == .edit) {
+                            const on_field = if (tree.hitTest(point)) |hit| std.mem.eql(u8, hit.id.value, "settings.input") else false;
+                            if (!on_field) try self.cancelSettingsEdit();
+                        }
+                        const before = uiInteractionState(tree);
+                        tree.pointerPressed(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        return true;
+                    },
+                    .repeat => return true,
+                    .release => {
+                        if (!self.settings_pointer_owned) return true;
+                        self.settings_pointer_owned = false;
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        const activation = tree.pointerReleased(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        const requested = activation orelse return true;
+                        if (std.mem.eql(u8, requested.id.value, "settings.input")) return true;
+                        if (std.mem.eql(u8, requested.action, settings_activate_action)) {
+                            try self.dispatchAction(settings_activate_action, .{ .source = .mouse, .origin = requested.id });
+                        }
+                        return true;
+                    },
+                }
+            },
+            .wheel => return true,
+            .key => return false,
+            // Text and composition reach only the inline field; with no field
+            // they are swallowed rather than typed into the terminal beneath.
+            .text_input, .text_editing, .candidates => return self.settings_mode != .edit,
+            else => return false,
+        }
+    }
+
+    fn settingsOpenAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        try self.openSettings();
+    }
+
+    fn settingsActivateAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        if (!self.settingsVisible()) return;
+        const origin = invocation.origin orelse return;
+        const index = self.settingsRowIndex(origin.value) orelse return;
+        try self.activateSettingsRow(index, invocation.source);
+    }
+
     fn openPalette(self: *App) !void {
-        if (self.paletteVisible() or self.closeModalActive() or self.rename_tab_id != null or
+        if (self.paletteVisible() or self.settingsVisible() or self.closeModalActive() or self.rename_tab_id != null or
             self.ui_key_state.len != 0 or self.terminal_key_state.len != 0 or
             self.ui_pointer_owned or self.scratchpad_ui_pointer_owned or
             self.scratchpad_terminal_pointer_owned or self.terminal_pointer_presses != 0 or
             self.scratchpad_escape_owned) return;
+        try self.showPalette();
+    }
+
+    /// Show the palette's command step. Callers have checked that nothing
+    /// else owns the screen or an in-flight gesture the palette would take.
+    fn showPalette(self: *App) !void {
         const canvas = self.ui_canvas.bounds();
         if (canvas.width < 20 or canvas.height < 5) return;
         self.composition.cancel();
@@ -11092,7 +12035,7 @@ const App = struct {
             try self.refreshActiveUi();
             return;
         }
-        if (self.paletteVisible() or self.search_visible) return;
+        if (self.paletteVisible() or self.settingsVisible() or self.search_visible) return;
         self.presentedLive().terminal().userInput();
         queueCommittedText(&self.pending_committed_text, text);
         self.invalidateUi();
@@ -11410,8 +12353,17 @@ const App = struct {
             },
             else => {},
         };
+        if (!self.settingsVisible() and self.settings_pointer_owned) switch (event) {
+            .mouse_motion => return true,
+            .mouse_button => |button| {
+                if (button.action == .release) self.settings_pointer_owned = false;
+                return true;
+            },
+            else => {},
+        };
         if (self.contextMenuVisible()) return self.handleContextMenuUiEvent(event);
         if (self.paletteVisible()) return self.handlePaletteUiEvent(event);
+        if (self.settingsVisible()) return self.handleSettingsUiEvent(event);
         if (self.search_visible) return self.handleSearchUiEvent(event);
         if (self.closeModalActive()) switch (event) {
             .text_input, .text_editing, .candidates => return true,
@@ -13467,7 +14419,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 59 and
+    failures += reportCheck(out, registered_actions.len == 61 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -13526,7 +14478,9 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[55].name, font_ligatures_toggle_action) and
         std.mem.eql(u8, registered_actions[56].name, font_symbols_toggle_action) and
         std.mem.eql(u8, registered_actions[57].name, font_fallbacks_action) and
-        std.mem.eql(u8, registered_actions[58].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[58].name, settings_open_action) and
+        std.mem.eql(u8, registered_actions[59].name, settings_activate_action) and
+        std.mem.eql(u8, registered_actions[60].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -14889,9 +15843,9 @@ fn paletteTest(self: *App, io: Io, out: *Writer) !u8 {
     paletteCheck(out, &failures, self.paletteVisible() and dialog != null and centered and
         query != null and query.?.state.focused, "the centered semantic dialog opened with its filter focused", .{});
     paletteCheck(out, &failures, paletteContainsDefinition(self, tab_new_action) and
-        paletteContainsDefinition(self, pane_split_action) and
-        self.actions.lookup("settings.open") == null and self.actions.lookup("theme.select") == null and
-        self.actions.lookup("font.select") == null and self.actions.lookup("remote.connect") == null, "New tab and Split pane are present while unshipped commands are absent", .{});
+        paletteContainsDefinition(self, pane_split_action) and paletteContainsDefinition(self, settings_open_action) and
+        self.actions.lookup("theme.select") == null and
+        self.actions.lookup("font.select") == null and self.actions.lookup("remote.connect") == null, "New tab, Split pane and Settings are present while unshipped commands are absent", .{});
 
     paletteCheck(out, &failures, try postPaletteText(self, io, out, "newtab"), "fuzzy query text travelled through SDL", .{});
     const selected_new = self.palette_model.selectedDefinition();
@@ -17029,6 +17983,262 @@ fn fontTest(self: *App, io: Io, out: *Writer) !u8 {
     return if (failures == 0) 0 else 1;
 }
 
+/// The deterministic peer behind `--settings-test`'s terminal.
+const settings_test_script =
+    "stty -echo; " ++
+    "printf 'SETTINGS-READY\\r\\n'; " ++
+    "while IFS= read -r line; do printf 'SETTINGS-ECHO:%s\\r\\n' \"$line\"; done";
+
+/// The settings `--settings-test` starts with: everything at its default.
+const settings_test_initial = "# --settings-test settings\n";
+
+/// A private absolute path for `--settings-test`'s settings file.
+fn settingsTestPath(io: Io, env: EnvSource, buffer: []u8) ![]const u8 {
+    const base = firstEnv(env, temp_dir_vars[0..]) orelse "/tmp";
+    const root = if (base.len != 0 and base[0] == '/') base else "/tmp";
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = try generateRunId(io, &id_buffer);
+    return std.fmt.bufPrint(buffer, "{s}/conduit-settings-test-{s}/conduit/config", .{ root, id });
+}
+
+/// Remove `--settings-test`'s private directory: two levels above the file.
+fn removeSettingsTestDir(io: Io, path: []const u8) void {
+    const conduit_dir = config.directoryOf(path) orelse return;
+    const root = config.directoryOf(conduit_dir) orelse return;
+    if (std.mem.indexOf(u8, root, "conduit-settings-test-") == null) return;
+    Dir.cwd().deleteTree(io, root) catch |err| {
+        log.warn("could not remove the settings-test directory: {s}", .{@errorName(err)});
+    };
+}
+
+fn settingsCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("settings-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// The shipped settings chord: Ctrl+Shift+, (Cmd+Shift+, on macOS).
+fn settingsChord(self: *App, io: Io, out: *Writer) !bool {
+    const mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .shift = true, .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    return postKey(self, io, out, ',', mods);
+}
+
+/// The id of the highlighted settings row, or "" while the view is closed.
+fn settingsSelectedId(self: *const App) []const u8 {
+    if (!self.settingsVisible() or self.settings_selected >= self.settings_row_count) return "";
+    return self.settingsRowId(self.settings_selected);
+}
+
+/// Move the highlight with real Down presses until it is on `id`.
+fn selectSettingsRow(self: *App, io: Io, out: *Writer, id: []const u8) !bool {
+    for (0..self.settings_row_count + 1) |_| {
+        if (std.mem.eql(u8, settingsSelectedId(self), id)) return true;
+        if (!try postNamedKey(self, io, out, .down, .{})) return false;
+    }
+    return false;
+}
+
+/// The semantic label of element `id`, or "" when it is not in the tree.
+fn settingsLabel(self: *const App, id: []const u8) []const u8 {
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return "";
+    return element.label;
+}
+
+/// Exercise TASK-41 end to end through real SDL keys and pointer events: the
+/// view opened from the palette and by its chord, keyboard navigation over
+/// the group headings, a bool by Enter and by click, a percentage through the
+/// inline Input, the size stepped with Right, an invalid value refused with
+/// its diagnostic, a two-value enum cycled, a keybinding captured, a
+/// conflicting chord refused and then taken, the raw-file row and modal
+/// isolation, with the settings file read back after every change.
+fn settingsTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    const path_copy = self.config_path orelse {
+        out.writeAll("settings-test: FAIL no settings path\n") catch {};
+        return 1;
+    };
+    var path_buffer: [path_capacity]u8 = undefined;
+    @memcpy(path_buffer[0..path_copy.len], path_copy);
+    const path = path_buffer[0..path_copy.len];
+    var editor_trace: EditorSpawnTrace = .{};
+    self.editor_spawn_observer = .{ .context = &editor_trace, .observe_fn = recordEditorSpawn };
+    defer self.editor_spawn_observer = .{};
+
+    const ligatures_off = settings_test_initial ++ "font.ligatures = false\n";
+    const ligatures_on = settings_test_initial ++ "font.ligatures = true\n";
+    const scratchpad_35 = ligatures_on ++ "scratchpad.size = 35\n";
+    const size_15 = scratchpad_35 ++ "font.size = 15\n";
+    const right_paste = size_15 ++ "mouse.right_click = paste\n";
+    const right_menu = size_15 ++ "mouse.right_click = menu\n";
+    const rebound = right_menu ++ "keybind = ctrl+shift+p=unbind\nkeybind = ctrl+alt+k=palette.open\n";
+    const stolen = right_menu ++ "keybind = ctrl+shift+p=unbind\nkeybind = ctrl+shift+t=palette.open\n";
+    const palette_row = "settings.row.keybind." ++ palette_open_action;
+
+    try self.drawFrame();
+    settingsCheck(out, &failures, try waitForPanes(self, io, out, .{ .focused_text = "SETTINGS-READY" }), "the real settings-test child became ready", .{});
+    settingsCheck(out, &failures, try waitForConfig(self, io, out, .font_settled), "startup drew the bundled face", .{});
+
+    // Opened from the palette by keyboard, on the first setting.
+    settingsCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Settings") and self.settingsVisible() and
+        !self.paletteVisible() and self.ui_tree.byId(.{ .value = "settings.dialog" }) != null, "typing settings into the palette and Enter opened settings.dialog", .{});
+    settingsCheck(out, &failures, std.mem.eql(u8, settingsSelectedId(self), "settings.row.theme") and
+        self.ui_tree.byId(.{ .value = "settings.heading.appearance" }) != null and
+        std.mem.indexOf(u8, settingsLabel(self, "settings.row.font.size"), "14") != null, "the first setting is highlighted under its heading and rows show live values", .{});
+
+    // Navigation skips the headings and wraps.
+    _ = try postNamedKey(self, io, out, .down, .{});
+    settingsCheck(out, &failures, std.mem.eql(u8, settingsSelectedId(self), "settings.row.font.family"), "Down skipped the Fonts heading to font.family", .{});
+    _ = try postNamedKey(self, io, out, .up, .{});
+    _ = try postNamedKey(self, io, out, .up, .{});
+    settingsCheck(out, &failures, std.mem.eql(u8, settingsSelectedId(self), "settings.raw"), "Up past the first heading wrapped to the raw-file row", .{});
+    _ = try postNamedKey(self, io, out, .home, .{});
+    const home = settingsSelectedId(self);
+    _ = try postNamedKey(self, io, out, .end, .{});
+    settingsCheck(out, &failures, std.mem.eql(u8, home, "settings.row.theme") and
+        std.mem.eql(u8, settingsSelectedId(self), "settings.raw") and self.ui_tree.byId(.{ .value = "settings.raw" }) != null, "Home and End jump to the first and last rows and keep the highlight on screen", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    settingsCheck(out, &failures, !self.settingsVisible() and self.ui_tree.byId(.{ .value = "settings.dialog" }) == null, "Escape closed the view", .{});
+    settingsCheck(out, &failures, try settingsChord(self, io, out) and self.settingsVisible(), "the shipped Ctrl+Shift+, opened it again", .{});
+
+    // A fixed-choice row opens the existing chooser.
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    settingsCheck(out, &failures, !self.settingsVisible() and self.themePickerSelection() != null, "Enter on theme opened the theme chooser", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try settingsChord(self, io, out);
+
+    // A bool by keyboard and by mouse.
+    settingsCheck(out, &failures, try selectSettingsRow(self, io, out, "settings.row.font.ligatures"), "Down reached font.ligatures", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    settingsCheck(out, &failures, !self.font_settings.values.ligatures and !self.fonts.ligatures() and fontFileIs(io, path, ligatures_off) and
+        std.mem.endsWith(u8, settingsLabel(self, "settings.row.font.ligatures"), "false ·"), "Enter turned ligatures off, wrote font.ligatures = false and marked the row as set in the file", .{});
+    settingsCheck(out, &failures, try clickTabsElement(self, io, out, "settings.row.font.ligatures") and self.settingsVisible() and
+        self.font_settings.values.ligatures and fontFileIs(io, path, ligatures_on), "clicking the row turned them back on and rewrote the same line", .{});
+
+    // A percentage through the inline Input, by keyboard.
+    settingsCheck(out, &failures, try selectSettingsRow(self, io, out, "settings.row.scratchpad.size"), "Down reached scratchpad.size", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    const field = self.ui_tree.byId(.{ .value = "settings.input" });
+    settingsCheck(out, &failures, field != null and field.?.state.focused and std.mem.eql(u8, self.settings_input.text(), "50"), "Enter opened the focused settings.input holding 50", .{});
+    _ = try postNamedKey(self, io, out, .backspace, .{});
+    _ = try postNamedKey(self, io, out, .backspace, .{});
+    _ = try postPaletteText(self, io, out, "35");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    settingsCheck(out, &failures, self.settings_mode == .browse and self.ui_tree.byId(.{ .value = "settings.input" }) == null and
+        self.scratchpad_percent_small == 35 and fontFileIs(io, path, scratchpad_35), "typing 35 and Enter saved scratchpad.size = 35", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try scratchpadChord(self, io, out, false);
+    const dock = self.scratchpadBounds();
+    settingsCheck(out, &failures, dock != null and dock.?.height == expectedScratchpadHeight(self, 35), "the scratchpad chord opened a 35 percent dock", .{});
+    _ = try scratchpadChord(self, io, out, false);
+
+    // The size stepped with Right: cell metrics, the file, no second build.
+    _ = try settingsChord(self, io, out);
+    settingsCheck(out, &failures, try selectSettingsRow(self, io, out, "settings.row.font.size"), "Down reached font.size", .{});
+    const height_before = self.fonts.metrics().cell.height_px;
+    const reloads = self.config_reload_count;
+    _ = try postNamedKey(self, io, out, .right, .{});
+    const loads = self.font_load_count;
+    settingsCheck(out, &failures, try waitForConfig(self, io, out, .font_settled) and self.font_settings.values.points == 15 and
+        self.fonts.metrics().cell.height_px > height_before and fontFileIs(io, path, size_15), "Right stepped to 15 points: cell height {d}px -> {d}px and font.size = 15 saved", .{ height_before, self.fonts.metrics().cell.height_px });
+    settingsCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads + 2 }) and try waitForConfig(self, io, out, .font_settled) and
+        self.font_load_count == loads, "the watcher's reload of that write built nothing more", .{});
+
+    // An invalid value: the diagnostic, and nothing written.
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try postKey(self, io, out, 'a', switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true },
+    });
+    _ = try postPaletteText(self, io, out, "99");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    settingsCheck(out, &failures, std.mem.eql(u8, settingsLabel(self, "settings.error"), "font.size: expected 1 to 72 points") and
+        self.settings_mode == .edit and self.font_settings.values.points == 15 and fontFileIs(io, path, size_15), "99 points was refused with '{s}' and the file is unchanged", .{settingsLabel(self, "settings.error")});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    settingsCheck(out, &failures, self.settings_mode == .browse and self.settingsVisible() and
+        self.ui_tree.byId(.{ .value = "settings.error" }) == null, "Escape cancelled the edit and cleared the error", .{});
+
+    // A two-value enum cycles.
+    settingsCheck(out, &failures, try selectSettingsRow(self, io, out, "settings.row.mouse.right_click"), "Down reached mouse.right_click", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    settingsCheck(out, &failures, self.right_click == .paste and fontFileIs(io, path, right_paste), "Enter cycled the right click to paste and saved it", .{});
+    _ = try postNamedKey(self, io, out, .left, .{});
+    settingsCheck(out, &failures, self.right_click == .menu and fontFileIs(io, path, right_menu), "Left cycled it back to menu", .{});
+
+    // A keybinding captured through the real key path.
+    const tabs = self.activeWorkspace().tabCount();
+    settingsCheck(out, &failures, try selectSettingsRow(self, io, out, palette_row), "Down reached the Open command palette key row", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    settingsCheck(out, &failures, self.settings_mode == .capture and
+        std.mem.indexOf(u8, settingsLabel(self, palette_row), settings_capture_text) != null, "Enter asked for a chord", .{});
+    _ = try postKey(self, io, out, 'k', .{ .ctrl = true, .alt = true });
+    settingsCheck(out, &failures, self.settings_mode == .browse and fontFileIs(io, path, rebound) and
+        std.mem.indexOf(u8, settingsLabel(self, palette_row), "Ctrl+Alt+K") != null, "Ctrl+Alt+K was captured and saved, replacing the shipped chord", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    settingsCheck(out, &failures, try postKey(self, io, out, 'k', .{ .ctrl = true, .alt = true }) and self.paletteVisible(), "the captured Ctrl+Alt+K opened the palette", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try paletteChord(self, io, out);
+    settingsCheck(out, &failures, !self.paletteVisible(), "the old Ctrl+Shift+P no longer does", .{});
+
+    // A chord another command holds: named, kept on Escape, taken on Enter.
+    _ = try settingsChord(self, io, out);
+    _ = try selectSettingsRow(self, io, out, palette_row);
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try postKey(self, io, out, 't', .{ .ctrl = true, .shift = true });
+    settingsCheck(out, &failures, self.settings_mode == .conflict and std.mem.eql(u8, settingsLabel(self, "settings.error"), "conflict: New tab") and
+        self.activeWorkspace().tabCount() == tabs and fontFileIs(io, path, rebound), "Ctrl+Shift+T was reported as '{s}' without opening a tab", .{settingsLabel(self, "settings.error")});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    const kept = inputmod.findBinding(self.bindings, try inputmod.parseChord("ctrl+shift+t"));
+    settingsCheck(out, &failures, self.settings_mode == .browse and self.ui_tree.byId(.{ .value = "settings.error" }) == null and
+        kept != null and std.mem.eql(u8, kept.?.action, tab_new_action) and fontFileIs(io, path, rebound), "Escape kept New tab's chord and the file", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try postKey(self, io, out, 't', .{ .ctrl = true, .shift = true });
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    settingsCheck(out, &failures, self.settings_mode == .browse and fontFileIs(io, path, stolen) and
+        std.mem.indexOf(u8, settingsLabel(self, palette_row), "Ctrl+Shift+T") != null, "Enter took Ctrl+Shift+T for the palette and saved it", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    settingsCheck(out, &failures, try postKey(self, io, out, 't', .{ .ctrl = true, .shift = true }) and self.paletteVisible() and
+        self.activeWorkspace().tabCount() == tabs, "Ctrl+Shift+T now opens the palette and no tab", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+
+    // Modal isolation: keys, text and clicks behind the view do nothing.
+    _ = try settingsChord(self, io, out);
+    const routes = self.terminal_key_route_count;
+    const dispatches = self.action_dispatch_count;
+    _ = try postKey(self, io, out, 't', .{ .ctrl = true, .shift = true });
+    _ = try postKey(self, io, out, 'x', .{});
+    _ = try postPaletteText(self, io, out, "zz");
+    settingsCheck(out, &failures, self.settingsVisible() and !self.paletteVisible() and self.terminal_key_route_count == routes and
+        self.action_dispatch_count == dispatches, "a bound chord, a key and typed text behind the view reached nothing", .{});
+    _ = try postNamedKey(self, io, out, .home, .{});
+    settingsCheck(out, &failures, try clickTabsElement(self, io, out, "settings.heading.appearance") and self.settingsVisible() and
+        self.action_dispatch_count == dispatches, "clicking a heading did nothing", .{});
+    _ = try postLeftClick(self, io, out, 2, 2);
+    settingsCheck(out, &failures, !self.settingsVisible() and !self.paletteVisible() and !self.settings_pointer_owned and
+        self.action_dispatch_count == dispatches and self.terminal_key_route_count == routes, "a click outside closed the view and reached nothing beneath", .{});
+
+    // The raw-file row, by mouse, opens the file in an editor tab.
+    _ = try settingsChord(self, io, out);
+    _ = try postNamedKey(self, io, out, .end, .{});
+    var expected_argv_buffer: [path_capacity + 16]u8 = undefined;
+    const expected_argv = try std.fmt.bufPrint(&expected_argv_buffer, "vi -- {s}", .{path});
+    settingsCheck(out, &failures, try clickTabsElement(self, io, out, "settings.raw") and !self.settingsVisible() and
+        self.activeWorkspace().tabCount() == tabs + 1 and editor_trace.calls == 1 and std.mem.eql(u8, editor_trace.argv(), expected_argv), "clicking Open config file opened '{s}' in a new tab", .{editor_trace.argv()});
+    settingsCheck(out, &failures, try waitForConfig(self, io, out, .{ .active_text = "ctrl+shift+t=palette.open" }), "the editor drew the saved file", .{});
+
+    // Leave the view open with a row highlighted for the screenshot.
+    _ = try settingsChord(self, io, out);
+    _ = try postNamedKey(self, io, out, .down, .{});
+    _ = try postNamedKey(self, io, out, .down, .{});
+    try self.drawFrame();
+    settingsCheck(out, &failures, self.settingsVisible() and std.mem.eql(u8, settingsSelectedId(self), "settings.row.font.bold"), "the view is open on font.bold for the screenshot", .{});
+
+    out.print("settings-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
 const ime_test_commit: [:0]const u8 = "日本語";
 const ime_test_preedit: [:0]const u8 = "にほん";
 const ime_test_wide: [:0]const u8 = "日本";
@@ -18275,6 +19485,9 @@ const usage =
     \\  --font-test                        drive the font commands: size, ligatures,
     \\                                    symbols, fallbacks and the family picker's
     \\                                    preview and saved choice through SDL, then exit
+    \\  --settings-test                    drive the settings view: every row kind by key
+    \\                                    and mouse, keybinding capture and conflicts,
+    \\                                    the raw-file row and modal isolation, then exit
     \\  --right-click=<menu|paste>        what a right click over a terminal does when
     \\                                    the program has not captured the mouse
     \\                                    (default: menu)
@@ -18429,6 +19642,11 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         try writeConfigTestFile(init.io, options.run.config_path.?, font_test_initial);
     }
     defer if (options.run.font_test) removeFontTestDir(init.io, options.run.config_path.?);
+    if (options.run.settings_test) {
+        options.run.config_path = try settingsTestPath(init.io, env, &config_path_buffer);
+        try writeConfigTestFile(init.io, options.run.config_path.?, settings_test_initial);
+    }
+    defer if (options.run.settings_test) removeSettingsTestDir(init.io, options.run.config_path.?);
     try platform.setAppMetadata(.{
         .name = app_name,
         .version = version,
@@ -18458,7 +19676,7 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.ime_test or options.run.sidebar_test or options.run.tabs_test or options.run.panes_test or
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
-                options.run.config_test or options.run.theme_test or options.run.font_test or
+                options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
                 options.run.driver_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
@@ -18571,6 +19789,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try themeTest(app, init.io, out);
     } else if (options.run.font_test) {
         check_status = try fontTest(app, init.io, out);
+    } else if (options.run.settings_test) {
+        check_status = try settingsTest(app, init.io, out);
     } else {
         try app.run(init.io, runDeadline(init.io, options.run.run_ms));
     }
@@ -19014,6 +20234,23 @@ test "--font-test owns a fixed real-child viewport and its own deterministic chi
     try std.testing.expectEqualStrings(font_test_script, spec.argv[2]);
     var buffer: [path_capacity]u8 = undefined;
     // Like every built-in check, it never reads the user's settings.
+    try std.testing.expectEqual(@as(?[]const u8, null), configPathFor(resolved, env.source(), &buffer));
+}
+
+test "--settings-test owns a fixed real-child viewport and its own deterministic child" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--settings-test" }, env.source());
+    const resolved = optionsForRun(parsed);
+    try std.testing.expect(parsed.run.settings_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--settings-test") != null);
+    try std.testing.expectEqual(ui_test_width, resolved.run.width);
+    try std.testing.expect(resolved.run.hidden);
+    try std.testing.expect(wantsChild(resolved));
+    try std.testing.expect(usesDeterministicScratchpad(resolved));
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, env.source(), .local, resolved);
+    defer spec.deinit();
+    try std.testing.expectEqualStrings(settings_test_script, spec.argv[2]);
+    var buffer: [path_capacity]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), configPathFor(resolved, env.source(), &buffer));
 }
 
@@ -20133,6 +21370,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
         "--config-test",
         "--theme-test",
         "--font-test",
+        "--settings-test",
         "--no-child",
     }, env);
     try testing.expectEqualStrings("echo hi", options.run.command.?);
@@ -20155,6 +21393,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
     try testing.expect(options.run.config_test);
     try testing.expect(options.run.theme_test);
     try testing.expect(options.run.font_test);
+    try testing.expect(options.run.settings_test);
     try testing.expect(options.run.no_child);
 
     // The defaults are the ones a plain run uses: an interactive shell, no
@@ -20180,6 +21419,7 @@ test "the terminal flags are parsed, and a value flag refuses a missing value" {
     try testing.expect(!plain.run.config_test);
     try testing.expect(!plain.run.theme_test);
     try testing.expect(!plain.run.font_test);
+    try testing.expect(!plain.run.settings_test);
     try testing.expect(plain.run.config_path == null);
     try testing.expect(!plain.run.no_child);
     try testing.expect(wantsChild(plain));

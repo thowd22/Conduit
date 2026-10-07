@@ -690,6 +690,7 @@ const macos_default_bindings = [_]Binding{
     .{ .chord = .{ .key = .{ .character = '=' }, .modifiers = .{ .shift = true, .super = true } }, .action = "font.size.increase" },
     .{ .chord = .{ .key = .{ .character = '-' }, .modifiers = .{ .super = true } }, .action = "font.size.decrease" },
     .{ .chord = .{ .key = .{ .character = '0' }, .modifiers = .{ .super = true } }, .action = "font.size.reset" },
+    .{ .chord = .{ .key = .{ .character = ',' }, .modifiers = .{ .shift = true, .super = true } }, .action = "settings.open" },
 };
 
 const linux_windows_default_bindings = [_]Binding{
@@ -740,6 +741,9 @@ const linux_windows_default_bindings = [_]Binding{
     .{ .chord = .{ .key = .{ .character = '=' }, .modifiers = .{ .ctrl = true, .shift = true } }, .action = "font.size.increase" },
     .{ .chord = .{ .key = .{ .character = '-' }, .modifiers = .{ .ctrl = true } }, .action = "font.size.decrease" },
     .{ .chord = .{ .key = .{ .character = '0' }, .modifiers = .{ .ctrl = true } }, .action = "font.size.reset" },
+    // Ctrl+Shift+, has no C0 control code and no common program binds it; it pairs with Ctrl+,
+    // (the raw file) the way editors pair a settings view with its file.
+    .{ .chord = .{ .key = .{ .character = ',' }, .modifiers = .{ .ctrl = true, .shift = true } }, .action = "settings.open" },
 };
 
 /// Conduit's deterministic shipped bindings for `profile`.
@@ -869,6 +873,63 @@ fn parseBindingKey(text: []const u8) ChordError!BindingKey {
 /// Whether two chords match the same key transitions: same key, same intent modifiers.
 pub fn chordEql(a: Chord, b: Chord) bool {
     return bindingKeyEql(a.key, b.key) and std.meta.eql(a.modifiers.normalized(), b.modifiers.normalized());
+}
+
+/// The chord a raw key press is, as a binding would match it: the layout-independent key plus the
+/// intent modifiers. Null for a transition with no key identity of its own, such as a modifier key
+/// pressed alone or a control codepoint.
+pub fn chordOf(raw: platform.KeyEvent) ?Chord {
+    const key = bindingKey(raw) orelse return null;
+    return .{ .key = key, .modifiers = modifiersFrom(raw.mods).normalized() };
+}
+
+/// Whether `chord` would type text if it were bound: a character key with no Ctrl, Alt or Super.
+/// Shift alone still types, so `shift+a` counts too.
+pub fn chordTypesText(chord: Chord) bool {
+    return switch (chord.key) {
+        .character => !chord.modifiers.isCommand(),
+        .named => false,
+    };
+}
+
+/// The first binding in table order whose chord is `chord`: the one a press of it dispatches.
+/// Borrowed from `bindings`.
+pub fn findBinding(bindings: []const Binding, chord: Chord) ?*const Binding {
+    for (bindings) |*binding| {
+        if (chordEql(binding.chord, chord)) return binding;
+    }
+    return null;
+}
+
+/// The settings-file spelling of `chord` that `parseChord` reads back as the same chord:
+/// `ctrl+alt+super+shift+<key>`, the key a named key's tag (`page_up`, `f10`), a lowercase letter,
+/// one character, or the word for a character a chord cannot hold (`plus`, `equal`, `space`).
+pub fn formatChordSpelling(buffer: []u8, chord: Chord) error{NoSpaceLeft}![]const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    const modifiers = chord.modifiers.normalized();
+    if (modifiers.ctrl) writer.writeAll("ctrl+") catch return error.NoSpaceLeft;
+    if (modifiers.alt) writer.writeAll("alt+") catch return error.NoSpaceLeft;
+    if (modifiers.super) writer.writeAll("super+") catch return error.NoSpaceLeft;
+    if (modifiers.shift) writer.writeAll("shift+") catch return error.NoSpaceLeft;
+    switch (chord.key) {
+        .named => |named| writer.writeAll(@tagName(named)) catch return error.NoSpaceLeft,
+        .character => |codepoint| {
+            const word: ?[]const u8 = switch (codepoint) {
+                '+' => "plus",
+                '=' => "equal",
+                ' ' => "space",
+                else => null,
+            };
+            if (word) |text| {
+                writer.writeAll(text) catch return error.NoSpaceLeft;
+            } else {
+                var encoded: [4]u8 = undefined;
+                const length = std.unicode.utf8Encode(codepoint, &encoded) catch return error.NoSpaceLeft;
+                writer.writeAll(encoded[0..length]) catch return error.NoSpaceLeft;
+            }
+        },
+    }
+    return writer.buffered();
 }
 
 /// One configured change to the binding table.
@@ -1765,7 +1826,7 @@ test "platform profiles preserve existing defaults before pane bindings" {
     const macos = defaultBindings(.macos);
     const linux_windows = defaultBindings(.linux_windows);
 
-    try testing.expectEqual(@as(usize, 43), macos.len);
+    try testing.expectEqual(@as(usize, 44), macos.len);
     try testing.expectEqualStrings("clipboard.copy", macos[0].action);
     try testing.expect(bindingKeyEql(.{ .character = 'c' }, macos[0].chord.key));
     try testing.expectEqual(Modifiers{ .super = true }, macos[0].chord.modifiers);
@@ -1794,7 +1855,7 @@ test "platform profiles preserve existing defaults before pane bindings" {
     try testing.expect(bindingKeyEql(.{ .character = 'p' }, macos[36].chord.key));
     try testing.expectEqual(Modifiers{ .shift = true, .super = true }, macos[36].chord.modifiers);
 
-    try testing.expectEqual(@as(usize, 43), linux_windows.len);
+    try testing.expectEqual(@as(usize, 44), linux_windows.len);
     try testing.expectEqualStrings("clipboard.copy", linux_windows[0].action);
     try testing.expect(bindingKeyEql(.{ .character = 'c' }, linux_windows[0].chord.key));
     try testing.expectEqual(Modifiers{ .ctrl = true, .shift = true }, linux_windows[0].chord.modifiers);
@@ -1833,6 +1894,9 @@ test "platform profiles preserve existing defaults before pane bindings" {
         try testing.expectEqualStrings("font.size.increase", table[40].action);
         try testing.expectEqualStrings("font.size.decrease", table[41].action);
         try testing.expectEqualStrings("font.size.reset", table[42].action);
+        try testing.expectEqualStrings("settings.open", table[43].action);
+        try testing.expect(bindingKeyEql(.{ .character = ',' }, table[43].chord.key));
+        try testing.expect(table[43].chord.modifiers.shift);
     }
     try testing.expectEqual(@as(usize, 0), macos[0].arguments.len);
     try testing.expectEqual(@as(usize, 0), linux_windows[0].arguments.len);
@@ -1924,6 +1988,17 @@ test "font size defaults zoom with the platform modifier and leave the plain key
     }
     // Ctrl+Shift+- (Ctrl+_) stays the terminal's on Linux and Windows: it is a C0 control.
     try expectDefaultTerminal(.linux_windows, symbolKey('-', '_', .{ .ctrl = true, .shift = true }));
+}
+
+test "the settings view opens with Shift added to the config file chord and the near misses stay the terminal's" {
+    try expectDefaultAction(.linux_windows, symbolKey(',', '<', .{ .ctrl = true, .shift = true }), "settings.open", null);
+    try expectDefaultAction(.macos, symbolKey(',', '<', .{ .shift = true, .super = true }), "settings.open", null);
+    try expectDefaultAction(.linux_windows, symbolKey(',', '<', .{ .ctrl = true }), "config.open", null);
+    try expectDefaultAction(.macos, symbolKey(',', '<', .{ .super = true }), "config.open", null);
+    for ([_]PlatformProfile{ .linux_windows, .macos }) |profile| {
+        try expectDefaultTerminal(profile, symbolKey(',', '<', .{ .shift = true }));
+        try expectDefaultTerminal(profile, symbolKey(',', '<', .{ .alt = true, .shift = true }));
+    }
 }
 
 test "tab defaults route exact platform actions and static arguments" {
@@ -3744,6 +3819,40 @@ test "overrides replace, add and unbind while defaults stay borrowed" {
         try testing.expect(!std.mem.eql(u8, binding.action, "scratchpad.toggle-50"));
     }
     try testing.expectEqual(@as(usize, 2), ninety);
+}
+
+test "a pressed chord is spelled so it parses back to itself and finds its binding" {
+    const testing = std.testing;
+    for ([_]PlatformProfile{ .macos, .linux_windows }) |profile| {
+        for (defaultBindings(profile)) |binding| {
+            var buffer: [64]u8 = undefined;
+            const spelling = try formatChordSpelling(&buffer, binding.chord);
+            try testing.expect(chordEql(binding.chord, try parseChord(spelling)));
+            const found = findBinding(defaultBindings(profile), binding.chord).?;
+            try testing.expect(chordEql(found.chord, binding.chord));
+        }
+    }
+    var buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings("ctrl+alt+super+shift+page_up", try formatChordSpelling(&buffer, .{ .key = .{ .named = .page_up }, .modifiers = .{ .ctrl = true, .alt = true, .super = true, .shift = true, .caps_lock = true } }));
+    try testing.expectEqualStrings("ctrl+plus", try formatChordSpelling(&buffer, .{ .key = .{ .character = '+' }, .modifiers = .{ .ctrl = true } }));
+    try testing.expectEqualStrings("ctrl+equal", try formatChordSpelling(&buffer, .{ .key = .{ .character = '=' }, .modifiers = .{ .ctrl = true } }));
+    try testing.expectEqualStrings("alt+space", try formatChordSpelling(&buffer, .{ .key = .{ .character = ' ' }, .modifiers = .{ .alt = true } }));
+    try testing.expectEqualStrings("alt+\u{e9}", try formatChordSpelling(&buffer, .{ .key = .{ .character = 0xe9 }, .modifiers = .{ .alt = true } }));
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, formatChordSpelling(&tiny, .{ .key = .{ .named = .f10 }, .modifiers = .{ .ctrl = true } }));
+
+    // The press the user makes is the chord, whatever character the layout shifted it to.
+    const pressed = chordOf(symbolKey(',', '<', .{ .ctrl = true, .shift = true })).?;
+    try testing.expect(chordEql(pressed, try parseChord("ctrl+shift+,")));
+    try testing.expect(chordOf(.{ .action = .press }) == null);
+    try testing.expectEqualStrings("palette.open", findBinding(defaultBindings(.linux_windows), try parseChord("ctrl+shift+p")).?.action);
+    try testing.expect(findBinding(defaultBindings(.linux_windows), try parseChord("ctrl+alt+k")) == null);
+
+    try testing.expect(chordTypesText(try parseChord("k")));
+    try testing.expect(chordTypesText(try parseChord("shift+k")));
+    try testing.expect(!chordTypesText(try parseChord("ctrl+k")));
+    try testing.expect(!chordTypesText(try parseChord("alt+shift+k")));
+    try testing.expect(!chordTypesText(try parseChord("f5")));
 }
 
 fn routeThrough(bindings: []const Binding, raw: platform.KeyEvent) Route {
