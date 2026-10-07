@@ -54,6 +54,7 @@ Conduit/
 │   ├── workspace.zig    workspace/session/tab/pane lifecycle and ExecutionContext owner
 │   ├── session.zig      PTY + terminal state for one live terminal
 │   ├── config.zig       settings file, defaults, hot reload
+│   ├── state.zig        persisted workspace layout, its versioned file and restore plan
 │   ├── theme.zig        palette and colour schemes
 │   ├── agent.zig        adapter interface + Claude Code / Codex / Pi
 │   ├── backlog.zig      backlog.md data layer
@@ -742,7 +743,18 @@ nothing else is a legal dependency.
   workspace could be remote (P7, invariant 5). Never terminate a session to hide it (P8,
   invariant 6). Never let an agent or the control API own, target or take over the scratchpad
   (P9, invariant 7).
-- **May depend on** `pty`, `session` and `term` for today's owner, tab index and pane trees. Composed
+- **TASK-65 persistence hooks.** `WorkspaceRegistry.snapshot` captures every live workspace in
+  presentation order as an owned `state.Snapshot`: name, kind, cwd, the SSH target
+  (`ssh.SshContext.fromContext`: destination, port and `-o` options, never the test-only
+  `config_file`), tab order, a tab's name only when `Tab.userNamed` (set by `renameTab`), each
+  pane tree with `first_weight / total_weight` as the split ratio and each leaf session's tracked
+  OSC 7 cwd (the workspace cwd when none was reported), the focused leaf as a left-to-right index,
+  zoom and the active tab and workspace. It reads no terminal contents. The theme, window
+  geometry, save time and scratchpad size are the app's to fill. `Workspace.setPaneSplitRatio`
+  lets restore set the divider above a freshly split pane to a saved ratio (weights over 10 000),
+  clamped by leaf minimums at layout like every weight. The module is imported as `persistence`
+  because `state` is also a PTY vtable callback name in this file.
+- **May depend on** `pty`, `session`, `state` and `term` for today's owner, tab index and pane trees. Composed
   workspace views live at the `app` boundary and may also use `config`, `input`, `render`, `theme`
   and `ui`; `agent` and `backlog` depend on `workspace`, never the reverse.
 - **Lands** M3 — TASK-27 implements the nonvisual owner, Local execution context and session
@@ -781,7 +793,7 @@ nothing else is a legal dependency.
   a `keybind` line is carried as text for `input` and the registry.
 - **May depend on** no other Conduit module (`std` and `builtin` only; `builtin.os.tag` selects
   the location and the watch backend). Workspace-scoped state belongs to `workspace`; *how*
-  workspace state is persisted is TASK-65.
+  workspace state is persisted is `state` (TASK-65).
 - **Lands** M4 — TASK-37. TASK-35 added the first resolved setting declaration ahead of the file
   layer: `RightClick` (`mouse.right_click`, built-in `menu`, with `paste` supplied through the
   session layer by the `--right-click=` launch flag).
@@ -832,6 +844,57 @@ nothing else is a legal dependency.
   `<chord>=<action>` appended, every other line kept byte for byte; `writeActionKeybinds` applies
   it to the file with the same create-from-defaults, sibling write and rename (`replaceDocument`)
   as `writeDocumentValue`. `--settings-test` is the fourth check that reads a private file.
+
+### `state`
+
+- **Owns** what Conduit remembers between runs and how: the `Snapshot` model (workspaces with
+  name, kind, cwd and SSH destination/port/options; tabs with user-chosen names, binary pane
+  trees with split direction, ratio and per-leaf cwd, focused leaf and zoom; the active tab and
+  workspace; per-workspace scratchpad percent; theme; window geometry), its versioned JSON codec,
+  forward migration, the platform state path, atomic save, bounded load, quarantine of an
+  unusable file, and `planRestore`.
+- **Never** persist terminal contents, scrollback, environment, clipboard data or credentials (an
+  SSH workspace keeps only what reconnecting by alias needs). Never crash on the file: it may be
+  hand-edited, truncated or written by a newer Conduit. Never spawn or own a workspace: the app
+  replays the plan through the normal workspace operations, so every restored shell still spawns
+  through its workspace's `ExecutionContext`.
+- **May depend on** no other Conduit module (`std` and `builtin`). `workspace` builds a snapshot
+  from live state; `app` owns when to save and how to restore.
+- **Format.** `encode` writes pretty JSON with a fixed key order and null optionals omitted, so
+  one state is one byte sequence; ratios carry four decimals. `{"version": 1, "saved_at_unix",
+  "theme"?, "window"?: {x?, y?, width, height, maximized}, "active_workspace"?, "workspaces":
+  [{"name", "kind": local|ssh|wsl, "cwd", "ssh"?: {destination, port?, options}, "active_tab"?,
+  "scratchpad_percent"?, "tabs": [{"name"?, "focused_leaf", "zoomed", "panes": {"type": "leaf",
+  "cwd"?} | {"type": "split", "direction": right|down, "ratio", "first", "second"}}]}]}`.
+  `encode` refuses (`error.Unrepresentable`) anything `decode` would refuse, so Conduit never
+  writes a file it cannot read back.
+- **Decoding.** `decode` parses into an arena-owned `Owned` snapshot. It is bounded (1 MiB file,
+  64 workspaces, 256 tabs per workspace, 256 panes per tab, pane depth 16 checked before each
+  descent, 256-byte names, 4096-byte paths, 32 SSH options), ignores unknown fields, treats JSON
+  null as absent, and defaults every optional field. A version above `current_version` is
+  `error.Incompatible`; anything malformed, out of range or inconsistent (an index past its list,
+  duplicate workspace names, an SSH workspace without a valid destination) is `error.Corrupt`.
+  Both fill a `Diagnostic` naming the field path, never a value. `migrate` rewrites an older
+  document's JSON tree step by step before it is read; version 0 (pre-release) named `kind`
+  `context`.
+- **Storage.** `statePath`: `$XDG_STATE_HOME/conduit/state.json` (absolute only), else
+  `~/.local/state/conduit/state.json`; `~/Library/Application Support/conduit/state.json` on
+  macOS; `%LOCALAPPDATA%\conduit\state.json` on Windows. `conduit-test launch` isolates
+  `XDG_STATE_HOME`. `save` creates the directory, writes `state.json.saving` (mode 0600 on POSIX),
+  fsyncs, then renames it over the file. `load` reads into a caller buffer one byte larger than
+  the cap so an oversized file is detected. `restoreFromDisk` turns a missing file into a clean
+  start, an unreadable one into a clean start with a diagnostic, and a corrupt or newer one into a
+  clean start after renaming it to `state.json.corrupt-<unix>` so the evidence is kept.
+- **Restore plan.** `planRestore` returns ordered `Step`s that borrow the snapshot: per workspace
+  `create_workspace` (with `needs_reconnect` for SSH and WSL, so the app prompts rather than
+  connects), then per tab `create_tab` (leaf 0's cwd), `split_pane` steps depth-first (the split
+  pane keeps the first child, so `new_leaf` is the split leaf plus the first child's leaf count;
+  set the ratio on the new pane at once), `focus_pane` and `zoom_pane`; then `select_tab`; and a
+  final `select_workspace`. A workspace saved without tabs gets one default tab.
+- **Threads.** Everything runs on the caller's thread. `app` captures and encodes on the owner
+  thread; `save` may run on a worker with an owned copy of the bytes, one save per path at a time.
+- **Lands** M8 — TASK-65 part one (model, codec, storage, plan and the `workspace` hooks); the app
+  wiring (save on change and exit, restore on launch, the reconnect prompt) is part two.
 
 ### `theme`
 
@@ -1364,7 +1427,7 @@ layout). A module may depend only on modules in a strictly lower layer than its 
                 │
   depth 1   theme             term       control     colours, terminal state, control API
                 │
-  depth 0   platform          pty          config    font       link
+  depth 0   platform          pty          config    font       link       state
 ```
 
 Two ways to read that:
@@ -1372,7 +1435,7 @@ Two ways to read that:
 - **Downward is allowed.** An import edge only ever goes from a higher depth to a lower one.
 - **Sideways is not.** `input` imports `ui`, not the reverse. `term`, `pty`, `font` and `link` remain
   below product concerns; `term`'s only Conduit dependency is `pty`, while `pty` and `font` have
-  no Conduit dependencies and `link` is a pure leaf.
+  no Conduit dependencies and `link` and `state` are pure leaves.
 
 **(convention)** `ui` is the primitive layer and nothing else. It does not import `agent`,
 `backlog`, `session` or `workspace`; every product view — sidebar, tabs, splits, palette,
@@ -1404,6 +1467,7 @@ graph TD
     app --> pty
     app --> term
     app --> testdriver
+    app --> state
     agent --> config
     agent --> input
     agent --> session
@@ -1424,6 +1488,7 @@ graph TD
     workspace --> theme
     workspace --> config
     workspace --> term
+    workspace --> state
     session --> config
     session --> pty
     session --> term

@@ -22,6 +22,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pty = @import("pty");
 const session = @import("session");
+// The `state` module, under another name: `state` is also a PTY vtable
+// callback name in this file.
+const persistence = @import("state");
 const term = @import("term");
 
 const Allocator = std.mem.Allocator;
@@ -1387,6 +1390,8 @@ pub const Tab = struct {
     zoomed_pane_id: ?PaneId,
     label_bytes: []u8,
     attention_value: TabAttention,
+    // Set by `renameTab`: only a name the user chose is persisted (TASK-65).
+    user_named: bool,
     semantic_storage: [semantic_capacity]u8,
     semantic_len: u8,
 
@@ -1403,6 +1408,12 @@ pub const Tab = struct {
     /// Cached attention prefix followed by the copied tab name.
     pub fn displayLabel(self: *const Tab) []const u8 {
         return self.label_bytes;
+    }
+
+    /// Whether the name was chosen by the user through `renameTab`, rather
+    /// than derived by the app when the tab was created.
+    pub fn userNamed(self: *const Tab) bool {
+        return self.user_named;
     }
 
     /// Current background attention state.
@@ -1462,6 +1473,7 @@ fn initializeTab(
         .zoomed_pane_id = null,
         .label_bytes = label_bytes,
         .attention_value = .none,
+        .user_named = false,
         .semantic_storage = undefined,
         .semantic_len = 0,
     };
@@ -1832,6 +1844,7 @@ pub const Workspace = struct {
         @memcpy(label_bytes[0..tab_label_prefix_len], attentionPrefix(tab_record.attention_value));
         const old_label = tab_record.label_bytes;
         tab_record.label_bytes = label_bytes;
+        tab_record.user_named = true;
         self.allocator.free(old_label);
     }
 
@@ -2139,6 +2152,123 @@ pub const Workspace = struct {
         }
         tab_record.zoomed_pane_id = tab_record.focused_pane_id;
         return true;
+    }
+
+    /// Set the divider directly above a leaf to give the parent's first child
+    /// `ratio` of the space beside it (TASK-65 restore). Restore calls it on
+    /// the pane a split just created, whose parent is that new divider. Like
+    /// every weight, it is clamped to the leaf minimums at layout time, so it
+    /// needs no geometry. A ratio outside `persistence.min_ratio..persistence.max_ratio`
+    /// (including NaN) is refused.
+    pub fn setPaneSplitRatio(
+        self: *Workspace,
+        tab_id: TabId,
+        pane_id: PaneId,
+        ratio: f32,
+    ) error{ UnknownTab, UnknownPane, NotSplit, InvalidRatio }!void {
+        if (!(ratio >= persistence.min_ratio and ratio <= persistence.max_ratio)) return error.InvalidRatio;
+        const tab_index = self.tabIndex(tab_id) orelse return error.UnknownTab;
+        const tab_record = self.tabs.items[tab_index];
+        if (findPaneConst(tab_record.root, pane_id) == null) return error.UnknownPane;
+        const parent = parentForPane(tab_record.root, pane_id) orelse return error.NotSplit;
+        const branch = &parent.parent.branch;
+        branch.total_weight = ratio_weight_total;
+        branch.first_weight = @intFromFloat(@round(ratio * @as(f32, ratio_weight_total)));
+    }
+
+    /// The divider weight scale `setPaneSplitRatio` writes: four decimals,
+    /// the precision the state file keeps.
+    const ratio_weight_total: u32 = 10_000;
+
+    /// Capture this workspace's persistent layout into `arena` (TASK-65):
+    /// tab order, user-chosen tab names, every pane tree with split ratios
+    /// and each leaf's tracked OSC 7 cwd (the workspace cwd when none was
+    /// reported), focus, zoom, the active tab, and the SSH target. Terminal
+    /// contents are never read. `scratchpad_percent` is presentation state
+    /// and is left null for the app to fill.
+    pub fn captureState(self: *const Workspace, arena: Allocator) Allocator.Error!persistence.WorkspaceState {
+        const cwd = try arena.dupe(u8, self.cwd_bytes);
+        const kind: persistence.ContextKind = switch (self.contextKind()) {
+            .local => .local,
+            .ssh => .ssh,
+            .wsl => .wsl,
+        };
+        var target: ?persistence.SshTarget = null;
+        if (ssh.SshContext.fromContext(&self.context)) |context| {
+            const options = try arena.alloc([]const u8, context.options.len);
+            for (context.options, options) |option, *out| out.* = try arena.dupe(u8, option);
+            target = .{
+                .destination = try arena.dupe(u8, context.destination),
+                .port = context.port,
+                .options = options,
+            };
+        }
+        const tabs = try arena.alloc(persistence.TabState, self.tabs.items.len);
+        var active_tab: ?usize = null;
+        for (self.tabs.items, tabs, 0..) |tab_record, *out, index| {
+            if (self.active_tab_id == tab_record.id_value) active_tab = index;
+            var walk: CaptureWalk = .{ .focused = tab_record.focused_pane_id };
+            out.* = .{
+                .name = if (tab_record.user_named) try arena.dupe(u8, tab_record.name()) else null,
+                .panes = try self.capturePanes(arena, tab_record.root, cwd, &walk),
+                .focused_leaf = walk.focused_leaf,
+                .zoomed = tab_record.zoomed_pane_id != null,
+            };
+        }
+        return .{
+            .name = try arena.dupe(u8, self.name_bytes),
+            .kind = kind,
+            .cwd = cwd,
+            .ssh = target,
+            .active_tab = active_tab,
+            .tabs = tabs,
+        };
+    }
+
+    const CaptureWalk = struct {
+        focused: PaneId,
+        next_leaf: usize = 0,
+        focused_leaf: usize = 0,
+    };
+
+    fn capturePanes(
+        self: *const Workspace,
+        arena: Allocator,
+        node: *const PaneNode,
+        workspace_cwd: []const u8,
+        walk: *CaptureWalk,
+    ) Allocator.Error!persistence.PaneNode {
+        switch (node.*) {
+            .leaf => |leaf| {
+                if (leaf.id == walk.focused) walk.focused_leaf = walk.next_leaf;
+                walk.next_leaf += 1;
+                const record = self.recordByIdConst(leaf.session_id);
+                const tracked: ?[]const u8 = if (record) |value|
+                    if (value.live) |*live| live.workingDirectory() else null
+                else
+                    null;
+                return .{ .leaf = .{
+                    .cwd = if (tracked) |dir| try arena.dupe(u8, dir) else workspace_cwd,
+                } };
+            },
+            .branch => |branch| {
+                const first = try arena.create(persistence.PaneNode);
+                first.* = try self.capturePanes(arena, branch.first, workspace_cwd, walk);
+                const second = try arena.create(persistence.PaneNode);
+                second.* = try self.capturePanes(arena, branch.second, workspace_cwd, walk);
+                const share = @as(f32, @floatFromInt(branch.first_weight)) /
+                    @as(f32, @floatFromInt(branch.total_weight));
+                return .{ .split = .{
+                    .direction = switch (branch.split) {
+                        .right => .right,
+                        .down => .down,
+                    },
+                    .ratio = std.math.clamp(share, persistence.min_ratio, persistence.max_ratio),
+                    .first = first,
+                    .second = second,
+                } };
+            },
+        }
     }
 
     /// Close a non-final pane, release its session, and promote its sibling.
@@ -2722,6 +2852,25 @@ pub const WorkspaceRegistry = struct {
     pub fn activate(self: *WorkspaceRegistry, key: WorkspaceKey) ActivateError!void {
         _ = self.indexOfKey(key) orelse return error.UnknownWorkspace;
         self.active_key = key;
+    }
+
+    /// Capture every live workspace, in presentation order, with the active
+    /// selection, as an owned `persistence.Snapshot` (TASK-65). Owner thread only.
+    /// The theme, window geometry, save time and each workspace's scratchpad
+    /// size belong to the app, which fills them through `Owned.allocator()`
+    /// before `persistence.encode`. A layout beyond the state file's bounds is
+    /// still captured; `persistence.encode` reports it as unrepresentable.
+    pub fn snapshot(self: *const WorkspaceRegistry, allocator: Allocator) Allocator.Error!persistence.Owned {
+        var owned: persistence.Owned = .{ .arena = .init(allocator), .snapshot = .{} };
+        errdefer owned.arena.deinit();
+        const arena = owned.arena.allocator();
+        const workspaces = try arena.alloc(persistence.WorkspaceState, self.records.items.len);
+        for (self.records.items, workspaces) |record, *out| {
+            out.* = try record.workspace.captureState(arena);
+        }
+        owned.snapshot.workspaces = workspaces;
+        if (self.active_key) |key| owned.snapshot.active_workspace = self.indexOfKey(key);
+        return owned;
     }
 
     /// Remove and fully deinitialize a workspace.
@@ -4934,6 +5083,274 @@ test "the local context runs a bounded command and reports its exit, output and 
         .argv = &.{},
         .cwd = "/",
     }));
+}
+
+fn reportTestCwd(workspace: *Workspace, id: session.SessionId, cwd: []const u8) !void {
+    var buffer: [256]u8 = undefined;
+    const osc = try std.fmt.bufPrint(&buffer, "\x1b]7;file://localhost{s}\x07", .{cwd});
+    workspace.sessionById(id).?.terminal().feed(osc);
+}
+
+/// The registry the TASK-65 tests capture: two local workspaces, the first
+/// with a renamed, split, resized, zoomed tab beside a plain one, the second
+/// active with one tab whose shell reported a directory of its own.
+fn buildPersistenceFixture(
+    registry: *WorkspaceRegistry,
+    audit: *FakeAudit,
+    size: term.GridSize,
+    bounds: CellRect,
+) !void {
+    const testing = std.testing;
+    const main_key = try insertFakeWorkspace(registry, testing.io, testing.allocator, audit, "main", "/home/u", size);
+    const side_key = try insertFakeWorkspace(registry, testing.io, testing.allocator, audit, "side", "/srv", size);
+    const main = registry.byKey(main_key).?;
+
+    const build = try main.createTab("Terminal 1", size);
+    const root_pane = main.focusedPaneId(build.tab_id).?;
+    const right = try main.createPaneSession(build.tab_id, root_pane, .human_terminal, size, .right, bounds);
+    const lower = try main.createPaneSession(build.tab_id, root_pane, .human_terminal, size, .down, bounds);
+    // The outer divider starts at 15 of 30 cells; five more make it 20/30.
+    try testing.expect(try main.resizePaneEdge(build.tab_id, root_pane, .right, 5, bounds));
+    try main.renameTab(build.tab_id, "build");
+    try reportTestCwd(main, right.session_id, "/home/u/right");
+    try main.focusPane(build.tab_id, lower.pane_id);
+    try testing.expect(try main.togglePaneZoom(build.tab_id));
+    _ = try main.createTab("Terminal 2", size);
+    try main.activateTab(build.tab_id);
+    const side = registry.byKey(side_key).?;
+    const side_tab = try side.createTab("Terminal 1", size);
+    try reportTestCwd(side, side_tab.session_id, "/srv/www");
+    try registry.activate(side_key);
+}
+
+const persistence_root_leaf: persistence.PaneNode = .{ .leaf = .{ .cwd = "/home/u" } };
+const persistence_lower_leaf: persistence.PaneNode = .{ .leaf = .{ .cwd = "/home/u" } };
+const persistence_right_leaf: persistence.PaneNode = .{ .leaf = .{ .cwd = "/home/u/right" } };
+const persistence_left_column: persistence.PaneNode = .{ .split = .{
+    .direction = .down,
+    .ratio = 0.5,
+    .first = &persistence_root_leaf,
+    .second = &persistence_lower_leaf,
+} };
+const persistence_main_tabs = [_]persistence.TabState{
+    .{
+        .name = "build",
+        .panes = .{ .split = .{
+            .direction = .right,
+            .ratio = 20.0 / 30.0,
+            .first = &persistence_left_column,
+            .second = &persistence_right_leaf,
+        } },
+        .focused_leaf = 1,
+        .zoomed = true,
+    },
+    .{ .panes = .{ .leaf = .{ .cwd = "/home/u" } } },
+};
+const persistence_side_tabs = [_]persistence.TabState{.{ .panes = .{ .leaf = .{ .cwd = "/srv/www" } } }};
+const persistence_workspaces = [_]persistence.WorkspaceState{
+    .{ .name = "main", .cwd = "/home/u", .active_tab = 0, .tabs = &persistence_main_tabs },
+    .{ .name = "side", .cwd = "/srv", .active_tab = 0, .tabs = &persistence_side_tabs },
+};
+const persistence_expected: persistence.Snapshot = .{
+    .active_workspace = 1,
+    .workspaces = &persistence_workspaces,
+};
+
+/// Execute a restore plan the way the app does, over fake contexts. Each
+/// started shell then reports the directory it was started in.
+fn applyTestRestorePlan(
+    registry: *WorkspaceRegistry,
+    audit: *FakeAudit,
+    plan: persistence.RestorePlan,
+    size: term.GridSize,
+    bounds: CellRect,
+) !void {
+    const testing = std.testing;
+    var keys: [4]WorkspaceKey = undefined;
+    var tab_ids: [4][4]TabId = undefined;
+    var leaf_panes: [8]PaneId = undefined;
+    for (plan.steps) |step| switch (step) {
+        .create_workspace => |s| {
+            keys[s.workspace] = try insertFakeWorkspace(registry, testing.io, testing.allocator, audit, s.name, s.cwd, size);
+        },
+        .create_tab => |s| {
+            const workspace = registry.byKey(keys[s.workspace]).?;
+            const created = try workspace.createTab(s.name orelse "Terminal", size);
+            if (s.name) |name| try workspace.renameTab(created.tab_id, name);
+            tab_ids[s.workspace][s.tab] = created.tab_id;
+            leaf_panes[0] = workspace.focusedPaneId(created.tab_id).?;
+            try reportTestCwd(workspace, created.session_id, s.cwd);
+        },
+        .split_pane => |s| {
+            const workspace = registry.byKey(keys[s.workspace]).?;
+            const tab_id = tab_ids[s.workspace][s.tab];
+            const split: PaneSplit = switch (s.direction) {
+                .right => .right,
+                .down => .down,
+            };
+            const created = try workspace.createPaneSession(tab_id, leaf_panes[s.leaf], .human_terminal, size, split, bounds);
+            try workspace.setPaneSplitRatio(tab_id, created.pane_id, s.ratio);
+            leaf_panes[s.new_leaf] = created.pane_id;
+            try reportTestCwd(workspace, created.session_id, s.cwd);
+        },
+        .focus_pane => |s| try registry.byKey(keys[s.workspace]).?.focusPane(tab_ids[s.workspace][s.tab], leaf_panes[s.leaf]),
+        .zoom_pane => |s| _ = try registry.byKey(keys[s.workspace]).?.togglePaneZoom(tab_ids[s.workspace][s.tab]),
+        .select_tab => |s| try registry.byKey(keys[s.workspace]).?.activateTab(tab_ids[s.workspace][s.tab]),
+        .select_workspace => |s| try registry.activate(keys[s.workspace]),
+    };
+}
+
+test "a registry snapshot captures workspaces, tabs, pane trees, cwd, focus, zoom and selection" {
+    const testing = std.testing;
+    const size = try term.GridSize.init(40, 16);
+    const bounds = try CellRect.init(0, 0, 31, 17);
+    var audit: FakeAudit = .{};
+    var registry = WorkspaceRegistry.init(testing.allocator);
+    defer registry.deinit() catch |err| std.debug.panic("registry cleanup failed: {s}", .{@errorName(err)});
+    try buildPersistenceFixture(&registry, &audit, size, bounds);
+
+    var owned = try registry.snapshot(testing.allocator);
+    defer owned.deinit();
+    try persistence.expectSameSnapshot(&persistence_expected, &owned.snapshot);
+    // Only a renamed tab carries its name; a derived one is assigned again.
+    try testing.expect(registry.at(0).?.tabAt(0).?.userNamed());
+    try testing.expect(!registry.at(0).?.tabAt(1).?.userNamed());
+
+    // The app's own values join the snapshot through its arena, and the
+    // result survives the file format unchanged.
+    owned.snapshot.theme = try owned.allocator().dupe(u8, "Gruvbox Dark");
+    owned.snapshot.window = .{ .width = 1280, .height = 800 };
+    var diagnostic: persistence.Diagnostic = .{};
+    const bytes = try persistence.encode(testing.allocator, &owned.snapshot, &diagnostic);
+    defer testing.allocator.free(bytes);
+    var decoded = try persistence.decode(testing.allocator, bytes, &diagnostic);
+    defer decoded.deinit();
+    try persistence.expectSameSnapshot(&owned.snapshot, &decoded.snapshot);
+}
+
+test "executing a restore plan rebuilds the same workspaces, layout and cwd" {
+    const testing = std.testing;
+    const size = try term.GridSize.init(40, 16);
+    const bounds = try CellRect.init(0, 0, 31, 17);
+
+    var original_audit: FakeAudit = .{};
+    var original = WorkspaceRegistry.init(testing.allocator);
+    defer original.deinit() catch |err| std.debug.panic("registry cleanup failed: {s}", .{@errorName(err)});
+    try buildPersistenceFixture(&original, &original_audit, size, bounds);
+    var saved = try original.snapshot(testing.allocator);
+    defer saved.deinit();
+    var diagnostic: persistence.Diagnostic = .{};
+    const bytes = try persistence.encode(testing.allocator, &saved.snapshot, &diagnostic);
+    defer testing.allocator.free(bytes);
+
+    // A relaunch: decode the file, plan, and replay through the normal
+    // workspace, tab and pane operations.
+    var loaded = try persistence.decode(testing.allocator, bytes, &diagnostic);
+    defer loaded.deinit();
+    var plan = try persistence.planRestore(testing.allocator, &loaded.snapshot);
+    defer plan.deinit(testing.allocator);
+    var restored_audit: FakeAudit = .{};
+    var restored = WorkspaceRegistry.init(testing.allocator);
+    defer restored.deinit() catch |err| std.debug.panic("registry cleanup failed: {s}", .{@errorName(err)});
+    try applyTestRestorePlan(&restored, &restored_audit, plan, size, bounds);
+
+    var again = try restored.snapshot(testing.allocator);
+    defer again.deinit();
+    try persistence.expectSameSnapshot(&persistence_expected, &again.snapshot);
+
+    // The restored divider lays out where the saved one did.
+    var saved_dividers: [2]DividerLayout = undefined;
+    var restored_dividers: [2]DividerLayout = undefined;
+    const original_main = original.at(0).?;
+    const restored_main = restored.at(0).?;
+    _ = try original_main.togglePaneZoom(original_main.tabAt(0).?.id());
+    _ = try restored_main.togglePaneZoom(restored_main.tabAt(0).?.id());
+    try testing.expectEqual(@as(usize, 2), try original_main.layoutDividers(original_main.tabAt(0).?.id(), bounds, &saved_dividers));
+    try testing.expectEqual(@as(usize, 2), try restored_main.layoutDividers(restored_main.tabAt(0).?.id(), bounds, &restored_dividers));
+    for (saved_dividers, restored_dividers) |saved_divider, restored_divider| {
+        try testing.expectEqual(saved_divider.split, restored_divider.split);
+        try testing.expectEqual(saved_divider.rect, restored_divider.rect);
+    }
+}
+
+test "a split ratio is set only on a divider, within bounds" {
+    const testing = std.testing;
+    const size = try term.GridSize.init(40, 16);
+    const bounds = try CellRect.init(0, 0, 31, 17);
+    var audit: FakeAudit = .{};
+    const context = try FakeContext.create(testing.allocator, &audit, .local);
+    var workspace = try Workspace.init(testing.io, testing.allocator, "ratio", "/tmp", context, size);
+    defer workspace.deinit() catch |err| std.debug.panic("workspace cleanup failed: {s}", .{@errorName(err)});
+
+    const created = try workspace.createTab("t", size);
+    const root = workspace.focusedPaneId(created.tab_id).?;
+    try testing.expectError(error.NotSplit, workspace.setPaneSplitRatio(created.tab_id, root, 0.5));
+    const right = try workspace.createPaneSession(created.tab_id, root, .human_terminal, size, .right, bounds);
+    try testing.expectError(error.InvalidRatio, workspace.setPaneSplitRatio(created.tab_id, right.pane_id, 0));
+    try testing.expectError(error.InvalidRatio, workspace.setPaneSplitRatio(created.tab_id, right.pane_id, 1));
+    try testing.expectError(error.InvalidRatio, workspace.setPaneSplitRatio(created.tab_id, right.pane_id, std.math.nan(f32)));
+    try testing.expectError(error.UnknownPane, workspace.setPaneSplitRatio(created.tab_id, PaneId.fromOrdinal(99), 0.5));
+    try testing.expectError(error.UnknownTab, workspace.setPaneSplitRatio(TabId.fromOrdinal(99), right.pane_id, 0.5));
+
+    // A quarter of the 30 cells beside the divider, from either child.
+    try workspace.setPaneSplitRatio(created.tab_id, root, 0.25);
+    var panes: [2]PaneLayout = undefined;
+    try testing.expectEqual(@as(usize, 2), try workspace.layoutPanes(created.tab_id, bounds, &panes));
+    try testing.expectEqual(@as(u16, 8), panes[0].rect.cols);
+    // An extreme ratio still leaves each pane its minimum.
+    try workspace.setPaneSplitRatio(created.tab_id, right.pane_id, persistence.max_ratio);
+    _ = try workspace.layoutPanes(created.tab_id, bounds, &panes);
+    try testing.expectEqual(min_pane_cols, panes[1].rect.cols);
+}
+
+test "an ssh workspace snapshot keeps its target but never its test-only config file" {
+    const testing = std.testing;
+    if (!ssh.supported) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var relative: [128]u8 = undefined;
+    // A relative runtime directory keeps the control socket path short; no
+    // master is started, so it is never bound.
+    const runtime_dir = try std.fmt.bufPrint(&relative, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    const size = try term.GridSize.init(40, 16);
+    const options = [_][]const u8{"ServerAliveInterval=30"};
+    // Creating the context validates and prepares its control directory but
+    // starts no process; nothing connects in this test.
+    const context = ssh.SshContext.create(testing.allocator, testing.io, .{
+        .target = .{ .destination = "deploy@prod", .port = 2222, .config_file = "/dev/null", .options = &options },
+        .local_env = &.{},
+        .runtime_dir = runtime_dir,
+    }) catch |err| switch (err) {
+        // A deep worktree path can exceed sockaddr_un; that is not this test.
+        error.ControlPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+    var candidate = try Workspace.init(testing.io, testing.allocator, "prod", "/home/deploy", context, size);
+    var registry = WorkspaceRegistry.init(testing.allocator);
+    defer registry.deinit() catch |err| std.debug.panic("registry cleanup failed: {s}", .{@errorName(err)});
+    _ = registry.insert(&candidate) catch |err| {
+        candidate.deinit() catch |cleanup_err| std.debug.panic("workspace cleanup failed: {s}", .{@errorName(cleanup_err)});
+        return err;
+    };
+
+    var owned = try registry.snapshot(testing.allocator);
+    defer owned.deinit();
+    const captured = owned.snapshot.workspaces[0];
+    try testing.expectEqual(persistence.ContextKind.ssh, captured.kind);
+    try testing.expectEqualStrings("deploy@prod", captured.ssh.?.destination);
+    try testing.expectEqual(@as(?u16, 2222), captured.ssh.?.port);
+    try testing.expectEqual(@as(usize, 1), captured.ssh.?.options.len);
+    try testing.expectEqualStrings("ServerAliveInterval=30", captured.ssh.?.options[0]);
+
+    var diagnostic: persistence.Diagnostic = .{};
+    const bytes = try persistence.encode(testing.allocator, &owned.snapshot, &diagnostic);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "/dev/null") == null);
+    var plan = try persistence.planRestore(testing.allocator, &owned.snapshot);
+    defer plan.deinit(testing.allocator);
+    try testing.expect(plan.steps[0].create_workspace.needs_reconnect);
+    try testing.expectEqualStrings("deploy@prod", plan.steps[0].create_workspace.ssh.?.destination);
 }
 
 test {
