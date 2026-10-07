@@ -319,6 +319,74 @@ const font_coverage_steps = [_]Step{
     .screenshot,
 };
 
+// Palette choice rows are `palette.choice.<action index>.<choice>`, where the
+// action index is the command's position in the app's action registry:
+// `theme.pick` is 50 and `font.pick` is 51. These shift when an action is
+// registered before them in `App.init`; `--ui-test` pins the same order.
+const theme_pick_first_choice = "palette.choice.50.0";
+const theme_pick_second_choice = "palette.choice.50.1";
+const font_pick_first_choice = "palette.choice.51.0";
+const font_pick_second_choice = "palette.choice.51.1";
+
+// TASK-38: the theme picker by keyboard (Down previews the next theme live,
+// Escape closes and reverts) and by mouse (the sidebar hint, the typed
+// command, a clicked choice that commits and closes the dialog).
+const theme_picker_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "theme" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = theme_pick_first_choice, .state = "exists", .equals = true } },
+    .{ .key = "DOWN" },
+    .screenshot,
+    .{ .key = "ESCAPE" },
+    .{ .wait_element = .{ .id = "palette.dialog", .state = "exists", .equals = false } },
+    .{ .click = "sidebar.palette" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "theme" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = theme_pick_second_choice, .state = "exists", .equals = true } },
+    .{ .click = theme_pick_second_choice },
+    .{ .wait_element = .{ .id = "palette.dialog", .state = "exists", .equals = false } },
+    .screenshot,
+};
+
+// TASK-40: the font family picker. Its `palette.preview` line exists only
+// while the window is drawn with the highlighted family, so waiting for it
+// after Down waits for the previewed face to finish loading. The mouse path
+// commits the second listed family; reopening the picker then lists it first
+// and, once its line is back, the screenshot shows the committed face.
+const font_picker_label = "Font: Change Family";
+
+const font_picker_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = font_picker_label },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = font_pick_first_choice, .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "palette.preview", .state = "exists", .equals = true } },
+    .{ .key = "DOWN" },
+    .{ .wait_element = .{ .id = "palette.preview", .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .key = "ESCAPE" },
+    .{ .wait_element = .{ .id = "palette.dialog", .state = "exists", .equals = false } },
+    .{ .click = "sidebar.palette" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = font_picker_label },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = font_pick_second_choice, .state = "exists", .equals = true } },
+    .{ .click = font_pick_second_choice },
+    .{ .wait_element = .{ .id = "palette.dialog", .state = "exists", .equals = false } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = font_picker_label },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "palette.preview", .state = "exists", .equals = true } },
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -370,6 +438,16 @@ pub const all = [_]Scenario{
         .name = "font-coverage",
         .command = font_coverage_command,
         .steps = &font_coverage_steps,
+    },
+    .{
+        .name = "theme-picker",
+        .command = deterministic_shell,
+        .steps = &theme_picker_steps,
+    },
+    .{
+        .name = "font-picker",
+        .command = deterministic_shell,
+        .steps = &font_picker_steps,
     },
 };
 
@@ -531,4 +609,40 @@ test "sidebar palette scenario clicks the footer hint and waits for the focused 
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "picker scenarios drive both pickers by keyboard and by a clicked choice row" {
+    const theme_scenario = all[10];
+    const font_scenario = all[11];
+    try std.testing.expectEqualStrings("theme-picker", theme_scenario.name);
+    try std.testing.expectEqualStrings("font-picker", font_scenario.name);
+    for ([_]struct { scenario: Scenario, choice: []const u8 }{
+        .{ .scenario = theme_scenario, .choice = theme_pick_second_choice },
+        .{ .scenario = font_scenario, .choice = font_pick_second_choice },
+    }) |case| {
+        var saw_down = false;
+        var saw_escape = false;
+        var saw_hint = false;
+        var saw_choice_click = false;
+        for (case.scenario.steps) |step| switch (step) {
+            .key => |key| {
+                if (std.mem.eql(u8, key, "DOWN")) saw_down = true;
+                if (std.mem.eql(u8, key, "ESCAPE")) saw_escape = true;
+            },
+            .click => |id| {
+                if (std.mem.eql(u8, id, "sidebar.palette")) saw_hint = true;
+                if (std.mem.eql(u8, id, case.choice)) saw_choice_click = true;
+            },
+            else => {},
+        };
+        try std.testing.expect(saw_down and saw_escape and saw_hint and saw_choice_click);
+    }
+    // A font preview is waited for after Down, never assumed.
+    for (font_scenario.steps, 0..) |step, index| switch (step) {
+        .key => |key| if (std.mem.eql(u8, key, "DOWN")) switch (font_scenario.steps[index + 1]) {
+            .wait_element => |wait| try std.testing.expectEqualStrings("palette.preview", wait.id),
+            else => return error.TestUnexpectedResult,
+        },
+        else => {},
+    };
 }
