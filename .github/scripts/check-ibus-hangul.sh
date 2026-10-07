@@ -32,6 +32,9 @@ cleanup() {
     fi
     driver quit >/dev/null 2>&1 || true
   fi
+  if [[ -n "${xim_bridge_pid:-}" ]]; then
+    kill "$xim_bridge_pid" >/dev/null 2>&1 || true
+  fi
   ibus exit >/dev/null 2>&1 || true
   if (( status != 0 )); then
     mkdir -p "$artifact_root/failure-driver-root"
@@ -68,7 +71,11 @@ gsettings set org.freedesktop.ibus.engine.hangul initial-input-mode hangul
   echo "initial-input-mode $(gsettings get org.freedesktop.ibus.engine.hangul initial-input-mode)"
 } >"$artifact_root/ibus-settings.txt"
 
-ibus-daemon --daemonize --replace --xim --panel disable \
+# Without `--xim`: the daemon would spawn its XIM bridge (ibus-x11) at once, and on a hosted
+# runner that spawn races the daemon's own bus, so the bridge dies with "Not connected to the
+# ibus bus" and XIM_SERVERS never appears (release gate run 37642511355). The bridge is started
+# below, only after the daemon has answered a query.
+ibus-daemon --daemonize --replace --panel disable \
   >"$artifact_root/ibus-daemon.stdout" \
   2>"$artifact_root/ibus-daemon.stderr"
 
@@ -87,14 +94,34 @@ done
 # candidate, so a context created at any later moment also starts on Hangul.
 ibus engine hangul
 
-# `ibus-daemon --xim` starts the XIM bridge (ibus-x11) asynchronously. SDL opens its X input
-# method once, when the window is created, so if Conduit starts before the bridge has registered
-# itself on the X server every key stays plain ASCII for the whole session (seen on a hosted run
-# as a lone probe 'g'). The root window's XIM_SERVERS property is the readiness signal.
+# The XIM bridge (ibus-x11) is started here, now that the daemon answers, so it cannot lose the
+# race its daemon-spawned form loses. SDL opens its X input method once, when the window is
+# created, so if Conduit starts before the bridge has registered itself on the X server every
+# key stays plain ASCII for the whole session (seen on a hosted run as a lone probe 'g'). The
+# root window's XIM_SERVERS property is the readiness signal.
+xim_bridge=""
+for candidate in /usr/libexec/ibus-x11 /usr/lib/ibus/ibus-x11 \
+    /usr/lib/x86_64-linux-gnu/ibus/ibus-x11 "$(command -v ibus-x11 2>/dev/null || true)"; do
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    xim_bridge="$candidate"
+    break
+  fi
+done
+if [[ -z "$xim_bridge" ]]; then
+  echo "no ibus-x11 XIM bridge executable found" >&2
+  exit 1
+fi
+echo "$xim_bridge" >"$artifact_root/xim-bridge.txt"
+"$xim_bridge" >"$artifact_root/ibus-x11.stdout" 2>"$artifact_root/ibus-x11.stderr" &
+xim_bridge_pid=$!
 deadline=$((SECONDS + 20))
 until xprop -root XIM_SERVERS 2>/dev/null | grep -q '@server=ibus'; do
   if (( SECONDS >= deadline )); then
     echo "the IBus XIM server did not register with the X server within 20 seconds" >&2
+    if ! kill -0 "$xim_bridge_pid" 2>/dev/null; then
+      echo "the XIM bridge exited early; its stderr follows" >&2
+      cat "$artifact_root/ibus-x11.stderr" >&2 || true
+    fi
     exit 1
   fi
   sleep 0.05

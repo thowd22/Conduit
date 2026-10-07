@@ -349,11 +349,14 @@ standard freedesktop paths, and the installed payload passes desktop-file valida
 hosted Linux gate supplies the external evidence: `check-sway-fractional.sh` runs Sway 1.9
 headless (GLES2 where a DRM render node exists, pixman otherwise, because hosted runners have no
 `/dev/dri`) at compositor scale 1.25 and Conduit reports an 800x450 surface for 640x360 logical
-geometry with a crisp frame; `check-ibus-hangul.sh` runs a real `ibus-daemon --xim` with `ibus-hangul` as the only preloaded
+geometry with a crisp frame; `check-ibus-hangul.sh` runs a real `ibus-daemon` with `ibus-hangul` as the only preloaded
 global engine started in Hangul mode (its default is Latin), all written to gsettings before the
 daemon starts because changing them afterwards races the first context; SDL 3.4's X11 backend
 reaches input methods only through XIM (its D-Bus IBus client serves Wayland), so `XMODIFIERS`
-must name IBus. XTest Dubeolsik keys then produce a semantic preedit and exactly one committed
+must name IBus. The script starts the XIM bridge `ibus-x11` itself once the daemon answers an
+engine query and waits for the root window's `XIM_SERVERS` to name it, because the bridge the
+daemon spawns with `--xim` can race the daemon's own bus and die with "Not connected to the ibus
+bus" (release gate run 37642511355); its stdout/stderr are retained with the check's artifacts. XTest Dubeolsik keys then produce a semantic preedit and exactly one committed
 `한글`;
 `check-x11-primary.sh` proves PRIMARY interoperability with `xclip`. Neither IBus nor Sway is
 installed on the dev box, so those checks are reproduced locally in an `ubuntu:24.04` container.
