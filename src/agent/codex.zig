@@ -884,11 +884,23 @@ pub const Mode = enum {
     stdio,
 };
 
-/// Whether a foreground program name (`agent.commandName`, a basename) is
-/// Codex, for observed agents (TASK-56). npm's `codex` launcher is a Node
-/// script that runs the native `codex` binary, so both spell the same name.
+/// Whether a foreground program name (`agent.commandName`, a basename or an
+/// npm package) is Codex, for observed agents (TASK-56). npm's `codex`
+/// launcher is a Node script (`@openai/codex/bin/codex.js`) that runs the
+/// native `codex` binary, so the program and the package both name it; case
+/// is ignored, as Windows ignores it (TASK-81).
 pub fn recognizeCommand(name: []const u8) bool {
-    return std.mem.eql(u8, name, "codex");
+    return spelledAs(name, "codex") or spelledAs(name, "@openai/codex");
+}
+
+/// `name` spelled as `spelling`: in any case, and with `\` for `/`, as an
+/// npm package path reads on Windows.
+fn spelledAs(name: []const u8, spelling: []const u8) bool {
+    if (name.len != spelling.len) return false;
+    for (name, spelling) |a, b| {
+        if (std.ascii.toLower(a) != std.ascii.toLower(b) and !(a == '\\' and b == '/')) return false;
+    }
+    return true;
 }
 
 /// Where Codex reads its instructions (TASK-59), from its AGENTS.md

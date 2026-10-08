@@ -30,7 +30,7 @@ name: Windows
 
 on:
   push:
-    branches: ["task-49-windows", "task-49-windows-release", "task-49-conpty", "task-47-wsl*", "task-82-*"]
+    branches: ["task-49-windows", "task-49-windows-release", "task-49-conpty", "task-47-wsl*", "task-82-*", "task-81-*"]
   workflow_dispatch:
     inputs:
       version:
@@ -233,7 +233,18 @@ jobs:
           bash .github/scripts/windows-builtin-checks.sh ./zig-out/bin/conduit.exe "$ARTIFACT_ROOT/builtin" \
             --self-test --grid-test --ui-test --driver-test --scroll-test --mouse-test --sidebar-test \
             --scratchpad-test --menu-test --theme-test --font-test --tabs-test --palette-test --workspaces-test \
-            --control-test
+            --control-test --agent-test
+
+      # TASK-81 AC2: an npm-installed Claude Code, never authenticated, started
+      # by hand in a PowerShell tab, is observed from the ConPTY process tree.
+      - name: Hand-started Claude Code is observed (TASK-81)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          npm install --global --no-audit --no-fund @anthropic-ai/claude-code
+          claude --version || true
+          bash .github/scripts/windows-claude-observe.sh "$PWD/zig-out/bin/conduit.exe" "$PWD/zig-out/bin/conduit-test.exe" \
+            "$ARTIFACT_ROOT/claude-observe"
 
       # Reported, not gating (docs/release.md says why each fails):
       # --clipboard-test pins SDL's offscreen driver, which needs EGL on Windows;

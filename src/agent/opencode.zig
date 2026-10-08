@@ -1054,9 +1054,21 @@ const parse_options: json.ParseOptions = .{ .duplicate_field_behavior = .use_las
 /// OpenCode, for observed agents (TASK-56). npm's `opencode-ai` installs a
 /// Node launcher `bin/opencode` that runs the native `opencode` binary; the
 /// terminal's foreground leader is the launcher, `node .../bin/opencode`
-/// (observed with 1.18.35), and a native install runs `opencode` itself.
+/// (observed with 1.18.35), and a native install runs `opencode` itself. The
+/// npm package (`opencode-ai`) names it too, and case is ignored, as Windows
+/// ignores it (TASK-81).
 pub fn recognizeCommand(name: []const u8) bool {
-    return std.mem.eql(u8, name, "opencode");
+    return spelledAs(name, "opencode") or spelledAs(name, "opencode-ai");
+}
+
+/// `name` spelled as `spelling`: in any case, and with `\` for `/`, as an
+/// npm package path reads on Windows.
+fn spelledAs(name: []const u8, spelling: []const u8) bool {
+    if (name.len != spelling.len) return false;
+    for (name, spelling) |a, b| {
+        if (std.ascii.toLower(a) != std.ascii.toLower(b) and !(a == '\\' and b == '/')) return false;
+    }
+    return true;
 }
 
 // Instructions (TASK-59) -------------------------------------------------------

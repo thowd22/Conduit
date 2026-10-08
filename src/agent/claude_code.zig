@@ -837,12 +837,25 @@ pub const SessionMatch = union(enum) {
 
 // Instructions (TASK-59) ---------------------------------------------------------
 
-/// Whether a foreground program name (`agent.commandName`, a basename) is
-/// Claude Code, so the agent core can classify a process the human started
-/// in their own terminal (TASK-56 observed agents). The native installer and
-/// npm both install `claude`, and Claude Code retitles its process `claude`.
+/// Whether a foreground program name (`agent.commandName`, a basename or an
+/// npm package) is Claude Code, so the agent core can classify a process the
+/// human started in their own terminal (TASK-56 observed agents). The native
+/// installer and npm both install `claude` (`claude.exe` on Windows), Claude
+/// Code retitles its process `claude`, and an npm shim on Windows runs
+/// `node <prefix>\node_modules\@anthropic-ai\claude-code\cli.js` (TASK-81).
+/// Case is ignored, as Windows ignores it.
 pub fn recognizeCommand(name: []const u8) bool {
-    return std.mem.eql(u8, name, "claude");
+    return spelledAs(name, "claude") or spelledAs(name, "@anthropic-ai/claude-code");
+}
+
+/// `name` spelled as `spelling`: in any case, and with `\` for `/`, as an
+/// npm package path reads on Windows.
+fn spelledAs(name: []const u8, spelling: []const u8) bool {
+    if (name.len != spelling.len) return false;
+    for (name, spelling) |a, b| {
+        if (std.ascii.toLower(a) != std.ascii.toLower(b) and !(a == '\\' and b == '/')) return false;
+    }
+    return true;
 }
 
 /// Where Claude Code reads its instructions, from its memory documentation

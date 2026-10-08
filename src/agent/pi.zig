@@ -285,13 +285,28 @@ pub const Options = struct {
     max_line_bytes: usize = default_max_line_bytes,
 };
 
-/// Whether `argv0` runs Pi or omp, by its basename. Lets the agent core
-/// classify a foreground process found in a human terminal.
+/// Whether `argv0` (or an `agent.commandName`) runs Pi or omp, by its
+/// basename after either separator, or by Pi's npm package
+/// (`@mariozechner/pi-coding-agent`, whose `dist/cli.js` npm runs). Lets the
+/// agent core classify a foreground process found in a human terminal. Case
+/// is ignored, as Windows ignores it (TASK-81).
 pub fn recognizeCommand(argv0: []const u8) ?Variant {
-    const base = std.fs.path.basenamePosix(argv0);
-    if (std.mem.eql(u8, base, "pi")) return .pi;
-    if (std.mem.eql(u8, base, "omp")) return .omp;
+    if (spelledAs(argv0, "@mariozechner/pi-coding-agent")) return .pi;
+    const cut = std.mem.lastIndexOfAny(u8, argv0, "/\\");
+    const base = if (cut) |at| argv0[at + 1 ..] else argv0;
+    if (spelledAs(base, "pi")) return .pi;
+    if (spelledAs(base, "omp")) return .omp;
     return null;
+}
+
+/// `name` spelled as `spelling`: in any case, and with `\` for `/`, as an
+/// npm package path reads on Windows.
+fn spelledAs(name: []const u8, spelling: []const u8) bool {
+    if (name.len != spelling.len) return false;
+    for (name, spelling) |a, b| {
+        if (std.ascii.toLower(a) != std.ascii.toLower(b) and !(a == '\\' and b == '/')) return false;
+    }
+    return true;
 }
 
 /// The session directory name Pi uses for `cwd`:

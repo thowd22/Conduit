@@ -243,14 +243,20 @@ pub const Pty = struct {
 /// borrows the caller's buffer. Conduit's own types only: `pid` is informational (a harness's
 /// own session registry may be keyed by it) and is never signalled.
 ///
-/// Linux reads `/proc/<pgid>/cmdline` and `/proc/<pgid>/cwd`. The macOS and Windows backends do
-/// not implement it yet and answer null, so observed agents are Linux-only for now.
+/// Linux reads `/proc/<pgid>/cmdline` and `/proc/<pgid>/cwd`. Windows has no process groups and no
+/// terminal foreground, so the ConPTY backend walks the child's process tree instead (TASK-81,
+/// `selectForegroundJob`) and reads the chosen process's command line and PEB working directory.
+/// The macOS backend does not implement it yet and answers null.
 pub const ForegroundProcess = struct {
     pid: u32,
     /// The first command-line word, as the process was started (or retitled itself).
     argv0: []const u8,
-    /// The second word, empty when there is none: the script an interpreter (`node`, `sh`,
-    /// `python3`, `bun`) runs, which names the program when `argv0` is only the interpreter.
+    /// Every later word, each separated from the next by one NUL byte as `/proc/<pid>/cmdline`
+    /// keeps them, and empty when there is none (`sleep 30` gives `30`). The first is the script an
+    /// interpreter (`node`, `sh`, `python3`, `bun`) runs, which names the program when `argv0` is
+    /// only the interpreter; a wrapper such as `cmd /c claude` names it further on. Windows hands a
+    /// process one string, so that backend splits it with the Windows quoting rules
+    /// (`splitWindowsCommandLine`). Cut at a word boundary when the buffer is short.
     argv1: []const u8,
     /// The process's working directory; empty when the OS would not say.
     cwd: []const u8,
@@ -1292,7 +1298,8 @@ const sys = struct {
         var parts = std.mem.splitScalar(u8, words[0..filled], 0);
         const argv0 = parts.first();
         if (argv0.len == 0) return null;
-        const argv1 = parts.next() orelse "";
+        // Every later word, still NUL-separated as the kernel keeps them.
+        const argv1 = if (argv0.len < filled) std.mem.trimEnd(u8, words[argv0.len + 1 .. filled], "\x00") else "";
 
         const cwd_path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/cwd", .{pid}) catch return null;
         const rest = buffer[half..];
@@ -1843,6 +1850,7 @@ pub fn spawnConPty(gpa: Allocator, request: SpawnRequest) Error!Pty {
         .output = invalid_handle,
         .console = null,
         .child = invalid_handle,
+        .pid = 0,
         .read_done = invalid_handle,
         .space = invalid_handle,
         .owner_wake = invalid_handle,
@@ -1864,6 +1872,7 @@ pub fn spawnConPty(gpa: Allocator, request: SpawnRequest) Error!Pty {
     pty.console = console;
     console = null;
     pty.child = child.handle;
+    pty.pid = child.pid;
     child.handle = invalid_handle;
 
     // The handles this terminal waits on: one completion for the read, one for the owner's "there
@@ -1961,6 +1970,9 @@ const ConPty = struct {
     /// the only one that can observe the exit code, and `kill` never reaches a process whose end
     /// has already been published.
     child: win.HANDLE,
+    /// The child's process id: the root of the process tree `foregroundProcess` walks. Never
+    /// signalled; `child` is the handle every signal goes through.
+    pid: win.DWORD,
     /// Signalled when the output read completes. Manual-reset, because a completion that arrives
     /// between one wait and the next must not be lost.
     read_done: win.HANDLE,
@@ -1994,6 +2006,7 @@ const ConPty = struct {
         .state = conState,
         .waitReadable = conWaitReadable,
         .destroy = conDestroy,
+        .foregroundProcess = conForegroundProcess,
     };
 
     /// The body of the read thread, and the only place a terminal blocks on IO.
@@ -2327,6 +2340,13 @@ fn conState(ptr: *anyopaque) ChildState {
 fn conWaitReadable(ptr: *anyopaque, timeout_ms: u32) bool {
     const self: *ConPty = @ptrCast(@alignCast(ptr));
     return self.waitUntilPending(timeout_ms);
+}
+
+fn conForegroundProcess(ptr: *anyopaque, buffer: []u8) ?ForegroundProcess {
+    const self: *ConPty = @ptrCast(@alignCast(ptr));
+    // A collected child's pid may already belong to somebody else.
+    if (self.finished()) return null;
+    return win_processes.foreground(self.pid, buffer);
 }
 
 fn conDestroy(ptr: *anyopaque) void {
@@ -3237,6 +3257,404 @@ const win = struct {
         const attributes = GetFileAttributesW(path.ptr);
         if (attributes == invalid_file_attributes) return false;
         return attributes & file_attribute_directory == 0;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The Windows foreground job (TASK-81)
+// ---------------------------------------------------------------------------
+
+/// One process of a Windows process snapshot, as the foreground selection needs it.
+const ProcessNode = struct {
+    pid: u32,
+    parent: u32,
+    /// Whether the image is a command shell (`shellImage`): a process that runs other programs in
+    /// front of itself rather than being the program somebody started.
+    shell: bool,
+};
+
+/// How far below the terminal's child the selection looks. A human's job is a few levels down
+/// (pwsh, a `cmd /c` for an npm shim, the program); the bound only ends a pathological tree.
+const max_foreground_depth = 32;
+
+/// Images that are command shells, compared without case and without `.exe`. Git for Windows'
+/// MSYS `sh` and `bash` are here because they fork a copy of themselves before they run a program.
+const shell_images = [_][]const u8{ "cmd", "powershell", "pwsh", "sh", "bash", "dash", "zsh", "fish", "nu" };
+
+/// Whether an image name (a snapshot's `szExeFile`, or a path) is a command shell.
+fn shellImage(name: []const u8) bool {
+    const cut = std.mem.lastIndexOfAny(u8, name, "/\\");
+    const base = if (cut) |at| name[at + 1 ..] else name;
+    const stem = if (std.ascii.endsWithIgnoreCase(base, ".exe")) base[0 .. base.len - 4] else base;
+    for (shell_images) |shell| {
+        if (std.ascii.eqlIgnoreCase(stem, shell)) return true;
+    }
+    return false;
+}
+
+fn findNode(nodes: []const ProcessNode, pid: u32) ?ProcessNode {
+    for (nodes) |node| {
+        if (node.pid == pid) return node;
+    }
+    return null;
+}
+
+/// Which process is a Windows terminal's foreground job, from a process snapshot and the
+/// terminal's own child (`root`). Windows has no process groups and a pseudoconsole has no
+/// foreground, so this stands in for POSIX's `tcgetpgrp`: starting at the root, while the process
+/// reached is a command shell, step to its most recently created child. The first process that is
+/// not a shell is the job, as a group leader would be, and a shell with no children is itself the
+/// answer. Stopping at that program rather than going on to the deepest leaf is what keeps a
+/// harness in front while it runs helpers of its own (`git`, a tool's `bash`), which would
+/// otherwise take its place and give it back between looks.
+///
+/// `context.created(pid)` answers a process's creation time, or null when it is gone or will not
+/// say. A child created before its parent is not that parent's child (the parent id was reused)
+/// and is skipped; equal times go to the higher pid. Null only when the root itself is gone.
+fn selectForegroundJob(nodes: []const ProcessNode, root: u32, context: anytype) ?u32 {
+    var current = root;
+    var current_created = context.created(root) orelse return null;
+    var depth: usize = 0;
+    while (depth < max_foreground_depth) : (depth += 1) {
+        const node = findNode(nodes, current) orelse break;
+        if (!node.shell) break;
+        var best: ?u32 = null;
+        var best_created: u64 = 0;
+        for (nodes) |candidate| {
+            if (candidate.parent != current or candidate.pid == current or candidate.pid == 0) continue;
+            const created = context.created(candidate.pid) orelse continue;
+            if (created < current_created) continue;
+            if (best == null or created > best_created or (created == best_created and candidate.pid > best.?)) {
+                best = candidate.pid;
+                best_created = created;
+            }
+        }
+        current = best orelse break;
+        current_created = best_created;
+    }
+    return current;
+}
+
+/// A Windows command line split into words (`splitWindowsCommandLine`), borrowing the output
+/// buffer.
+const WindowsWords = struct {
+    argv0: []const u8,
+    /// Every later word, separated by one NUL byte (`ForegroundProcess.argv1`).
+    rest: []const u8,
+};
+
+/// Split a Windows command line by the rules `CommandLineToArgvW` and the C runtime share, copying
+/// the words into `out`. The first word runs to whitespace, or between quotes with no escapes;
+/// later words read `2n` backslashes before a quote as `n` backslashes and a quote that opens or
+/// closes, `2n+1` as `n` and a literal quote, and `""` inside quotes as one literal quote. A word
+/// that does not fit is left out whole, with every word after it. Null when there is no first word
+/// or it does not fit.
+fn splitWindowsCommandLine(line: []const u8, out: []u8) ?WindowsWords {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    var start = i;
+    var end = i;
+    if (i < line.len and line[i] == '"') {
+        start = i + 1;
+        end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse line.len;
+        i = @min(end + 1, line.len);
+    } else {
+        while (i < line.len and line[i] != ' ' and line[i] != '\t') i += 1;
+        end = i;
+    }
+    const first = end - start;
+    if (first == 0 or first > out.len) return null;
+    @memcpy(out[0..first], line[start..end]);
+
+    var len = first;
+    // The end of the last word that fitted whole.
+    var kept = first;
+    while (true) {
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+        if (i >= line.len) break;
+        len = kept;
+        var fits = append(out, &len, 0);
+        var quoted = false;
+        while (i < line.len) {
+            const c = line[i];
+            if (!quoted and (c == ' ' or c == '\t')) break;
+            if (c == '\\') {
+                var count: usize = 0;
+                while (i < line.len and line[i] == '\\') : (i += 1) count += 1;
+                const before_quote = i < line.len and line[i] == '"';
+                var emit = if (before_quote) count / 2 else count;
+                while (emit > 0) : (emit -= 1) fits = append(out, &len, '\\') and fits;
+                if (before_quote and count % 2 == 1) {
+                    fits = append(out, &len, '"') and fits;
+                    i += 1;
+                }
+                continue;
+            }
+            if (c == '"') {
+                if (quoted and i + 1 < line.len and line[i + 1] == '"') {
+                    fits = append(out, &len, '"') and fits;
+                    i += 2;
+                    continue;
+                }
+                quoted = !quoted;
+                i += 1;
+                continue;
+            }
+            fits = append(out, &len, c) and fits;
+            i += 1;
+        }
+        if (!fits) break;
+        kept = len;
+    }
+    return .{ .argv0 = out[0..first], .rest = if (kept > first) out[first + 1 .. kept] else "" };
+}
+
+fn append(out: []u8, len: *usize, byte: u8) bool {
+    if (len.* >= out.len) return false;
+    out[len.*] = byte;
+    len.* += 1;
+    return true;
+}
+
+/// The Windows calls behind `ConPty`'s `foregroundProcess`: a Toolhelp process snapshot, process
+/// creation times, the chosen process's command line and its PEB working directory. Owner thread;
+/// the snapshot is shared by every terminal and kept for `cache_ms`, so looking at several
+/// terminals at once, or at one twice in a row, costs one snapshot.
+const win_processes = struct {
+    const windows = std.os.windows;
+    const HANDLE = windows.HANDLE;
+    const DWORD = windows.DWORD;
+    const BOOL = windows.BOOL;
+
+    /// `TH32CS_SNAPPROCESS`, from tlhelp32.h.
+    const th32cs_snapprocess: DWORD = 0x00000002;
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` and `PROCESS_VM_READ`, from winnt.h: enough for the
+    /// creation time and the command line, and for reading the working directory out of the PEB.
+    const process_query_limited_information: DWORD = 0x1000;
+    const process_vm_read: DWORD = 0x0010;
+
+    /// How many processes one snapshot keeps. A desktop runs a few hundred; past this the rest are
+    /// not looked at, which can only make a deep job look shallower.
+    const capacity = 4096;
+    /// How long a snapshot answers for. Observed-agent checks come every two seconds per session,
+    /// so this only folds the looks of one pass together.
+    const cache_ms = 250;
+    /// The longest command line read, in UTF-16 units, and the longest working directory.
+    const command_line_units = 4096;
+    const cwd_units = 1024;
+
+    /// `PROCESSENTRY32W`, from tlhelp32.h.
+    const ProcessEntry32W = extern struct {
+        dwSize: DWORD,
+        cntUsage: DWORD,
+        th32ProcessID: DWORD,
+        th32DefaultHeapID: windows.ULONG_PTR,
+        th32ModuleID: DWORD,
+        cntThreads: DWORD,
+        th32ParentProcessID: DWORD,
+        pcPriClassBase: windows.LONG,
+        dwFlags: DWORD,
+        szExeFile: [260]u16,
+    };
+
+    /// `PROCESS_BASIC_INFORMATION`, from winternl.h, with every pointer kept as an address: the PEB
+    /// lives in the other process, so it is only ever read through `ReadProcessMemory`.
+    const BasicInformation = extern struct {
+        exit_status: i32,
+        peb: usize,
+        affinity_mask: usize,
+        base_priority: i32,
+        unique_process_id: usize,
+        inherited_from: usize,
+    };
+
+    /// `UNICODE_STRING` as another process holds it: the buffer is an address in that process.
+    const RemoteString = extern struct {
+        length: u16,
+        maximum_length: u16,
+        buffer: usize,
+    };
+
+    extern "kernel32" fn CreateToolhelp32Snapshot(flags: DWORD, pid: DWORD) callconv(.winapi) HANDLE;
+    extern "kernel32" fn Process32FirstW(snapshot: HANDLE, entry: *ProcessEntry32W) callconv(.winapi) BOOL;
+    extern "kernel32" fn Process32NextW(snapshot: HANDLE, entry: *ProcessEntry32W) callconv(.winapi) BOOL;
+    extern "kernel32" fn OpenProcess(access: DWORD, inherit: BOOL, pid: DWORD) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GetProcessTimes(
+        process: HANDLE,
+        creation: *windows.FILETIME,
+        exit: *windows.FILETIME,
+        kernel: *windows.FILETIME,
+        user: *windows.FILETIME,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetExitCodeProcess(process: HANDLE, code: *DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn ReadProcessMemory(
+        process: HANDLE,
+        address: usize,
+        buffer: *anyopaque,
+        size: usize,
+        read: ?*usize,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn QueryFullProcessImageNameW(process: HANDLE, flags: DWORD, name: [*]u16, size: *DWORD) callconv(.winapi) BOOL;
+
+    /// The last snapshot. Guarded by `lock`, though every caller is the owner thread today.
+    var nodes: [capacity]ProcessNode = undefined;
+    var count: usize = 0;
+    var taken_ms: ?u64 = null;
+    var lock: win.SrwLock = .{};
+    /// How many snapshots have been taken: the evidence that looks are folded together.
+    var snapshots: u64 = 0;
+
+    /// The foreground job of the terminal whose child is `root`, its text copied into `buffer`.
+    fn foreground(root: u32, buffer: []u8) ?ForegroundProcess {
+        if (buffer.len < 16 or root == 0) return null;
+        const pid = blk: {
+            win.acquireLock(&lock);
+            defer win.releaseLock(&lock);
+            refresh();
+            break :blk selectForegroundJob(nodes[0..count], root, Times{}) orelse return null;
+        };
+        return describe(pid, buffer);
+    }
+
+    /// Take a new snapshot when the last one is older than `cache_ms`. A failed snapshot leaves an
+    /// empty table for the same time, so a refusing system is not asked again at every look.
+    fn refresh() void {
+        const now = win.monotonicMillis();
+        if (taken_ms) |taken| {
+            if (now -% taken < cache_ms) return;
+        }
+        taken_ms = now;
+        count = 0;
+        snapshots += 1;
+        const snapshot = CreateToolhelp32Snapshot(th32cs_snapprocess, 0);
+        if (snapshot == windows.INVALID_HANDLE_VALUE) return;
+        defer win.closeHandle(snapshot);
+        var entry: ProcessEntry32W = undefined;
+        entry.dwSize = @sizeOf(ProcessEntry32W);
+        var more = Process32FirstW(snapshot, &entry) != .FALSE;
+        while (more and count < capacity) {
+            nodes[count] = .{
+                .pid = entry.th32ProcessID,
+                .parent = entry.th32ParentProcessID,
+                .shell = shellImageWide(std.mem.sliceTo(&entry.szExeFile, 0)),
+            };
+            count += 1;
+            more = Process32NextW(snapshot, &entry) != .FALSE;
+        }
+    }
+
+    fn shellImageWide(name: []const u16) bool {
+        var ascii: [64]u8 = undefined;
+        if (name.len > ascii.len) return false;
+        for (name, 0..) |unit, i| {
+            if (unit > 0x7f) return false;
+            ascii[i] = @intCast(unit);
+        }
+        return shellImage(ascii[0..name.len]);
+    }
+
+    /// Creation times, asked of the OS one process at a time.
+    const Times = struct {
+        fn created(_: Times, pid: u32) ?u64 {
+            if (pid == 0) return null;
+            const process = OpenProcess(process_query_limited_information, .FALSE, pid) orelse return null;
+            defer win.closeHandle(process);
+            // A process that has ended but is still held open by somebody is not running anything.
+            var code: DWORD = 0;
+            if (GetExitCodeProcess(process, &code) == .FALSE or code != win.still_active) return null;
+            var creation: windows.FILETIME = undefined;
+            var exit: windows.FILETIME = undefined;
+            var kernel: windows.FILETIME = undefined;
+            var user: windows.FILETIME = undefined;
+            if (GetProcessTimes(process, &creation, &exit, &kernel, &user) == .FALSE) return null;
+            return (@as(u64, creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+        }
+    };
+
+    /// Process `pid`'s words and working directory, into `buffer`: the words in its first half,
+    /// the directory in the second. Null when the process cannot be opened at all.
+    fn describe(pid: u32, buffer: []u8) ?ForegroundProcess {
+        const half = buffer.len / 2;
+        const full = OpenProcess(process_query_limited_information | process_vm_read, .FALSE, pid);
+        const process = full orelse OpenProcess(process_query_limited_information, .FALSE, pid) orelse return null;
+        defer win.closeHandle(process);
+
+        var text: [command_line_units]u8 = undefined;
+        const line = commandLine(process, &text) orelse imageName(process, &text) orelse return null;
+        const words = splitWindowsCommandLine(line, buffer[0..half]) orelse return null;
+        const cwd = if (full != null) workingDirectory(process, buffer[half..]) else "";
+        return .{ .pid = pid, .argv0 = words.argv0, .argv1 = words.rest, .cwd = cwd };
+    }
+
+    /// The process's command line (`ProcessCommandLineInformation`, Windows 8.1 and later) as
+    /// WTF-8, cut to fit `out`.
+    fn commandLine(process: HANDLE, out: []u8) ?[]const u8 {
+        // Room for the `UNICODE_STRING` header the call writes first, then the text behind it.
+        var raw: [command_line_units / 2 + 8]usize = undefined;
+        var returned: windows.ULONG = 0;
+        const status = windows.ntdll.NtQueryInformationProcess(process, .CommandLineInformation, &raw, @sizeOf(@TypeOf(raw)), &returned);
+        if (status != .SUCCESS) return null;
+        const header: *const RemoteString = @ptrCast(&raw);
+        const base = @intFromPtr(&raw);
+        const length = header.length / 2 * 2;
+        // The text must lie inside what was written, after the header; anything else is not used.
+        if (header.buffer < base + @sizeOf(RemoteString) or header.buffer + length > base + @sizeOf(@TypeOf(raw))) return null;
+        const units_ptr: [*]const u16 = @ptrFromInt(header.buffer);
+        return toWtf8(units_ptr[0 .. length / 2], out);
+    }
+
+    /// The process's image path, the first word when the command line cannot be read.
+    fn imageName(process: HANDLE, out: []u8) ?[]const u8 {
+        var units: [1024]u16 = undefined;
+        var size: DWORD = units.len;
+        if (QueryFullProcessImageNameW(process, 0, &units, &size) == .FALSE or size > units.len) return null;
+        // Quoted, so a path with spaces stays one word through the split.
+        if (out.len < 2) return null;
+        out[0] = '"';
+        const inner = toWtf8(units[0..size], out[1 .. out.len - 1]);
+        out[1 + inner.len] = '"';
+        return out[0 .. inner.len + 2];
+    }
+
+    /// The process's working directory from its PEB, without the trailing separator Windows keeps
+    /// (`C:\work\`, but `C:\` stays). Empty for a 32-bit process under WOW64, whose own PEB this
+    /// does not read, and whenever any read fails.
+    fn workingDirectory(process: HANDLE, out: []u8) []const u8 {
+        var wow64: usize = 0;
+        if (windows.ntdll.NtQueryInformationProcess(process, .Wow64Information, &wow64, @sizeOf(usize), null) != .SUCCESS or wow64 != 0) return "";
+        var basic: BasicInformation = undefined;
+        if (windows.ntdll.NtQueryInformationProcess(process, .BasicInformation, &basic, @sizeOf(BasicInformation), null) != .SUCCESS) return "";
+        if (basic.peb == 0) return "";
+        var parameters: usize = 0;
+        if (!readRemote(process, basic.peb + @offsetOf(windows.PEB, "ProcessParameters"), std.mem.asBytes(&parameters))) return "";
+        if (parameters == 0) return "";
+        var directory: RemoteString = undefined;
+        const at = parameters + @offsetOf(windows.RTL_USER_PROCESS_PARAMETERS, "CurrentDirectory") + @offsetOf(windows.CURDIR, "DosPath");
+        if (!readRemote(process, at, std.mem.asBytes(&directory))) return "";
+        const length = directory.length / 2 * 2;
+        if (length == 0 or length > cwd_units * 2 or directory.buffer == 0) return "";
+        var units: [cwd_units]u16 = undefined;
+        if (!readRemote(process, directory.buffer, std.mem.sliceAsBytes(units[0 .. length / 2]))) return "";
+        var path = units[0 .. length / 2];
+        if (path.len > 3 and path[path.len - 1] == '\\') path = path[0 .. path.len - 1];
+        if (std.unicode.calcWtf8Len(path) > out.len) return "";
+        return toWtf8(path, out);
+    }
+
+    fn readRemote(process: HANDLE, address: usize, into: []u8) bool {
+        var read: usize = 0;
+        if (ReadProcessMemory(process, address, into.ptr, into.len, &read) == .FALSE) return false;
+        return read == into.len;
+    }
+
+    /// WTF-16 to WTF-8, never failing: a lone surrogate is kept as WTF-8 rather than refused, and
+    /// text longer than `out` is cut to a prefix that fits.
+    fn toWtf8(units: []const u16, out: []u8) []const u8 {
+        var taken = units;
+        while (taken.len != 0 and std.unicode.calcWtf8Len(taken) > out.len) {
+            taken = taken[0..@min(taken.len - 1, out.len / 3)];
+        }
+        return out[0..std.unicode.wtf16LeToWtf8(out, taken)];
     }
 };
 
@@ -4371,4 +4789,163 @@ test "a Git for Windows sh read loop that ignores WINCH survives a ConPTY resize
     const gpa = testing.allocator;
     const loop = "printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
     try testing.expect(try gitShSurvivesResize(gpa, "trap '' WINCH; " ++ loop));
+}
+
+// --- The Windows foreground job (TASK-81) -----------------------------------------------------
+//
+// The selection and the command-line split are plain functions over plain data, so they run on
+// every platform; the snapshot and the reads behind them are proved by the ConPTY test after them.
+
+test "a Windows command line splits into its first word and NUL-separated later words" {
+    var out: [128]u8 = undefined;
+    var words = splitWindowsCommandLine("\"C:\\Program Files\\nodejs\\node.exe\" \"C:\\Users\\a b\\node_modules\\@anthropic-ai\\claude-code\\cli.js\" --resume", &out).?;
+    try testing.expectEqualStrings("C:\\Program Files\\nodejs\\node.exe", words.argv0);
+    try testing.expectEqualStrings("C:\\Users\\a b\\node_modules\\@anthropic-ai\\claude-code\\cli.js\x00--resume", words.rest);
+
+    words = splitWindowsCommandLine("  ping  -n 30\t127.0.0.1 ", &out).?;
+    try testing.expectEqualStrings("ping", words.argv0);
+    try testing.expectEqualStrings("-n\x0030\x00127.0.0.1", words.rest);
+
+    // Backslashes are literal except before a quote; `""` inside quotes is one quote.
+    words = splitWindowsCommandLine("cmd.exe /c \"a\\\\\\\"b c\" d\\\"e \"x\"\"y\" C:\\dir\\", &out).?;
+    try testing.expectEqualStrings("cmd.exe", words.argv0);
+    try testing.expectEqualStrings("/c\x00a\\\"b c\x00d\"e\x00x\"y\x00C:\\dir\\", words.rest);
+
+    // The first word takes no escapes and may be quoted without a closing quote.
+    words = splitWindowsCommandLine("\"C:\\a\\b\\", &out).?;
+    try testing.expectEqualStrings("C:\\a\\b\\", words.argv0);
+    try testing.expectEqualStrings("", words.rest);
+
+    // Nothing to name, and a first word that does not fit, are no answer at all.
+    try testing.expect(splitWindowsCommandLine("", &out) == null);
+    try testing.expect(splitWindowsCommandLine("   \"\" x", &out) == null);
+    try testing.expect(splitWindowsCommandLine("a-long-program-name", out[0..4]) == null);
+    // A later word that does not fit is left out whole, with everything after it.
+    words = splitWindowsCommandLine("node cli.js --a-long-option x", out[0..14]).?;
+    try testing.expectEqualStrings("node", words.argv0);
+    try testing.expectEqualStrings("cli.js", words.rest);
+}
+
+/// Creation times for the selection tests: a pid's time, or null for a process that is gone.
+const FakeTimes = struct {
+    times: []const struct { u32, u64 },
+
+    fn created(self: FakeTimes, pid: u32) ?u64 {
+        for (self.times) |entry| {
+            if (entry[0] == pid) return entry[1];
+        }
+        return null;
+    }
+};
+
+test "the Windows foreground job is the first program below the terminal's shells" {
+    // pwsh (10) runs node (20) for an npm-installed harness, which runs git (30) for itself: the
+    // harness is the job, as its group leader would be on POSIX, not the helper below it.
+    const harness = [_]ProcessNode{
+        .{ .pid = 10, .parent = 4, .shell = true },
+        .{ .pid = 20, .parent = 10, .shell = false },
+        .{ .pid = 30, .parent = 20, .shell = false },
+        .{ .pid = 99, .parent = 1, .shell = false },
+    };
+    const times: FakeTimes = .{ .times = &.{ .{ 10, 100 }, .{ 20, 200 }, .{ 30, 300 }, .{ 99, 50 } } };
+    try testing.expectEqual(@as(?u32, 20), selectForegroundJob(&harness, 10, times));
+
+    // Through `cmd /c` for a `.cmd` shim, and through MSYS `sh` forking before it runs a script.
+    const shim = [_]ProcessNode{
+        .{ .pid = 10, .parent = 4, .shell = true },
+        .{ .pid = 11, .parent = 10, .shell = true },
+        .{ .pid = 12, .parent = 11, .shell = false },
+    };
+    try testing.expectEqual(@as(?u32, 12), selectForegroundJob(&shim, 10, FakeTimes{ .times = &.{ .{ 10, 1 }, .{ 11, 2 }, .{ 12, 3 } } }));
+    const msys = [_]ProcessNode{
+        .{ .pid = 10, .parent = 4, .shell = true },
+        .{ .pid = 11, .parent = 10, .shell = true },
+        .{ .pid = 12, .parent = 11, .shell = true },
+    };
+    try testing.expectEqual(@as(?u32, 12), selectForegroundJob(&msys, 10, FakeTimes{ .times = &.{ .{ 10, 1 }, .{ 11, 2 }, .{ 12, 3 } } }));
+
+    // An idle shell is its own foreground; a root that is gone has none.
+    try testing.expectEqual(@as(?u32, 10), selectForegroundJob(harness[0..1], 10, times));
+    try testing.expect(selectForegroundJob(&harness, 77, times) == null);
+
+    // The newest child wins, equal times go to the higher pid, a child that has ended is passed
+    // over, and a "child" older than its parent belongs to a reused parent id.
+    const siblings = [_]ProcessNode{
+        .{ .pid = 10, .parent = 4, .shell = true },
+        .{ .pid = 21, .parent = 10, .shell = false },
+        .{ .pid = 22, .parent = 10, .shell = false },
+        .{ .pid = 23, .parent = 10, .shell = false },
+        .{ .pid = 24, .parent = 10, .shell = false },
+        .{ .pid = 25, .parent = 10, .shell = false },
+    };
+    try testing.expectEqual(@as(?u32, 23), selectForegroundJob(&siblings, 10, FakeTimes{ .times = &.{ .{ 10, 100 }, .{ 21, 200 }, .{ 22, 300 }, .{ 23, 300 }, .{ 24, 50 } } }));
+    try testing.expectEqual(@as(?u32, 10), selectForegroundJob(&siblings, 10, FakeTimes{ .times = &.{ .{ 10, 100 }, .{ 24, 50 } } }));
+
+    // A cycle of equal times (never a real tree) still ends.
+    const cycle = [_]ProcessNode{
+        .{ .pid = 10, .parent = 11, .shell = true },
+        .{ .pid = 11, .parent = 10, .shell = true },
+    };
+    try testing.expect(selectForegroundJob(&cycle, 10, FakeTimes{ .times = &.{ .{ 10, 1 }, .{ 11, 1 } } }) != null);
+
+    try testing.expect(shellImage("PWSH.EXE"));
+    try testing.expect(shellImage("C:\\Windows\\System32\\cmd.exe"));
+    try testing.expect(shellImage("sh"));
+    try testing.expect(!shellImage("node.exe"));
+    try testing.expect(!shellImage("claude.exe"));
+    try testing.expect(!shellImage("shell.exe"));
+}
+
+/// Wait until a Windows terminal's foreground job runs `stem` (compared without case, path or
+/// `.exe`), within the test deadline, through bounded `waitReadable` steps.
+fn waitForWindowsForeground(pty: Pty, buffer: []u8, stem: []const u8) ?ForegroundProcess {
+    const deadline = testDeadline();
+    while (true) {
+        if (pty.foregroundProcess(buffer)) |found| {
+            const cut = std.mem.lastIndexOfAny(u8, found.argv0, "/\\");
+            const base = if (cut) |at| found.argv0[at + 1 ..] else found.argv0;
+            const name = if (std.ascii.endsWithIgnoreCase(base, ".exe")) base[0 .. base.len - 4] else base;
+            if (std.ascii.eqlIgnoreCase(name, stem)) return found;
+        }
+        const left = timeLeft(deadline) orelse return null;
+        _ = pty.waitReadable(@min(left, test_step_ms));
+        var scratch: [256]u8 = undefined;
+        _ = pty.takeBytes(&scratch);
+    }
+}
+
+test "a Windows terminal's foreground job is the program its shell runs, with its words and directory" {
+    // TASK-81's fourth acceptance criterion, which only a Windows runtime can answer.
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try spawnConPty(gpa, windowsRequest(&windows_shell_argv));
+    defer pty.destroy();
+
+    // An idle shell is its own foreground.
+    var idle_buffer: [1024]u8 = undefined;
+    const idle = waitForWindowsForeground(pty, &idle_buffer, "cmd") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("/Q", idle.argv1);
+
+    // A nested program, started from another directory, is the job.
+    try writeAll(pty, "cd /d C:\\Windows\\System32\rping -n 30 127.0.0.1\r");
+    var found_buffer: [1024]u8 = undefined;
+    const found = waitForWindowsForeground(pty, &found_buffer, "ping") orelse return error.TestUnexpectedResult;
+    try testing.expect(found.pid != 0 and found.pid != idle.pid);
+    try testing.expectEqualStrings("-n\x0030\x00127.0.0.1", found.argv1);
+    try testing.expect(std.ascii.eqlIgnoreCase("C:\\Windows\\System32", found.cwd));
+
+    // Looks in quick succession share one snapshot.
+    const before = win_processes.snapshots;
+    var again: [1024]u8 = undefined;
+    const second = pty.foregroundProcess(&again) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(found.pid, second.pid);
+    const third = pty.foregroundProcess(&again) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(found.pid, third.pid);
+    try testing.expect(win_processes.snapshots - before <= 1);
+
+    // Ctrl+C ends the job and the shell is in front again.
+    try writeAll(pty, "\x03");
+    var back_buffer: [1024]u8 = undefined;
+    const back = waitForWindowsForeground(pty, &back_buffer, "cmd") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(idle.pid, back.pid);
 }
