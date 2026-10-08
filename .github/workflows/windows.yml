@@ -250,12 +250,26 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 10
         run: |
+          # The restored cache can hold test binaries built for another runner's
+          # CPU (the build uses -mcpu native); one that dies with an illegal
+          # instruction is not a result, so the next newest is tried.
           status=0
           for name in font workspace; do
-            bin="$(ls -t $(find .zig-cache -type f -name "$name-test.exe") | head -n 1)"
-            echo "== $name-test ($bin)"
-            "$bin" > "$ARTIFACT_ROOT/$name-test.txt" 2>&1 || status=1
-            grep -iE "wsl|directwrite|windows|passed|failed|skipped" "$ARTIFACT_ROOT/$name-test.txt" | head -n 60
+            ran=""
+            for bin in $(ls -t $(find .zig-cache -type f -name "$name-test.exe")); do
+              rc=0
+              "$bin" > "$ARTIFACT_ROOT/$name-test.txt" 2>&1 || rc=$?
+              if grep -q "Illegal instruction" "$ARTIFACT_ROOT/$name-test.txt"; then
+                echo "== $bin was built for another CPU; trying the next"
+                continue
+              fi
+              ran="$bin"
+              [ "$rc" -eq 0 ] || status=1
+              break
+            done
+            echo "== $name-test (${ran:-no runnable binary})"
+            [ -n "$ran" ] || status=1
+            grep -iE "wsl|directwrite|windows|passed|failed|skipped" "$ARTIFACT_ROOT/$name-test.txt" | head -n 60 || true
           done
           exit $status
 
