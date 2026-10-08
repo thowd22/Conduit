@@ -15,10 +15,13 @@
 #   Windows clipboard         Ctrl+Shift+V from and Ctrl+Shift+C to it
 #   font discovery (AC2)      system and per-user families through DirectWrite
 #   WSL (TASK-47)             a real distribution when the image can run one,
-#                             otherwise a scripted wsl.exe stand-in
+#                             otherwise a scripted wsl.exe stand-in, for the
+#                             context's tests; the app's WSL workspace (AC1-AC3)
+#                             is driven through conduit-test against the real
+#                             Ubuntu and gates
 #   unit tests                the same `zig build test` as ci.yml
 #
-# Triggers: a push to the task-49 branches (Debug, or ReleaseSafe and a fixed
+# Triggers: a push to the task-49 branches or `task-47-wsl` (Debug, or ReleaseSafe and a fixed
 # prerelease version on `task-49-windows-release`), a manual dispatch once this
 # file is on main, and `workflow_call` from release.yml, which passes the tag's
 # version and ReleaseSafe and publishes the uploaded zip.
@@ -27,7 +30,7 @@ name: Windows
 
 on:
   push:
-    branches: ["task-49-windows", "task-49-windows-release"]
+    branches: ["task-49-windows", "task-49-windows-release", "task-47-wsl"]
   workflow_dispatch:
     inputs:
       version:
@@ -214,6 +217,14 @@ jobs:
             echo "INFO no wsl.exe on this image; the WSL tests use the stand-in"
           fi
 
+      - name: WSL workspace through conduit-test (TASK-47 AC1-AC3)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          [ -n "${CONDUIT_TEST_WSL_DISTRO:-}" ] || { echo "::error::no runnable WSL distribution on this runner"; exit 1; }
+          bash .github/scripts/windows-wsl-check.sh "$PWD/zig-out/bin/conduit.exe" "$PWD/zig-out/bin/conduit-test.exe" \
+            "$ARTIFACT_ROOT/wsl" "$CONDUIT_TEST_WSL_DISTRO"
+
       - name: Built-in checks (required)
         id: builtin
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -221,21 +232,20 @@ jobs:
         run: |
           bash .github/scripts/windows-builtin-checks.sh ./zig-out/bin/conduit.exe "$ARTIFACT_ROOT/builtin" \
             --self-test --grid-test --ui-test --driver-test --scroll-test --mouse-test --sidebar-test \
-            --scratchpad-test --menu-test --theme-test --font-test --tabs-test --palette-test --workspaces-test
+            --scratchpad-test --menu-test --theme-test --font-test --tabs-test --palette-test --workspaces-test \
+            --panes-test --search-test
 
       # Reported, not gating (docs/release.md says why each fails):
       # --clipboard-test pins SDL's offscreen driver, which needs EGL on Windows;
       # --ime-test's MSYS child cannot put a ConPTY console into raw mode;
-      # --links-test opens `vi`, which the runner does not have as vi.exe;
-      # --panes-test and --search-test stop when a write reaches a ConPTY whose
-      # child has exited (ERROR_NO_DATA becomes SystemError in pty.zig).
+      # --links-test opens `vi`, which the runner does not have as vi.exe.
       - name: Built-in checks (survey)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 30
         run: |
           bash .github/scripts/windows-builtin-checks.sh ./zig-out/bin/conduit.exe "$ARTIFACT_ROOT/survey" \
-            --clipboard-test --ime-test --links-test --panes-test --search-test
+            --clipboard-test --ime-test --links-test
 
       - name: Unit tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
