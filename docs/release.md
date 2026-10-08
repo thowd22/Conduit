@@ -1,7 +1,7 @@
-# Cutting a Conduit release (Linux, TASK-69.1)
+# Cutting a Conduit release (Linux, TASK-69.1; macOS, TASK-48/TASK-69)
 
-This describes the Linux x86_64 release path. macOS and Windows artifacts are
-deferred to TASK-69 and nothing below builds, signs or publishes them.
+This describes the Linux x86_64 release path and, in [macOS](#macos), the arm64
+disk image published beside it. Windows artifacts are deferred to TASK-69.
 
 ## Tag format
 
@@ -141,9 +141,78 @@ package `./zig-out`, which other builds may be writing to. `zig build
 the intended behaviour. With the same `SOURCE_DATE_EPOCH` the tar.gz and .deb
 are byte-for-byte reproducible.
 
+## macOS
+
+The `macos` job in `release.yml` calls the reusable `.github/workflows/macos.yml`
+with the tag's version and `optimize: ReleaseSafe`, after the Linux gate. On a
+GitHub arm64 macOS runner (`macos-14`) it:
+
+1. builds and runs the required built-in checks (`--self-test`, `--grid-test`,
+   `--ui-test`, `--driver-test`, `--clipboard-test`) in real Cocoa windows;
+2. stages `Conduit.app` with `zig build bundle` (`Contents/MacOS/conduit`, a
+   generated `Info.plist`, `Resources/AppIcon.icns`, the fonts, shell
+   integration and licences; see `assets/macos/README.md`);
+3. checks the bundle (`macos-bundle-check.sh`: `Info.plist`, icon, resources,
+   `--version`, `codesign --verify`, a Launch Services start with `open`, the
+   display's density and a 2x frame), the system clipboard and font discovery;
+4. packages `conduit-<version>-macos-arm64.dmg` (the app plus an
+   `/Applications` link, UDZO) with `macos-dmg.sh`, mounts it read-only and
+   verifies the payload, the signature and that the mounted app prints
+   `conduit <version>`, and writes `<dmg>.sha256`;
+5. uploads the dmg as the `conduit-macos-arm64-<version>` artifact.
+
+`publish-macos` then uploads the dmg and its `.sha256` to the release with
+`--clobber`. It needs `publish`; `publish` does not need it, so a tag whose
+macOS leg fails still publishes the Linux assets and the release simply lacks
+the dmg until the job is rerun.
+
+**The dmg is unsigned for Gatekeeper.** Without Apple credentials the app is
+signed ad hoc, which keeps the bundle's seal intact but is not a Developer ID
+signature, and it is not notarized. A downloaded copy is quarantined, so macOS
+refuses to open it with a double click. Users open it once with Control-click
+▸ Open (or `xattr -dr com.apple.quarantine /Applications/Conduit.app`). To
+ship a signed, notarized dmg, add these repository secrets; the steps already
+use them and skip themselves when they are absent (this path has not run):
+
+| Secret | What |
+|---|---|
+| `MACOS_CERTIFICATE_P12_BASE64` | a "Developer ID Application" certificate and key, exported as .p12, base64 |
+| `MACOS_CERTIFICATE_PASSWORD` | the .p12's password |
+| `MACOS_SIGNING_IDENTITY` | the identity name, `Developer ID Application: <Name> (<TEAM>)` |
+| `MACOS_NOTARY_APPLE_ID`, `MACOS_NOTARY_TEAM_ID`, `MACOS_NOTARY_PASSWORD` | an Apple ID, its team and an app-specific password for `notarytool` |
+
+With the first three, `macos-import-identity.sh` imports the identity into a
+temporary keychain and `macos-dmg.sh` signs the app with the hardened runtime
+and the dmg; with the notary three as well it runs `notarytool submit --wait`,
+`stapler staple` and `spctl --assess`.
+
+The minimum macOS version is the runner's (the `LSMinimumSystemVersion` the
+build writes is the target's minimum, which for a native build is the host's:
+14 on `macos-14`). Building for an older minimum needs a non-native
+`-Dtarget` and SDL's `-Dsystem_include_path`/`-Dsystem_framework_path`/
+`-Dlibrary_path` pointed at the SDK; not done yet. Only arm64 is built.
+
+### Dry run without a tag
+
+`macos.yml` also runs on `workflow_dispatch` with optional `version` and
+`optimize` inputs, which exercises exactly the job the release calls. GitHub
+only dispatches a workflow that exists on the default branch, so this works
+once `macos.yml` is on `main`:
+
+```sh
+gh workflow run macos.yml --ref <branch> -f version=0.2.0-rc.1 -f optimize=ReleaseSafe
+```
+
+Before that, pushing a commit to the branch `task-48-macos-release` runs the
+same job at ReleaseSafe with the version `0.1.8-macos.dryrun.<run>`.
+
+The `conduit-macos-arm64-<version>` artifact is the dmg the release would
+publish; the `conduit-macos-evidence-*` artifact holds the screenshots and logs.
+
 ## Deferred and unverified
 
-- macOS and Windows packages, signing and notarisation: TASK-69.
+- Windows packages: TASK-69. macOS Developer ID signing and notarisation need
+  the user's Apple credentials (above); until then the dmg is ad hoc signed.
 - Signing the Linux artifacts (GPG or Sigstore) is not part of this slice;
   `SHA256SUMS` is the only integrity artifact.
 - The ReleaseSafe binary keeps its debug information so Zig's safety panics

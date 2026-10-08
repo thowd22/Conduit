@@ -50,6 +50,15 @@ rm -f "$dmg"
 hdiutil create -volname "Conduit $version" -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg" > /dev/null
 if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
   codesign --force --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$dmg"
+  if [ -n "${MACOS_NOTARY_APPLE_ID:-}" ] && [ -n "${MACOS_NOTARY_TEAM_ID:-}" ] && [ -n "${MACOS_NOTARY_PASSWORD:-}" ]; then
+    xcrun notarytool submit "$dmg" --apple-id "$MACOS_NOTARY_APPLE_ID" --team-id "$MACOS_NOTARY_TEAM_ID" \
+      --password "$MACOS_NOTARY_PASSWORD" --wait
+    xcrun stapler staple "$dmg"
+    spctl --assess --type open --context context:primary-signature --verbose "$dmg"
+    signing="$signing, notarized"
+  else
+    echo "INFO: no notary credentials; the signed dmg is not notarized"
+  fi
 fi
 hdiutil verify "$dmg" > /dev/null
 echo "PASS created $name, app signed $signing"

@@ -1,43 +1,81 @@
-# macOS platform evidence (TASK-48, TASK-15 AC1, TASK-69's macOS half).
+# macOS platform evidence and the macOS release artifact (TASK-48, TASK-15
+# AC1, TASK-69's macOS half).
 #
 # The dev box is Linux, so everything macOS-specific is proved here, on a
 # GitHub arm64 macOS runner with a real window server:
 #
-#   build and unit tests      the same `zig build` / `zig build test` as ci.yml
+#   build                     `zig build` at the requested optimize mode
 #   built-in checks           real Cocoa windows, no Xvfb (see the script)
 #   Conduit.app               `zig build bundle`, its structure, signature,
 #                             Launch Services start and a Retina (2x) frame
 #   system clipboard          Cmd+V from and Cmd+C to the macOS pasteboard
 #   font discovery            per-user (~/Library/Fonts) and system families
-#   disk image                the dmg the release workflow publishes
+#   disk image                built, mounted and verified (macos-dmg.sh)
+#   unit tests                the same `zig build test` as ci.yml
 #
-# `ci.yml` stays the cross-platform unit-test matrix; this workflow is the
-# macOS acceptance run. The Zig version is read from build.zig.zon exactly as
-# ci.yml does. Artifacts (screenshots, logs, the dmg) are uploaded on every run.
+# Triggers: a push to the TASK-48 branch (Debug); a push to
+# `task-48-macos-release`, which dry-runs the release path (ReleaseSafe and a
+# fixed prerelease version) because GitHub only dispatches workflows that are
+# on the default branch; a manual dispatch with optional version and optimize
+# once this file is on main; and `workflow_call` from release.yml, which passes
+# the tag's version and ReleaseSafe and publishes the uploaded
+# `conduit-macos-arm64-<version>` dmg.
+# The Zig version is read from build.zig.zon exactly as ci.yml does.
+#
+# Signing: with the MACOS_* secrets absent (the case today) the app is signed
+# ad hoc, which Gatekeeper does not trust; docs/release.md says what to add.
 name: macOS
 
 on:
   push:
-    branches: ["task-48-macos"]
+    branches: ["task-48-macos", "task-48-macos-release"]
   workflow_dispatch:
     inputs:
       version:
-        description: "SemVer stamped into the bundle and dmg (no leading v)"
+        description: "SemVer stamped into the bundle and dmg (no leading v); empty for 0.0.0-ci.<run>"
         required: false
         default: ""
+      optimize:
+        description: "Zig optimize mode for the build, bundle and dmg"
+        required: false
+        default: "Debug"
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      optimize:
+        type: string
+        required: false
+        default: "ReleaseSafe"
+    secrets:
+      MACOS_CERTIFICATE_P12_BASE64:
+        required: false
+      MACOS_CERTIFICATE_PASSWORD:
+        required: false
+      MACOS_SIGNING_IDENTITY:
+        required: false
+      MACOS_NOTARY_APPLE_ID:
+        required: false
+      MACOS_NOTARY_TEAM_ID:
+        required: false
+      MACOS_NOTARY_PASSWORD:
+        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: macos-${{ github.ref }}
+  group: macos-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   macos:
-    name: macOS arm64 platform checks
+    name: macOS arm64 platform checks and dmg
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 120
+    env:
+      OPTIMIZE: ${{ inputs.optimize || (github.ref_name == 'task-48-macos-release' && 'ReleaseSafe') || 'Debug' }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
@@ -47,7 +85,10 @@ jobs:
         run: |
           zig_version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)"
           [ -n "$zig_version" ] || { echo "::error::build.zig.zon declares no .minimum_zig_version" >&2; exit 1; }
-          version="${{ github.event.inputs.version }}"
+          version="${{ inputs.version }}"
+          if [ -z "$version" ] && [ "$GITHUB_REF_NAME" = task-48-macos-release ]; then
+            version="0.1.8-macos.dryrun.${{ github.run_number }}"
+          fi
           [ -n "$version" ] || version="0.0.0-ci.${{ github.run_number }}"
           {
             echo "ZIG_VERSION=$zig_version"
@@ -55,6 +96,7 @@ jobs:
             # Short: Darwin's Unix socket paths stop at 104 bytes.
             echo "ARTIFACT_ROOT=$RUNNER_TEMP/m"
           } >> "$GITHUB_ENV"
+          echo "version $version, optimize $OPTIMIZE"
           sw_vers
           uname -m
           system_profiler SPDisplaysDataType | sed -n '1,40p' || true
@@ -90,7 +132,7 @@ jobs:
       - name: Build
         id: build
         shell: bash
-        run: zig build -Dversion="$CONDUIT_VERSION"
+        run: zig build -Doptimize="$OPTIMIZE" -Dversion="$CONDUIT_VERSION"
 
       - name: Built-in checks (required)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -104,7 +146,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         run: |
-          zig build bundle -Dversion="$CONDUIT_VERSION"
+          zig build bundle -Doptimize="$OPTIMIZE" -Dversion="$CONDUIT_VERSION"
           find zig-out/Conduit.app -maxdepth 3 | sort
 
       - name: Bundle structure, Launch Services and Retina frame
@@ -130,12 +172,38 @@ jobs:
             "DejaVu Sans Mono=$HOME/Library/Fonts" \
             "Menlo=/System/Library/Fonts"
 
-      - name: Disk image
+      # Placeholder until the project has Apple credentials: every secret is
+      # optional, and with none of them the import is skipped and the dmg step
+      # signs ad hoc. docs/release.md lists the secrets.
+      - name: Import the Developer ID identity (skipped without secrets)
+        id: identity
         if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
         shell: bash
         env:
-          MACOS_SIGNING_IDENTITY: ""
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: bash .github/scripts/macos-import-identity.sh
+
+      - name: Disk image
+        id: dmg
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        shell: bash
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ steps.identity.outputs.identity }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
         run: bash .github/scripts/macos-dmg.sh zig-out/Conduit.app "$CONDUIT_VERSION" "$ARTIFACT_ROOT/dist"
+
+      - name: Upload the disk image
+        if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conduit-macos-arm64-${{ env.CONDUIT_VERSION }}
+          path: ${{ runner.temp }}/m/dist
+          if-no-files-found: error
+          retention-days: 14
 
       # Every other built-in check, reported but not gating: they were written
       # and proved on Linux, and this is their first macOS run.
@@ -153,13 +221,13 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         timeout-minutes: 40
-        run: zig build test -Dversion="$CONDUIT_VERSION" --summary all
+        run: zig build test -Doptimize="$OPTIMIZE" -Dversion="$CONDUIT_VERSION" --summary all
 
       - name: Upload the evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: conduit-macos-evidence-${{ github.run_id }}
+          name: conduit-macos-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/m
           if-no-files-found: warn
           retention-days: 14

@@ -2,8 +2,9 @@
 # becomes a published Linux x86_64 release once the complete Linux unit and E2E
 # gate has passed on that exact commit.
 #
-# Scope (TASK-69.1): Linux only. macOS and Windows artifacts are explicitly
-# deferred to TASK-69; nothing here builds, signs or notarizes for them.
+# Scope (TASK-69.1): Linux x86_64. TASK-48/TASK-69 add a macOS arm64 disk
+# image beside it (the `macos` and `publish-macos` jobs below); Windows stays
+# deferred to TASK-69.
 #
 # Flow:
 #   validate-tag  strict SemVer check; emits `version` (tag without `v`) and
@@ -17,6 +18,13 @@
 #   publish       creates or updates the GitHub release for the tag (prerelease
 #                 when the tag says so) and uploads the assets with --clobber,
 #                 so rerunning the same tag replaces rather than duplicates
+#   macos         the reusable macOS workflow (`macos.yml`) at ReleaseSafe with
+#                 the tag's version: built-in checks, Conduit.app, its bundle,
+#                 Retina, clipboard and font checks, then the verified dmg
+#   publish-macos uploads that dmg and its .sha256 to the same release. It
+#                 needs `publish`, but `publish` never needs it: a red macOS
+#                 leg leaves the Linux release published, and only the dmg is
+#                 missing. Unsigned (ad hoc) until the MACOS_* secrets exist.
 #
 # The Zig version is never written here: it is read from `.minimum_zig_version`
 # in build.zig.zon exactly as ci.yml does. The glibc baseline lives once, in
@@ -212,3 +220,46 @@ jobs:
             "${{ needs.validate-tag.outputs.version }}" \
             "${{ needs.validate-tag.outputs.prerelease }}" \
             "$DIST"
+
+  # TASK-69 (macOS): the same workflow the TASK-48 branch dry-runs through
+  # workflow_dispatch, here at ReleaseSafe with the tag's version. It waits
+  # for the Linux gate so no artifact ships from a commit that failed it.
+  macos:
+    name: macOS arm64 bundle and dmg
+    needs: [validate-tag, linux-gate]
+    uses: ./.github/workflows/macos.yml
+    with:
+      version: ${{ needs.validate-tag.outputs.version }}
+      optimize: ReleaseSafe
+    secrets: inherit
+    permissions:
+      contents: read
+
+  publish-macos:
+    name: Publish the macOS disk image
+    needs: [validate-tag, publish, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download the verified disk image
+        uses: actions/download-artifact@v4
+        with:
+          name: conduit-macos-arm64-${{ needs.validate-tag.outputs.version }}
+          path: ${{ runner.temp }}/conduit-macos-dist
+
+      # `publish` created the release; --clobber makes a rerun replace the
+      # same-named assets rather than fail or duplicate them.
+      - name: Upload the dmg to the release
+        shell: bash
+        run: |
+          shopt -s nullglob
+          assets=("$RUNNER_TEMP"/conduit-macos-dist/*.dmg "$RUNNER_TEMP"/conduit-macos-dist/*.dmg.sha256)
+          [ "${#assets[@]}" -eq 2 ] || { echo "FAIL: expected one dmg and its .sha256" >&2; exit 1; }
+          (cd "$RUNNER_TEMP/conduit-macos-dist" && sha256sum --check ./*.dmg.sha256)
+          gh release upload "${{ needs.validate-tag.outputs.tag }}" "${assets[@]}" --clobber
+          gh release view "${{ needs.validate-tag.outputs.tag }}" --json assets --jq '"INFO: assets=" + ([.assets[].name] | join(", "))'
