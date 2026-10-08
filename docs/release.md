@@ -1,7 +1,7 @@
 # Cutting a Conduit release (Linux, TASK-69.1; macOS, TASK-48/TASK-69; Windows, TASK-49/TASK-69)
 
 This describes the Linux x86_64 release path and, in [macOS](#macos), the arm64
-disk image published beside it. Windows artifacts are deferred to TASK-69.
+disk image published beside it, and a Windows portable zip (see the Windows section).
 
 ## Tag format
 

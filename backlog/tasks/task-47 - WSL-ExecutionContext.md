@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-08 02:42'
+updated_date: '2026-10-08 05:28'
 labels:
   - windows
   - wsl
@@ -37,3 +37,9 @@ Enumerate installed WSL distributions and offer them as workspace contexts on Wi
 2. Offered as workspace contexts in Remote: connect on Windows; tabs, panes and scratchpad inside the distribution; cwd tracking via OSC 7 from the WSL shell.
 3. Verified on the Windows runner if a distribution can be installed there (wsl --install is restricted on hosted runners: document the limit and fall back to unit tests with a scripted wsl.exe).
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Coordinator 2026-10-08: context level landed on main (WslContext, distribution listing, link.WslPaths, remote wsl choice helpers; context test green against WSL2 Ubuntu on the hosted runner). App wiring in main.zig (palette choice, WSL workspace presentation, file-reference translation) dispatched as a follow-up slice with runner evidence required for ACs 1-3.
+<!-- SECTION:NOTES:END -->

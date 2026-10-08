@@ -4,7 +4,7 @@ title: Packaging and release pipeline
 status: To Do
 assignee: []
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-08 02:42'
+updated_date: '2026-10-08 05:28'
 labels:
   - release
   - infra
@@ -28,11 +28,13 @@ Release builds and installers: Linux (tarball plus AppImage or Flatpak and deb),
 <!-- AC:BEGIN -->
 - [ ] #1 Tagged builds produce installable artifacts for all three platforms
 - [x] #2 Version is stamped in the binary and shown by 'conduit --version'
-- [ ] #3 Bundled resources (themes, fallback font, shell integration) ship in every package
+- [x] #3 Bundled resources (themes, fallback font, shell integration) ship in every package
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-10-08: macOS half landed with TASK-48 (release.yml macos + publish-macos jobs, unsigned dmg verified by mount and --version in a dry run); AC2 (stamped version) holds on Linux and macOS; AC1/AC3 wait for the Windows package.
+
+Coordinator 2026-10-08: Windows portable zip (zig build portable + windows-package.sh, verified on the runner, ReleaseSafe dry run 37729065903) and macOS dmg (macos.yml) now ship bundled fonts, shell integration (incl. powershell/conduit.ps1) and licences; AC3 checked. AC1 waits for a real tagged release producing all three platforms' artifacts.
 <!-- SECTION:NOTES:END -->

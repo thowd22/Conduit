@@ -218,7 +218,8 @@ appimagetool 1.9.1 and type2 runtime, SHA-256 checked) and `SHA256SUMS`, verifie
 `ubuntu:22.04` Docker install), and publishes idempotently with `gh release` plus `--clobber`,
 marking prerelease tags. `docs/release.md` documents the procedure. Locally the full dry run
 passed 37/37 verifier checks; `ci.yml` and `linux-e2e.yml` now trigger only on branch pushes so a
-tag runs the gate once through the release workflow. macOS and Windows packaging stay in TASK-69.
+tag runs the gate once through the release workflow. The macOS dmg and the Windows portable zip
+are built and published by the same workflow (TASK-48 and TASK-49 below).
 
 TASK-35 is complete. A right click over the focused terminal pane opens a minimal terminal-style
 context menu at the pointer cell: a bordered `Surface` panel (`context-menu`) of `InteractiveText`
@@ -974,6 +975,44 @@ run on macOS (the offscreen driver has no OpenGL there). TASK-69's macOS half ad
 `--settings-test` still fail (spawned-child cwd checks under `/private/tmp`, Ctrl-chord capture,
 search paging) and are reported, not gating; `window.fullscreen` and a settings row for the
 Option setting are still to do.
+
+TASK-49 is complete on the hosted Windows runner. `conduit.exe` embeds `assets/windows/conduit.manifest`
+(per-monitor-v2 DPI awareness, UTF-8 code page, Windows 10/11 supportedOS, asInvoker) and the
+icon from `conduit.rc`. `Window.create` sets a dark DWM title bar (`setTitleBarDark` is not yet
+called on theme changes), logs the DPI awareness, and frees a console Windows created only for
+this process. `font.discoverCatalog` lists fonts through DirectWrite and catalogues each file with
+FreeType; without DirectWrite it walks `%WINDIR%\Fonts` and the per-user font directory. Every
+Windows argument is copied out of the iterator's buffer, which `deinit` frees (before that fix
+`--version` and every flag read freed memory). `.github/workflows/windows.yml` (run 37731052008)
+proves on windows-latest, using Mesa llvmpipe as the OpenGL driver because the runner's GDI
+OpenGL is 1.1, and Git's `sh` as `\bin\sh` for `--command` children: cmd.exe and PowerShell typed
+and drawn at scale 1 and 1.5; Unicode text input; Ctrl+Shift+V/C through the Windows clipboard;
+Consolas, Cascadia Mono and a per-user DejaVu Sans Mono; a live display-scale change from 100%
+to 125% re-rendering at 800x450; and 14 gating built-in checks. `--clipboard-test` (needs EGL),
+`--ime-test` (an MSYS child cannot enter raw mode), `--links-test` (no `vi.exe`) and
+`--panes-test`/`--search-test` (`ERROR_NO_DATA` from a ConPTY whose child exited is not yet
+mapped to `Closed`) are reported but do not gate. Local process runs use `create_no_window`, and
+`build.zig` translates the C header seams as Debug on Windows because MinGW's `_FORTIFY_SOURCE`
+breaks translate-c at ReleaseSafe. A real GPU driver, a second monitor and real IME composition
+are unverified.
+
+TASK-47 is implemented at the context level. `workspace.wsl.WslContext` runs every process
+through `wsl.exe -d <distro> --cd ~ -e /bin/sh -c <script>`: sessions under ConPTY, and files,
+run, stateDir and watch over pipes with the SSH helper scripts. Distributions come from HKCU
+`Lxss` or `wsl --list --quiet` (UTF-16LE decoded). `link.WslPaths` translates drive and
+`\\wsl.localhost` paths using the mount root learned from `wslpath`, and `remote.zig` has the
+`wsl:<name>` choice helpers. On windows-latest the workflow installs Ubuntu under WSL2, and the
+context test passes against it: commands, files, watch, three concurrent sessions inside the
+distribution, and translation that agrees with `wslpath -w`. A stand-in launcher covers Linux.
+The palette entry, the WSL workspace presentation and file-reference translation in `main.zig`
+are being wired next.
+
+TASK-69 (Windows): `zig build portable` and `windows-package.sh` produce
+`conduit-<v>-windows-x86_64.zip` plus `.sha256`, verified on the runner (checksum, fresh unpack,
+payload, forward-slash entry names, embedded manifest, `--version` from the unpacked copy).
+`release.yml`'s `windows`/`publish-windows` jobs upload them beside the Linux release; nothing
+waits for them. The ReleaseSafe dry run 37729065903 passed. The zip is unsigned and there is no
+installer; `docs/release.md` says why.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
