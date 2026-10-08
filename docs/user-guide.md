@@ -174,7 +174,7 @@ Workspaces are managed from the palette:
   Closing the last workspace quits Conduit.
 
 Quitting Conduit ends every shell, but the layout comes back next time: see
-[Sessions are restored](#sessions-are-restored). WSL workspaces are planned and not available yet.
+[Sessions are restored](#sessions-are-restored). WSL workspaces (Windows) are not restored yet.
 
 ## Sessions are restored
 
@@ -530,10 +530,12 @@ or registered. The executables are not code-signed yet, so SmartScreen may warn 
 
 ### WSL
 
-The WSL execution context is in place, but the app does not offer it yet: once wired, **Remote:
-Connect** on Windows lists the installed WSL distributions (`<name>  WSL`), and choosing one opens
-a workspace whose tabs, panes and scratchpad all run inside that distribution through `wsl.exe`,
-starting in its home directory. File references in a WSL terminal may be spelled either
+**Remote: Connect** on Windows lists the installed WSL distributions (`<name>  WSL`) after the SSH
+hosts, profiles and recent destinations; click one or filter to it and press Enter. That opens a
+workspace named after the distribution whose tabs, panes and scratchpad all run the
+distribution's login shell through `wsl.exe`, starting in its home directory. There is no
+connection step: the distribution boots with the first terminal. A WSL workspace is not saved
+for the next start yet. File references in a WSL terminal may be spelled either
 way: a Windows path such as `C:\Users\me\notes.txt:12` opens as `/mnt/c/Users/me/notes.txt` inside
 the distribution, and a distribution path translates to `\\wsl.localhost\<distro>\...` where
 Windows needs it. The drive mount root is read from the distribution's own `wslpath`, so a custom
@@ -548,8 +550,9 @@ and the built-in checks listed in `docs/release.md`. The WSL context was proved 
 Ubuntu (WSL2) the workflow installs on the runner, and against a scripted `wsl.exe` stand-in:
 commands, file reads and atomic writes, a directory watch, three concurrent sessions in their own
 directories inside the distribution, and path translation that agrees with the distribution's
-`wslpath`. The palette entry that opens a WSL workspace is not wired into the app yet. Not
-verified: a real GPU driver, a second monitor, and IME composition with a real input method.
+`wslpath`. The app's WSL workspace was driven through `conduit-test` against that Ubuntu: Remote:
+Connect listing it, its first tab, a split pane and the scratchpad running inside it, and a
+ctrl-clicked `C:\Windows\win.ini:3` opening vi on `/mnt/c/Windows/win.ini`. Not verified: a real GPU driver, a second monitor, and IME composition with a real input method.
 
 ## Configuration file
 
