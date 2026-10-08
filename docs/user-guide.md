@@ -502,6 +502,53 @@ proved with a fixed scale), desktop notifications (not implemented on macOS), cl
 items, and the tab, pane, palette, workspace, search, config and settings checks, which still
 fail on macOS (see `docs/release.md`).
 
+## Windows
+
+Conduit for Windows is a portable folder, shipped as `conduit-<version>-windows-x86_64.zip` beside
+the Linux and macOS packages. Unzip it anywhere and run `Conduit\conduit.exe`; nothing is installed
+or registered. The executables are not code-signed yet, so SmartScreen may warn on first launch
+(**More info ▸ Run anyway**). Windows 10 1809 or later (ConPTY) on x86-64 is required.
+
+- **Keys** are the Linux ones (Ctrl+Shift+C / Ctrl+Shift+V, Ctrl+Shift+T, Ctrl+Shift+P; the
+  [Linux and Windows table](#linux-and-windows)). Ctrl+C without a selection is always the
+  interrupt.
+- **Shell**: the terminal runs your shell under ConPTY. Until shell profiles land (TASK-46), the
+  shell is the program `SHELL` names (for example `set SHELL=C:\Windows\System32\cmd.exe` or the
+  path to `pwsh.exe`).
+- **High DPI**: Conduit is per-monitor DPI aware. Moving the window to a monitor with a different
+  scale, or changing **Settings ▸ Display ▸ Scale**, re-renders text at the new density instead of
+  stretching a blurry bitmap.
+- **Title bar**: dark, to match the default theme.
+- **Fonts**: `font.family` finds every font Windows lists (through DirectWrite): the fonts in
+  `C:\Windows\Fonts` (Consolas, Cascadia Mono) and fonts installed **for one user**
+  (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`).
+- **Clipboard**: copy and paste go through the Windows clipboard.
+- **OpenGL**: Conduit draws with OpenGL 3.3, which every Windows display driver provides. A
+  virtual machine with only Microsoft's basic display adapter has no OpenGL 3.3; there,
+  Mesa's `opengl32.dll` (llvmpipe) placed beside `conduit.exe` works.
+- **Settings file**: `%APPDATA%\conduit\config`.
+
+### WSL
+
+The WSL execution context is in place, but the app does not offer it yet: once wired, **Remote:
+Connect** on Windows lists the installed WSL distributions (`<name>  WSL`), and choosing one opens
+a workspace whose tabs, panes and scratchpad all run inside that distribution through `wsl.exe`,
+starting in its home directory. File references in a WSL terminal may be spelled either
+way: a Windows path such as `C:\Users\me\notes.txt:12` opens as `/mnt/c/Users/me/notes.txt` inside
+the distribution, and a distribution path translates to `\\wsl.localhost\<distro>\...` where
+Windows needs it. The drive mount root is read from the distribution's own `wslpath`, so a custom
+`[automount] root` in `/etc/wsl.conf` is honoured.
+
+Verified on a GitHub `windows-latest` runner (Windows Server 2025, build 26100, with Mesa's
+llvmpipe standing in for a display driver): cmd.exe and PowerShell 7 typed into and drawn at scale
+1 and 1.5, Unicode text input, Ctrl+Shift+V from and Ctrl+Shift+C to the Windows clipboard,
+Consolas, Cascadia Mono and a per-user DejaVu Sans Mono found through DirectWrite, a live change
+of the display scale from 100% to 125% re-rendering the open window at 800x450, the portable zip,
+and the built-in checks listed in `docs/release.md`. The WSL context was proved against a scripted
+`wsl.exe` stand-in, because the runner cannot install a distribution; the palette entry that
+opens a WSL workspace is not wired yet. Not verified: a real GPU driver, a second monitor, IME
+composition with a real input method, and a real WSL distribution.
+
 ## Configuration file
 
 | Platform | Path |

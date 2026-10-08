@@ -1,4 +1,4 @@
-# Cutting a Conduit release (Linux, TASK-69.1; macOS, TASK-48/TASK-69)
+# Cutting a Conduit release (Linux, TASK-69.1; macOS, TASK-48/TASK-69; Windows, TASK-49/TASK-69)
 
 This describes the Linux x86_64 release path and, in [macOS](#macos), the arm64
 disk image published beside it. Windows artifacts are deferred to TASK-69.
@@ -217,10 +217,86 @@ same job at ReleaseSafe with the version `0.1.8-macos.dryrun.<run>`.
 The `conduit-macos-arm64-<version>` artifact is the dmg the release would
 publish; the `conduit-macos-evidence-*` artifact holds the screenshots and logs.
 
+## Windows
+
+The `windows` job in `release.yml` calls the reusable
+`.github/workflows/windows.yml` with the tag's version and `optimize:
+ReleaseSafe`, after the Linux gate. On GitHub's `windows-latest` runner, which
+has an interactive desktop in which SDL creates real Win32 windows, it:
+
+1. builds for the explicit `<arch>-windows-gnu` host target `build.zig` picks
+   on Windows. `conduit.exe` embeds `assets/windows/conduit.manifest`
+   (per-monitor-v2 DPI awareness, UTF-8 process code page, Windows 10/11
+   `supportedOS`, `asInvoker`) and the icon from `assets/windows/conduit.rc`;
+2. checks that `conduit.exe --version` prints `conduit <version>`;
+3. stages the portable folder with `zig build portable` (`zig-out/Conduit`:
+   `conduit.exe`, `conduit-test.exe`, `share/conduit/{fonts,shell-integration,
+   themes,licenses}`, no PDBs) and zips it with `windows-package.sh` as
+   `conduit-<version>-windows-x86_64.zip` (the folder `Conduit/` inside) plus
+   `<zip>.sha256`, then verifies the zip as a user gets it: the checksum, a
+   fresh `Expand-Archive`, every payload file, the embedded manifest,
+   `--version` from the unpacked `conduit.exe` and that the unpacked
+   `conduit-test.exe` runs;
+4. uploads the zip as the `conduit-windows-x86_64-<version>` artifact;
+5. then, on test fixtures that never reach the zip (Mesa llvmpipe's
+   `opengl32.dll` beside the built `conduit.exe`, because the runner's only
+   OpenGL is Microsoft's GDI 1.1 implementation; and Git for Windows' `sh` at
+   `\bin\sh`, because `--command` children and the built-in checks' fixed
+   children run as `/bin/sh -c` until TASK-46 gives Windows its own shells),
+   runs the platform checks: `windows-smoke.sh` (cmd.exe and PowerShell under
+   ConPTY through `conduit-test`, Unicode text input, frames at scale 1 and
+   1.5), `windows-clipboard-check.sh` (Ctrl+Shift+V from and Ctrl+Shift+C to
+   the Windows clipboard), `windows-font-check.sh` (Consolas and Cascadia Mono
+   from `%WINDIR%\Fonts`, DejaVu Sans Mono installed for the runner's user
+   only, and a negative control), `windows-dpi-check.sh` (a real scale change
+   through `windows-set-dpi.ps1` while a window is open), the built-in checks,
+   and `zig build test`, whose WSL tests use a real distribution if the image
+   has one and a scripted `wsl.exe` stand-in otherwise.
+
+The built-in checks that pass on Windows gate the job: `--self-test`,
+`--grid-test`, `--ui-test`, `--driver-test`, `--scroll-test`, `--mouse-test`,
+`--sidebar-test`, `--scratchpad-test`, `--menu-test`, `--theme-test`,
+`--font-test`, `--tabs-test`, `--palette-test` and `--workspaces-test`. Five
+are run and reported without gating: `--clipboard-test` (it pins SDL's
+offscreen driver, which needs an EGL library on Windows; the Windows clipboard
+step is the real proof), `--ime-test` (its fixed child is an MSYS `sh` script
+that cannot put a ConPTY console into raw mode; the smoke's Unicode text input
+through cmd.exe is the Windows proof of committed text), `--links-test` (it
+opens `vi`, which the runner has only as an MSYS script, not `vi.exe`), and
+`--panes-test` and `--search-test` (a write that reaches a ConPTY whose child
+has just exited fails with `ERROR_NO_DATA`, which `pty.zig` reports as
+`SystemError` rather than `Closed`, and the check stops).
+
+`publish-windows` uploads the zip and its `.sha256` to the release with
+`--clobber`. Like `publish-macos` it needs `publish` and nothing needs it.
+
+**The zip is unsigned.** Neither executable carries an Authenticode
+signature, so SmartScreen may warn on first run of a downloaded copy. Signing
+needs a code-signing certificate (not available to the project yet); with one,
+`signtool sign /fd sha256 /tr <timestamp-url>` on both executables before
+`windows-package.sh` is the whole change. An installer (MSI, MSIX or Inno
+Setup) is not built: the portable folder needs no registration, and an
+installer adds a toolchain and a signing requirement for no capability the
+zip lacks.
+
+### Dry run without a tag
+
+Pushing a commit to `task-49-windows` runs the workflow at Debug; pushing to
+`task-49-windows-release` runs it at ReleaseSafe with the version
+`0.1.8-windows.dryrun.<run>`. Once `windows.yml` is on `main`:
+
+```sh
+gh workflow run windows.yml --ref <branch> -f version=0.2.0-rc.1 -f optimize=ReleaseSafe
+```
+
+The `conduit-windows-x86_64-<version>` artifact is the zip the release would
+publish; `conduit-windows-evidence-*` holds the screenshots and logs.
+
 ## Deferred and unverified
 
-- Windows packages: TASK-69. macOS Developer ID signing and notarisation need
-  the user's Apple credentials (above); until then the dmg is ad hoc signed.
+- macOS Developer ID signing and notarisation need the user's Apple
+  credentials (above); until then the dmg is ad hoc signed. The Windows zip is
+  not Authenticode-signed and has no installer (above).
 - Signing the Linux artifacts (GPG or Sigstore) is not part of this slice;
   `SHA256SUMS` is the only integrity artifact.
 - The ReleaseSafe binary keeps its debug information so Zig's safety panics

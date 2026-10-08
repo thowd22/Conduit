@@ -21,7 +21,8 @@ workspace_drive="$(cygpath -w "${GITHUB_WORKSPACE:-$PWD}" | cut -c1 | tr 'A-Z' '
 [ "$workspace_drive" = c ] || drives="$drives $workspace_drive"
 for drive in $drives; do
   dest="/$drive/bin"
-  mkdir -p "$dest"
+  # The MSYS runtime takes `\bin`'s parent as its root, so `/tmp` is `<drive>:\tmp`.
+  mkdir -p "$dest" "/$drive/tmp"
   cp "$git_usr"/*.dll "$dest/"
   for tool in sh bash cat printf sleep head tail seq stty env ls tr sed grep pwd mkdir rm touch wc od dd true false test; do
     if [ -f "$git_usr/$tool.exe" ]; then cp "$git_usr/$tool.exe" "$dest/"; fi

@@ -675,6 +675,17 @@ nothing else is a legal dependency.
   Minimize (Cmd+M) and Toggle Full Screen (Ctrl+Cmd+F) stay SDL's. `Window.setFullscreen` /
   `isFullscreen` wrap SDL's fullscreen for a future `window.fullscreen` action. The bundle is
   staged by `zig build bundle`; macOS desktop notifications are still `error.Unsupported`.
+  TASK-49 (Windows): `Window.create` borrows SDL's HWND (`SDL.window.win32.hwnd`) for three
+  Windows-only calls (`windows_window`, `dwmapi`/`user32` looked up at run time): a dark title bar
+  (`DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`, `Window.setTitleBarDark` for a light
+  theme), a log line with the thread's DPI awareness and the window's DPI, and `FreeConsole` when
+  the console-subsystem `conduit.exe` was started from Explorer with a console of its own (a
+  console shared with a shell is kept, so `conduit --version` still prints). Per-monitor-v2 DPI
+  awareness comes from the application manifest `build.zig` embeds
+  (`assets/windows/conduit.manifest`, which also sets UTF-8 as the process code page so
+  FreeType's ANSI file opens take any path) and from SDL, which declares it too; a DPI change
+  arrives as `SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED` and takes the existing `scale_changed`
+  path. Clipboard and IME text are SDL's Win32 implementations, unchanged.
 - **Never** contain product logic, layout or workspace behaviour; let an SDL handle escape above
   the seam; place an OS conditional in a shared module (P12, invariant 10 — the only permitted
   OS conditionals are *selecting* a backend).
@@ -767,6 +778,11 @@ nothing else is a legal dependency.
 - **May depend on** no other Conduit module.
 - **Lands** M3 — TASK-34. The URL, OSC 8 and file-reference detector is integrated; `app`
   performs cwd resolution and the decision-5 editor dispatch above it.
+- TASK-47: `isWindowsPath` and `WslPaths` are the pure half of `wslpath`: a drive path
+  (`C:\x` ↔ `/mnt/c/x`, under a configurable mount root) and the distribution's share
+  (`\\wsl.localhost\<distro>\x` or `\\wsl$\...` ↔ `/x`), written into the caller's buffer. No IO,
+  so a file reference can be translated on the UI thread; the WSL context supplies the learned
+  mount root.
 
 ### `render`
 
@@ -848,6 +864,14 @@ nothing else is a legal dependency.
   faces. The macOS workflow proves a per-user (`~/Library/Fonts`, DejaVu from Homebrew) and a
   system (Menlo) family load. CoreText-only fonts (downloadable assets under
   `/System/Library/AssetsV2`) are not searched.
+  TASK-49: `discoverCatalog` is the one entry point. On Windows it asks DirectWrite
+  (`windows_fonts`, plain COM vtable calls into `dwrite.dll` loaded at run time): every font of
+  every family in the system font collection becomes a font face, and each face's local file path
+  (`IDWriteLocalFontFileLoader`) is catalogued once with FreeType, so `%WINDIR%\Fonts`, per-user
+  fonts (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`, registered under HKCU) and fonts registered
+  from elsewhere are all found and described exactly as on the other OSes. When DirectWrite is
+  missing or lists nothing, `systemFontDirectories` (`%WINDIR%\Fonts` and the per-user directory,
+  read from the process environment) is walked instead.
 - **Never** know about sessions, workspaces, agents or UI (`AGENTS.md`). Never draw anything
   itself. Never let a missing glyph turn a terminal into boxes (CONDUIT.md §8).
 - **May depend on** no other Conduit module, plus the external FreeType and HarfBuzz seam.
@@ -1183,6 +1207,22 @@ nothing else is a legal dependency.
     The sshd-container integration test (`test/fixtures/ssh/Dockerfile`, skipped without Docker)
     proves one authentication for two shells, exec channels and a watch, loss detection and
     reconnect.
+- **WSL context (TASK-47).** `workspace.wsl` (`src/wsl.zig`) builds an owned `ExecutionContext` of
+  kind `.wsl` for one installed distribution. Every process is a Local spawn of `wsl.exe -d
+  <distro> --cd ~ -e /bin/sh -c <script>`: sessions under ConPTY with `ssh.sessionScript` (cd to
+  the requested distribution cwd, export the crossing overlay, exec argv or the login shell), and
+  the file, `run`, `stateDir` and `watch` capabilities over pipes (no console window) with the
+  same helper scripts and exit-code mapping as the SSH exec channels. `--exec` hands the
+  arguments to `/bin/sh` without a Linux shell in between, so OSC 7 and file-reference text stay
+  quoted words. There is no connection state: a spawn simply starts the distribution if WSL has
+  not. `listRegisteredDistributions` reads `HKCU\...\Lxss\{guid}\DistributionName` (no process,
+  safe on the UI thread); `listDistributions` falls back to `wsl.exe --list --quiet`, whose
+  UTF-16LE (or `WSL_UTF8=1` UTF-8) output `parseDistributionList` decodes. `toContextPath` /
+  `toLocalPath` translate with `link.WslPaths` and never block; `learnMountRoot` (a worker) asks
+  the distribution's `wslpath -u 'C:\'` once. The launcher is a parameter, so the unit tests drive
+  the whole context through a stand-in that speaks `wsl.exe`'s command line: `/bin/sh` on Linux,
+  Git for Windows' bash on the Windows runner (`CONDUIT_TEST_WSL_SH`), or a real distribution
+  (`CONDUIT_TEST_WSL_DISTRO`) where the image has one. `supported` is Windows only.
 - **Spawn boundary.** `ExecutionContext` owns and destroys its erased implementation. A worker may
   borrow an `ExecutionContext.Ref` and return the PTY for owner-thread `attachChild`. For a new
   tab, `app` snapshots and owns a copy of the invoking session's current validated OSC 7 cwd before
