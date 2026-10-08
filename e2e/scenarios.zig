@@ -3,6 +3,10 @@
 //! Scenario steps name only public `conduit-test` operations. Assertions use
 //! bounded driver waits, and pointer input names semantic ids rather than
 //! coordinates, so a layout or display-scale change does not rewrite tests.
+//!
+//! Workspace restore (TASK-65) has no scenario here: a scenario is one
+//! launch, and driven runs neither save nor restore by design. The built-in
+//! `--restore-test` covers it by running two apps in turn on one window.
 
 const std = @import("std");
 

@@ -133,8 +133,42 @@ Workspaces are managed from the palette:
 - **Close workspace** asks for confirmation, then ends every shell in it, scratchpad included.
   Closing the last workspace quits Conduit.
 
-Workspaces are not saved: quitting Conduit ends them. Remote (SSH, WSL) workspaces are planned
-and not available yet.
+Quitting Conduit ends every shell, but the layout comes back next time: see
+[Sessions are restored](#sessions-are-restored). WSL workspaces are planned and not available yet.
+
+## Sessions are restored
+
+Conduit remembers your workspaces and puts them back when it starts again:
+
+- every workspace with its name and directory, in sidebar order, and which one was selected;
+- every tab in order, with the names you gave them (others get a fresh `Terminal N`), and which
+  tab was selected;
+- each tab's pane layout: the splits, where you dragged the dividers, which pane had focus and
+  whether it was zoomed;
+- the directory each shell was last in (as the shell reports it), where a fresh shell starts;
+- the theme (unless the settings file names one, which always wins) and the window size.
+
+Terminal contents, scrollback, running programs, environment variables, clipboard contents and
+credentials are never saved: each restored pane starts a new shell in its directory. If that
+directory no longer exists, the shell starts in the workspace's directory and the sidebar's status
+line says which one moved. Agent tabs come back as plain shells.
+
+An SSH workspace comes back with its host and tabs but does not connect on its own, so no
+password, passphrase or host-key prompt appears before you ask for one. Its view reads
+`ssh <host> ─ saved session; press Enter or click reconnect to connect`; Enter, a click on
+`reconnect` or the palette's **Remote: reconnect** connects it, and every saved tab and pane then
+starts in its remote directory.
+
+The state is saved two seconds after the layout last changed and when Conduit quits, to
+`$XDG_STATE_HOME/conduit/state.json` (else `~/.local/state/conduit/state.json`;
+`~/Library/Application Support/conduit/state.json` on macOS, `%LOCALAPPDATA%\conduit\state.json`
+on Windows), readable only by you. If the file is damaged, or was written by a newer Conduit,
+Conduit starts clean, moves it aside as `state.json.corrupt-<time>`, and the status line reads
+`previous state was unreadable; starting clean`.
+
+To start clean once, run `conduit --no-restore` (that run still saves its own layout). To stop
+saving and restoring altogether, set `restore.enabled = false` in the settings file. Runs with
+`--command`, built-in checks and runs driven by `conduit-test` neither save nor restore.
 
 ## Links and file references
 
@@ -395,7 +429,8 @@ development builds, and off in release builds until you turn it on (or pass `--c
 | `--font=<family>` | Use this font family for this run, overriding `font.family` |
 | `--right-click=<menu\|paste>` | Right-click behaviour for this run, overriding `mouse.right_click` |
 | `--command=<line>` | Run this line with `/bin/sh -c` instead of an interactive shell, and quit when it ends |
-| `--width=<px> --height=<px>` | Initial window size in logical pixels (default 960x640) |
+| `--width=<px> --height=<px>` | Initial window size in logical pixels (default 960x640, or the restored size); either flag keeps the restored size from applying |
+| `--no-restore` | Start with one clean workspace instead of the saved ones; this run still saves |
 | `--scale=<factor>` | Fix the display scale instead of following the display |
 | `--no-shell-integration` | Start shells exactly as they would start outside Conduit |
 | `--log-level=<err\|warn\|info\|debug>`, `--log-dir=<dir>`, `--log-file=<path>` | Logging; `--print-log-path` prints where the log goes |

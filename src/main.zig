@@ -104,7 +104,7 @@ const backlog = @import("backlog");
 /// The token-scoped local control API and the single-instance endpoint
 /// (TASK-60, TASK-66).
 const control_api = @import("control");
-/// Only for the state directory the instance token is kept in.
+/// The state model and file (TASK-65), and the instance token's directory.
 const state_mod = @import("state");
 const ssh = workspace.ssh;
 
@@ -479,6 +479,22 @@ pub const Run = struct {
     /// platform one. Not a command-line flag: `runApp` sets it for
     /// `--control-test`.
     state_dir: ?[]const u8 = null,
+    /// Skip this launch's restore of the saved workspaces (TASK-65) and start
+    /// clean; the run still saves its own state as usual.
+    no_restore: bool = false,
+    /// Whether `--width` or `--height` was given: a saved window size is then
+    /// not restored over the size the command line asked for.
+    size_explicit: bool = false,
+    /// Exercise TASK-65 end to end: build workspaces, tabs, splits, a theme
+    /// and an SSH workspace through real input, quit, relaunch a second app
+    /// on the same window and prove what came back, then corrupt the file
+    /// and write a newer version and prove the clean starts, then exit.
+    restore_test: bool = false,
+    /// The state file to save to and restore from instead of the platform
+    /// one. Not a command-line flag: `runApp` sets it for `--restore-test`,
+    /// the one check that persists. Every other check neither saves nor
+    /// restores.
+    state_path: ?[]const u8 = null,
     /// Start the shell exactly as it would start without Conduit: no `--posix`,
     /// no `ENV`, no `ZDOTDIR` swap, and therefore no working-directory or prompt
     /// reports from Conduit's scripts. The settings file has no shell key yet, so
@@ -539,7 +555,8 @@ fn optionsForRun(options: Options) Options {
         !options.run.workspaces_test and !options.run.links_test and
         !options.run.search_test and !options.run.menu_test and !options.run.config_test and
         !options.run.theme_test and !options.run.font_test and !options.run.settings_test and
-        !options.run.git_test and !options.run.agent_test and !options.run.ssh_test) return options;
+        !options.run.git_test and !options.run.agent_test and !options.run.ssh_test and
+        !options.run.restore_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -650,8 +667,14 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             flag_dir = try takeValue(arg, "--log-dir", args, &i);
         } else if (namesValue(arg, "--width")) {
             run.width = try parseDimension(try takeValue(arg, "--width", args, &i));
+            run.size_explicit = true;
         } else if (namesValue(arg, "--height")) {
             run.height = try parseDimension(try takeValue(arg, "--height", args, &i));
+            run.size_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--no-restore")) {
+            run.no_restore = true;
+        } else if (std.mem.eql(u8, arg, "--restore-test")) {
+            run.restore_test = true;
         } else if (namesValue(arg, "--scale")) {
             run.scale = try parseScale(try takeValue(arg, "--scale", args, &i));
         } else if (namesValue(arg, "--run-ms")) {
@@ -1758,6 +1781,8 @@ const ChildSpec = struct {
             palette_test_script
         else if (options.run.workspaces_test)
             workspaces_test_script
+        else if (options.run.restore_test)
+            restore_test_script
         else if (options.run.links_test)
             links_test_script
         else if (options.run.search_test)
@@ -2218,6 +2243,7 @@ const idle_tick_ms: i32 = 16;
 /// because terminal input is only proved by what a program reads.
 fn wantsChild(options: Options) bool {
     if (options.run.ui_test or options.run.sidebar_test or options.run.ssh_test) return false;
+    if (options.run.restore_test) return true;
     if (options.run.clipboard_test or options.run.ime_test or options.run.tabs_test or
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
         options.run.links_test or options.run.search_test or options.run.menu_test or
@@ -2239,7 +2265,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
         run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test or run.git_test or
-        run.agent_test or run.ssh_test;
+        run.agent_test or run.ssh_test or run.restore_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -3600,10 +3626,43 @@ const WorkspacePresentation = struct {
     /// its terminals is spawned while the endpoint runs, revoked when the
     /// workspace closes.
     control_token: ?control_api.Token = null,
+    /// Restored shells still to start, in plan order (TASK-65). One starts
+    /// whenever `load` is free; an SSH workspace's wait for its connection.
+    /// Each cwd is owned.
+    restore_queue: std.ArrayList(RestoreStart) = .empty,
+
+    fn releaseRestoreQueue(self: *WorkspacePresentation, allocator: Allocator) void {
+        for (self.restore_queue.items) |item| allocator.free(item.cwd);
+        self.restore_queue.deinit(allocator);
+        self.restore_queue = .empty;
+    }
 };
 
+/// One restored session whose shell has not been started yet (TASK-65).
+const RestoreStart = struct {
+    session_id: session.SessionId,
+    /// Where it starts, owned: the saved directory, or a fallback, or empty
+    /// for the inherited (Local) or home (SSH) directory.
+    cwd: []u8,
+};
+
+// ---------------------------------------------------------------------------
+// Workspace persistence (TASK-65)
+// ---------------------------------------------------------------------------
+
+/// The line a corrupt, unreadable or newer state file leaves in the sidebar.
+const restore_unreadable_status = "previous state was unreadable; starting clean";
+/// How an SSH workspace's own directory is saved: the remote home, which has
+/// no local spelling (`state` refuses an empty cwd).
+const remote_home_marker = "~";
+/// A restored window size is kept within these logical pixels.
+const min_restored_window: u32 = 200;
+const max_restored_window: u32 = 16384;
+/// How long the layout must stay unchanged before it is saved.
+const save_debounce_ns: i128 = 2 * std.time.ns_per_s;
+
 /// When process startup began, for the debug startup phase log (TASK-67).
-/// Written once by `main` on the main thread before anything else reads it.
+/// Written once by `runApp` on the main thread before anything else reads it.
 var startup_epoch_ns: i128 = 0;
 
 /// One startup phase as the debug log prints it.
@@ -3620,6 +3679,386 @@ test "startup phase lines name the phase and the milliseconds since start" {
     var tiny: [8]u8 = undefined;
     try std.testing.expectEqualStrings("startup: phase", startupPhaseLine(&tiny, "first child", 1));
 }
+
+/// Saves after the layout has stayed unchanged for `save_debounce_ns`, and
+/// never twice for the same layout. Pure: the loop feeds it fingerprints and
+/// times.
+const SaveDebounce = struct {
+    /// The layout last observed and when it was first seen.
+    current: ?u64 = null,
+    changed_ns: i128 = 0,
+    /// The layout last handed to a save.
+    saved: ?u64 = null,
+
+    fn note(self: *SaveDebounce, fingerprint: u64, now_ns: i128) void {
+        if (self.current) |current| if (current == fingerprint) return;
+        self.current = fingerprint;
+        self.changed_ns = now_ns;
+    }
+
+    fn pending(self: *const SaveDebounce) bool {
+        const current = self.current orelse return false;
+        const saved = self.saved orelse return true;
+        return saved != current;
+    }
+
+    fn due(self: *const SaveDebounce, now_ns: i128) bool {
+        return self.pending() and now_ns - self.changed_ns >= save_debounce_ns;
+    }
+
+    /// When the pending save falls due, or null when nothing is owed.
+    fn deadline(self: *const SaveDebounce) ?i128 {
+        if (!self.pending()) return null;
+        return self.changed_ns + save_debounce_ns;
+    }
+
+    fn markSaved(self: *SaveDebounce) void {
+        self.saved = self.current;
+    }
+};
+
+test "a save is due two seconds after the last change and never twice for one layout" {
+    var debounce: SaveDebounce = .{};
+    try std.testing.expect(!debounce.due(0));
+    try std.testing.expectEqual(@as(?i128, null), debounce.deadline());
+    debounce.note(1, 0);
+    debounce.markSaved();
+    try std.testing.expect(!debounce.due(10 * std.time.ns_per_s));
+
+    debounce.note(2, std.time.ns_per_s);
+    try std.testing.expectEqual(@as(?i128, 3 * std.time.ns_per_s), debounce.deadline());
+    try std.testing.expect(!debounce.due(2 * std.time.ns_per_s));
+    // Another change restarts the wait; the same layout seen again does not.
+    debounce.note(3, 2 * std.time.ns_per_s);
+    debounce.note(3, 3 * std.time.ns_per_s);
+    try std.testing.expect(!debounce.due(3 * std.time.ns_per_s));
+    try std.testing.expect(debounce.due(4 * std.time.ns_per_s));
+    debounce.markSaved();
+    try std.testing.expect(!debounce.due(60 * std.time.ns_per_s));
+    // Returning to a layout that was saved earlier is still a change.
+    debounce.note(2, 61 * std.time.ns_per_s);
+    try std.testing.expect(debounce.due(63 * std.time.ns_per_s));
+}
+
+/// What the app adds to the registry's snapshot (TASK-65).
+const SnapshotExtras = struct {
+    theme: ?[]const u8 = null,
+    window: ?state_mod.Window = null,
+    saved_at_unix: i64 = 0,
+    /// The directory a workspace with an empty cwd means (the one Conduit
+    /// was started in), or null when unknown.
+    process_cwd: ?[]const u8 = null,
+    /// Per registry index: the scratchpad's percentage while shown.
+    scratchpad_percents: []const ?u8 = &.{},
+    /// Per registry index: whether the workspace is closing (not saved).
+    closing: []const bool = &.{},
+};
+
+/// Complete `owned` with the app's values and make it representable: an
+/// empty Local cwd becomes the process cwd (or `/`), an empty SSH cwd the
+/// remote home marker, a leaf that tracked no directory of its own falls
+/// back to its workspace's, and closing workspaces are dropped.
+fn completeSnapshot(owned: *state_mod.Owned, extras: SnapshotExtras) Allocator.Error!void {
+    const arena = owned.allocator();
+    const snapshot = &owned.snapshot;
+    snapshot.saved_at_unix = extras.saved_at_unix;
+    snapshot.theme = if (extras.theme) |name| try arena.dupe(u8, name) else null;
+    snapshot.window = extras.window;
+    var kept = try arena.alloc(state_mod.WorkspaceState, snapshot.workspaces.len);
+    var kept_len: usize = 0;
+    var active: ?usize = null;
+    for (snapshot.workspaces, 0..) |source, index| {
+        if (index < extras.closing.len and extras.closing[index]) continue;
+        if (snapshot.active_workspace) |selected| if (selected == index) {
+            active = kept_len;
+        };
+        var item = source;
+        if (item.cwd.len == 0) item.cwd = switch (item.kind) {
+            .ssh, .wsl => remote_home_marker,
+            .local => if (extras.process_cwd) |cwd| try arena.dupe(u8, cwd) else "/",
+        };
+        if (index < extras.scratchpad_percents.len) item.scratchpad_percent = extras.scratchpad_percents[index];
+        const tabs = try arena.alloc(state_mod.TabState, item.tabs.len);
+        for (item.tabs, tabs) |tab, *out| {
+            out.* = tab;
+            out.panes = try dropEmptyCwds(arena, &tab.panes);
+        }
+        item.tabs = tabs;
+        kept[kept_len] = item;
+        kept_len += 1;
+    }
+    snapshot.workspaces = kept[0..kept_len];
+    snapshot.active_workspace = if (kept_len == 0) null else active orelse 0;
+}
+
+fn dropEmptyCwds(arena: Allocator, node: *const state_mod.PaneNode) Allocator.Error!state_mod.PaneNode {
+    switch (node.*) {
+        .leaf => |leaf| {
+            const cwd = leaf.cwd orelse return node.*;
+            return if (cwd.len == 0) .{ .leaf = .{} } else node.*;
+        },
+        .split => |split| {
+            const first = try arena.create(state_mod.PaneNode);
+            first.* = try dropEmptyCwds(arena, split.first);
+            const second = try arena.create(state_mod.PaneNode);
+            second.* = try dropEmptyCwds(arena, split.second);
+            var out = split;
+            out.first = first;
+            out.second = second;
+            return .{ .split = out };
+        },
+    }
+}
+
+test "a completed snapshot carries the app's values and is always representable" {
+    const testing = std.testing;
+    const empty_leaf: state_mod.PaneNode = .{ .leaf = .{ .cwd = "" } };
+    const kept_leaf: state_mod.PaneNode = .{ .leaf = .{ .cwd = "/srv/app" } };
+    const tabs = [_]state_mod.TabState{.{ .panes = .{ .split = .{ .direction = .right, .ratio = 0.5, .first = &empty_leaf, .second = &kept_leaf } } }};
+    const remote_tabs = [_]state_mod.TabState{.{ .panes = .{ .leaf = .{ .cwd = "/home/deploy/www" } } }};
+    const workspaces = [_]state_mod.WorkspaceState{
+        .{ .name = "default", .cwd = "", .tabs = &tabs, .active_tab = 0 },
+        .{ .name = "closing", .cwd = "/tmp", .tabs = &tabs, .active_tab = 0 },
+        .{ .name = "prod", .kind = .ssh, .cwd = "", .ssh = .{ .destination = "deploy@prod" }, .tabs = &remote_tabs, .active_tab = 0 },
+    };
+    var owned: state_mod.Owned = .{ .arena = .init(testing.allocator), .snapshot = .{ .active_workspace = 2, .workspaces = &workspaces } };
+    defer owned.deinit();
+    try completeSnapshot(&owned, .{
+        .theme = "Nord",
+        .window = .{ .width = 640, .height = 360 },
+        .saved_at_unix = 1_800_000_000,
+        .process_cwd = "/home/u",
+        .scratchpad_percents = &.{ 90, null, null },
+        .closing = &.{ false, true, false },
+    });
+    const snapshot = owned.snapshot;
+    try testing.expectEqualStrings("Nord", snapshot.theme.?);
+    try testing.expectEqual(@as(u32, 640), snapshot.window.?.width);
+    try testing.expectEqual(@as(i64, 1_800_000_000), snapshot.saved_at_unix);
+    try testing.expectEqual(@as(usize, 2), snapshot.workspaces.len);
+    try testing.expectEqual(@as(?usize, 1), snapshot.active_workspace);
+    try testing.expectEqualStrings("/home/u", snapshot.workspaces[0].cwd);
+    try testing.expectEqual(@as(?u8, 90), snapshot.workspaces[0].scratchpad_percent);
+    try testing.expectEqual(@as(?[]const u8, null), snapshot.workspaces[0].tabs[0].panes.split.first.leaf.cwd);
+    try testing.expectEqualStrings("/srv/app", snapshot.workspaces[0].tabs[0].panes.split.second.leaf.cwd.?);
+    try testing.expectEqualStrings(remote_home_marker, snapshot.workspaces[1].cwd);
+    try testing.expectEqualStrings("deploy@prod", snapshot.workspaces[1].ssh.?.destination);
+    // What used to be refused (an empty cwd) now encodes and decodes.
+    var diagnostic: state_mod.Diagnostic = .{};
+    const bytes = try state_mod.encode(testing.allocator, &snapshot, &diagnostic);
+    defer testing.allocator.free(bytes);
+    var decoded = try state_mod.decode(testing.allocator, bytes, &diagnostic);
+    defer decoded.deinit();
+    try state_mod.expectSameSnapshot(&snapshot, &decoded.snapshot);
+}
+
+test "only a plain run or the restore check persists, and checks never read a state file" {
+    const testing = std.testing;
+    const env = test_env{ .vars = &.{ .{ "XDG_STATE_HOME", "/state" }, .{ "HOME", "/home/u" } } };
+    var plain = Persistence.forRun(testing.allocator, testing.io, env.source(), .{}, true);
+    defer plain.deinit();
+    try testing.expectEqualStrings("/state/conduit/state.json", plain.path.?);
+
+    var off = Persistence.forRun(testing.allocator, testing.io, env.source(), .{}, false);
+    defer off.deinit();
+    try testing.expect(off.path == null);
+
+    const refused = [_]Run{
+        .{ .tabs_test = true },
+        .{ .workspaces_test = true },
+        .{ .panes_test = true },
+        .{ .driver_test = true },
+        .{ .ui_test = true },
+        .{ .command = "true" },
+        .{ .test_driver_endpoint = "/tmp/driver.sock" },
+    };
+    for (refused) |run| {
+        var check = Persistence.forRun(testing.allocator, testing.io, env.source(), .{ .run = run }, true);
+        defer check.deinit();
+        try testing.expect(check.path == null);
+    }
+
+    var restore = Persistence.forRun(testing.allocator, testing.io, env.source(), .{ .run = .{ .restore_test = true, .state_path = "/tmp/r/state.json" } }, true);
+    defer restore.deinit();
+    try testing.expectEqualStrings("/tmp/r/state.json", restore.path.?);
+}
+
+test "--no-restore and --restore-test parse, and the check runs fixed and isolated" {
+    const env = test_env{ .vars = &.{} };
+    const parsed = try parseArgs(&.{ "conduit", "--no-restore", "--width=800" }, env.source());
+    try std.testing.expect(parsed.run.no_restore);
+    try std.testing.expect(parsed.run.size_explicit);
+    try std.testing.expect(!(try parseArgs(&.{"conduit"}, env.source())).run.size_explicit);
+    const restore = optionsForRun(try parseArgs(&.{ "conduit", "--restore-test" }, env.source()));
+    try std.testing.expect(restore.run.restore_test and restore.run.hidden and restore.run.width == ui_test_width);
+    try std.testing.expect(wantsChild(restore) and usesDeterministicScratchpad(restore));
+}
+
+/// Whether `path` is a directory in `context`.
+fn directoryExists(io: Io, context: workspace.ExecutionContext.Ref, path: []const u8) bool {
+    const stat = context.statPath(io, path) catch return false;
+    return stat.kind == .directory;
+}
+
+/// Whether a plan creates a workspace named `name` (names compare trimmed).
+fn planNamesWorkspace(plan: *const state_mod.RestorePlan, name: []const u8) bool {
+    const wanted = std.mem.trim(u8, name, std.ascii.whitespace[0..]);
+    for (plan.steps) |step| switch (step) {
+        .create_workspace => |value| if (std.mem.eql(u8, std.mem.trim(u8, value.name, std.ascii.whitespace[0..]), wanted)) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Writes one encoded state file on a worker, so the loop never waits on
+/// the disk. Main thread creates, polls and destroys it; the worker owns
+/// nothing but reads `bytes` and `path` and publishes `done`.
+const SaveJob = struct {
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    /// The encoded document, owned.
+    bytes: []u8,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    failure: ?[]const u8 = null,
+
+    fn work(self: *SaveJob) void {
+        state_mod.save(self.io, self.path, self.bytes) catch |err| {
+            self.failure = @errorName(err);
+        };
+        self.done.store(true, .release);
+    }
+
+    fn finish(self: *SaveJob) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        if (self.failure) |name| log.warn("the workspace state was not saved: {s}", .{name}) else log.debug("workspace state saved", .{});
+        self.allocator.free(self.bytes);
+        self.allocator.destroy(self);
+    }
+};
+
+/// The app's persistence state (TASK-65). Main thread.
+const Persistence = struct {
+    allocator: ?Allocator = null,
+    io: ?Io = null,
+    /// The state file, owned; null when this run neither saves nor restores.
+    path: ?[]u8 = null,
+    /// The directory Conduit was started in, owned: what a workspace with no
+    /// directory of its own (the default one) is saved as.
+    process_cwd: ?[:0]u8 = null,
+    debounce: SaveDebounce = .{},
+    worker: ?*SaveJob = null,
+    /// Saves completed (or attempted), for `--restore-test`.
+    saves: usize = 0,
+    /// The theme restored from the file, used while the settings file names
+    /// none (`resolveTheme`).
+    restored_theme_storage: [theme_name_capacity]u8 = undefined,
+    restored_theme_len: usize = 0,
+    /// Backs a restore status line.
+    status_storage: [palette_label_capacity]u8 = undefined,
+
+    /// Decide whether this run persists, and where: `--restore-test`'s
+    /// private file, else the platform state file for a plain run with
+    /// `restore.enabled` on. Checks, `--command` runs and driven runs never
+    /// save or restore, so automation leaves no state behind.
+    fn forRun(allocator: Allocator, io: Io, env: EnvSource, options: Options, setting: bool) Persistence {
+        var result: Persistence = .{ .allocator = allocator, .io = io };
+        var buffer: [path_capacity]u8 = undefined;
+        const path = options.run.state_path orelse path: {
+            if (!setting) return result;
+            if (usesDeterministicScratchpad(options) or options.run.command != null or
+                options.run.test_driver_endpoint != null) return result;
+            break :path state_mod.statePath(&buffer, builtin.os.tag, .{
+                .xdg_state_home = env.get("XDG_STATE_HOME"),
+                .home = env.get("HOME"),
+                .local_app_data = env.get("LOCALAPPDATA"),
+            }) orelse {
+                log.info("no state directory: workspaces are not saved", .{});
+                return result;
+            };
+        };
+        result.path = allocator.dupe(u8, path) catch return result;
+        result.process_cwd = std.process.currentPathAlloc(io, allocator) catch null;
+        log.debug("workspace state at {s}", .{path});
+        return result;
+    }
+
+    fn deinit(self: *Persistence) void {
+        self.joinWorker();
+        const allocator = self.allocator orelse return;
+        if (self.path) |path| allocator.free(path);
+        if (self.process_cwd) |cwd| allocator.free(cwd);
+        self.path = null;
+        self.process_cwd = null;
+    }
+
+    fn noteLayout(self: *Persistence, fingerprint: u64, now_ns: i128) void {
+        self.debounce.note(fingerprint, now_ns);
+    }
+
+    fn markSaved(self: *Persistence) void {
+        self.debounce.markSaved();
+    }
+
+    fn restoredTheme(self: *const Persistence) ?[]const u8 {
+        if (self.restored_theme_len == 0) return null;
+        return self.restored_theme_storage[0..self.restored_theme_len];
+    }
+
+    fn setRestoredTheme(self: *Persistence, name: []const u8) void {
+        const len = @min(name.len, self.restored_theme_storage.len);
+        @memcpy(self.restored_theme_storage[0..len], name[0..len]);
+        self.restored_theme_len = len;
+    }
+
+    /// Collect a finished save.
+    fn collect(self: *Persistence) void {
+        const job = self.worker orelse return;
+        if (!job.done.load(.acquire)) return;
+        job.finish();
+        self.worker = null;
+        self.saves += 1;
+    }
+
+    fn joinWorker(self: *Persistence) void {
+        const job = self.worker orelse return;
+        job.finish();
+        self.worker = null;
+        self.saves += 1;
+    }
+
+    /// Write `bytes` (ownership transfers) on a worker, or right here when
+    /// the worker cannot start.
+    fn saveAsync(self: *Persistence, bytes: []u8) void {
+        const allocator = self.allocator.?;
+        self.markSaved();
+        const job = allocator.create(SaveJob) catch {
+            defer allocator.free(bytes);
+            self.saveNow(bytes);
+            return;
+        };
+        job.* = .{ .allocator = allocator, .io = self.io.?, .path = self.path.?, .bytes = bytes };
+        job.thread = std.Thread.spawn(.{}, SaveJob.work, .{job}) catch {
+            allocator.destroy(job);
+            defer allocator.free(bytes);
+            self.saveNow(bytes);
+            return;
+        };
+        self.worker = job;
+    }
+
+    /// Write `bytes` (borrowed) on this thread.
+    fn saveNow(self: *Persistence, bytes: []const u8) void {
+        const path = self.path orelse return;
+        self.markSaved();
+        state_mod.save(self.io.?, path, bytes) catch |err| {
+            log.warn("the workspace state was not saved: {s}", .{@errorName(err)});
+        };
+        self.saves += 1;
+    }
+};
 
 /// One control request the owner has not answered yet (TASK-60).
 const ControlPending = struct {
@@ -3717,6 +4156,12 @@ const RemotePresentation = struct {
     host_probe: ?*HostProbe = null,
     /// The connection view's header, `ssh <destination> ─ <state>`.
     header_storage: [palette_label_capacity]u8 = undefined,
+    /// The header as painted, cut short of the row's control.
+    header_paint_storage: [palette_label_capacity + 3]u8 = undefined,
+    /// Restored from the state file and not yet asked to connect (TASK-65):
+    /// the view says so, and Enter or `reconnect` starts the first master,
+    /// so no credential prompt appears before the person asks for one.
+    saved: bool = false,
 
     fn remoteHost(self: *const RemotePresentation) ?[]const u8 {
         if (self.remote_host_len == 0) return null;
@@ -5129,6 +5574,9 @@ const App = struct {
     /// The coverage atlas size the current face was built with; every grid
     /// is attached at this size (TASK-67: 2048² from scale 1.5).
     atlas: render.AtlasSize,
+    /// Workspace persistence (TASK-65): where state is saved, the debounce,
+    /// the save worker. Main thread, apart from the worker's owned bytes.
+    persistence: Persistence = .{},
     /// When `init` started, for the debug startup phase log (TASK-67), and
     /// which of the late phases have been logged.
     startup_ns: i128 = 0,
@@ -6014,6 +6462,9 @@ const App = struct {
         if (options.run.hidden) app.agents.notifier = .{ .notify_fn = discardOsNotification };
         app.startup_ns = startup_epoch_ns;
         app.logStartupPhase("fonts");
+        // Decided before the theme so a restored theme name is known when
+        // `resolveTheme` runs; the file itself is read further down.
+        app.persistence = Persistence.forRun(allocator, io, env, options, loaded_config.settings.restore_enabled);
         app.resolveTheme();
         app.theme_catalog.order(app.activeThemeName());
         app.setThemeChoices();
@@ -6033,12 +6484,20 @@ const App = struct {
         // The control endpoints start before the first spawn so the first
         // tab's child already carries its control variables (TASK-60).
         app.startControl(env, options);
+        // A saved layout replaces the default workspace before anything has
+        // spawned (TASK-65); a run that restores nothing starts as before.
+        const restored = app.restoreAtLaunch(options);
         // Start the worker only after every fallible initialization step. On
         // an earlier error the local errdefers own cleanup; once this starts,
         // the returned App owns and joins it during deinit.
-        app.startScratchpad(false);
-        app.startChild();
+        if (!restored) {
+            app.startScratchpad(false);
+            app.startChild();
+        }
         app.startConfigWatcher();
+        app.persistence.noteLayout(app.layoutFingerprint(), Io.Clock.awake.now(io).nanoseconds);
+        // What was restored is what the file already says: no save is owed.
+        app.persistence.markSaved();
         return app;
     }
 
@@ -6050,6 +6509,448 @@ const App = struct {
         var buffer: [96]u8 = undefined;
         const elapsed = Io.Clock.awake.now(self.io).nanoseconds - self.startup_ns;
         log.debug("{s}", .{startupPhaseLine(&buffer, phase, elapsed)});
+    }
+
+    // Workspace persistence (TASK-65) -----------------------------------------
+
+    /// Everything that decides what a snapshot holds, folded together, so
+    /// the loop can tell a changed layout from an unchanged one without
+    /// building a snapshot.
+    fn layoutFingerprint(self: *const App) u64 {
+        var hasher = std.hash.Wyhash.init(self.workspace_registry.layoutFingerprint());
+        hasher.update(self.activeThemeName());
+        const logical = self.window.logicalSize();
+        if (logical) |size| hasher.update(std.mem.asBytes(&[2]u32{ size.width, size.height }));
+        for (self.workspace_presentations.items) |presentation| {
+            hasher.update(&.{ @intFromBool(presentation.closing), @intFromEnum(presentation.scratchpad_presentation) });
+        }
+        return hasher.final();
+    }
+
+    /// The state this run would save now: the registry's snapshot completed
+    /// with what only the app knows. Caller owns the result.
+    fn captureState(self: *App) !state_mod.Owned {
+        var owned = try self.workspace_registry.snapshot(self.allocator);
+        errdefer owned.deinit();
+        var percents: [state_mod.max_workspaces]?u8 = @splat(null);
+        var closing: [state_mod.max_workspaces]bool = @splat(false);
+        var index: usize = 0;
+        while (index < self.workspace_registry.count() and index < state_mod.max_workspaces) : (index += 1) {
+            const key = self.workspace_registry.keyAt(index) orelse continue;
+            const presentation = self.presentationByKey(key) orelse continue;
+            closing[index] = presentation.closing;
+            percents[index] = switch (presentation.scratchpad_presentation) {
+                .hidden => null,
+                .fifty => self.scratchpad_percent_small,
+                .ninety => self.scratchpad_percent_large,
+            };
+        }
+        const logical = self.window.logicalSize();
+        try completeSnapshot(&owned, .{
+            .theme = if (self.theme_name_len == 0) null else self.activeThemeName(),
+            .window = if (logical) |size| .{ .width = size.width, .height = size.height } else null,
+            .saved_at_unix = Io.Clock.real.now(self.io).toSeconds(),
+            .process_cwd = self.persistence.process_cwd,
+            .scratchpad_percents = percents[0..],
+            .closing = closing[0..],
+        });
+        return owned;
+    }
+
+    /// Encode the current state, or null (with a log line) when it cannot
+    /// be written. Caller owns the bytes.
+    fn encodeState(self: *App) ?[]u8 {
+        var owned = self.captureState() catch |err| {
+            log.warn("the workspace state could not be captured: {s}", .{@errorName(err)});
+            return null;
+        };
+        defer owned.deinit();
+        var diagnostic: state_mod.Diagnostic = .{};
+        return state_mod.encode(self.allocator, &owned.snapshot, &diagnostic) catch |err| {
+            log.warn("the workspace state was not saved: {s}: {s}", .{ @errorName(err), diagnostic.message() });
+            return null;
+        };
+    }
+
+    /// The loop's persistence step: notice a changed layout, collect a
+    /// finished save, and start the debounced one that is due.
+    fn pollPersistence(self: *App) void {
+        if (self.persistence.path == null) return;
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        self.persistence.collect();
+        self.persistence.noteLayout(self.layoutFingerprint(), now);
+        if (!self.persistence.debounce.due(now) or self.persistence.worker != null) return;
+        const bytes = self.encodeState() orelse {
+            // Unrepresentable or out of memory: try again after the next change.
+            self.persistence.markSaved();
+            return;
+        };
+        self.persistence.saveAsync(bytes);
+    }
+
+    /// The save every normal shutdown makes, on this thread, after any save
+    /// still in flight: what the person last saw is what the next launch
+    /// restores.
+    fn saveStateAtExit(self: *App) void {
+        if (self.persistence.path == null) return;
+        self.persistence.joinWorker();
+        const bytes = self.encodeState() orelse return;
+        defer self.allocator.free(bytes);
+        self.persistence.saveNow(bytes);
+    }
+
+    /// Restore the saved workspaces in place of the default one, when this
+    /// run restores. Returns whether anything was restored; on false the
+    /// default workspace starts as usual.
+    fn restoreAtLaunch(self: *App, options: Options) bool {
+        const path = self.persistence.path orelse return false;
+        if (options.run.no_restore) {
+            log.info("--no-restore: starting clean", .{});
+            return false;
+        }
+        const buffer = self.allocator.alloc(u8, state_mod.load_buffer_bytes) catch |err| {
+            log.warn("no memory to read the saved state: {s}", .{@errorName(err)});
+            return false;
+        };
+        defer self.allocator.free(buffer);
+        var diagnostic: state_mod.Diagnostic = .{};
+        const now_unix = Io.Clock.real.now(self.io).toSeconds();
+        const outcome = state_mod.restoreFromDisk(self.io, self.allocator, path, buffer, now_unix, &diagnostic) catch |err| {
+            log.warn("the saved state could not be read: {s}", .{@errorName(err)});
+            return false;
+        };
+        var owned = switch (outcome) {
+            .clean => {
+                if (diagnostic.len != 0) {
+                    log.warn("previous state was unusable: {s}", .{diagnostic.message()});
+                    self.setWorkspaceStatus(restore_unreadable_status);
+                }
+                return false;
+            },
+            .snapshot => |value| value,
+        };
+        defer owned.deinit();
+        var plan = state_mod.planRestore(self.allocator, &owned.snapshot) catch |err| {
+            log.warn("the saved state could not be planned: {s}", .{@errorName(err)});
+            return false;
+        };
+        defer plan.deinit(self.allocator);
+        if (plan.steps.len == 0) return false;
+        const restored = self.executeRestore(&plan) catch |err| {
+            log.warn("the saved workspaces could not be restored: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (!restored) return false;
+        if (plan.theme) |name| self.adoptRestoredTheme(name);
+        if (plan.window) |window_state| if (!options.run.size_explicit) self.applyRestoredWindow(window_state);
+        log.info("restored {d} workspace(s) from the state file", .{owned.snapshot.workspaces.len});
+        return true;
+    }
+
+    /// The saved theme applies when the settings file names none: a theme the
+    /// person set in the file always wins over the remembered one.
+    fn adoptRestoredTheme(self: *App, name: []const u8) void {
+        if (self.config_current.settings.theme.len != 0) return;
+        const index = self.theme_catalog.find(name) orelse {
+            log.info("the restored theme is no longer available; keeping the default", .{});
+            return;
+        };
+        self.persistence.setRestoredTheme(self.theme_catalog.entries[index].value);
+        self.adoptThemeEntry(index, 0);
+        self.theme_catalog.order(self.activeThemeName());
+        self.setThemeChoices();
+    }
+
+    /// Give the window its saved size, within what the platform allows. The
+    /// position and maximized state are not applied: `platform` has no
+    /// query for the displays or a placement call yet.
+    fn applyRestoredWindow(self: *App, saved: state_mod.Window) void {
+        const width = std.math.clamp(saved.width, min_restored_window, max_restored_window);
+        const height = std.math.clamp(saved.height, min_restored_window, max_restored_window);
+        const current = self.window.logicalSize() orelse return;
+        if (current.width == width and current.height == height) return;
+        self.window.setLogicalSize(.{ .width = width, .height = height }) catch |err| {
+            log.info("the saved window size was not applied: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Replay `plan` through the normal workspace, tab and pane operations.
+    /// The default workspace `init` made is closed once a restored one is
+    /// active; every restored shell is queued to start in its directory.
+    fn executeRestore(self: *App, plan: *const state_mod.RestorePlan) !bool {
+        const initial = self.activePresentation();
+        // The default workspace's name would collide with a saved "default".
+        {
+            var name_buffer: [64]u8 = undefined;
+            var suffix: usize = 0;
+            while (true) : (suffix += 1) {
+                const candidate = try std.fmt.bufPrint(&name_buffer, "restoring-{d}", .{suffix});
+                if (!planNamesWorkspace(plan, candidate)) {
+                    try self.workspace_registry.rename(initial.key, candidate);
+                    break;
+                }
+            }
+        }
+        const size = self.activeLive().terminal().gridSize();
+        const bounds = self.terminalCellBounds() orelse return false;
+        var created: [state_mod.max_workspaces]?*WorkspacePresentation = @splat(null);
+        var selected: ?workspace.WorkspaceKey = null;
+        const cursor = try self.allocator.create(workspace.RestoreCursor);
+        defer self.allocator.destroy(cursor);
+        for (plan.steps) |step| switch (step) {
+            .create_workspace => |value| {
+                cursor.* = .{};
+                if (value.workspace >= created.len) continue;
+                created[value.workspace] = self.createRestoredPresentation(value) catch |err| blk: {
+                    log.warn("a saved workspace could not be restored: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
+            },
+            .select_workspace => |value| {
+                if (value.workspace < created.len) {
+                    if (created[value.workspace]) |presentation| selected = presentation.key;
+                }
+            },
+            inline else => |value| {
+                if (value.workspace < created.len) {
+                    if (created[value.workspace]) |presentation| {
+                        try self.applyRestoreStep(presentation, cursor, step, size, bounds);
+                    }
+                }
+            },
+        };
+        var first: ?workspace.WorkspaceKey = null;
+        for (created) |maybe| {
+            const presentation = maybe orelse continue;
+            const model = self.workspace_registry.byKey(presentation.key) orelse continue;
+            if (model.tabCount() == 0) {
+                // Every saved tab failed: the workspace still shows one.
+                try self.addRestoredTab(presentation, model, size);
+            }
+            const tab_id = model.activeTabId() orelse continue;
+            presentation.active_session_id = model.focusedPaneSessionId(tab_id) orelse continue;
+            if (first == null) first = presentation.key;
+        }
+        const target = selected orelse first orelse return false;
+        try self.workspace_registry.activate(target);
+        initial.closing = true;
+        _ = self.finalizeClosingPresentations();
+        self.requested_shutdown = false;
+        for (created) |maybe| {
+            const presentation = maybe orelse continue;
+            if (presentation.remote == null) self.startScratchpadFor(presentation, false);
+        }
+        _ = self.driveRestoreQueues();
+        try self.syncGrid();
+        try self.composeUi();
+        self.invalidateUi();
+        return true;
+    }
+
+    /// Build an empty restored workspace: Local in its saved directory, or
+    /// SSH with its saved target and no connection until the person asks.
+    fn createRestoredPresentation(self: *App, value: anytype) !*WorkspacePresentation {
+        const name = try self.uniqueWorkspaceName(value.name);
+        defer self.allocator.free(name);
+        switch (value.kind) {
+            .local => return self.createEmptyPresentation(name, value.cwd, value.scratchpad_percent),
+            .ssh => {
+                const target = value.ssh orelse return error.MissingTarget;
+                const presentation = try self.createRemotePresentationWith(name, target.destination, target.port, target.options, true);
+                self.applyScratchpadPercent(presentation, value.scratchpad_percent);
+                return presentation;
+            },
+            // WSL workspaces are not built yet; their layout is dropped.
+            .wsl => return error.Unsupported,
+        }
+    }
+
+    fn applyScratchpadPercent(self: *const App, presentation: *WorkspacePresentation, percent: ?u8) void {
+        const value = percent orelse return;
+        presentation.scratchpad_presentation = if (value == self.scratchpad_percent_large and value != self.scratchpad_percent_small)
+            .ninety
+        else
+            .fifty;
+    }
+
+    /// A Local workspace with its scratchpad and no tab yet; the plan's
+    /// `create_tab` steps add them.
+    fn createEmptyPresentation(self: *App, name: []const u8, directory: []const u8, percent: ?u8) !*WorkspacePresentation {
+        const grid_size = self.activeLive().terminal().gridSize();
+        var candidate = try workspace.Workspace.initLocal(self.io, self.allocator, name, directory, grid_size);
+        var candidate_owned = true;
+        errdefer if (candidate_owned) candidate.deinit() catch |err| log.warn(
+            "could not release a refused workspace: {s}",
+            .{@errorName(err)},
+        );
+        var scratchpad_grid = try render.Grid.init(self.allocator, gridColors(self.palette));
+        var scratchpad_grid_owned = true;
+        errdefer if (scratchpad_grid_owned) scratchpad_grid.deinit();
+        try scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), self.atlas);
+        try self.workspace_presentations.ensureUnusedCapacity(self.allocator, 1);
+        const presentation = try self.allocator.create(WorkspacePresentation);
+        errdefer self.allocator.destroy(presentation);
+        const key = try self.workspace_registry.insert(&candidate);
+        candidate_owned = false;
+        presentation.* = .{
+            .key = key,
+            .active_session_id = .first,
+            .pane_renderers = .empty,
+            .scratchpad_grid = scratchpad_grid,
+        };
+        scratchpad_grid_owned = false;
+        self.workspace_presentations.appendAssumeCapacity(presentation);
+        self.applyScratchpadPercent(presentation, percent);
+        return presentation;
+    }
+
+    /// One plan step on one restored workspace: the model replays it, and a
+    /// session it created gets a renderer and a queued start in its saved
+    /// directory (the workspace's when that one is gone).
+    fn applyRestoreStep(
+        self: *App,
+        presentation: *WorkspacePresentation,
+        cursor: *workspace.RestoreCursor,
+        step: state_mod.Step,
+        size: term.GridSize,
+        bounds: workspace.CellRect,
+    ) !void {
+        const model = self.workspace_registry.byKey(presentation.key) orelse return;
+        var name_buffer: [32]u8 = undefined;
+        const derived = try std.fmt.bufPrint(&name_buffer, "Terminal {d}", .{model.registeredSessionCount()});
+        try presentation.pane_renderers.ensureUnusedCapacity(self.allocator, 1);
+        try presentation.restore_queue.ensureUnusedCapacity(self.allocator, 1);
+        const made = model.applyRestoreStep(cursor, step, derived, size, bounds) catch |err| {
+            log.warn("a saved tab or pane could not be restored: {s}", .{@errorName(err)});
+            return;
+        };
+        const created = made orelse return;
+        try self.adoptRestoredSession(presentation, model, created.session_id, created.cwd);
+    }
+
+    fn addRestoredTab(self: *App, presentation: *WorkspacePresentation, model: *workspace.Workspace, size: term.GridSize) !void {
+        try presentation.pane_renderers.ensureUnusedCapacity(self.allocator, 1);
+        try presentation.restore_queue.ensureUnusedCapacity(self.allocator, 1);
+        const created = try model.createTab("Terminal 1", size);
+        try self.adoptRestoredSession(presentation, model, created.session_id, model.workingDirectory());
+    }
+
+    /// Give a restored session its renderer and queue its shell. Capacity
+    /// for both was reserved by the caller.
+    fn adoptRestoredSession(
+        self: *App,
+        presentation: *WorkspacePresentation,
+        model: *workspace.Workspace,
+        session_id: session.SessionId,
+        saved_cwd: []const u8,
+    ) !void {
+        if (model.sessionById(session_id)) |live| live.terminal().setClipboardAccess(.{
+            .read_fn = readNativeClipboard,
+            .write_fn = writeNativeClipboard,
+        });
+        const cwd = try self.restoredDirectory(model, saved_cwd);
+        errdefer self.allocator.free(cwd);
+        var pane_renderer = try self.newPaneRenderer(session_id);
+        errdefer pane_renderer.deinit();
+        presentation.pane_renderers.appendAssumeCapacity(pane_renderer);
+        presentation.restore_queue.appendAssumeCapacity(.{ .session_id = session_id, .cwd = cwd });
+    }
+
+    /// The directory a restored shell starts in, owned: the saved one when
+    /// it still exists, else the workspace's, else the inherited directory,
+    /// with a status line naming the move. Remote directories are the
+    /// remote shell's to check; `~` stands for the remote home.
+    fn restoredDirectory(self: *App, model: *workspace.Workspace, saved: []const u8) ![]u8 {
+        if (model.contextKind() != .local) {
+            return self.allocator.dupe(u8, if (std.mem.eql(u8, saved, remote_home_marker)) "" else saved);
+        }
+        if (saved.len == 0 or directoryExists(self.io, model.contextRef(), saved)) return self.allocator.dupe(u8, saved);
+        const fallback = model.workingDirectory();
+        const usable = if (fallback.len != 0 and directoryExists(self.io, model.contextRef(), fallback)) fallback else "";
+        self.setRestoreMovedStatus(saved, if (usable.len == 0) "the start directory" else usable);
+        return self.allocator.dupe(u8, usable);
+    }
+
+    fn setRestoreMovedStatus(self: *App, missing: []const u8, instead: []const u8) void {
+        const text = std.fmt.bufPrint(&self.persistence.status_storage, "restore: {s} is gone; started in {s}", .{ missing, instead }) catch
+            "restore: a saved directory is gone";
+        self.setWorkspaceStatus(text);
+    }
+
+    /// Start queued restored shells, one per workspace at a time through the
+    /// workspace's spawn slot; an SSH workspace's wait for its connection.
+    fn driveRestoreQueues(self: *App) bool {
+        var changed = false;
+        for (self.workspace_presentations.items) |presentation| {
+            if (presentation.closing or presentation.load != null) continue;
+            if (presentation.restore_queue.items.len == 0) continue;
+            if (presentation.remote) |record| if (!record.ready()) continue;
+            const item = presentation.restore_queue.orderedRemove(0);
+            self.startRestoredChild(presentation, item);
+            changed = true;
+        }
+        return changed;
+    }
+
+    fn restoreQueuesRunnable(self: *const App) bool {
+        for (self.workspace_presentations.items) |presentation| {
+            if (presentation.closing or presentation.restore_queue.items.len == 0) continue;
+            if (presentation.remote) |record| if (!record.ready()) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// Spawn one restored shell on a worker in its saved directory. Ownership
+    /// of `item.cwd` transfers on entry.
+    fn startRestoredChild(self: *App, presentation: *WorkspacePresentation, item: RestoreStart) void {
+        const model = self.workspace_registry.byKey(presentation.key) orelse {
+            self.allocator.free(item.cwd);
+            return;
+        };
+        const process = self.processFor(model, &self.spec);
+        if (process.argv.len == 0 and model.contextKind() != .ssh) {
+            self.allocator.free(item.cwd);
+            return;
+        }
+        var request = model.spawnRequest(item.session_id, process) catch |err| {
+            log.warn("a restored shell could not be prepared: {s}", .{@errorName(err)});
+            self.allocator.free(item.cwd);
+            return;
+        };
+        request.cwd = item.cwd;
+        const control_env = self.controlEnvFor(presentation, model, item.session_id, process.env);
+        if (control_env) |env| request.env = env;
+        const job = self.allocator.create(Load) catch |err| {
+            log.warn("no memory to start a restored shell: {s}", .{@errorName(err)});
+            self.allocator.free(item.cwd);
+            if (control_env) |env| freeEntries(self.allocator, env);
+            return;
+        };
+        job.* = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .spawn = request,
+            .spawn_cwd = item.cwd,
+            .spawn_env = control_env,
+            .spawn_session_id = item.session_id,
+            .workspace_key = presentation.key,
+            .execution_context = model.contextRef(),
+        };
+        job.start(self.window) catch |err| {
+            log.warn("could not start the worker for a restored shell: {s}", .{@errorName(err)});
+            job.freeSpawnInputs();
+            self.allocator.destroy(job);
+            return;
+        };
+        presentation.load = job;
+    }
+
+    /// Whether the active workspace is a restored SSH workspace that has not
+    /// been asked to connect yet, so Enter connects it.
+    fn savedSessionWaiting(self: *const App) bool {
+        const record = self.activeRemote() orelse return false;
+        return record.saved and record.state == .disconnected;
     }
 
     // The control API and the single instance (TASK-60, TASK-66) -------------
@@ -6864,12 +7765,26 @@ const App = struct {
         destination: []const u8,
         port: ?u16,
     ) !*WorkspacePresentation {
+        return self.createRemotePresentationWith(name, destination, port, &.{}, false);
+    }
+
+    /// `createRemotePresentation`, with `-o` options, or `restored`: then
+    /// there is no `Terminal 1` tab (the restore plan adds the saved tabs)
+    /// and no master is started until the person asks (TASK-65).
+    fn createRemotePresentationWith(
+        self: *App,
+        name: []const u8,
+        destination: []const u8,
+        port: ?u16,
+        options: []const []const u8,
+        restored: bool,
+    ) !*WorkspacePresentation {
         // Elsewhere the context is not built (decision-8); nothing below is
         // analysed for those targets.
         if (comptime !ssh.supported) return error.Unsupported;
         const grid_size = self.activeLive().terminal().gridSize();
         const context = try ssh.SshContext.create(self.allocator, self.io, .{
-            .target = .{ .destination = destination, .port = port, .config_file = self.ssh_config_override },
+            .target = .{ .destination = destination, .port = port, .config_file = self.ssh_config_override, .options = options },
             .local_env = self.ssh_client_spec.env,
             .runtime_dir = self.ssh_runtime_dir,
             .wake = .{ .context = self, .wake_fn = sshWake },
@@ -6883,13 +7798,18 @@ const App = struct {
             "could not release a refused ssh workspace: {s}",
             .{@errorName(err)},
         );
-        const session_id = try candidate.createSession(.human_terminal, grid_size);
-        _ = try candidate.registerTab("Terminal 1", session_id);
-        const live = candidate.sessionById(session_id) orelse return error.SessionNotFound;
-        live.terminal().setClipboardAccess(.{
-            .read_fn = readNativeClipboard,
-            .write_fn = writeNativeClipboard,
-        });
+        // A restored workspace gets its tabs from the plan; its active
+        // session is set once they exist.
+        var session_id: session.SessionId = .first;
+        if (!restored) {
+            session_id = try candidate.createSession(.human_terminal, grid_size);
+            _ = try candidate.registerTab("Terminal 1", session_id);
+            const live = candidate.sessionById(session_id) orelse return error.SessionNotFound;
+            live.terminal().setClipboardAccess(.{
+                .read_fn = readNativeClipboard,
+                .write_fn = writeNativeClipboard,
+            });
+        }
         const connection_id = try candidate.createSession(.connection, grid_size);
         // The view's `destroy` only lets go; the context keeps the master.
         try candidate.attachChild(connection_id, ssh_context.masterTerminal());
@@ -6900,7 +7820,7 @@ const App = struct {
             pane_renderers.deinit(self.allocator);
         }
         try pane_renderers.ensureUnusedCapacity(self.allocator, 2);
-        pane_renderers.appendAssumeCapacity(try self.newPaneRenderer(session_id));
+        if (!restored) pane_renderers.appendAssumeCapacity(try self.newPaneRenderer(session_id));
         pane_renderers.appendAssumeCapacity(try self.newPaneRenderer(connection_id));
 
         var scratchpad_grid = try render.Grid.init(self.allocator, gridColors(self.palette));
@@ -6910,7 +7830,7 @@ const App = struct {
 
         const record = try self.allocator.create(RemotePresentation);
         errdefer self.allocator.destroy(record);
-        record.* = .{ .context = ssh_context, .connection_id = connection_id };
+        record.* = .{ .context = ssh_context, .connection_id = connection_id, .saved = restored };
 
         try self.workspace_presentations.ensureUnusedCapacity(self.allocator, 1);
         const presentation = try self.allocator.create(WorkspacePresentation);
@@ -6927,6 +7847,10 @@ const App = struct {
         scratchpad_grid_owned = false;
         self.workspace_presentations.appendAssumeCapacity(presentation);
 
+        // A saved session waits for Enter or `reconnect`: connecting could
+        // put a host-key or password prompt in front of someone who only
+        // reopened the app.
+        if (restored) return presentation;
         ssh_context.connect(pty.WindowSize.init(grid_size.rows, grid_size.cols)) catch |err| {
             log.warn("the ssh client could not be started: {s}", .{@errorName(err)});
         };
@@ -7049,6 +7973,13 @@ const App = struct {
     fn startRemoteSessions(self: *App, presentation: *WorkspacePresentation, model: *workspace.Workspace, record: *RemotePresentation) void {
         if (!record.ever_connected) {
             record.ever_connected = true;
+            // A restored workspace's queue starts every saved shell in its
+            // remote directory (`driveRestoreQueues`); only the scratchpad
+            // is started here.
+            if (presentation.restore_queue.items.len != 0) {
+                self.startScratchpadFor(presentation, false);
+                return;
+            }
             if (model.tabAt(0)) |first| {
                 const first_session = model.focusedPaneSessionId(first.id()) orelse first.sessionId();
                 if (model.sessionById(first_session)) |live| {
@@ -7378,6 +8309,8 @@ const App = struct {
             live.terminal().feed("\x1b[H\x1b[2J\x1b[3J");
             live.rearmChildOutput();
         }
+        // Asked for: a restored session now behaves as any other.
+        record.saved = false;
         record.context.reconnect() catch |err| {
             log.warn("the ssh client could not be restarted: {s}", .{@errorName(err)});
             self.setRemoteStatus("ssh: could not reconnect ({s})", .{@errorName(err)});
@@ -7441,14 +8374,29 @@ const App = struct {
             std.fmt.bufPrint(&port_text, ":{d}", .{port}) catch ""
         else
             "";
-        const header = std.fmt.bufPrint(&record.header_storage, "ssh {s}{s} ─ {s}", .{
-            destination,
-            port_suffix,
-            remote.stateWords(record.state),
-        }) catch "ssh";
+        const header = if (record.saved and record.state == .disconnected)
+            std.fmt.bufPrint(&record.header_storage, "ssh {s}{s} ─ saved session; press Enter or click reconnect to connect", .{
+                destination,
+                port_suffix,
+            }) catch "ssh ─ saved session"
+        else
+            std.fmt.bufPrint(&record.header_storage, "ssh {s}{s} ─ {s}", .{
+                destination,
+                port_suffix,
+                remote.stateWords(record.state),
+            }) catch "ssh";
         const header_id: ui.Id = .{ .value = try connectionSemanticId(&self.connection_semantic_storage[0], key, "") };
+        // The painted header stops short of the control on its row, which a
+        // long saved-session line would otherwise run under; the semantic
+        // label keeps the whole line.
+        const control_cells: u32 = switch (record.state) {
+            .connecting => 0,
+            .connected => "hide".len + 2,
+            .lost, .failed, .disconnected => "reconnect".len + 2,
+        };
+        const painted = ellipsizeToCells(&record.header_paint_storage, header, layout.rect.cols -| control_cells);
         const header_runs = [_]ui.Run{.{
-            .text = header,
+            .text = painted,
             .style = .{
                 .foreground = switch (record.state) {
                     .lost, .failed => .danger,
@@ -7637,6 +8585,10 @@ const App = struct {
     /// Give back everything the app owns, in the reverse of the order it was
     /// built. The window belongs to `main`, which outlives the app.
     fn deinit(self: *App) void {
+        // What the person last saw is what the next launch restores; saved
+        // before anything below starts taking the workspaces apart.
+        self.saveStateAtExit();
+        self.persistence.deinit();
         // No control request may reach a workspace that is going away.
         self.stopControl();
         if (self.config_watcher) |watcher| watcher.stop();
@@ -7705,6 +8657,7 @@ const App = struct {
             for (presentation.pane_renderers.items) |*pane_renderer| pane_renderer.deinit();
             presentation.pane_renderers.deinit(self.allocator);
             presentation.scratchpad_grid.deinit();
+            presentation.releaseRestoreQueue(self.allocator);
             self.allocator.destroy(presentation);
         }
         self.workspace_presentations.deinit(self.allocator);
@@ -14079,6 +15032,15 @@ const App = struct {
             }
             return;
         }
+        // A restored SSH workspace waits for the person (TASK-65): Enter over
+        // its connection view starts the connection, as `reconnect` does.
+        if (key.key == .enter and !key.mods.ctrl and !key.mods.alt and !key.mods.shift and !key.mods.super and
+            !self.paletteVisible() and !self.closeModalActive() and !self.scratchpadVisible() and
+            !self.contextMenuVisible() and !self.notificationsVisible() and self.savedSessionWaiting())
+        {
+            if (key.action == .press) try self.dispatchAction(remote_reconnect_action, .{ .source = .keybinding });
+            return;
+        }
         var scratch: inputmod.TextScratch = .{};
         const translated = translateAppKey(&self.composition, &scratch, key);
         const modal = self.closeModalActive();
@@ -14506,6 +15468,14 @@ const App = struct {
             .unknown => null,
         };
         const name = selection.name(preference) orelse {
+            // A file silent about the theme keeps the one restored from the
+            // last session (TASK-65); otherwise Conduit's default.
+            if (self.persistence.restoredTheme()) |restored| {
+                if (self.theme_catalog.find(restored)) |index| {
+                    self.adoptThemeEntry(index, line);
+                    return;
+                }
+            }
             self.commitTheme(theme.default_id, default_palette);
             return;
         };
@@ -15334,6 +16304,7 @@ const App = struct {
             for (presentation.pane_renderers.items) |*pane_renderer| pane_renderer.deinit();
             presentation.pane_renderers.deinit(self.allocator);
             presentation.scratchpad_grid.deinit();
+            presentation.releaseRestoreQueue(self.allocator);
             self.allocator.destroy(presentation);
             _ = self.workspace_presentations.orderedRemove(index);
             changed = true;
@@ -16467,8 +17438,9 @@ const App = struct {
             => if (self.config_current.settings.notifications.get(key) orelse true) "true" else "false",
             // Repeating and recorded keys have no row: the connection
             // manager edits them (TASK-44). `control.enabled` applies at
-            // startup only, so it is a file setting without a row (TASK-60).
-            .remote_profile, .remote_recent, .control_enabled, .keybind => "",
+            // startup only, so it is a file setting without a row (TASK-60),
+            // as are `restore.enabled` and `accessibility.enabled`.
+            .remote_profile, .remote_recent, .control_enabled, .restore_enabled, .accessibility_enabled, .keybind => "",
         };
     }
 
@@ -17946,6 +18918,9 @@ const App = struct {
     /// wrong: a finished job, the child's output, and the cursor's blink.
     fn poll(self: *App) bool {
         var changed = self.pollLoad();
+        // A slot freed above starts the next restored shell at once.
+        changed = self.driveRestoreQueues() or changed;
+        defer self.pollPersistence();
         if (self.config_watcher) |watcher| {
             if (watcher.takeChanged()) {
                 self.reloadConfig();
@@ -19569,6 +20544,18 @@ const App = struct {
     /// loop cannot wait on the PTY's wakeup and SDL's queue at once, so it asks
     /// the terminal whether anything has arrived and gives up after this long.
     fn waitBudget(self: *App, io: Io, deadline_ns: ?i128) i32 {
+        const budget = self.loopWaitBudget(io, deadline_ns);
+        // A debounced save wakes the loop when it falls due (TASK-65).
+        if (self.persistence.path == null) return budget;
+        const due_ns = self.persistence.debounce.deadline() orelse return budget;
+        // A save still writing is collected on the next tick, not in a spin.
+        if (self.persistence.worker != null) return if (budget < 0) idle_tick_ms else @min(budget, idle_tick_ms);
+        const left_ns = due_ns - Io.Clock.awake.now(io).nanoseconds;
+        const left_ms: i32 = @intCast(std.math.clamp(@divTrunc(left_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms), 0, max_wait_ms));
+        return if (budget < 0) left_ms else @min(budget, left_ms);
+    }
+
+    fn loopWaitBudget(self: *App, io: Io, deadline_ns: ?i128) i32 {
         const driver_deadline = self.earliestDriverDeadline();
         const effective_deadline = if (deadline_ns) |run_deadline|
             if (driver_deadline) |pending_deadline| @min(run_deadline, pending_deadline) else run_deadline
@@ -19587,6 +20574,7 @@ const App = struct {
                 has_attached_child = has_attached_child or model.hasAttachedChild();
             }
         }
+        has_load = has_load or self.restoreQueuesRunnable();
         if (has_load) {
             if (budget < 0) return idle_tick_ms;
             return @min(budget, idle_tick_ms);
@@ -24432,6 +25420,504 @@ fn removeAgentTestDir(io: Io, dir: []const u8) void {
 }
 
 // ---------------------------------------------------------------------------
+// --restore-test (TASK-65)
+// ---------------------------------------------------------------------------
+
+/// The restore check's terminal peer: it reports its directory through OSC 7
+/// (so the tracked cwd is the one saved), changes directory on `cd <dir>`,
+/// answers `pwd`, and echoes anything else, all through real PTY input.
+/// Directories are printed as `RA:`/`RP:` and their last component cut to
+/// twelve bytes, so an answer fits on one row of a narrow pane.
+const restore_test_script =
+    "stty -echo; " ++
+    "r() { b=${PWD##*/}; printf '\\033]7;file://localhost%s\\007RA:%.12s\\r\\n' \"$PWD\" \"$b\"; }; r; " ++
+    "while IFS= read -r line; do case \"$line\" in " ++
+    "'cd '*) cd \"${line#cd }\" && r;; " ++
+    "pwd) b=${PWD##*/}; printf 'RP:%.12s.\\r\\n' \"$b\";; " ++
+    "*) printf 'RE:%s\\r\\n' \"$line\";; " ++
+    "esac; done";
+
+/// What the restore script prints for `dir`: its last component, cut to
+/// twelve bytes, after `prefix`.
+fn restoreMarker(buffer: []u8, prefix: []const u8, dir: []const u8) ![]const u8 {
+    const base = std.fs.path.basenamePosix(dir);
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ prefix, base[0..@min(base.len, 12)] });
+}
+
+/// Printed by a shell in the first run; the saved state must not contain it.
+const restore_test_secret = "RESTORE-SECRET-OUTPUT-7f3a";
+
+fn restoreCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("restore-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    out.flush() catch {};
+    if (!ok) failures.* += 1;
+}
+
+fn restoreTestDir(io: Io, buffer: []u8) ![]const u8 {
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = try generateRunId(io, &id_buffer);
+    // Short, so the control socket under it fits `sockaddr_un`.
+    return std.fmt.bufPrint(buffer, "/tmp/conduit-restore-{s}", .{id[id.len - 6 ..]});
+}
+
+fn removeRestoreTestDir(io: Io, dir: []const u8) void {
+    if (std.mem.indexOf(u8, dir, "conduit-restore-") == null) return;
+    Dir.cwd().deleteTree(io, dir) catch |err| {
+        log.warn("could not remove the restore-test directory: {s}", .{@errorName(err)});
+    };
+}
+
+/// One pane element's geometry and whether it has focus.
+const RestorePane = struct { bounds: ui.Bounds, focused: bool };
+
+/// The active workspace's pane elements, in registration order.
+fn restorePanes(self: *App, buffer: []RestorePane) []RestorePane {
+    var count: usize = 0;
+    const key = self.workspace_registry.activeKey() orelse return buffer[0..0];
+    var prefix_buffer: [workspace_semantic_capacity]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buffer, "workspace.{d}.pane.", .{@intFromEnum(key)}) catch return buffer[0..0];
+    for (self.ui_tree.elements()) |element| {
+        if (!std.mem.startsWith(u8, element.id.value, prefix)) continue;
+        if (!std.mem.eql(u8, element.role, "pane")) continue;
+        if (count == buffer.len) break;
+        buffer[count] = .{ .bounds = element.bounds, .focused = element.state.selected };
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
+fn samePanes(a: []const RestorePane, b: []const RestorePane) bool {
+    if (a.len != b.len) return false;
+    for (a) |pane| {
+        const found = for (b) |other| {
+            if (std.meta.eql(pane.bounds, other.bounds) and pane.focused == other.focused) break true;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// The id of the active workspace's pane element whose bounds are `bounds`.
+fn restorePaneId(self: *App, bounds: ui.Bounds) ?[]const u8 {
+    const key = self.workspace_registry.activeKey() orelse return null;
+    var prefix_buffer: [workspace_semantic_capacity]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buffer, "workspace.{d}.pane.", .{@intFromEnum(key)}) catch return null;
+    for (self.ui_tree.elements()) |element| {
+        if (!std.mem.startsWith(u8, element.id.value, prefix) or !std.mem.eql(u8, element.role, "pane")) continue;
+        if (std.meta.eql(element.bounds, bounds)) return element.id.value;
+    }
+    return null;
+}
+
+/// The sidebar row of the workspace whose label ends with `name`.
+fn restoreWorkspaceRow(self: *App, name: []const u8, buffer: []u8) ?[]const u8 {
+    var index: usize = 0;
+    while (index < self.workspace_registry.count()) : (index += 1) {
+        const key = self.workspace_registry.keyAt(index) orelse continue;
+        const id = workspaceSemanticId(buffer, key) catch return null;
+        const element = self.ui_tree.byId(.{ .value = id }) orelse continue;
+        if (std.mem.endsWith(u8, element.label, name)) return id;
+    }
+    return null;
+}
+
+/// How many workspace rows the sidebar shows.
+fn restoreWorkspaceRows(self: *App) usize {
+    var rows: usize = 0;
+    for (self.ui_tree.elements()) |element| {
+        const rest = if (std.mem.startsWith(u8, element.id.value, "workspace.")) element.id.value["workspace.".len..] else continue;
+        _ = std.fmt.parseUnsigned(u32, rest, 10) catch continue;
+        rows += 1;
+    }
+    return rows;
+}
+
+fn restoreStatus(self: *App) []const u8 {
+    const element = self.ui_tree.byId(.{ .value = "workspace.status" }) orelse return "";
+    return element.label;
+}
+
+/// Ask the focused restored shell for its directory through real input and
+/// wait for the answer.
+fn restorePwd(self: *App, io: Io, out: *Writer, expected: []const u8) !bool {
+    if (!try sshType(self, io, out, "pwd", .{})) return false;
+    var wanted_buffer: [path_capacity]u8 = undefined;
+    const marker = try restoreMarker(&wanted_buffer, "RP:", expected);
+    // The trailing dot ends the answer, so `sub` never matches `subway`.
+    wanted_buffer[marker.len] = '.';
+    return waitForSsh(self, io, out, .{ .presented_text = wanted_buffer[0 .. marker.len + 1] });
+}
+
+/// Wait until every restored shell of every workspace has started.
+fn restoreSettled(self: *App, io: Io, out: *Writer) !bool {
+    const deadline = Io.Clock.real.now(io).nanoseconds + ssh_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        var pending = false;
+        for (self.workspace_presentations.items) |presentation| {
+            if (presentation.remote != null) continue;
+            if (presentation.restore_queue.items.len != 0 or presentation.load != null or presentation.scratchpad_load != null) pending = true;
+        }
+        if (!pending) return true;
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) return false;
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return false;
+        }
+        if (self.outputReadable()) {
+            if (try self.drainChildren(io) != 0) self.scheduler.invalidate();
+        }
+        if (self.poll()) self.scheduler.invalidate();
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+    }
+}
+
+/// Drop whatever the previous app left in SDL's queue, so the next one starts
+/// from a quiet window as a relaunch would.
+fn restoreDrainEvents(window: *platform.Window) void {
+    while (window.pump(0)) |_| {}
+}
+
+fn restoreQuarantined(io: Io, state_dir: []const u8, buffer: []u8) ?[]const u8 {
+    var dir = Dir.cwd().openDir(io, state_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (iterator.next(io) catch return null) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "state.json.corrupt-")) continue;
+        return std.fmt.bufPrint(buffer, "{s}/{s}", .{ state_dir, entry.name }) catch null;
+    }
+    return null;
+}
+
+/// TASK-65 end to end: one run builds a layout through real input and quits
+/// through the normal path; a second app on the same window restores it;
+/// a corrupt file and a newer version then each start clean.
+fn restoreTest(init: std.process.Init, env: EnvSource, window: *platform.Window, base_options: Options, out: *Writer) !u8 {
+    const io = init.io;
+    const gpa = init.gpa;
+    var failures: usize = 0;
+
+    var dir_buffer: [path_capacity]u8 = undefined;
+    const dir = try restoreTestDir(io, &dir_buffer);
+    defer removeRestoreTestDir(io, dir);
+    var paths: [8][path_capacity]u8 = undefined;
+    const dir_a = try std.fmt.bufPrint(&paths[0], "{s}/ws-a", .{dir});
+    const dir_sub = try std.fmt.bufPrint(&paths[1], "{s}/ws-a/sub", .{dir});
+    const dir_gone = try std.fmt.bufPrint(&paths[2], "{s}/ws-a/gone", .{dir});
+    const dir_b = try std.fmt.bufPrint(&paths[3], "{s}/ws-b", .{dir});
+    const state_dir = try std.fmt.bufPrint(&paths[4], "{s}/state/conduit", .{dir});
+    const state_path = try std.fmt.bufPrint(&paths[5], "{s}/state.json", .{state_dir});
+    const ssh_config = try std.fmt.bufPrint(&paths[6], "{s}/home/.ssh/config", .{dir});
+    for ([_][]const u8{ dir_sub, dir_gone, dir_b, state_dir }) |path| try Dir.cwd().createDirPath(io, path);
+    // The SSH control sockets live in a private run directory of the check.
+    var run_buffer: [path_capacity]u8 = undefined;
+    _ = try Dir.cwd().createDirPathStatus(io, try std.fmt.bufPrint(&run_buffer, "{s}/run", .{dir}), .fromMode(0o700));
+    try Dir.cwd().createDirPath(io, std.fs.path.dirnamePosix(ssh_config).?);
+    // A host alias whose port refuses at once: the first run's connection
+    // fails without any prompt, and nothing outside this directory is read.
+    try Dir.cwd().writeFile(io, .{ .sub_path = ssh_config, .data = "Host restore-box\n  HostName 127.0.0.1\n  Port 9\n  User restore\n  BatchMode yes\n" });
+    const process_cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(process_cwd);
+
+    var options = base_options;
+    options.run.state_path = state_path;
+    options.run.ssh_test_dir = dir;
+
+    // ---- The first run: build a layout through real input, then quit. ----
+    var saved_panes_storage: [8]RestorePane = undefined;
+    var saved_panes: []RestorePane = saved_panes_storage[0..0];
+    var theme_buffer: [theme_name_capacity]u8 = undefined;
+    var theme_name: []const u8 = "";
+    {
+        const self = try App.init(io, env, gpa, window, options);
+        var destroyed = false;
+        defer if (!destroyed) self.destroy();
+        try self.syncTextInput();
+        try self.drawFrame();
+        restoreCheck(out, &failures, self.workspace_registry.count() == 1 and self.persistence.path != null, "a first run with no state file starts clean and persists to the private state file", .{});
+        restoreCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = "RA:" }), "the first tab's shell started", .{});
+        _ = try sshType(self, io, out, "cd {s}", .{dir_a});
+        _ = try sshType(self, io, out, "{s}", .{restore_test_secret});
+        var echo_buffer: [128]u8 = undefined;
+        restoreCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = try std.fmt.bufPrint(&echo_buffer, "RE:{s}", .{restore_test_secret}) }), "the shell moved to ws-a and printed terminal content", .{});
+
+        // Split right by mouse through the palette, then down by keyboard.
+        restoreCheck(out, &failures, try clickPaletteCommand(self, io, out, pane_split_action, 0), "Split pane right was clicked in the palette", .{});
+        var at_buffer: [path_capacity]u8 = undefined;
+        restoreCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = try restoreMarker(&at_buffer, "RA:", dir_a) }), "the right pane started in the tracked ws-a", .{});
+        _ = try sshType(self, io, out, "cd {s}", .{dir_sub});
+        restoreCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = try restoreMarker(&at_buffer, "RA:", dir_sub) }), "the right pane moved to ws-a/sub", .{});
+        const split_mods: platform.Mods = switch (self.binding_profile) {
+            .macos => .{ .super = true, .shift = true },
+            .linux_windows => .{ .ctrl = true, .shift = true },
+        };
+        _ = try postKey(self, io, out, if (self.binding_profile == .macos) 'd' else 'o', split_mods);
+        restoreCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = try restoreMarker(&at_buffer, "RA:", dir_sub) }), "a nested split down started in ws-a/sub", .{});
+        _ = try sshType(self, io, out, "cd {s}", .{dir_gone});
+        restoreCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = try restoreMarker(&at_buffer, "RA:", dir_gone) }), "the bottom pane moved to a directory the relaunch will not find", .{});
+        // Move the outer divider two cells left from the keyboard.
+        const resize_mods: platform.Mods = switch (self.binding_profile) {
+            .macos => .{ .super = true, .ctrl = true },
+            .linux_windows => .{ .ctrl = true, .alt = true },
+        };
+        _ = try postNamedKey(self, io, out, .left, resize_mods);
+        _ = try postNamedKey(self, io, out, .left, resize_mods);
+        // Rename the tab with F2.
+        _ = try postNamedKey(self, io, out, .f2, .{});
+        _ = try postKey(self, io, out, 'a', if (self.binding_profile == .macos) .{ .super = true } else .{ .ctrl = true });
+        _ = try postPaletteText(self, io, out, "build");
+        _ = try postNamedKey(self, io, out, .enter, .{});
+        const first_key = self.workspace_registry.activeKey().?;
+        var tab_buffer: [workspace_semantic_capacity]u8 = undefined;
+        const tab_row = try tabSemanticId(&tab_buffer, first_key, self.activeWorkspace().activeTabId().?);
+        restoreCheck(out, &failures, if (self.ui_tree.byId(.{ .value = tab_row })) |row| std.mem.eql(u8, std.mem.trimStart(u8, row.label, " *!"), "build") else false, "F2 renamed the tab to build", .{});
+        // Focus the top right pane by clicking it, and remember the layout.
+        try self.drawFrame();
+        var panes_buffer: [8]RestorePane = undefined;
+        const before_focus = restorePanes(self, &panes_buffer);
+        restoreCheck(out, &failures, before_focus.len == 3, "the tab holds three panes ({d})", .{before_focus.len});
+        var left_x: i32 = std.math.maxInt(i32);
+        for (before_focus) |pane| left_x = @min(left_x, pane.bounds.x);
+        var top_right: ?ui.Bounds = null;
+        for (before_focus) |pane| {
+            if (pane.bounds.x == left_x) continue;
+            if (top_right == null or pane.bounds.y < top_right.?.y or (pane.bounds.y == top_right.?.y and pane.bounds.x > top_right.?.x)) top_right = pane.bounds;
+        }
+        if (top_right) |bounds| if (restorePaneId(self, bounds)) |id| {
+            var id_copy: [pane_semantic_capacity]u8 = undefined;
+            @memcpy(id_copy[0..id.len], id);
+            _ = try clickTabsElement(self, io, out, id_copy[0..id.len]);
+        };
+        try self.drawFrame();
+        const focused_panes = restorePanes(self, &panes_buffer);
+        @memcpy(saved_panes_storage[0..focused_panes.len], focused_panes);
+        saved_panes = saved_panes_storage[0..focused_panes.len];
+        const focus_ok = for (focused_panes) |pane| {
+            if (pane.focused) break top_right != null and std.meta.eql(pane.bounds, top_right.?);
+        } else false;
+        restoreCheck(out, &failures, focus_ok, "a click focused the top right pane", .{});
+        // Zoom it, then open a second tab and come back to the first.
+        _ = try postNamedKey(self, io, out, .enter, if (self.binding_profile == .macos) .{ .super = true, .shift = true } else .{ .ctrl = true, .shift = true });
+        try self.drawFrame();
+        restoreCheck(out, &failures, restorePanes(self, &panes_buffer).len == 1, "the zoom chord filled the tab with the focused pane", .{});
+        _ = try postKey(self, io, out, 't', if (self.binding_profile == .macos) .{ .super = true } else .{ .ctrl = true, .shift = true });
+        restoreCheck(out, &failures, try waitForSsh(self, io, out, .{ .presented_text = try restoreMarker(&at_buffer, "RA:", dir_sub) }), "a second tab started in the focused pane's directory", .{});
+        _ = try postKey(self, io, out, '1', if (self.binding_profile == .macos) .{ .super = true } else .{ .alt = true });
+        restoreCheck(out, &failures, self.ui_tree.byId(.{ .value = tab_row }) != null and self.ui_tree.byId(.{ .value = tab_row }).?.state.selected, "the first tab is selected again", .{});
+
+        // A second workspace in ws-b from the palette.
+        _ = try openWorkspacePaletteCommand(self, io, out, "createworkspace", workspace_create_action);
+        var dir_b_z: [path_capacity:0]u8 = undefined;
+        _ = try postPaletteText(self, io, out, try std.fmt.bufPrintZ(&dir_b_z, "{s}", .{dir_b}));
+        _ = try postNamedKey(self, io, out, .enter, .{});
+        restoreCheck(out, &failures, try waitForWorkspaces(self, io, out, .{ .count = 2 }), "Create workspace opened ws-b", .{});
+
+        // A theme from the picker: the second one listed.
+        _ = try paletteChord(self, io, out);
+        _ = try postPaletteText(self, io, out, "Theme: choose");
+        _ = try postNamedKey(self, io, out, .enter, .{});
+        _ = try postNamedKey(self, io, out, .down, .{});
+        _ = try postNamedKey(self, io, out, .enter, .{});
+        const chosen = self.activeThemeName();
+        @memcpy(theme_buffer[0..chosen.len], chosen);
+        theme_name = theme_buffer[0..chosen.len];
+        restoreCheck(out, &failures, !self.paletteVisible() and !std.mem.eql(u8, theme_name, theme.default_id), "the theme picker applied {s}", .{theme_name});
+
+        // An SSH workspace whose connection the first run tries and fails.
+        if (ssh.supported) {
+            _ = try openRemoteConnect(self, io, out);
+            _ = try postPaletteText(self, io, out, "restore-box");
+            _ = try postNamedKey(self, io, out, .enter, .{});
+            restoreCheck(out, &failures, try waitForWorkspaces(self, io, out, .{ .count = 3 }) and self.activePresentation().remote != null, "Remote: connect opened the restore-box SSH workspace", .{});
+        }
+
+        // Back to the first workspace, then quit through the normal path.
+        var row_buffer: [workspace_semantic_capacity]u8 = undefined;
+        _ = try clickTabsElement(self, io, out, try workspaceSemanticId(&row_buffer, first_key));
+        restoreCheck(out, &failures, self.workspace_registry.activeKey() == first_key, "clicking the first workspace's row selected it", .{});
+        try self.window.postCloseRequest();
+        try self.run(io, runDeadline(io, 5000));
+        destroyed = true;
+        self.destroy();
+    }
+
+    // ---- The file the first run left. ----
+    {
+        const buffer = try gpa.alloc(u8, state_mod.load_buffer_bytes);
+        defer gpa.free(buffer);
+        const bytes = Dir.cwd().readFile(io, state_path, buffer) catch &.{};
+        var diagnostic: state_mod.Diagnostic = .{};
+        if (state_mod.decode(gpa, bytes, &diagnostic)) |decoded_value| {
+            var decoded = decoded_value;
+            defer decoded.deinit();
+            const snapshot = decoded.snapshot;
+            restoreCheck(out, &failures, snapshot.version == 1 and snapshot.workspaces.len == (if (ssh.supported) @as(usize, 3) else 2), "quitting saved a version {d} state file with {d} workspaces", .{ snapshot.version, snapshot.workspaces.len });
+            restoreCheck(out, &failures, snapshot.window != null and snapshot.window.?.width == 640 and snapshot.window.?.height == 360 and
+                snapshot.theme != null and std.mem.eql(u8, snapshot.theme.?, theme_name), "it holds the 640x360 window and the chosen theme", .{});
+            if (snapshot.workspaces.len != 0) {
+                const first = snapshot.workspaces[0];
+                const first_tab: ?state_mod.TabState = if (first.tabs.len != 0) first.tabs[0] else null;
+                restoreCheck(out, &failures, first.tabs.len == 2 and first.active_tab != null and first.active_tab.? == 0 and
+                    first_tab != null and first_tab.?.zoomed and first_tab.?.panes.leafCount() == 3 and
+                    first_tab.?.name != null and std.mem.eql(u8, first_tab.?.name.?, "build"), "the first workspace's two tabs, names, zoom and three panes were saved ({d} tabs, active {?d}, zoomed {}, {d} panes, name {?s})", .{
+                    first.tabs.len,
+                    first.active_tab,
+                    if (first_tab) |tab| tab.zoomed else false,
+                    if (first_tab) |tab| tab.panes.leafCount() else 0,
+                    if (first_tab) |tab| tab.name else null,
+                });
+            }
+        } else |err| restoreCheck(out, &failures, false, "the state file decodes ({s}: {s})", .{ @errorName(err), diagnostic.message() });
+        restoreCheck(out, &failures, std.mem.indexOf(u8, bytes, restore_test_secret) == null and std.mem.indexOf(u8, bytes, "RE:") == null and
+            std.mem.indexOf(u8, bytes, "RA:") == null, "no terminal text reached the state file ({d} bytes)", .{bytes.len});
+    }
+    // The bottom pane's directory goes away between the runs.
+    try Dir.cwd().deleteTree(io, dir_gone);
+    restoreDrainEvents(window);
+
+    // ---- The relaunch: everything comes back. ----
+    {
+        const self = try App.init(io, env, gpa, window, options);
+        defer self.destroy();
+        try self.syncTextInput();
+        try self.drawFrame();
+        restoreCheck(out, &failures, try restoreSettled(self, io, out), "every restored local shell started", .{});
+        try self.drawFrame();
+        var row_buffers: [3][workspace_semantic_capacity]u8 = undefined;
+        const default_row = restoreWorkspaceRow(self, "default", &row_buffers[0]);
+        const b_row = restoreWorkspaceRow(self, "ws-b", &row_buffers[1]);
+        const ssh_row = restoreWorkspaceRow(self, "restore-box", &row_buffers[2]);
+        restoreCheck(out, &failures, restoreWorkspaceRows(self) == (if (ssh.supported) @as(usize, 3) else 2) and default_row != null and b_row != null and
+            (ssh_row != null or !ssh.supported), "the sidebar lists the restored default, ws-b and restore-box workspaces", .{});
+        restoreCheck(out, &failures, if (default_row) |id| if (self.ui_tree.byId(.{ .value = id })) |row| row.state.selected else false else false, "the first workspace is selected again", .{});
+        var status_buffer: [path_capacity * 2]u8 = undefined;
+        const moved = try std.fmt.bufPrint(&status_buffer, "restore: {s} is gone; started in {s}", .{ dir_gone, process_cwd });
+        restoreCheck(out, &failures, std.mem.eql(u8, restoreStatus(self), moved), "the status line names the missing directory and the fallback ({s})", .{restoreStatus(self)});
+        var tab_count: usize = 0;
+        var build_selected = false;
+        const key = self.workspace_registry.activeKey().?;
+        var tab_prefix_buffer: [workspace_semantic_capacity]u8 = undefined;
+        const tab_prefix = try std.fmt.bufPrint(&tab_prefix_buffer, "workspace.{d}.tab.", .{@intFromEnum(key)});
+        for (self.ui_tree.elements()) |element| {
+            if (!std.mem.startsWith(u8, element.id.value, tab_prefix)) continue;
+            _ = std.fmt.parseUnsigned(u32, element.id.value[tab_prefix.len..], 10) catch continue;
+            tab_count += 1;
+            if (std.mem.eql(u8, std.mem.trimStart(u8, element.label, " *!"), "build") and element.state.selected) build_selected = true;
+        }
+        restoreCheck(out, &failures, tab_count == 2 and build_selected, "both tabs came back with the renamed build tab selected ({d})", .{tab_count});
+        var panes_buffer: [8]RestorePane = undefined;
+        const zoomed = restorePanes(self, &panes_buffer);
+        restoreCheck(out, &failures, zoomed.len == 1 and zoomed[0].focused, "the tab is still zoomed on its focused pane", .{});
+        _ = try postNamedKey(self, io, out, .enter, if (self.binding_profile == .macos) .{ .super = true, .shift = true } else .{ .ctrl = true, .shift = true });
+        try self.drawFrame();
+        const restored_panes = restorePanes(self, &panes_buffer);
+        restoreCheck(out, &failures, samePanes(saved_panes, restored_panes), "unzoomed, the three panes have the saved bounds, divider ratios and focus", .{});
+        restoreCheck(out, &failures, std.mem.eql(u8, self.activeThemeName(), theme_name), "the {s} theme is drawn again", .{theme_name});
+
+        // Every shell started where it was: asked through real input.
+        var expected: [3][]const u8 = undefined;
+        var left_x: i32 = std.math.maxInt(i32);
+        for (restored_panes) |pane| left_x = @min(left_x, pane.bounds.x);
+        for (restored_panes, 0..) |pane, index| {
+            if (index >= expected.len) break;
+            expected[index] = if (pane.bounds.x == left_x) dir_a else if (pane.focused) dir_sub else process_cwd;
+        }
+        var cwd_ok = restored_panes.len == 3;
+        for (restored_panes[0..@min(restored_panes.len, 3)], 0..) |pane, index| {
+            const id = restorePaneId(self, pane.bounds) orelse {
+                cwd_ok = false;
+                continue;
+            };
+            var id_copy: [pane_semantic_capacity]u8 = undefined;
+            @memcpy(id_copy[0..id.len], id);
+            if (!try clickTabsElement(self, io, out, id_copy[0..id.len])) cwd_ok = false;
+            if (!try restorePwd(self, io, out, expected[index])) cwd_ok = false;
+        }
+        restoreCheck(out, &failures, cwd_ok, "each pane's shell answers pwd with its saved directory (or the fallback)", .{});
+        try self.drawFrame();
+        var shot_buffer: [path_capacity]u8 = undefined;
+        var id_buffer: [path_capacity]u8 = undefined;
+        const shot = try std.fmt.bufPrint(&shot_buffer, "{s}{c}restore-test-{s}.png", .{ fallback_log_dir, std.fs.path.sep, try generateRunId(io, &id_buffer) });
+        try writePngOffThread(gpa, io, shot, try self.capture(), self.size);
+        out.print("restore-test: screenshot {s}\n", .{shot}) catch {};
+
+        _ = try postKey(self, io, out, '2', if (self.binding_profile == .macos) .{ .super = true } else .{ .alt = true });
+        restoreCheck(out, &failures, try restorePwd(self, io, out, dir_sub), "the second tab's shell is in ws-a/sub", .{});
+        if (b_row) |id| {
+            _ = try clickTabsElement(self, io, out, id);
+            try self.drawFrame();
+            // The row click focused the sidebar; a click on the pane gives
+            // the keyboard to its shell.
+            var b_panes_buffer: [8]RestorePane = undefined;
+            const b_panes = restorePanes(self, &b_panes_buffer);
+            if (b_panes.len == 1) if (restorePaneId(self, b_panes[0].bounds)) |pane_id| {
+                var id_copy: [pane_semantic_capacity]u8 = undefined;
+                @memcpy(id_copy[0..pane_id.len], pane_id);
+                _ = try clickTabsElement(self, io, out, id_copy[0..pane_id.len]);
+            };
+            restoreCheck(out, &failures, b_panes.len == 1 and try restorePwd(self, io, out, dir_b), "ws-b's shell is in ws-b", .{});
+        }
+        _ = try paletteChord(self, io, out);
+        _ = try postPaletteText(self, io, out, "Theme: choose");
+        _ = try postNamedKey(self, io, out, .enter, .{});
+        var first_choice: []const u8 = "";
+        for (self.ui_tree.elements()) |element| {
+            if (!std.mem.startsWith(u8, element.id.value, "palette.choice.") or !std.mem.endsWith(u8, element.id.value, ".0")) continue;
+            first_choice = element.label;
+        }
+        restoreCheck(out, &failures, theme.sameName(first_choice, theme_name), "the theme picker lists the restored theme first ({s})", .{first_choice});
+        _ = try postNamedKey(self, io, out, .escape, .{});
+
+        if (ssh.supported) if (ssh_row) |id| {
+            _ = try clickTabsElement(self, io, out, id);
+            try self.drawFrame();
+            const ssh_key = self.workspace_registry.activeKey().?;
+            var ids: [3][workspace_semantic_capacity]u8 = undefined;
+            const header = try connectionSemanticId(&ids[0], ssh_key, "");
+            const reconnect = try connectionSemanticId(&ids[1], ssh_key, "reconnect");
+            const disconnected = try std.fmt.bufPrint(&ids[2], "workspace.{d}.ssh.disconnected", .{@intFromEnum(ssh_key)});
+            const header_label = if (self.ui_tree.byId(.{ .value = header })) |element| element.label else "";
+            restoreCheck(out, &failures, std.mem.eql(u8, header_label, "ssh restore-box ─ saved session; press Enter or click reconnect to connect"), "the SSH workspace shows its saved-session view ({s})", .{header_label});
+            restoreCheck(out, &failures, self.ui_tree.byId(.{ .value = reconnect }) != null and self.ui_tree.byId(.{ .value = disconnected }) != null and
+                self.activePresentation().remote.?.context.state() == .disconnected, "with a clickable reconnect control and no connection attempted", .{});
+            var ssh_shot_buffer: [path_capacity]u8 = undefined;
+            const ssh_shot = try std.fmt.bufPrint(&ssh_shot_buffer, "{s}{c}restore-test-ssh-{s}.png", .{ fallback_log_dir, std.fs.path.sep, try generateRunId(io, &id_buffer) });
+            try writePngOffThread(gpa, io, ssh_shot, try self.capture(), self.size);
+            out.print("restore-test: screenshot {s}\n", .{ssh_shot}) catch {};
+        };
+        const logical = self.window.logicalSize();
+        restoreCheck(out, &failures, logical != null and logical.?.width == 640 and logical.?.height == 360, "the window kept its saved 640x360 size", .{});
+    }
+
+    // ---- A corrupt file and a newer one each start clean. ----
+    const cases = [_]struct { name: []const u8, bytes: []const u8 }{
+        .{ .name = "a corrupt file", .bytes = "{\"version\": 1, \"workspaces\": [" },
+        .{ .name = "a newer version", .bytes = "{\"version\": 2, \"workspaces\": []}\n" },
+    };
+    for (cases) |case| {
+        restoreDrainEvents(window);
+        try Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = case.bytes });
+        // Each case's quarantined copy is told apart by its contents.
+        var stale_buffer: [path_capacity]u8 = undefined;
+        if (restoreQuarantined(io, state_dir, &stale_buffer)) |stale| Dir.cwd().deleteFile(io, stale) catch {};
+        const self = try App.init(io, env, gpa, window, options);
+        defer self.destroy();
+        try self.drawFrame();
+        restoreCheck(out, &failures, restoreWorkspaceRows(self) == 1 and restoreWorkspaceRow(self, "default", &stale_buffer) != null, "{s}: a clean start with the one default workspace", .{case.name});
+        restoreCheck(out, &failures, std.mem.eql(u8, restoreStatus(self), restore_unreadable_status), "{s}: the status line says so ({s})", .{ case.name, restoreStatus(self) });
+        var quarantine_buffer: [path_capacity]u8 = undefined;
+        var content_buffer: [256]u8 = undefined;
+        const quarantined = restoreQuarantined(io, state_dir, &quarantine_buffer);
+        const content: []const u8 = if (quarantined) |path| Dir.cwd().readFile(io, path, &content_buffer) catch "" else "";
+        restoreCheck(out, &failures, quarantined != null and std.mem.eql(u8, content, case.bytes), "{s}: the file was moved aside as state.json.corrupt-<time>", .{case.name});
+    }
+
+    out.print("restore-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
+// ---------------------------------------------------------------------------
 // --ssh-test (TASK-43 part two, TASK-44, TASK-45)
 // ---------------------------------------------------------------------------
 
@@ -28578,7 +30064,8 @@ const usage =
     \\          [--ui-test] [--ime-test] [--sidebar-test] [--tabs-test]
     \\          [--panes-test] [--scratchpad-test] [--palette-test]
     \\          [--workspaces-test] [--links-test] [--search-test] [--git-test]
-    \\          [--ssh-test] [--control-test]
+    \\          [--ssh-test] [--control-test] [--restore-test]
+    \\          [--no-restore]
     \\          [--test-driver=<endpoint>]
     \\          [--test-artifact-dir=<dir>]
     \\          [--driver-test]
@@ -28597,6 +30084,10 @@ const usage =
     \\
     \\  --control / --no-control           run the control and instance endpoints,
     \\                                    or not (default: control.enabled)
+    \\  --no-restore                       start clean instead of restoring the saved
+    \\                                    workspaces; this run still saves its own
+    \\  --restore-test                     save a layout, relaunch, prove it came
+    \\                                    back, prove the clean starts, then exit
     \\  --log-level=<err|warn|info|debug>  minimum level written (default: debug
     \\                                    in a debug build, info in a release one)
     \\  --log-file=<path>                  log to exactly this path
@@ -29216,7 +30707,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
                 options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
-                options.run.git_test or options.run.agent_test or options.run.ssh_test or options.run.driver_test) return err;
+                options.run.git_test or options.run.agent_test or options.run.ssh_test or options.run.driver_test or
+                options.run.restore_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
                 "no usable display ({s}): there is no window to draw in. Set DISPLAY, or run under xvfb-run",
@@ -29283,6 +30775,14 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
     // state rather than the grid.
     if (options.run.grid_test) {
         const status = try gridTest(init.io, init.gpa, env, options.run.font_family, out);
+        out_file.interface.flush() catch {};
+        return status;
+    }
+
+    // The restore check runs several apps, one after another, on this window:
+    // a relaunch is what it proves.
+    if (options.run.restore_test) {
+        const status = try restoreTest(init, env, &window, options, out);
         out_file.interface.flush() catch {};
         return status;
     }

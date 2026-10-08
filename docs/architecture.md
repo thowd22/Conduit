@@ -500,6 +500,40 @@ nothing else is a legal dependency.
   it before any log file or window exists (`runCommand`: the terminal's own endpoint when its
   control variables are set, else the instance endpoint and token) and, when nothing answers,
   starts the app and queues it as the startup request.
+- **Workspace persistence (TASK-65 part two).** `App.persistence` (`Persistence`) decides at
+  startup whether the run persists: a plain run with `restore.enabled` on uses `state.statePath`;
+  `--restore-test` uses its private file; every other check, `--command` run and driven run
+  neither saves nor restores. On launch, unless `--no-restore`, `restoreAtLaunch` reads the file
+  with `state.restoreFromDisk` (a corrupt, unreadable or newer file is quarantined and leaves the
+  `workspace.status` line `previous state was unreadable; starting clean`), plans it and
+  `executeRestore` replays it before anything spawns: the default workspace `init` built is
+  renamed out of the way, each saved workspace is built empty (`createEmptyPresentation`, or
+  `createRemotePresentationWith(..., restored = true)`, which creates the SSH context with its
+  target and `-o` options but starts no master), each tab step goes through
+  `Workspace.applyRestoreStep`, every created session gets a renderer and a `RestoreStart` in its
+  presentation's `restore_queue` with its saved directory (checked through the context; a missing
+  Local directory falls back to the workspace's with a status line), the saved selection is
+  activated and the default workspace closed. `driveRestoreQueues` (from `poll`) starts one shell
+  per workspace whenever its spawn slot is free, and an SSH workspace's only once its connection is
+  ready; until then its connection view reads `ssh <host> ─ saved session; press Enter or click
+  reconnect to connect` (`RemotePresentation.saved`), Enter over it or `reconnect` dispatches
+  `remote.reconnect`, and the first `connected` starts the queue and the scratchpad. The saved
+  theme applies while the settings file names none (`resolveTheme` keeps it across reloads), and
+  the saved size while no `--width`/`--height` was given (position and maximized state are not
+  applied: `platform` has no display or placement query). Saving: `pollPersistence` feeds
+  `layoutFingerprint` (registry, theme name, window size, scratchpad presentations) to a
+  `SaveDebounce`; two seconds after the last change it captures (`WorkspaceRegistry.snapshot`
+  completed by `completeSnapshot`: theme, window, save time, scratchpad percent, the process
+  directory for a workspace without one, `~` for an SSH workspace's home, closing workspaces
+  dropped), encodes on the owner thread and writes through `state.save` on a `SaveJob` worker with
+  the owned bytes; `waitBudget` wakes the loop when a save falls due. `deinit` joins any save in
+  flight and saves once more before tearing anything down.
+- **Startup (TASK-67 follow-ups).** A `Load` job is given the window and posts a driver wake once
+  its result is published, so a finished spawn or face is collected at once rather than at the next
+  16 ms idle tick. The glyph atlas is 2048² from display scale 1.5 (`atlasSizeFor`; the request a
+  face is built from and every `Grid.attachAtlas` use the same `App.atlas`, replaced when a face
+  built at another scale lands). At debug level the log records the startup phases (`startup:
+  window|fonts|theme|first frame|first child after <ms>`) from the start of `main`.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
@@ -1057,8 +1091,13 @@ nothing else is a legal dependency.
   zoom and the active tab and workspace. It reads no terminal contents. The theme, window
   geometry, save time and scratchpad size are the app's to fill. `Workspace.setPaneSplitRatio`
   lets restore set the divider above a freshly split pane to a saved ratio (weights over 10 000),
-  clamped by leaf minimums at layout like every weight. The module is imported as `persistence`
-  because `state` is also a PTY vtable callback name in this file.
+  clamped by leaf minimums at layout like every weight. `Workspace.applyRestoreStep` replays one
+  tab-level `state.Step` (`create_tab`, `split_pane` with its ratio, `focus_pane`, `zoom_pane`,
+  `select_tab`) through those same operations with a `RestoreCursor` mapping the plan's tab and
+  leaf numbering to live ids; a split that no longer fits the bounds is skipped together with
+  every step naming its leaves. `WorkspaceRegistry.layoutFingerprint` hashes what a snapshot holds
+  (including tracked cwds, never contents) so the app saves only after a change. The module is
+  imported as `persistence` because `state` is also a PTY vtable callback name in this file.
 - **May depend on** `pty`, `session`, `state` and `term` for today's owner, tab index and pane trees. Composed
   workspace views live at the `app` boundary and may also use `config`, `input`, `render`, `theme`
   and `ui`; `agent` and `backlog` depend on `workspace`, never the reverse.
@@ -1201,8 +1240,9 @@ nothing else is a legal dependency.
   final `select_workspace`. A workspace saved without tabs gets one default tab.
 - **Threads.** Everything runs on the caller's thread. `app` captures and encodes on the owner
   thread; `save` may run on a worker with an owned copy of the bytes, one save per path at a time.
-- **Lands** M8 — TASK-65 part one (model, codec, storage, plan and the `workspace` hooks); the app
-  wiring (save on change and exit, restore on launch, the reconnect prompt) is part two.
+- **Lands** M8 — TASK-65 part one (model, codec, storage, plan and the `workspace` hooks) and part
+  two (the app wiring described under `app`: save on change and exit, restore on launch, the
+  saved-session prompt for SSH workspaces, `--restore-test`).
 
 ### `theme`
 

@@ -119,11 +119,14 @@ keybind = ctrl+alt+p=palette.open
 | `remote.profile` | `<name> = <[user@]host[:port]>`, repeats | none | A saved SSH connection listed by **Remote: connect**; see [Remote connections](#remote-connections) |
 | `remote.recent` | comma-separated `[user@]host[:port]`, at most 10 | `""` | The destinations connected to most recently, newest first; written by Conduit |
 | `control.enabled` | `true` or `false` | `true` in development (Debug) builds, `false` in release builds | Read at startup: whether this run starts the local control endpoint harnesses use and the single-instance endpoint `conduit` commands reuse ([control-api.md](control-api.md)). No settings-view row |
+| `restore.enabled` | `true` or `false` | `true` | Read at startup: whether Conduit saves its workspaces, tabs, pane layouts, working directories, theme and window size to the state file and restores them on the next launch ([user-guide.md](user-guide.md#sessions-are-restored)). `false` neither saves nor restores. No settings-view row |
+| `accessibility.enabled` | `true` or `false` | `true` | Read at startup: whether the interface is exposed to screen readers and other assistive technology (AT-SPI on Linux; [accessibility.md](accessibility.md)). No settings-view row |
 | `keybind` | see below | the shipped bindings | Applies |
 
 Command-line flags are a session layer above the file: `--font=<family>` wins over `font.family`
 and `--right-click=<menu|paste>` wins over `mouse.right_click`, for that run only. `--control` and
-`--no-control` win over `control.enabled` the same way.
+`--no-control` win over `control.enabled` the same way. `--no-restore` starts one run clean
+without changing `restore.enabled`; that run still saves.
 
 ## Fonts
 

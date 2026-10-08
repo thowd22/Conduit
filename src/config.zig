@@ -221,6 +221,8 @@ pub const Key = enum {
     remote_profile,
     remote_recent,
     control_enabled,
+    restore_enabled,
+    accessibility_enabled,
     keybind,
 
     /// The key's spelling in the file, which is also its `Name`.
@@ -252,6 +254,8 @@ pub const Key = enum {
             .remote_profile => "remote.profile",
             .remote_recent => "remote.recent",
             .control_enabled => "control.enabled",
+            .restore_enabled => "restore.enabled",
+            .accessibility_enabled => "accessibility.enabled",
             .keybind => "keybind",
         };
     }
@@ -306,6 +310,15 @@ pub const Settings = struct {
     /// file is silent, which means on in Debug builds and off in release
     /// builds (`controlEnabled`). Read at startup only.
     control_enabled: ?bool = null,
+    /// `restore.enabled` (TASK-65): whether a plain run saves its workspaces,
+    /// tabs, pane layout, theme and window size to the state file and restores
+    /// them on the next launch. Read at startup only. False neither saves nor
+    /// restores; `--no-restore` skips one restore and still saves.
+    restore_enabled: bool = true,
+    /// `accessibility.enabled` (TASK-68): whether the accessibility bridge
+    /// exposes the semantic tree to the platform's assistive technologies
+    /// (AT-SPI2 on Linux). Read at startup only.
+    accessibility_enabled: bool = true,
 };
 
 /// The built-in value of `control.enabled`: on in development builds, off in
@@ -619,6 +632,8 @@ pub const Config = struct {
                 to.remote_recent = list;
             },
             .control_enabled => to.control_enabled = from.control_enabled,
+            .restore_enabled => to.restore_enabled = from.restore_enabled,
+            .accessibility_enabled => to.accessibility_enabled = from.accessibility_enabled,
             // Keybind lines are resolved against the previous binding table by `app`, which is
             // the only place that knows what a rejected chord used to do.
             .keybind => {},
@@ -837,6 +852,8 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
             settings.remote_recent = list;
         },
         .control_enabled => settings.control_enabled = try parseBool(value),
+        .restore_enabled => settings.restore_enabled = try parseBool(value),
+        .accessibility_enabled => settings.accessibility_enabled = try parseBool(value),
         .keybind => {
             const split = try splitKeybind(value);
             try result.keybinds.append(allocator, .{
@@ -1124,6 +1141,13 @@ pub const defaults_document =
     "# conduit command reuses. Read at startup. Off in release builds unless turned on.\n" ++
     control_default_line ++
     "\n" ++
+    "# Save workspaces, tabs, pane layouts, working directories, the theme and the window size,\n" ++
+    "# and restore them on the next launch. Terminal contents are never saved. Read at startup.\n" ++
+    "# restore.enabled = true\n" ++
+    "\n" ++
+    "# Expose the interface to screen readers and other assistive technologies. Read at startup.\n" ++
+    "# accessibility.enabled = true\n" ++
+    "\n" ++
     "# Keybindings: keybind = <chord>=<action>[:<argument>], or <chord>=unbind.\n" ++
     "# Modifiers are ctrl, shift, alt and super (cmd). These lines repeat some defaults.\n" ++
     keybind_examples;
@@ -1206,6 +1230,8 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
             .font_ligatures,
             .font_nerd_symbols,
             .control_enabled,
+            .restore_enabled,
+            .accessibility_enabled,
             .notifications_enabled,
             .notifications_os,
             .notifications_permission,
@@ -2550,6 +2576,29 @@ test "saving a profile replaces its own line, keeps the rest and never writes a 
     defer parsed.deinit();
     try testing.expect(!parsed.hasDiagnostics());
     try testing.expectEqual(@as(usize, 2), parsed.settings.remote_profiles.len);
+}
+
+test "restore.enabled and accessibility.enabled are booleans that default on" {
+    var silent = try parse(testing.allocator, "", null);
+    defer silent.deinit();
+    try testing.expect(silent.settings.restore_enabled);
+    try testing.expect(silent.settings.accessibility_enabled);
+
+    var off = try parse(testing.allocator, "restore.enabled = false\naccessibility.enabled = false\n", null);
+    defer off.deinit();
+    try testing.expect(!off.hasDiagnostics());
+    try testing.expect(!off.settings.restore_enabled);
+    try testing.expect(!off.settings.accessibility_enabled);
+
+    var bad = try parse(testing.allocator, "restore.enabled = sometimes\naccessibility.enabled = 2\n", null);
+    defer bad.deinit();
+    try testing.expect(bad.hasDiagnostics());
+    try testing.expect(bad.settings.restore_enabled);
+    try testing.expect(bad.settings.accessibility_enabled);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.restore_enabled, "false"));
+    try testing.expect(checkValue(.accessibility_enabled, "yes") != null);
+    try testing.expectEqualStrings("restore.enabled", Key.restore_enabled.name());
+    try testing.expectEqual(Key.accessibility_enabled, Key.fromName("accessibility.enabled").?);
 }
 
 test "control.enabled is a boolean the session layer overrides and the build defaults" {
