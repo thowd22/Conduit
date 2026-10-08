@@ -247,7 +247,20 @@ pub const Server = struct {
         self.stopping.store(true, .release);
         self.queue.stop();
         shutdownStream(self.io, .{ .socket = self.listener.server.socket });
+        // Darwin's shutdown(2) refuses a listening socket and leaves a blocked
+        // accept(2) asleep, where Linux's wakes it, so the join below would
+        // wait forever (TASK-5). One connection to the server's own endpoint
+        // wakes it there; the listener sees `stopping` and refuses it. The
+        // connection stays open until the join so that refusal never writes
+        // to a closed peer.
+        var waker: ?std.Io.net.Stream = null;
+        if (comptime builtin.os.tag != .linux) {
+            if (std.Io.net.UnixAddress.init(self.endpoint)) |address| {
+                waker = address.connect(self.io) catch null;
+            } else |_| {}
+        }
         if (self.listener_thread) |thread| thread.join();
+        if (waker) |stream| stream.close(self.io);
 
         self.mutex.lockUncancelable(self.io);
         for (self.connections) |*connection| {
