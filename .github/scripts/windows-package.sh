@@ -45,7 +45,9 @@ for file in \
   conduit.exe conduit-test.exe \
   share/conduit/fonts/JetBrainsMono-Regular.ttf share/conduit/fonts/SymbolsNerdFontMono-Regular.ttf \
   share/conduit/shell-integration/bash/conduit.bash share/conduit/shell-integration/zsh/conduit.zsh \
-  share/conduit/shell-integration/zsh/.zshenv share/conduit/shell-integration/fish/vendor_conf.d/conduit.fish \
+  share/conduit/shell-integration/zsh/.zshenv share/conduit/shell-integration/zsh/.zprofile \
+  share/conduit/shell-integration/zsh/.zshrc share/conduit/shell-integration/zsh/.zlogin \
+  share/conduit/shell-integration/fish/vendor_conf.d/conduit.fish \
   share/conduit/themes/README.md \
   share/conduit/licenses/LICENSE share/conduit/licenses/Ghostty-LICENSE share/conduit/licenses/SDL-LICENSE.txt \
   share/conduit/licenses/JetBrainsMono-OFL-1.1.txt share/conduit/licenses/NerdFonts-LICENSE.txt \

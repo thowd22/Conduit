@@ -19,7 +19,7 @@ is used here.
 | Shell | Script | Tested |
 |---|---|---|
 | bash | `bash/conduit.bash` | yes — real bash 5.3 over a real PTY |
-| zsh | `zsh/.zshenv` + `zsh/conduit.zsh` | yes — real zsh 5.9 over a real PTY |
+| zsh | `zsh/.zshenv`, `.zprofile`, `.zshrc`, `.zlogin` + `zsh/conduit.zsh` | yes — real zsh 5.9 over a real PTY |
 | fish | `fish/vendor_conf.d/conduit.fish` | **no, by decision** — the project proves bash and zsh only |
 | PowerShell | `powershell/conduit.ps1` | yes — PowerShell 7 over Windows ConPTY on the hosted Windows runner (TASK-46, CI run 37720295115), and pwsh over a Linux PTY |
 
@@ -40,9 +40,13 @@ any of your files:
   `~/.bashrc` itself, exactly as a normal interactive bash would have. Your `PROMPT_COMMAND` keeps
   running and sees the real exit status.
 - **zsh** — started with `ZDOTDIR` pointing at the `zsh/` directory and your own `ZDOTDIR` (or
-  its absence) saved in `CONDUIT_ZSH_ZDOTDIR`. The `.zshenv` there restores your `ZDOTDIR` before
-  anything else runs and sources your own `.zshenv`, so `.zshrc`, `.zprofile` and `.zlogin` are
-  read from where they always were.
+  its absence) saved in `CONDUIT_ZSH_ZDOTDIR`. `ZDOTDIR` stays there for the whole startup, so
+  zsh reads that directory's `.zshenv`, `.zprofile`, `.zshrc` and `.zlogin`; each one sources
+  your file of the same name with your own `ZDOTDIR` in place, and the `.zshrc` wrapper loads
+  `conduit.zsh` only after your `.zshrc` has run, so an rc file that assigns `precmd_functions`
+  outright cannot remove the hooks. Your `ZDOTDIR` is restored for good at the end of startup
+  (`.zshrc` for a non-login shell, `.zlogin` for a login shell), so nested shells and your
+  `.zlogout` see your own value.
 - **fish** — started with the integration directory prepended to `XDG_DATA_DIRS`, so fish loads
   `vendor_conf.d/conduit.fish` at startup. The script removes that directory again.
 - **PowerShell** (`pwsh` or `powershell`, with or without `.exe`, on any platform) — started with

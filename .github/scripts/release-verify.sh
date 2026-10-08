@@ -64,6 +64,9 @@ payload_files=(
   share/conduit/shell-integration/powershell/conduit.ps1
   share/conduit/shell-integration/zsh/.zshenv
   share/conduit/shell-integration/zsh/conduit.zsh
+  share/conduit/shell-integration/zsh/.zprofile
+  share/conduit/shell-integration/zsh/.zshrc
+  share/conduit/shell-integration/zsh/.zlogin
   share/conduit/shell-integration/fish/vendor_conf.d/conduit.fish
   share/licenses/conduit/LICENSE
   share/licenses/conduit/Ghostty-LICENSE

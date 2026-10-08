@@ -1,28 +1,47 @@
-# Conduit shell integration for zsh: the ZDOTDIR entry point.
+# Conduit zsh integration: the first file zsh reads, because Conduit started
+# the shell with ZDOTDIR pointing at this directory and the user's own value
+# (or its absence, as an empty string) in CONDUIT_ZSH_ZDOTDIR.
 #
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 the Conduit authors. Written for Conduit; not derived from
-# any other terminal's integration script.
-#
-# Conduit points ZDOTDIR at this directory and saves the user's own value (or
-# its absence) in CONDUIT_ZSH_ZDOTDIR. This file puts ZDOTDIR back before
-# anything else runs, so the user's .zshenv, .zprofile, .zshrc and .zlogin are
-# read from exactly where zsh would have looked for them, then loads the
-# integration for interactive shells.
+# ZDOTDIR stays here for the rest of startup so that zsh also reads this
+# directory's .zprofile, .zshrc and .zlogin; each of them sources the user's
+# file of the same name with the user's ZDOTDIR in place, and the .zshrc
+# wrapper loads conduit.zsh only after the user's .zshrc has run, so an rc
+# file that assigns precmd_functions outright cannot remove the hooks. The
+# user's ZDOTDIR is restored for good at the end of startup (.zshrc for a
+# non-login shell, .zlogin for a login shell) and at once for a
+# non-interactive shell, which reads no rc file.
+typeset -g __conduit_wrapper_dir=${${(%):-%x}:A:h}
+typeset -g __conduit_zdotdir=${CONDUIT_ZSH_ZDOTDIR-}
+builtin unset CONDUIT_ZSH_ZDOTDIR
 
-if [[ -n ${CONDUIT_ZSH_ZDOTDIR+set} ]]; then
-    if [[ -n $CONDUIT_ZSH_ZDOTDIR ]]; then
-        builtin export ZDOTDIR=$CONDUIT_ZSH_ZDOTDIR
+# Run the user's file of this name with their ZDOTDIR in place.
+__conduit_source_user() {
+    builtin local file=$1
+    if [[ -n $__conduit_zdotdir ]]; then
+        builtin export ZDOTDIR=$__conduit_zdotdir
     else
         builtin unset ZDOTDIR
     fi
-    builtin unset CONDUIT_ZSH_ZDOTDIR
-fi
-
-# The user's own .zshenv, from wherever ZDOTDIR now says (HOME by default).
-() {
-    builtin local user_zshenv=${ZDOTDIR-$HOME}/.zshenv
-    [[ -r $user_zshenv ]] && builtin source "$user_zshenv"
+    builtin local user_file=${ZDOTDIR-$HOME}/$file
+    [[ -r $user_file ]] && builtin source "$user_file"
+    return 0
 }
 
-[[ -o interactive ]] && builtin source "${${(%):-%x}:A:h}/conduit.zsh"
+# Put the user's ZDOTDIR back for good.
+__conduit_restore_zdotdir() {
+    if [[ -n $__conduit_zdotdir ]]; then
+        builtin export ZDOTDIR=$__conduit_zdotdir
+    else
+        builtin unset ZDOTDIR
+    fi
+    builtin unset __conduit_zdotdir __conduit_wrapper_dir
+    builtin unfunction __conduit_source_user __conduit_restore_zdotdir 2>/dev/null
+}
+
+__conduit_source_user .zshenv
+if [[ -o interactive ]]; then
+    # Keep reading startup files from here.
+    builtin export ZDOTDIR=$__conduit_wrapper_dir
+else
+    __conduit_restore_zdotdir
+fi

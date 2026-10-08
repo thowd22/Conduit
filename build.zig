@@ -290,6 +290,9 @@ fn installLinuxPayload(
         .{ .source = b.path("assets/shell-integration/bash/conduit.bash"), .destination = "share/conduit/shell-integration/bash/conduit.bash" },
         .{ .source = b.path("assets/shell-integration/zsh/.zshenv"), .destination = "share/conduit/shell-integration/zsh/.zshenv" },
         .{ .source = b.path("assets/shell-integration/zsh/conduit.zsh"), .destination = "share/conduit/shell-integration/zsh/conduit.zsh" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zprofile"), .destination = "share/conduit/shell-integration/zsh/.zprofile" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zshrc"), .destination = "share/conduit/shell-integration/zsh/.zshrc" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zlogin"), .destination = "share/conduit/shell-integration/zsh/.zlogin" },
         .{ .source = b.path("assets/shell-integration/fish/vendor_conf.d/conduit.fish"), .destination = "share/conduit/shell-integration/fish/vendor_conf.d/conduit.fish" },
         .{ .source = b.path("assets/shell-integration/powershell/conduit.ps1"), .destination = "share/conduit/shell-integration/powershell/conduit.ps1" },
         .{ .source = b.path("assets/fonts/LICENSE-JetBrainsMono-OFL-1.1.txt"), .destination = "share/licenses/conduit/JetBrainsMono-OFL-1.1.txt" },
@@ -376,6 +379,9 @@ fn addMacosBundle(
         .{ .source = b.path("assets/shell-integration/bash/conduit.bash"), .destination = "shell-integration/bash/conduit.bash" },
         .{ .source = b.path("assets/shell-integration/zsh/.zshenv"), .destination = "shell-integration/zsh/.zshenv" },
         .{ .source = b.path("assets/shell-integration/zsh/conduit.zsh"), .destination = "shell-integration/zsh/conduit.zsh" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zprofile"), .destination = "shell-integration/zsh/.zprofile" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zshrc"), .destination = "shell-integration/zsh/.zshrc" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zlogin"), .destination = "shell-integration/zsh/.zlogin" },
         .{ .source = b.path("assets/shell-integration/fish/vendor_conf.d/conduit.fish"), .destination = "shell-integration/fish/vendor_conf.d/conduit.fish" },
         .{ .source = b.path("LICENSE"), .destination = "licenses/LICENSE" },
         .{ .source = b.path("assets/fonts/LICENSE-JetBrainsMono-OFL-1.1.txt"), .destination = "licenses/JetBrainsMono-OFL-1.1.txt" },
@@ -460,6 +466,9 @@ fn addWindowsPortable(
         .{ .source = b.path("assets/shell-integration/bash/conduit.bash"), .destination = "shell-integration/bash/conduit.bash" },
         .{ .source = b.path("assets/shell-integration/zsh/.zshenv"), .destination = "shell-integration/zsh/.zshenv" },
         .{ .source = b.path("assets/shell-integration/zsh/conduit.zsh"), .destination = "shell-integration/zsh/conduit.zsh" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zprofile"), .destination = "shell-integration/zsh/.zprofile" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zshrc"), .destination = "shell-integration/zsh/.zshrc" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zlogin"), .destination = "shell-integration/zsh/.zlogin" },
         .{ .source = b.path("assets/shell-integration/fish/vendor_conf.d/conduit.fish"), .destination = "shell-integration/fish/vendor_conf.d/conduit.fish" },
         .{ .source = b.path("assets/themes/README.md"), .destination = "themes/README.md" },
         .{ .source = b.path("LICENSE"), .destination = "licenses/LICENSE" },
@@ -617,6 +626,9 @@ fn wireThirdPartySeams(
                 \\pub const bash: []const u8 = @embedFile("conduit.bash");
                 \\pub const zsh_env: []const u8 = @embedFile("zshenv");
                 \\pub const zsh: []const u8 = @embedFile("conduit.zsh");
+                \\pub const zsh_profile: []const u8 = @embedFile("zprofile");
+                \\pub const zsh_rc: []const u8 = @embedFile("zshrc");
+                \\pub const zsh_login: []const u8 = @embedFile("zlogin");
                 \\pub const fish: []const u8 = @embedFile("conduit.fish");
                 \\pub const powershell: []const u8 = @embedFile("conduit.ps1");
             ),
@@ -750,6 +762,9 @@ const shell_integration_assets = [_]struct { source: []const u8, name: []const u
     .{ .source = "assets/shell-integration/bash/conduit.bash", .name = "conduit.bash" },
     .{ .source = "assets/shell-integration/zsh/.zshenv", .name = "zshenv" },
     .{ .source = "assets/shell-integration/zsh/conduit.zsh", .name = "conduit.zsh" },
+    .{ .source = "assets/shell-integration/zsh/.zprofile", .name = "zprofile" },
+    .{ .source = "assets/shell-integration/zsh/.zshrc", .name = "zshrc" },
+    .{ .source = "assets/shell-integration/zsh/.zlogin", .name = "zlogin" },
     .{ .source = "assets/shell-integration/fish/vendor_conf.d/conduit.fish", .name = "conduit.fish" },
     .{ .source = "assets/shell-integration/powershell/conduit.ps1", .name = "conduit.ps1" },
 };

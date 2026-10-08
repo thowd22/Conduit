@@ -54,7 +54,8 @@ esac
 for resource in \
   fonts/JetBrainsMono-Regular.ttf fonts/SymbolsNerdFontMono-Regular.ttf \
   shell-integration/bash/conduit.bash shell-integration/zsh/conduit.zsh \
-  shell-integration/zsh/.zshenv shell-integration/fish/vendor_conf.d/conduit.fish \
+  shell-integration/zsh/.zshenv shell-integration/zsh/.zprofile shell-integration/zsh/.zshrc \
+  shell-integration/zsh/.zlogin shell-integration/fish/vendor_conf.d/conduit.fish \
   licenses/LICENSE licenses/Ghostty-LICENSE licenses/SDL-LICENSE.txt \
   licenses/JetBrainsMono-OFL-1.1.txt licenses/NerdFonts-LICENSE.txt licenses/FreeType-LICENSE.TXT \
   licenses/HarfBuzz-COPYING.txt licenses/Oniguruma-COPYING.txt licenses/zlib-LICENSE.txt \

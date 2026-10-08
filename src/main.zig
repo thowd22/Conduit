@@ -2202,7 +2202,8 @@ fn shellIntegrationDir(buffer: []u8, env: EnvSource) ![]const u8 {
 }
 
 /// Write the embedded scripts under `root`, in the layout each shell expects:
-/// `bash/conduit.bash`, `zsh/.zshenv` + `zsh/conduit.zsh`,
+/// `bash/conduit.bash`, `zsh/.zshenv` + the `.zprofile`/`.zshrc`/`.zlogin` wrappers +
+/// `zsh/conduit.zsh`,
 /// `fish/vendor_conf.d/conduit.fish` (fish finds that through `XDG_DATA_DIRS`)
 /// and `powershell/conduit.ps1`.
 fn writeShellScripts(io: Io, root: []const u8) !void {
@@ -2211,6 +2212,9 @@ fn writeShellScripts(io: Io, root: []const u8) !void {
         .{ .dir = "bash", .name = "conduit.bash", .data = shell_scripts.bash },
         .{ .dir = "zsh", .name = ".zshenv", .data = shell_scripts.zsh_env },
         .{ .dir = "zsh", .name = "conduit.zsh", .data = shell_scripts.zsh },
+        .{ .dir = "zsh", .name = ".zprofile", .data = shell_scripts.zsh_profile },
+        .{ .dir = "zsh", .name = ".zshrc", .data = shell_scripts.zsh_rc },
+        .{ .dir = "zsh", .name = ".zlogin", .data = shell_scripts.zsh_login },
         .{ .dir = "fish" ++ std.fs.path.sep_str ++ "vendor_conf.d", .name = "conduit.fish", .data = shell_scripts.fish },
         .{ .dir = "powershell", .name = "conduit.ps1", .data = shell_scripts.powershell },
     };
@@ -36966,6 +36970,39 @@ test "a real zsh started by Conduit reports its directory and marks its prompts"
     try std.testing.expectEqual(@as(?i32, 1), run.first_exit);
     // Each prompt the shell marked is a row a jump-to-prompt can reach.
     try std.testing.expect(run.prompt_rows >= 2);
+}
+
+test "a real zsh whose .zshrc overwrites precmd_functions still reports its directory" {
+    // Regression: the hooks used to be installed from `.zshenv`, before the
+    // user's `.zshrc`, so an rc file assigning `precmd_functions=(...)` outright
+    // removed them and the branch row, cwd inheritance and prompt marks all
+    // went quiet. The wrappers now run the user's rc first; it must also see
+    // the user's own ZDOTDIR (absent here), not the integration directory.
+    try requireShell("/usr/bin/zsh");
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [path_capacity]u8 = undefined;
+    const home = try tmpPath(&tmp, "", &home_buffer);
+    var root_buffer: [path_capacity]u8 = undefined;
+    const root = try tmpPath(&tmp, "integration", &root_buffer);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".zshrc", .data =
+        \\my_precmd() { PS1="%~ %# "; }
+        \\precmd_functions=(my_precmd)
+        \\print -r -- "ZDOTDIR=${ZDOTDIR-unset}" > "$HOME/rc-saw"
+        \\
+    });
+
+    var spec = try shellTestSpec(gpa, home, "/usr/bin/zsh", root, false);
+    defer spec.deinit();
+    const run = try runShellInConduit(gpa, spec);
+    defer if (run.cwd) |dir| gpa.free(dir);
+    try std.testing.expectEqualStrings("/tmp", run.cwd orelse return error.NoWorkingDirectory);
+    try std.testing.expect(run.prompt_starts >= 2);
+    try std.testing.expect(run.command_ends >= 2);
+    var saw_buffer: [64]u8 = undefined;
+    const saw = try tmp.dir.readFile(std.testing.io, "rc-saw", &saw_buffer);
+    try std.testing.expectEqualStrings("ZDOTDIR=unset\n", saw);
 }
 
 test "--no-shell-integration starts the shell untouched, and it reports nothing" {
