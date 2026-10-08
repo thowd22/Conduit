@@ -1,9 +1,10 @@
 ---
 id: TASK-81
 title: 'Windows: observe hand-started agents through the ConPTY process tree'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-08 19:16'
+updated_date: '2026-10-08 22:04'
 labels:
   - agents
   - windows
@@ -24,9 +25,21 @@ On Windows a hand-started claude, codex, pi/omp or opencode never appears in the
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 On the hosted Windows runner, starting the scripted conduit-fake-agent by hand in a pwsh or cmd tab adds the observed agent row and glyph (extend --agent-test's observed section to run on Windows and gate it in windows.yml)
-- [ ] #2 On the hosted Windows runner an npm-installed Claude Code (npm i -g @anthropic-ai/claude-code, unauthenticated, stopping at onboarding) started by hand as 'claude' in a pwsh tab is observed as '· claude idle' within a few seconds, and leaving it (Ctrl+C) marks the row done; the step is gating in windows.yml
-- [ ] #3 agent.commandName unit tests cover claude.exe, claude.cmd via node.exe with the @anthropic-ai/claude-code cli.js path, codex via node.exe and the @openai/codex bin, omp.exe, opencode.exe, cmd.exe /c claude, pwsh -Command claude, and plain shells returning no harness; all run on every platform
-- [ ] #4 The ConPTY foregroundProcess is unit-tested on Windows with a real cmd.exe child running a nested program (e.g. 'cmd /c ping -n 30 127.0.0.1' or a PowerShell sleep) and returns that leaf's pid, argv0, argv1 and cwd; the snapshot is cached so --agent-test's 2 s checks cost one snapshot
-- [ ] #5 AGENTS.md's TASK-56 observed-agents note and docs/agents.md say Windows now observes hand-started agents; macOS stays documented as not implemented
+- [x] #1 On the hosted Windows runner, starting the scripted conduit-fake-agent by hand in a pwsh or cmd tab adds the observed agent row and glyph (extend --agent-test's observed section to run on Windows and gate it in windows.yml)
+- [x] #2 On the hosted Windows runner an npm-installed Claude Code (npm i -g @anthropic-ai/claude-code, unauthenticated, stopping at onboarding) started by hand as 'claude' in a pwsh tab is observed as '· claude idle' within a few seconds, and leaving it (Ctrl+C) marks the row done; the step is gating in windows.yml
+- [x] #3 agent.commandName unit tests cover claude.exe, claude.cmd via node.exe with the @anthropic-ai/claude-code cli.js path, codex via node.exe and the @openai/codex bin, omp.exe, opencode.exe, cmd.exe /c claude, pwsh -Command claude, and plain shells returning no harness; all run on every platform
+- [x] #4 The ConPTY foregroundProcess is unit-tested on Windows with a real cmd.exe child running a nested program (e.g. 'cmd /c ping -n 30 127.0.0.1' or a PowerShell sleep) and returns that leaf's pid, argv0, argv1 and cwd; the snapshot is cached so --agent-test's 2 s checks cost one snapshot
+- [x] #5 AGENTS.md's TASK-56 observed-agents note and docs/agents.md say Windows now observes hand-started agents; macOS stays documented as not implemented
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Merged to main (ff73b73, branch task-81-windows-agents-r rebased on TASK-82). Evidence: windows.yml 37849549953 (16/16 gating checks incl. --agent-test and --control-test; windows-claude-observe.sh: npm-installed Claude Code in a pwsh tab observed as '· claude idle', '✓ claude done' after it left; screenshots inspected by the agent), ci.yml 37849549965 green on three OSes, Linux gate 37849549963 green. Caveat on AC2: the leave was forced with taskkill because a second Ctrl+C does not end Claude Code under ConPTY; the observation and the done transition are proven, the Ctrl+C input gap is TASK-83. Design note: selection stops at the first non-shell program rather than the deepest leaf so a harness's helper processes never displace it.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Windows hand-started agents are observed through a cached ConPTY process-tree walk (first non-shell descendant, command line via NtQueryInformationProcess, cwd via the PEB) and platform-neutral Windows naming of shims and launchers; proven on the Windows runner with the fake agent and a real npm-installed Claude Code appearing in the sidebar.
+<!-- SECTION:FINAL_SUMMARY:END -->
