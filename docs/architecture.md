@@ -51,6 +51,8 @@ Conduit/
 │   ├── render.zig       GPU surface, draw, present, capture
 │   ├── font.zig         discovery, shaping, glyph atlas
 │   ├── ui.zig           four primitives, semantic tree, hit testing
+│   ├── accessibility.zig  TASK-68 semantic-tree snapshots for platform accessibility APIs
+│   ├── accessibility/   dbus.zig (bounded D-Bus client), atspi.zig (AT-SPI2 objects), snapshot.zig
 │   ├── input.zig        key/mouse encoding, actions, keybindings
 │   ├── workspace.zig    workspace/session/tab/pane lifecycle and ExecutionContext owner
 │   ├── session.zig      PTY + terminal state for one live terminal
@@ -784,6 +786,24 @@ nothing else is a legal dependency.
   state. It only returns borrowed definition indices and presentation text to `app`.
 - **May depend on** `input` and no other Conduit module.
 - **Lands** M3 — TASK-31.
+
+### `accessibility`
+
+- **Owns** the bridge from the semantic tree to platform accessibility APIs (TASK-68,
+  `docs/accessibility.md`): an immutable, fixed-capacity `Snapshot` of the tree (ids, product
+  roles, labels, actions, window-pixel bounds, parent links, focus and selection), a one-slot
+  mailbox to its worker, a bounded queue of AT requests (activate, focus) back to the owner, and on
+  Linux the AT-SPI2 service: a minimal bounded D-Bus client (wire format, SASL EXTERNAL, Unix
+  socket) in `accessibility/dbus.zig` and the object model, role/state mapping and snapshot-diff
+  events in `accessibility/atspi.zig`. No C dependency: libdbus and at-spi2-core headers are not
+  used.
+- **Never** touch the live `ui.Tree` off the owner thread (the snapshot is a projection of the one
+  tree, not a second model, invariant 3), run an AT request anywhere but the owner's loop, expose
+  terminal contents or input text, or fail start-up because no bus exists: without a session bus,
+  an accessibility bus or the setting, the bridge is `off` and `publish` is a no-op.
+- **May depend on** `ui` and no other Conduit module. `app` imports it.
+- **Lands** M8 — TASK-68 (Linux AT-SPI2; the macOS NSAccessibility and Windows UI Automation
+  plans are in `docs/accessibility.md`).
 
 ### `workspace`
 
@@ -1653,7 +1673,7 @@ layout). A module may depend only on modules in a strictly lower layer than its 
                 │
   depth 5   workspace         palette                 workspace model and palette search
                 │
-  depth 4   input                                     actions and routing
+  depth 4   input             accessibility           actions and routing; AT snapshots
                 │
   depth 3   ui                                        primitives and semantic tree
                 │
@@ -1701,6 +1721,8 @@ graph TD
     app --> pty
     app --> term
     app --> testdriver
+    app --> accessibility
+    accessibility --> ui
     app --> state
     agent --> config
     agent --> input
@@ -1762,6 +1784,7 @@ Prohibitions — the edges people reach for by accident, and why not:
 | anything but `term` | the `ghostty-vt` package | keeps the unstable upstream API in one file |
 | `ui` | `pty` | a view never talks to a PTY; it goes through `session` |
 | `ui` | `session`, `agent`, `backlog`, `workspace` | `ui` is the primitive layer; views are composed above it (P4) |
+| `accessibility` | `ui.Tree` off the owner thread, any module but `ui` | the worker reads only immutable snapshots; AT requests return to the owner as data |
 | `palette` | `ui`, `workspace`, action handlers | palette is a bounded search/presentation model over borrowed `input` definitions; `app` owns composition and dispatch |
 | `workspace` | `agent`, `backlog` | those feature layers consume workspace state; reversing the edge would create a cycle |
 | `app`-level feature code | a harness name (Claude Code, Codex, Pi) | invariant 9 / P11 |
@@ -1915,6 +1938,7 @@ inside the same event loop, so the main thread is that render/UI thread.
 | Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)**; a context `WatchHandle` has no thread and is polled by the `Project` owner |
 | Backlog CLI writes | `backlog.Cli`, worker thread | `ExecutionContext.run` waits for the bounded child; the CLI's file edits return through `Project.poll` |
 | Control API sockets, framing, token resolution | `control.Server`: one listener thread plus one thread per client connection (bounded) | each connection validates a request, submits it with its parse arena to the mutex-guarded `control.Queue`, wakes the owner through `Waker`, and waits for the reply with a deadline (`TimedOut` after it); the owner thread calls `service`, performs each request through the `Handler` vtable, and answers now or later through `complete`; a request the client gave up on is released by the owner's late answer |
+| Accessibility bus connection, AT-SPI objects and events | `accessibility.Bridge` worker thread (Linux) | the owner `publish`es a snapshot of the finished tree into a four-buffer mailbox (allocation free; skipped when the fingerprint is unchanged) and wakes the worker through a pipe; the worker diffs snapshots into `Object` signals and answers AT calls from the current snapshot only; `DoAction`/`GrabFocus` push a bounded request (32) under the bridge mutex and call the owner's `Waker`; the owner's loop `drainRequests` and performs each as a semantic click or focus |
 
 **(d)** = derived by applying the AGENTS.md rule "the render/UI thread never blocks on IO" to a
 source of IO. The rule is the constraint; *which* IO runs off-thread and how it hands over is
