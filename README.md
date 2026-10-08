@@ -8,8 +8,9 @@ element is exposed to a test driver so that an AI agent can launch, drive and sc
 user. First-class support for coding-agent CLIs (Claude Code, Codex, Pi) and Backlog.md planning
 is the goal of the next milestones; today those tools run in Conduit as ordinary terminal programs.
 
-Conduit is pre-1.0. Linux x86_64 is the only released and tested platform. The code builds for
-macOS and Windows, but neither has a release and their behaviour is unverified.
+Conduit is pre-1.0. Linux x86_64 is the primary platform, with the fullest test coverage. macOS
+arm64 (a disk image, ad hoc signed and not notarized) and Windows x86_64 (a portable zip, unsigned)
+are released from v0.1.9 on and verified only on GitHub's hosted runners, so expect rough edges.
 
 ![Conduit with a workspace sidebar, two tabs and a split pane](docs/images/main-window.png)
 
@@ -56,8 +57,10 @@ macOS/Windows releases.
 
 Releases are published at <https://github.com/thowd22/Conduit/releases>. Each release has a
 Debian package, an AppImage, a tarball and a `SHA256SUMS` file. They need glibc 2.35 or newer
-(Ubuntu 22.04 or later), OpenGL 3.3 and an X11 or Wayland session. macOS and Windows are not
-released yet.
+(Ubuntu 22.04 or later), OpenGL 3.3 and an X11 or Wayland session. From v0.1.9 each release
+also has `conduit-<version>-macos-arm64.dmg` (macOS 14 or newer; ad hoc signed, so Gatekeeper
+needs a right-click Open the first time) and `conduit-<version>-windows-x86_64.zip` (unpack and
+run `Conduit\conduit.exe`; unsigned, so SmartScreen warns), each with a `.sha256` file.
 
 Download the assets for a version (here 0.1.8) and check them:
 

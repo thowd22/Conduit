@@ -206,7 +206,10 @@ engine, bounded draining and frame pacing; `seq 1 200000` takes 0.12 s in that b
 the desktop environment. `v0.1.7` (https://github.com/thowd22/Conduit/releases/tag/v0.1.7) carries
 TASK-74 (sidebar Palette hint and version, content-sized palette) and TASK-75 (PTY wakeup fix);
 `v0.1.8` (https://github.com/thowd22/Conduit/releases/tag/v0.1.8) carries M4: TASK-37, 38, 39, 40 and
-41. `v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
+41. `v0.1.9` (https://github.com/thowd22/Conduit/releases/tag/v0.1.9, release run 37776779436) is
+the first release with all three platforms: the Linux packages, the macOS arm64 dmg and the
+Windows x86_64 portable zip, each with checksums; every asset was downloaded and its checksum
+re-verified locally, and the zip's payload inspected. `v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
 the `less` wheel test ordering and the IBus bridge race that the following commits fixed. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
 re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
