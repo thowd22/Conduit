@@ -3311,6 +3311,10 @@ fn findNode(nodes: []const ProcessNode, pid: u32) ?ProcessNode {
 /// `context.created(pid)` answers a process's creation time, or null when it is gone or will not
 /// say. A child created before its parent is not that parent's child (the parent id was reused)
 /// and is skipped; equal times go to the higher pid. Null only when the root itself is gone.
+///
+/// One tree this cannot follow: Git for Windows' (MSYS/Cygwin) shells exec another MSYS program by
+/// starting it and ending their own process, so that program has no live Windows parent. A native
+/// program they run (`claude.exe`, `node.exe`, `cmd.exe`) keeps its parent waiting and is found.
 fn selectForegroundJob(nodes: []const ProcessNode, root: u32, context: anytype) ?u32 {
     var current = root;
     var current_created = context.created(root) orelse return null;

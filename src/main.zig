@@ -28565,9 +28565,14 @@ const agent_test_script =
     "printf 'ARMED\\r\\n'; " ++
     // `fake` starts the scripted fake by hand, as a person starts a harness:
     // a foreground job of its own (job control), named
-    // `conduit-fake-agent` (TASK-56 observed agents).
-    "elif [ \"$line\" = fake ]; then " ++
-    "set -m; sh \"${" ++ agent_test_trigger_env ++ "%/*}/conduit-fake-agent\"; set +m; printf 'FAKE-BACK\\r\\n'; " ++
+    // `conduit-fake-agent` (TASK-56 observed agents). On Windows (TASK-81)
+    // it is started through `cmd /c`, as from a cmd tab: Git for Windows'
+    // `sh` execs another MSYS program by starting it and ending its own
+    // process, which leaves no Windows parent to find it through, while a
+    // native program it runs keeps its parent waiting.
+    "elif [ \"$line\" = fake ]; then f=\"${" ++ agent_test_trigger_env ++ "%/*}/conduit-fake-agent\"; " ++
+    "if command -v cmd.exe > /dev/null 2>&1; then cmd.exe //c \"\\\\bin\\\\sh.exe $f\"; " ++
+    "else set -m; sh \"$f\"; set +m; fi; printf 'FAKE-BACK\\r\\n'; " ++
     "else printf 'ECHO:%s\\r\\n' \"$line\"; fi; done";
 
 /// The fake harness a person starts by hand in `--agent-test`'s first tab:
