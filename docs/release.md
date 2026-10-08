@@ -151,7 +151,12 @@ GitHub arm64 macOS runner (`macos-14`) it:
    `--grid-test`, `--ui-test`, `--driver-test`, `--scroll-test`,
    `--mouse-test`, `--ime-test`, `--sidebar-test`, `--scratchpad-test`,
    `--links-test`, `--menu-test`, `--theme-test`, `--font-test`) in real
-   Cocoa windows, and reports the rest without gating on them;
+   Cocoa windows, and reports the rest without gating on them (`--tabs-test`,
+   `--panes-test`, `--palette-test`, `--workspaces-test`, `--search-test`,
+   `--config-test` and `--settings-test` fail on macOS today; several compare a
+   spawned child's cwd with the requested one, and `/tmp` is `/private/tmp`
+   there). `--clipboard-test` cannot run: its offscreen SDL driver has no
+   OpenGL on macOS;
 2. stages `Conduit.app` with `zig build bundle` (`Contents/MacOS/conduit`, a
    generated `Info.plist`, `Resources/AppIcon.icns`, the fonts, shell
    integration and licences; see `assets/macos/README.md`);

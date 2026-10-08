@@ -455,11 +455,13 @@ launch of a downloaded copy is refused; Control-click the app and choose **Open*
 - **Settings file**: `~/Library/Application Support/conduit/config`.
 
 Verified on a GitHub macOS 14 arm64 runner: the bundle and its icon, Launch Services start, a 2x
-frame, Cmd+V and Cmd+C through the system pasteboard, per-user and system font discovery, and the
-built-in checks listed in `docs/release.md`. Not verified: a physical keyboard (the runner only
-injects SDL events, so the Option key's composition and dead keys have unit tests but no live
-proof), a real Retina display (the runner's display reports 1x; 2x was proved with a fixed scale),
-desktop notifications (not implemented on macOS) and the menu items themselves.
+frame, Cmd+V and Cmd+C through the system pasteboard, per-user and system font discovery, Option+x
+typed through the system's keyboard event tap (`≈` by default, ESC x with
+`macos.option_as_alt = true`), and the built-in checks listed in `docs/release.md`. Not verified:
+dead keys (Option+e then e), a real Retina display (the runner's display reports 1x; 2x was
+proved with a fixed scale), desktop notifications (not implemented on macOS), clicking the menu
+items, and the tab, pane, palette, workspace, search, config and settings checks, which still
+fail on macOS (see `docs/release.md`).
 
 ## Configuration file
 
