@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-08 05:28'
+updated_date: '2026-10-08 07:19'
 labels:
   - platform
   - windows
@@ -44,6 +44,8 @@ Bring the window, renderer and input layers up on Windows: GPU backend, DirectWr
 
 <!-- SECTION:NOTES:BEGIN -->
 Coordinator 2026-10-08: merged the Windows slice (branch task-49-windows, 11 commits rebased onto main). Evidence: windows.yml run 37731052008 (success) on windows-latest build 26100: cmd.exe and pwsh under ConPTY drawn and typed through conduit-test at scale 1 and 1.5 (screenshots inspected: crisp text, correct sidebar), Unicode input delivered once, Windows clipboard both ways, DirectWrite listing 151 font files with Consolas/Cascadia Mono/per-user DejaVu resolved, live 100->125% DPI change re-rendering at 800x450, 14 gating built-in checks and the windows-smoke.sh E2E step. Not gating: clipboard/ime/links/panes/search built-ins (reasons in AGENTS.md). Unverified: real GPU driver, multi-monitor, real IME.
+
+ConPTY follow-up merged (48048d2, 52d66ed): the panes/search failures were the fixtures' POSIX-mode sh loop exiting on SIGWINCH, not a handle bug; resize after child exit is no longer an error, owed input to a closed terminal is dropped, fixtures trap WINCH; both checks now gate in windows.yml pending the next main run.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

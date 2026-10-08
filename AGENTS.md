@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its thirty-two Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its thirty-three Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--agent-prompts-test`, `--profiles-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--agent-prompts-test`, `--profiles-test`, `--editor-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its twenty-one declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its twenty-two declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -990,9 +990,7 @@ and drawn at scale 1 and 1.5; Unicode text input; Ctrl+Shift+V/C through the Win
 Consolas, Cascadia Mono and a per-user DejaVu Sans Mono; a live display-scale change from 100%
 to 125% re-rendering at 800x450; and 14 gating built-in checks. `--clipboard-test` (needs EGL),
 `--ime-test` (an MSYS child cannot enter raw mode), `--links-test` (no `vi.exe`) and
-`--panes-test`/`--search-test` (a write to a live pane's pseudoconsole fails with
-`ERROR_NO_DATA`, now reported as `Closed`, right after that pane's shell draws its prompt; the
-cause is still open in `pty.zig`) are reported but do not gate. The smoke opens cmd.exe through
+`--panes-test`/`--search-test` were reported only until the ConPTY follow-up below. The smoke opens cmd.exe through
 New tab with profile because pwsh is the default shell since TASK-46. Local process runs use `create_no_window`, and
 `build.zig` translates the C header seams as Debug on Windows because MinGW's `_FORTIFY_SOURCE`
 breaks translate-c at ReleaseSafe. A real GPU driver, a second monitor and real IME composition
@@ -1045,8 +1043,51 @@ snippets (unrun against live harnesses). `platform.Window.embedForeignWindow(mat
 `moveEmbedded`, `showEmbedded`, `closeEmbedded` and `unembed` host a foreign X11 window through
 a `dlopen`ed `libX11.so.6` on a private display connection (no link-time X11 dependency; tested
 under Xvfb with a real `xlogo`), and answer `error.Unsupported` elsewhere. The app still answers
-`Unavailable` to every editor request: phase two wires the pane leaf, the actions, hosting, the
-`--editor-test` check and the e2e scenario.
+`Unavailable` to every editor request until phase two.
+
+TASK-79 phase two is complete on Linux/X11. Each workspace presentation owns an
+`EditorPresentation`: the `editor.Editor` model, availability from a detection worker (run when
+the workspace becomes active and when `editor.command` changes; built-in checks other than
+`--editor-test` never detect), and one launch worker that seeds the user-data-dir under
+`<state>/conduit/editor/<id>` and runs the `buildLaunch` argv through the workspace
+ExecutionContext. The editor pane is an ordinary layout leaf whose `human_terminal` session never
+gets a child, so focus, resize, zoom and close are the pane chords (`childGone` ignores the
+placeholder). An opaque `Surface` `workspace.<k>.pane.<n>.editor` carries the status line, a
+`.status` Text and a clickable `.close`, and an `editor.placeholder` line shows while VSCodium's
+window is not hosted. Escape over the focused pane, `× close`, `Editor: close` and
+`editor.close` give the space back. `performEditor` is the single path for
+`editor.open/goto/diff/reveal/close` from the control API, the driver's `editor_open`/`editor_goto`
+(which reply `{}`; `testdriver.Result` has no opened variant yet), the palette's `Editor: open
+file…` (`path[:line[:col]]`, shown only where VSCodium was found; in SSH workspaces it opens `vi`
+in a new tab and says why) and the context menu's `open in editor` over a file reference (the
+menu is 18 columns wide now). Paths resolve against the requesting terminal's OSC 7 cwd and are
+checked with a local `stat` (the editor is Local-only); later requests reuse the pane; harness
+requests keep focus on their terminal; a request during a running launch gets `wait`. On X11 the
+window is found by its title marker (for up to 20 s), hosted over the pane below its header,
+moved on every layout change and hidden while the pane is not presented or covered; a closed
+window stays hidden in its container until its client has gone, so it is never re-hosted, and a
+window found mid-frame recomposes that frame. The settings view has an Editor group with
+`editor.command`. The deterministic `--editor-test` (in the CI Xvfb block, which now installs
+`x11-apps` for `xlogo`) and the twenty-second scenario `editor-pane` use a stand-in `codium` that
+maps a real `xlogo` window; they cover the not-installed path (no palette row, `conduit control
+editor.open` exits non-zero with the vscodium.com hint), palette by keyboard, context menu by
+mouse, every control method typed into a real tab shell, reuse, resize, zoom, Escape and click
+close; X root captures of a visible run show the xlogo hosted beside the terminal pane. Known
+limits: session restore saves the editor pane as a terminal pane; quitting leaves a hosted editor
+window on the desktop; closing the last tab's only editor pane quits. Real VSCodium (never
+installed here), typing into a reparented Electron window, the Wayland fallback and macOS/Windows
+hosting are unverified.
+
+TASK-49 ConPTY follow-up: `--panes-test` and `--search-test` stopped on Windows with `conduit
+stopped: Closed` because their fixed child, a `while IFS= read -r line` loop under Git for
+Windows' `sh` (bash in POSIX mode), ends when MSYS turns a pseudoconsole resize into SIGWINCH and
+`read` returns 128; the pane's shell exits 0, the exit watcher closes its pseudoconsole, and owed
+input or the next layout resize met a closed terminal. It was not handle confusion between
+consoles: a `pty` test destroys one of two ConPTYs and the other keeps taking input and resizes.
+The ConPTY backend now takes a resize of a terminal whose child has ended without error, as a
+POSIX master does (a test failed first on windows-latest with `Closed`); owed input to a closed
+terminal is dropped with a debug line instead of stopping the app; and both fixtures run `trap ''
+WINCH`, so the two checks gate in windows.yml (pending the next run on main).
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
@@ -1244,7 +1285,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--restore-test` / `--a11y-test` / `--agent-prompts-test` / `--profiles-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--restore-test` / `--a11y-test` / `--agent-prompts-test` / `--profiles-test` / `--editor-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:

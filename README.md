@@ -119,7 +119,7 @@ xvfb-run -a zig build e2e -- --artifact-dir="$(mktemp -d)"   # the scripted scen
 The built-in checks are `--grid-test`, `--self-test`, `--scroll-test`, `--mouse-test`,
 `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`, `--panes-test`,
 `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`, `--search-test`,
-`--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--agent-prompts-test`, `--profiles-test` and
+`--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--agent-prompts-test`, `--profiles-test`, `--editor-test` and
 `--driver-test`; each exits non-zero on failure. `conduit --help` lists every flag.
 
 ## Documentation

@@ -1,10 +1,10 @@
 ---
 id: TASK-79
 title: Embedded VSCodium editor pane exposed to harnesses as a tool
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-08 03:39'
-updated_date: '2026-10-08 05:43'
+updated_date: '2026-10-08 07:19'
 labels:
   - editor
   - agents
@@ -29,15 +29,23 @@ Design notes a future agent cannot recover from the code: (1) VSCodium is an Ele
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [x] #1 A Backlog decision records the per-platform embedding strategy (X11 reparenting into a pane-tracked child window, Wayland fallback, macOS and Windows native hosting) and which parts are implemented now
-- [ ] #2 With VSCodium installed, 'Editor: open file' from the palette and 'Open in editor' from the context menu over a file reference open VSCodium in a new split pane of the current tab at the referenced file and line; the pane follows focus, resize, zoom and close like any other pane, and Escape/close returns the space to the sibling
-- [ ] #3 A process inside a Conduit terminal (and therefore a harness) can call editor.open, editor.goto, editor.diff, editor.reveal and editor.close through the control API scoped to its workspace; a second editor.open or editor.goto reuses the open editor pane instead of spawning another; the scratchpad cannot be targeted
-- [ ] #4 The editor launches through the workspace ExecutionContext with a per-workspace user-data-dir and never touches the user's own VSCodium instance or settings; when VSCodium is not installed the actions are hidden and 'conduit control editor.open' replies with a clear fault naming how to install it
-- [ ] #5 The harness-facing documentation (docs/control-api.md and docs/agents.md) shows each harness how to use the editor tool, and a conduit-test/MCP tool mirrors editor.open and editor.goto for driving the app
-- [ ] #6 A deterministic Linux check (and an e2e scenario where the runner can provide a stand-in 'codium') proves open-at-line, goto in the open pane, diff, reveal and close through the real input and control paths, with an inspected screenshot of the editor pane beside a terminal pane; behaviour without VSCodium installed is covered too
+- [x] #2 With VSCodium installed, 'Editor: open file' from the palette and 'Open in editor' from the context menu over a file reference open VSCodium in a new split pane of the current tab at the referenced file and line; the pane follows focus, resize, zoom and close like any other pane, and Escape/close returns the space to the sibling
+- [x] #3 A process inside a Conduit terminal (and therefore a harness) can call editor.open, editor.goto, editor.diff, editor.reveal and editor.close through the control API scoped to its workspace; a second editor.open or editor.goto reuses the open editor pane instead of spawning another; the scratchpad cannot be targeted
+- [x] #4 The editor launches through the workspace ExecutionContext with a per-workspace user-data-dir and never touches the user's own VSCodium instance or settings; when VSCodium is not installed the actions are hidden and 'conduit control editor.open' replies with a clear fault naming how to install it
+- [x] #5 The harness-facing documentation (docs/control-api.md and docs/agents.md) shows each harness how to use the editor tool, and a conduit-test/MCP tool mirrors editor.open and editor.goto for driving the app
+- [x] #6 A deterministic Linux check (and an e2e scenario where the runner can provide a stand-in 'codium') proves open-at-line, goto in the open pane, diff, reveal and close through the real input and control paths, with an inspected screenshot of the editor pane beside a terminal pane; behaviour without VSCodium installed is covered too
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 Phase one merged to main (94847f5): decision-12, src/editor.zig model, editor.* control methods and faults, conduit-test/MCP editor tools, docs, and the X11 foreign-window hosting seam in platform (dlopen'ed Xlib, tested under Xvfb with xlogo). The app answers Unavailable until phase two wires main.zig and the workspace pane leaf.
+
+Phase two merged to main (7864057, rebased cleanly). Evidence: --editor-test (29+ checks through real SDL events and a real tab shell typing conduit control editor.*), the twenty-second e2e scenario editor-pane, 22/22 scenarios locally, X root captures of a visible run showing the stand-in's xlogo window hosted beside the terminal pane under the 'editor ─ notes.txt:2  × close' header; not-installed path proven (no palette row, control fault with the vscodium.com hint). Known limits: restore saves the editor pane as a terminal pane; quitting leaves a hosted window on the desktop; closing a last tab's only editor pane quits. Unverified: real VSCodium (never installed on this box), typing into a reparented Electron window, the Wayland separate-window fallback, macOS and Windows hosting (decision-12 records them as later work).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Embedded editor pane: VSCodium is detected (editor.command or codium) and launched through the workspace ExecutionContext with a per-workspace user-data-dir into a split pane that behaves like any pane; harnesses drive it through the control API's editor.open/goto/diff/reveal/close (reusing the pane, never the scratchpad), humans through the palette and the context menu; on X11 the window is reparented over the pane. Proven with a stand-in editor by --editor-test and the editor-pane scenario; real VSCodium and non-X11 hosting remain unverified.
+<!-- SECTION:FINAL_SUMMARY:END -->
