@@ -16493,18 +16493,7 @@ const App = struct {
         const child = self.presentedLive().child() orelse return;
         while (self.pending_child_offset < self.pending_child_bytes.items.len) {
             const pending = self.pending_child_bytes.items[self.pending_child_offset..];
-            const took = child.write(pending) catch |err| switch (err) {
-                // The terminal is gone (its child ended, which the session
-                // reports on its own): nobody will read what was owed, and a
-                // closed terminal is no reason to stop the app.
-                error.Closed => {
-                    log.debug("{d} owed input byte(s) dropped: the terminal is closed", .{pending.len});
-                    self.pending_child_bytes.clearRetainingCapacity();
-                    self.pending_child_offset = 0;
-                    return;
-                },
-                else => return err,
-            };
+            const took = try child.write(pending);
             if (took > pending.len) return error.SystemError;
             if (took == 0) {
                 log.warn("the child took no input; {d} bytes are still owed", .{pending.len});
