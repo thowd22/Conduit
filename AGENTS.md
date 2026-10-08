@@ -1087,7 +1087,10 @@ consoles: a `pty` test destroys one of two ConPTYs and the other keeps taking in
 The ConPTY backend now takes a resize of a terminal whose child has ended without error, as a
 POSIX master does (a test failed first on windows-latest with `Closed`); owed input to a closed
 terminal is dropped with a debug line instead of stopping the app; and both fixtures run `trap ''
-WINCH`, so the two checks gate in windows.yml (pending the next run on main).
+WINCH`. With that, both checks get past the resize but fail on something else on windows-latest
+(run 37773403721): `--panes-test` at its pane-close confirmation steps and `--search-test` with
+`OutOfMemory` from the engine's search reload of the active area, so they stay reported rather
+than gating until each has had its own runner iteration.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`

@@ -259,8 +259,8 @@ has an interactive desktop in which SDL creates real Win32 windows, it:
 The built-in checks that pass on Windows gate the job: `--self-test`,
 `--grid-test`, `--ui-test`, `--driver-test`, `--scroll-test`, `--mouse-test`,
 `--sidebar-test`, `--scratchpad-test`, `--menu-test`, `--theme-test`,
-`--font-test`, `--tabs-test`, `--palette-test`, `--workspaces-test`,
-`--panes-test` and `--search-test`. Three are run and reported without gating:
+`--font-test`, `--tabs-test`, `--palette-test` and `--workspaces-test`. Five
+are run and reported without gating:
 `--clipboard-test` (it pins SDL's offscreen driver, which needs an EGL library
 on Windows; the Windows clipboard step is the real proof), `--ime-test` (its
 fixed child is an MSYS `sh` script that cannot put a ConPTY console into raw
@@ -273,7 +273,11 @@ POSIX mode, and MSYS raises SIGWINCH for a pseudoconsole resize, after which
 `read` returns 128 and the shell exits, so owed input met a closed terminal.
 The fixtures now run `trap '' WINCH`, a resize of a terminal whose child has
 ended is not an error, and owed input to a closed terminal is dropped with a
-debug line instead of stopping the app. The WSL step `windows-wsl-check.sh` (TASK-47) gates: it drives
+debug line instead of stopping the app. Both checks now get further and fail
+on something else (run 37773403721): `--panes-test` at its pane-close
+confirmation steps, and `--search-test` with `OutOfMemory` from the engine's
+search reload of the active area, so they stay reported until each has had
+its own runner iteration. The WSL step `windows-wsl-check.sh` (TASK-47) gates: it drives
 Remote: connect, a first tab, a split pane, the scratchpad and a Windows file
 reference inside the runner's WSL2 Ubuntu through `conduit-test`.
 
