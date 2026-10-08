@@ -594,7 +594,7 @@ nothing else is a legal dependency.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
-- **May depend on** `accessibility`, `agent`, `backlog`, `config`, `control`, `font`, `input`, `link`, `palette`, `platform`, `pty`,
+- **May depend on** `accessibility`, `agent`, `backlog`, `config`, `control`, `editor`, `font`, `input`, `link`, `palette`, `platform`, `pty`,
   `render`, `session`, `state`, `term`, `testdriver`, `theme`, `ui`, and `workspace` — every other Conduit
   module.
 - **Root** `src/main.zig` — this module *is* the executable's root module, so there is no
@@ -686,6 +686,16 @@ nothing else is a legal dependency.
   FreeType's ANSI file opens take any path) and from SDL, which declares it too; a DPI change
   arrives as `SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED` and takes the existing `scale_changed`
   path. Clipboard and IME text are SDL's Win32 implementations, unchanged.
+  TASK-79 (decision-12): `Window.embedForeignWindow(match, rect)` hosts another application's
+  top-level window (the VSCodium editor) over a pane's device-pixel rectangle, found by
+  `_NET_WM_PID`, `WM_CLASS` or a title substring; `moveEmbedded`, `showEmbedded`,
+  `closeEmbedded` (`WM_DELETE_WINDOW`) and `unembed` (gives the client back to the root) manage
+  it. Only X11 can do this: a private display connection creates a container child of SDL's X11
+  window and `XReparentWindow`s the client into it. Xlib is `dlopen`ed (`libX11.so.6`) on first
+  use rather than linked, so Conduit keeps no link-time X11 dependency, and every batch of
+  requests runs under a temporary Xlib error handler restored after `XSync`, so a vanished client
+  is `error.Failed`, never Xlib's default exit. Wayland, macOS and Windows answer
+  `error.Unsupported`; `embedSupported(videoDriverName())` says which.
 - **Never** contain product logic, layout or workspace behaviour; let an SDL handle escape above
   the seam; place an OS conditional in a shared module (P12, invariant 10 — the only permitted
   OS conditionals are *selecting* a backend).
@@ -1668,6 +1678,25 @@ nothing else is a legal dependency.
     a hangup), a write wait reports writable at once because a pipe has no write readiness, and
     sockets are not served.
 
+### `editor`
+
+- **Owns** the VSCodium editor pane's model (TASK-79, decision-12), `src/editor.zig`: `detect`
+  (`<editor.command> --version`, then `codium --version`, through `ExecutionContext.run`), the
+  per-workspace `--user-data-dir` (`<state dir>/editor/<16 hex of SHA-256(name, directory)>`)
+  and its seeded `User/settings.json` (a window-title marker `platform` matches), lexical path
+  resolution against a session's cwd plus `checkTarget` through `statPath`, `buildLaunch` (the
+  `--new-window`/`--reuse-window`/`-r`, `--goto`, `--diff` argv, never `--extensions-dir`), and
+  `Editor`, one workspace's editor-pane state whose `plan` decides refuse / new pane / reuse /
+  wait / close, so a workspace has at most one editor pane.
+- **Never** spawn, embed or draw (the app does, through the workspace's ExecutionContext and
+  `platform`), touch the user's own VSCodium profile, install anything, or run in a remote
+  context (`Detection.remote`; the app falls back to `vi`). Paths are untrusted input and always
+  reach VSCodium absolute, so none can be read as an option.
+- **May depend on** `workspace` (the ExecutionContext types).
+- **Lands** M6 — TASK-79 phase one (model, protocol, driver and platform seams); phase two wires
+  `app` (the pane, palette and context-menu actions, control and driver handlers, rectangle
+  tracking, the deterministic check and e2e scenario).
+
 ### `backlog`
 
 - **Owns** the backlog.md data layer — projects, tasks, milestones, statuses, dependencies — and
@@ -1999,9 +2028,12 @@ first spawn and revoked when it closes, and the instance endpoint `instance.sock
 (`control.instance_workspace`) is written 0600 to `<state dir>/instance.token`. A live instance
 already at `instance.sock` keeps it (`EndpointOccupied`). Each workspace token resolves to the
 workspace key (one-based, as in the semantic ids); the instance token names no workspace and
-accepts only `ping` and the four `instance.*` methods. Twelve methods exist: `ping`, `tab.open`,
-`pane.split`, `view.agent`, `view.backlog`, `tab.status`, `notify`, `agent.event`,
-`instance.open_directory`, `instance.open_ssh`, `instance.open_workspace` and `instance.agent`.
+accepts only `ping` and the four `instance.*` methods. Seventeen methods exist: `ping`,
+`tab.open`, `pane.split`, `view.agent`, `view.backlog`, `tab.status`, `notify`, `agent.event`,
+`instance.open_directory`, `instance.open_ssh`, `instance.open_workspace`, `instance.agent`, and
+TASK-79's `editor.open`, `editor.goto`, `editor.diff`, `editor.reveal` and `editor.close`
+(answered `Unavailable` until its second phase). The editor faults `EditorNotInstalled` (-32005)
+and `EditorRemoteUnsupported` (-32006) carry fixed guidance as `error.data.hint`.
 
 The endpoint is one 0600 AF_UNIX socket per server inside a private 0700 directory
 (`platform.LocalSocketListener` refuses a parent with any group or other permission bit). Each
@@ -2022,7 +2054,7 @@ layout). A module may depend only on modules in a strictly lower layer than its 
 ```text
   depth 7   app                                      process lifetime, event loop, wiring
                 │
-  depth 6   agent             backlog     testdriver feature layers and automation
+  depth 6   agent             backlog     testdriver editor  feature layers and automation
                 │
   depth 5   workspace         palette                 workspace model and palette search
                 │

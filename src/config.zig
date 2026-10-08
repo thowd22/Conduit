@@ -260,6 +260,7 @@ pub const Key = enum {
     accessibility_enabled,
     shell,
     profile,
+    editor_command,
     keybind,
 
     /// The key's spelling in the file, which is also its `Name`.
@@ -296,6 +297,7 @@ pub const Key = enum {
             .accessibility_enabled => "accessibility.enabled",
             .shell => "shell",
             .profile => "profile",
+            .editor_command => "editor.command",
             .keybind => "keybind",
         };
     }
@@ -369,6 +371,10 @@ pub const Settings = struct {
     /// Shell profiles (TASK-46), in file order, one per name, with their
     /// `profile.<name>.*` attributes applied.
     shell_profiles: []const ShellProfile = &.{},
+    /// `editor.command` (TASK-79): the VSCodium command or path the editor
+    /// pane detects first, as one argv item resolved on the workspace
+    /// context's PATH. Empty means only the default `codium` is tried.
+    editor_command: []const u8 = "",
 };
 
 /// The built-in value of `control.enabled`: on in development builds, off in
@@ -962,6 +968,7 @@ pub const Config = struct {
             .accessibility_enabled => to.accessibility_enabled = from.accessibility_enabled,
             .shell => to.shell = try self.dupe(from.shell),
             .profile => to.shell_profiles = try self.dupeShellProfiles(from.shell_profiles),
+            .editor_command => to.editor_command = try self.dupe(from.editor_command),
             // Keybind lines are resolved against the previous binding table by `app`, which is
             // the only place that knows what a rejected chord used to do.
             .keybind => {},
@@ -1014,6 +1021,7 @@ const ValueError = error{
     ShellProfileShape,
     ShellProfileName,
     TooManyShellProfiles,
+    EditorCommand,
 };
 
 /// Parse `text` as a settings file.
@@ -1140,6 +1148,7 @@ fn valueMessage(key: Key, err: ValueError) []const u8 {
         error.ShellProfileShape => "expected `<name> = <command> [arguments...]`",
         error.ShellProfileName => "expected a profile name: letters, digits, `-` and `_`",
         error.TooManyShellProfiles => "more than 32 shell profiles; the rest are ignored",
+        error.EditorCommand => "expected a command name or path, not an option",
     };
 }
 
@@ -1214,6 +1223,7 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
             settings.shell = try allocator.dupe(u8, name);
         },
         .profile => try applyShellProfile(settings, allocator, value),
+        .editor_command => settings.editor_command = try allocator.dupe(u8, try parseEditorCommand(value)),
         .keybind => {
             const split = try splitKeybind(value);
             try result.keybinds.append(allocator, .{
@@ -1247,6 +1257,14 @@ fn parseString(value: []const u8) ValueError![]const u8 {
     if (inner.len > max_string_bytes) return error.TooLong;
     if (hasControl(inner)) return error.ControlCharacter;
     return inner;
+}
+
+/// One argv item: never an option, so a configured value cannot inject a flag
+/// into the editor's command line.
+fn parseEditorCommand(value: []const u8) ValueError![]const u8 {
+    const text = try parseString(value);
+    if (text.len != 0 and text[0] == '-') return error.EditorCommand;
+    return text;
 }
 
 fn parsePoints(value: []const u8) ValueError!f32 {
@@ -1520,6 +1538,10 @@ pub const defaults_document =
     "# Windows the first of pwsh, powershell and cmd that is installed).\n" ++
     "# shell = \"\"\n" ++
     "\n" ++
+    "# The VSCodium command (or its full path) the editor pane runs. Conduit never installs\n" ++
+    "# it; empty tries `codium` on the PATH.\n" ++
+    "# editor.command = \"\"\n" ++
+    "\n" ++
     "# Keybindings: keybind = <chord>=<action>[:<argument>], or <chord>=unbind.\n" ++
     "# Modifiers are ctrl, shift, alt and super (cmd). These lines repeat some defaults.\n" ++
     keybind_examples;
@@ -1645,6 +1667,11 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
                 if (std.mem.indexOfScalar(u8, value, '"') != null) break :check error.Unquoted;
                 const name = parseString(value) catch |err| break :check err;
                 if (name.len != 0 and !validShellProfileName(name)) break :check error.ShellProfileName;
+                return null;
+            },
+            .editor_command => {
+                if (std.mem.indexOfScalar(u8, value, '"') != null) break :check error.Unquoted;
+                _ = parseEditorCommand(value) catch |err| break :check err;
                 return null;
             },
             .profile => {
@@ -2988,6 +3015,28 @@ test "restore.enabled and accessibility.enabled are booleans that default on" {
     try testing.expect(checkValue(.accessibility_enabled, "yes") != null);
     try testing.expectEqualStrings("restore.enabled", Key.restore_enabled.name());
     try testing.expectEqual(Key.accessibility_enabled, Key.fromName("accessibility.enabled").?);
+}
+
+test "editor.command is one argv item that defaults to empty and refuses an option" {
+    var silent = try parse(testing.allocator, "", null);
+    defer silent.deinit();
+    try testing.expectEqualStrings("", silent.settings.editor_command);
+
+    var set = try parse(testing.allocator, "editor.command = \"/opt/VSCodium/bin/codium\"\n", null);
+    defer set.deinit();
+    try testing.expect(!set.hasDiagnostics());
+    try testing.expectEqualStrings("/opt/VSCodium/bin/codium", set.settings.editor_command);
+
+    var bad = try parse(testing.allocator, "editor.command = --disable-extensions\n", &set);
+    defer bad.deinit();
+    try testing.expect(bad.hasDiagnostics());
+    try testing.expectEqualStrings("/opt/VSCodium/bin/codium", bad.settings.editor_command);
+
+    try testing.expectEqual(Key.editor_command, Key.fromName("editor.command").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.editor_command, "codium"));
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.editor_command, ""));
+    try testing.expectEqualStrings("expected a command name or path, not an option", checkValue(.editor_command, "-r").?);
+    try testing.expect(checkValue(.editor_command, "a\x07b") != null);
 }
 
 test "control.enabled is a boolean the session layer overrides and the build defaults" {

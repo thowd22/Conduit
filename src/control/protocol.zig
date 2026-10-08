@@ -62,6 +62,8 @@ pub const max_workspace_name_bytes: usize = 256;
 pub const max_harness_bytes: usize = 32;
 /// Longest initial prompt `instance.agent` accepts.
 pub const max_prompt_bytes: usize = 4096;
+/// Largest line or column an `editor.*` method accepts (TASK-79).
+pub const max_editor_position: u32 = 10_000_000;
 
 /// A random 128-bit control token, kept as 32 lowercase hex digits. The owner
 /// supplies the random bytes, so this module needs no OS entropy.
@@ -123,6 +125,13 @@ pub const Method = enum {
     instance_open_ssh,
     instance_open_workspace,
     instance_agent,
+    /// TASK-79's editor methods: open, move, diff, reveal in and close the
+    /// caller workspace's one VSCodium editor pane (decision-12).
+    editor_open,
+    editor_goto,
+    editor_diff,
+    editor_reveal,
+    editor_close,
 
     /// Whether this is one of the instance methods.
     pub fn isInstance(self: Method) bool {
@@ -147,6 +156,19 @@ pub const Method = enum {
             .instance_open_ssh => "instance.open_ssh",
             .instance_open_workspace => "instance.open_workspace",
             .instance_agent => "instance.agent",
+            .editor_open => "editor.open",
+            .editor_goto => "editor.goto",
+            .editor_diff => "editor.diff",
+            .editor_reveal => "editor.reveal",
+            .editor_close => "editor.close",
+        };
+    }
+
+    /// Whether this is one of the `editor.*` methods.
+    pub fn isEditor(self: Method) bool {
+        return switch (self) {
+            .editor_open, .editor_goto, .editor_diff, .editor_reveal, .editor_close => true,
+            else => false,
         };
     }
 
@@ -170,6 +192,16 @@ pub const Spawn = struct {
     cwd: ?[]const u8 = null,
     /// An argv. Never interpreted by a shell.
     command: ?[]const []const u8 = null,
+};
+
+/// A file position named by `editor.open` and `editor.goto`. The path is an
+/// opaque string the owner resolves against the caller session's cwd through
+/// the workspace's ExecutionContext; `column` is only accepted with `line`.
+/// Both are one-based.
+pub const EditorLocation = struct {
+    path: []const u8,
+    line: ?u32 = null,
+    column: ?u32 = null,
 };
 
 /// Typed parameters. Every slice borrows the `Parsed` arena.
@@ -222,6 +254,23 @@ pub const Params = union(Method) {
         harness: []const u8,
         prompt: ?[]const u8 = null,
     },
+    editor_open: struct {
+        location: EditorLocation,
+        /// Where a new editor pane goes beside the caller's pane; ignored
+        /// when the workspace's editor pane is already open. Null is right.
+        split: ?Direction = null,
+    },
+    editor_goto: struct {
+        location: EditorLocation,
+    },
+    editor_diff: struct {
+        left: []const u8,
+        right: []const u8,
+    },
+    editor_reveal: struct {
+        path: []const u8,
+    },
+    editor_close: void,
 };
 
 /// A JSON-RPC style request id. String bytes are owned by `Parsed`.
@@ -257,6 +306,12 @@ pub const FaultCode = enum(i32) {
     busy = -32003,
     /// The named session or agent is not in the caller's workspace.
     not_found = -32004,
+    /// No VSCodium answered `--version` in the workspace's context
+    /// (TASK-79). The reply carries `editor_install_hint` as `data.hint`.
+    editor_not_installed = -32005,
+    /// The workspace is remote (SSH, WSL), where the editor pane does not
+    /// run. The reply's `data.hint` names the `vi` fallback.
+    editor_remote_unsupported = -32006,
     /// The owner did not reply before the server's deadline.
     timed_out = -32008,
 
@@ -272,10 +327,30 @@ pub const FaultCode = enum(i32) {
             .scratchpad_not_addressable => "ScratchpadNotAddressable",
             .busy => "Busy",
             .not_found => "NotFound",
+            .editor_not_installed => "EditorNotInstalled",
+            .editor_remote_unsupported => "EditorRemoteUnsupported",
             .timed_out => "TimedOut",
         };
     }
+
+    /// Fixed guidance sent as `error.data.hint`, never request text.
+    pub fn hint(self: FaultCode) ?[]const u8 {
+        return switch (self) {
+            .editor_not_installed => editor_install_hint,
+            .editor_remote_unsupported => editor_remote_hint,
+            else => null,
+        };
+    }
 };
+
+/// How to get the editor tool when VSCodium is missing. Conduit never
+/// installs it (decision-12).
+pub const editor_install_hint = "VSCodium is not installed: install it from https://vscodium.com or your package manager " ++
+    "(the command is `codium`), or set editor.command in Conduit's settings file to its path";
+
+/// What to use instead in a remote workspace.
+pub const editor_remote_hint = "the editor pane runs only in local workspaces; open the file in vi instead: " ++
+    "conduit control tab.open '{\"command\":[\"vi\",\"+<line>\",\"--\",\"<path>\"]}'";
 
 /// A rejected frame and the id to echo when one was recoverable.
 pub const Failure = struct {
@@ -474,7 +549,49 @@ fn parseParams(arena: Allocator, method: Method, object: std.json.ObjectMap) All
                 null;
             break :blk .{ .instance_agent = .{ .harness = harness, .prompt = prompt } };
         },
+        .editor_open => blk: {
+            if (!hasOnlyFields(object, &.{ "path", "line", "column", "split" })) break :blk null;
+            const location = editorLocation(object) orelse break :blk null;
+            const split: ?Direction = if (object.get("split")) |value|
+                (std.meta.stringToEnum(Direction, asString(value) orelse break :blk null) orelse break :blk null)
+            else
+                null;
+            break :blk .{ .editor_open = .{ .location = location, .split = split } };
+        },
+        .editor_goto => blk: {
+            if (!hasOnlyFields(object, &.{ "path", "line", "column" })) break :blk null;
+            break :blk .{ .editor_goto = .{ .location = editorLocation(object) orelse break :blk null } };
+        },
+        .editor_diff => blk: {
+            if (!hasOnlyFields(object, &.{ "left", "right" })) break :blk null;
+            const left = editorPath(object.get("left") orelse break :blk null) orelse break :blk null;
+            const right = editorPath(object.get("right") orelse break :blk null) orelse break :blk null;
+            break :blk .{ .editor_diff = .{ .left = left, .right = right } };
+        },
+        .editor_reveal => blk: {
+            if (!hasOnlyFields(object, &.{"path"})) break :blk null;
+            break :blk .{ .editor_reveal = .{ .path = editorPath(object.get("path") orelse break :blk null) orelse break :blk null } };
+        },
+        .editor_close => if (object.count() == 0) .{ .editor_close = {} } else null,
     };
+}
+
+/// An editor path: a bounded single-line string. Never resolved here.
+fn editorPath(value: JsonValue) ?[]const u8 {
+    return boundedText(value, 1, max_path_bytes, false);
+}
+
+fn editorPosition(value: JsonValue) ?u32 {
+    const position = positiveU32(value) orelse return null;
+    return if (position <= max_editor_position) position else null;
+}
+
+fn editorLocation(object: std.json.ObjectMap) ?EditorLocation {
+    const path = editorPath(object.get("path") orelse return null) orelse return null;
+    const line = if (object.get("line")) |value| (editorPosition(value) orelse return null) else null;
+    const column = if (object.get("column")) |value| (editorPosition(value) orelse return null) else null;
+    if (column != null and line == null) return null;
+    return .{ .path = path, .line = line, .column = column };
 }
 
 fn parseSpawn(arena: Allocator, object: std.json.ObjectMap) Allocator.Error!?Spawn {
@@ -660,10 +777,15 @@ fn writeReply(writer: *std.Io.Writer, id: ?RequestId, reply: Reply) std.Io.Write
         .string => |string| try std.json.Stringify.value(string, .{}, writer),
     } else try writer.writeAll("null");
     switch (reply) {
-        .fault => |code| try writer.print(
-            ",\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}",
-            .{ @intFromEnum(code), code.message() },
-        ),
+        .fault => |code| {
+            try writer.print(",\"error\":{{\"code\":{d},\"message\":\"{s}\"", .{ @intFromEnum(code), code.message() });
+            if (code.hint()) |text| {
+                try writer.writeAll(",\"data\":{\"hint\":");
+                try std.json.Stringify.value(text, .{}, writer);
+                try writer.writeByte('}');
+            }
+            try writer.writeAll("}}");
+        },
         .result => |result| {
             try writer.writeAll(",\"result\":");
             switch (result) {
@@ -809,6 +931,82 @@ test "every method parses its valid parameters" {
     try testing.expect(Method.instance_agent.isInstance() and !Method.tab_open.isInstance());
 }
 
+test "editor methods parse locations, splits, diffs, reveals and close" {
+    var open = try expectEnvelope("{\"id\":1,\"method\":\"editor.open\",\"token\":\"" ++ test_token ++
+        "\",\"session\":4,\"params\":{\"path\":\"src/main.zig\",\"line\":12,\"column\":5,\"split\":\"down\"}}", .editor_open);
+    defer open.deinit();
+    const editor_open = open.outcome.envelope.params.editor_open;
+    try testing.expectEqualStrings("src/main.zig", editor_open.location.path);
+    try testing.expectEqual(@as(?u32, 12), editor_open.location.line);
+    try testing.expectEqual(@as(?u32, 5), editor_open.location.column);
+    try testing.expectEqual(@as(?Direction, .down), editor_open.split);
+    try testing.expect(Method.editor_open.isEditor() and !Method.tab_open.isEditor());
+
+    var bare = try expectEnvelope("{\"id\":2,\"method\":\"editor.open\",\"token\":\"" ++ test_token ++
+        "\",\"params\":{\"path\":\"/tmp/a b; rm -rf /\"}}", .editor_open);
+    defer bare.deinit();
+    try testing.expectEqualStrings("/tmp/a b; rm -rf /", bare.outcome.envelope.params.editor_open.location.path);
+    try testing.expectEqual(@as(?u32, null), bare.outcome.envelope.params.editor_open.location.line);
+    try testing.expectEqual(@as(?Direction, null), bare.outcome.envelope.params.editor_open.split);
+
+    var goto = try expectEnvelope("{\"id\":3,\"method\":\"editor.goto\",\"token\":\"" ++ test_token ++
+        "\",\"params\":{\"path\":\"b.zig\",\"line\":10000000}}", .editor_goto);
+    defer goto.deinit();
+    try testing.expectEqual(@as(?u32, max_editor_position), goto.outcome.envelope.params.editor_goto.location.line);
+
+    var diff = try expectEnvelope("{\"id\":4,\"method\":\"editor.diff\",\"token\":\"" ++ test_token ++
+        "\",\"params\":{\"left\":\"a.orig\",\"right\":\"a\"}}", .editor_diff);
+    defer diff.deinit();
+    try testing.expectEqualStrings("a.orig", diff.outcome.envelope.params.editor_diff.left);
+    try testing.expectEqualStrings("a", diff.outcome.envelope.params.editor_diff.right);
+
+    var reveal = try expectEnvelope("{\"id\":5,\"method\":\"editor.reveal\",\"token\":\"" ++ test_token ++
+        "\",\"params\":{\"path\":\"docs\"}}", .editor_reveal);
+    defer reveal.deinit();
+    try testing.expectEqualStrings("docs", reveal.outcome.envelope.params.editor_reveal.path);
+
+    var close = try expectEnvelope("{\"id\":6,\"method\":\"editor.close\",\"token\":\"" ++ test_token ++ "\"}", .editor_close);
+    defer close.deinit();
+}
+
+test "editor parameters are refused when malformed or out of bounds" {
+    const prefix = "{\"id\":1,\"token\":\"" ++ test_token ++ "\",";
+    const bad = [_][]const u8{
+        "\"method\":\"editor.open\",\"params\":{}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"\"}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":7}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\\u0000b\"}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\\nb\"}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\",\"line\":0}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\",\"line\":-3}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\",\"line\":\"3\"}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\",\"line\":10000001}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\",\"column\":2}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\",\"split\":\"left\"}}",
+        "\"method\":\"editor.open\",\"params\":{\"path\":\"a\",\"command\":[\"sh\"]}}",
+        "\"method\":\"editor.goto\",\"params\":{\"path\":\"a\",\"split\":\"right\"}}",
+        "\"method\":\"editor.goto\",\"params\":{\"line\":3}}",
+        "\"method\":\"editor.diff\",\"params\":{\"left\":\"a\"}}",
+        "\"method\":\"editor.diff\",\"params\":{\"left\":\"a\",\"right\":\"\"}}",
+        "\"method\":\"editor.reveal\",\"params\":{}}",
+        "\"method\":\"editor.close\",\"params\":{\"force\":true}}",
+    };
+    for (bad) |suffix| {
+        const frame = try std.mem.concat(testing.allocator, u8, &.{ prefix, suffix });
+        defer testing.allocator.free(frame);
+        expectFault(frame, .invalid_params) catch |err| {
+            std.debug.print("accepted or misreported: {s}\n", .{frame});
+            return err;
+        };
+    }
+
+    var long_path: [max_path_bytes + 1]u8 = undefined;
+    @memset(&long_path, 'p');
+    const frame = try std.mem.concat(testing.allocator, u8, &.{ prefix, "\"method\":\"editor.reveal\",\"params\":{\"path\":\"", &long_path, "\"}}" });
+    defer testing.allocator.free(frame);
+    try expectFault(frame, .invalid_params);
+}
+
 test "malformed envelopes map to stable faults" {
     try expectFault("", .invalid_request);
     try expectFault("not json", .parse_error);
@@ -929,4 +1127,21 @@ test "replies encode ids, results and fixed fault names without request text" {
     const copy = IdCopy.from(.{ .string = &long_id });
     const encoded = try encodeReply(&buffer, copy.get(), .{ .fault = .timed_out });
     try testing.expect(encoded.len <= max_reply_bytes);
+
+    // The editor faults carry their fixed hint as `data.hint`, and still fit
+    // with the longest echoed id.
+    for ([_]FaultCode{ .editor_not_installed, .editor_remote_unsupported }) |code| {
+        const hinted = try encodeReply(&buffer, copy.get(), .{ .fault = code });
+        const parsed = try std.json.parseFromSlice(JsonValue, testing.allocator, hinted, .{});
+        defer parsed.deinit();
+        const failure = parsed.value.object.get("error").?.object;
+        try testing.expectEqualStrings(code.message(), failure.get("message").?.string);
+        try testing.expectEqualStrings(code.hint().?, failure.get("data").?.object.get("hint").?.string);
+    }
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32005,\"message\":\"EditorNotInstalled\",\"data\":{\"hint\":\"" ++ editor_install_hint ++ "\"}}}",
+        try encodeReply(&buffer, .{ .integer = 2 }, .{ .fault = .editor_not_installed }),
+    );
+    try testing.expect(std.mem.indexOf(u8, editor_install_hint, "https://vscodium.com") != null);
+    try testing.expect(std.mem.indexOf(u8, editor_remote_hint, "vi") != null);
 }

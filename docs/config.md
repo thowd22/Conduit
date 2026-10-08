@@ -130,6 +130,7 @@ keybind = ctrl+alt+p=palette.open
 | `profile.<name>.env` | `NAME=value`, repeats | none | A variable the profile's shell starts with |
 | `profile.<name>.cwd` | directory | `""` (the invoking terminal's) | Where the profile's shell starts |
 | `profile.<name>.login` | `true` or `false` | `false` | Start the profile's shell as a login shell |
+| `editor.command` | a command name or path | `""` (`codium` on the workspace's PATH) | The VSCodium the editor pane (TASK-79) detects first; `codium` is tried after it. One argument, never an option (a leading `-` is refused). Conduit never installs VSCodium. The pane itself is wired in TASK-79's second phase; no settings-view row yet |
 | `keybind` | see below | the shipped bindings | Applies |
 
 Command-line flags are a session layer above the file: `--font=<family>` wins over `font.family`

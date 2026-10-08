@@ -2,14 +2,17 @@
 
 A program running inside a Conduit terminal (a coding-agent harness, its hooks or extensions, or
 a script) can ask Conduit to open a tab or split pane in its own workspace, show an agent or
-backlog view, set its tab's status, raise a notification, and deliver structured agent events.
+backlog view, set its tab's status, raise a notification, deliver structured agent events, and
+drive the workspace's VSCodium editor pane (`editor.*`, TASK-79).
 The `conduit` command uses the same protocol to reuse a running Conduit: `conduit .`,
 `conduit ssh <host>`, `conduit workspace open <name>` and `conduit agent <harness>`. This page is
 the wire contract and the harness configuration guide. Code: `src/control.zig` (TASK-60) and the
 app handler and command-line client in `src/main.zig` (TASK-60 part two, TASK-66).
 
 Status: implemented and verified on Linux (`--control-test`, the `control-api` E2E scenario and
-the socket integration tests in `src/control.zig`). macOS uses the same POSIX code but has not
+the socket integration tests in `src/control.zig`). The five `editor.*` methods are part of the
+protocol (parsed, validated and queued like every other method), but until TASK-79's second phase
+wires the editor pane into the app, Conduit answers each of them `Unavailable`. macOS uses the same POSIX code but has not
 been run. Windows has no control transport yet: neither endpoint starts there, and `conduit`
 commands always start a new window.
 
@@ -58,7 +61,7 @@ Conduit workspace terminal (or the endpoint is disabled) and should do nothing.
   whose `session` is the scratchpad's id is refused with `ScratchpadNotAddressable`, by the server
   and again by Conduit itself. No method can show, hide, restart, type into or otherwise take over
   the scratchpad.
-- **Enumerated methods only.** The twelve methods below are the whole API; anything else is
+- **Enumerated methods only.** The seventeen methods below are the whole API; anything else is
   `MethodNotFound`. Nothing in a request is executed by a shell: `command` is an argv. A `cwd` is
   handed to the workspace's ExecutionContext (local, SSH or WSL) and never resolved by the
   server. Request text is never logged above debug level, and replies never echo it.
@@ -92,6 +95,7 @@ Request:
 
 Success reply: `{"jsonrpc":"2.0","id":1,"result":{...}}`.
 Error reply: `{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"ScratchpadNotAddressable"}}`.
+The two editor faults add fixed guidance as `error.data.hint` (never request text).
 When the request id could not be read, `id` is `null`.
 
 ### Timing
@@ -223,20 +227,71 @@ active workspace (the instance token). Params: `harness` (`claude`, `claude_code
 or `opencode`, required) and `prompt` (0–4096 bytes, optional). `NotFound` for a harness Conduit
 cannot launch. Result: `{"workspace":…,"tab":…,"session":…}`.
 
+### `editor.open`
+
+Opens a file in the caller workspace's VSCodium editor pane (decision-12). The first request
+splits the caller's pane (its `session`, else the active tab's focused pane) and starts
+VSCodium in the new pane; while that pane is open, every `editor.open` and `editor.goto` reuses it
+instead of starting another, so a workspace has at most one editor pane. Params:
+
+| Param | Meaning |
+|---|---|
+| `path` | Required, 1–4096 bytes. Absolute, or relative to the caller session's tracked cwd (else the workspace's directory). Resolved by Conduit through the workspace's ExecutionContext, never by the server. `~` is refused. A missing file in an existing directory opens as a new file. |
+| `line`, `column` | Optional, one-based, at most 10,000,000. `column` only with `line`. |
+| `split` | `"right"` (default) or `"down"`: where a new editor pane goes. Ignored when the pane is already open. |
+
+```json
+{"id":5,"method":"editor.open","token":"…","session":4,"params":{"path":"src/main.zig","line":120,"column":9}}
+{"jsonrpc":"2.0","id":5,"result":{"tab":3,"pane":8}}
+```
+
+VSCodium is detected (`codium --version`, or the `editor.command` setting) through the
+workspace's context and is never installed by Conduit; without it the reply is
+`EditorNotInstalled`. Conduit's editor runs with its own per-workspace `--user-data-dir` under
+Conduit's state directory, so it never touches your own VSCodium window or settings; your
+extensions are still used. In SSH and WSL workspaces the reply is `EditorRemoteUnsupported`: open
+the file with `tab.open` and `["vi", "+<line>", "--", "<path>"]` there instead.
+
+### `editor.goto`
+
+Moves the open editor pane to a file position, starting the pane first when none is open.
+Params: `path` (required), `line`, `column`, as for `editor.open`; the file must exist. Result as
+for `editor.open`.
+
+### `editor.diff`
+
+Shows VSCodium's diff of two existing files in the editor pane (`codium --diff`). Params: `left`
+and `right` (required paths, resolved as above). Result as for `editor.open`.
+
+### `editor.reveal`
+
+Opens a file or folder in the editor pane and lets the explorer select it (`codium -r <path>`).
+Params: `path` (required, must exist). Result as for `editor.open`.
+
+### `editor.close`
+
+Closes the workspace's editor pane and asks its window to close, returning the space to the
+sibling pane. Params: none. Result: `{}` (also when no editor is open).
+
+None of the editor methods can reach the scratchpad, run a command, or read editor text back:
+paths are the only input, and they are handed to VSCodium as single absolute arguments.
+
 ## Errors
 
 | Code | Message | Meaning |
 |---|---|---|
 | -32700 | `ParseError` | The line is not valid UTF-8 JSON. |
 | -32600 | `InvalidRequest` | Not an object, missing `id` or `method`, unknown member, too deep, or over 64 KiB. |
-| -32601 | `MethodNotFound` | Not one of the twelve methods. |
+| -32601 | `MethodNotFound` | Not one of the seventeen methods. |
 | -32602 | `InvalidParams` | A parameter is missing, has the wrong type, or is out of bounds. |
 | -32603 | `InternalError` | Conduit failed unexpectedly, or the new terminal's process did not start. |
 | -32000 | `Unavailable` | Valid, but Conduit cannot do it now (busy for 4 s, view not available, shutting down). |
 | -32001 | `Unauthorized` | Missing, malformed, unknown or expired token, or a workspace method with the instance token. |
 | -32002 | `ScratchpadNotAddressable` | The request named the scratchpad session. |
 | -32003 | `Busy` | Too many requests or connections in flight; retry later. |
-| -32004 | `NotFound` | The session, agent, harness or workspace is not there. |
+| -32004 | `NotFound` | The session, agent, harness, workspace or editor file is not there. |
+| -32005 | `EditorNotInstalled` | No VSCodium answered in this workspace. `error.data.hint` says how to install it or set `editor.command`. |
+| -32006 | `EditorRemoteUnsupported` | The workspace is remote (SSH, WSL), where the editor pane does not run. `error.data.hint` names the `vi` fallback. |
 | -32008 | `TimedOut` | Conduit did not answer within its deadline (5 s). The action may still happen. |
 
 ## The `conduit` command
@@ -296,6 +351,85 @@ conduit control pane.split '{"direction":"down"}'
 conduit control tab.status '{"text":"building","attention":false}'
 conduit control notify '{"title":"Build","body":"finished"}'
 ```
+
+### The editor tool
+
+Any harness that can run a shell command can use the editor pane as its editor: a model running
+inside a Conduit terminal calls `conduit control editor.open` instead of `$EDITOR`. The reply is
+one JSON line; `EditorNotInstalled` and `EditorRemoteUnsupported` carry a hint the model can
+relay.
+
+```sh
+conduit control editor.open '{"path":"src/main.zig","line":120,"column":9}'
+conduit control editor.goto '{"path":"src/render.zig","line":42}'
+conduit control editor.diff '{"left":"src/main.zig.orig","right":"src/main.zig"}'
+conduit control editor.reveal '{"path":"docs"}'
+conduit control editor.close
+```
+
+**Claude Code.** Claude Code runs shell commands through its Bash tool, so the editor is one
+instruction away. Add to the project's `CLAUDE.md` (or `~/.claude/CLAUDE.md`):
+
+```markdown
+When you want the human to look at a file, run
+`conduit control editor.open '{"path":"<file>","line":<n>}'` (it opens VSCodium in a pane
+beside this terminal; later calls reuse that pane). Use `editor.diff` with `left`/`right` to
+show a change and `editor.close` when done. If `CONDUIT_CONTROL_ENDPOINT` is unset, skip it.
+```
+
+To have the editor follow every file Claude Code edits, add a `PostToolUse` hook to
+`.claude/settings.json`; it reads the tool input on stdin and never changes Claude Code's
+behaviour:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command",
+      "command": "[ -n \"$CONDUIT_CONTROL_ENDPOINT\" ] && jq -c '{path: .tool_input.file_path}' | xargs -0 conduit control editor.goto >/dev/null 2>&1; true"}]}]
+  }
+}
+```
+
+**Codex.** Codex also runs shell commands; add the same instruction to the project's `AGENTS.md`.
+Codex's sandbox must allow the command to reach the control socket (the default
+`workspace-write` sandbox blocks sockets outside the workspace; approve the command or run with
+network-capable settings).
+
+**Pi.** Pi's bash tool runs the commands as they are. A Pi extension can also register a
+dedicated tool:
+
+```js
+import { execFileSync } from "node:child_process";
+export default function (pi) {
+  pi.registerTool({
+    name: "open_in_editor",
+    description: "Open a file at a line in the VSCodium pane beside this terminal",
+    parameters: { type: "object", properties: { path: { type: "string" }, line: { type: "integer" } }, required: ["path"] },
+    async execute(_id, params) {
+      const out = execFileSync("conduit", ["control", "editor.open", JSON.stringify(params)], { encoding: "utf8" });
+      return { content: [{ type: "text", text: out }] };
+    },
+  });
+}
+```
+
+**OpenCode.** A custom tool in `.opencode/tool/editor.ts`:
+
+```ts
+import { tool } from "@opencode-ai/plugin";
+import { execFileSync } from "node:child_process";
+export default tool({
+  description: "Open a file at a line in the VSCodium pane beside this terminal",
+  args: { path: tool.schema.string(), line: tool.schema.number().int().positive().optional() },
+  async execute(args) {
+    return execFileSync("conduit", ["control", "editor.open", JSON.stringify(args)], { encoding: "utf8" });
+  },
+});
+```
+
+The instruction, hook, extension and tool snippets follow each harness's documented interfaces
+and have not been run against a live harness or a real VSCodium yet (TASK-79's deterministic
+check uses a stand-in `codium`).
 
 ### Claude Code hooks
 
@@ -382,5 +516,10 @@ extension interfaces and have not been run against a live harness; the protocol 
 
 `conduit-test` has no control forwarding: the workspace tokens exist only inside the app and its
 terminals, so an agent driving an isolated run types `conduit control …` into a terminal through
-the driver (`type`, `key`), as the `control-api` E2E scenario does. `conduit-test launch` puts
+the driver (`type`, `key`), as the `control-api` E2E scenario does. The one exception is the
+editor: `conduit-test editor-open <path> [line] [column] [--split right|down]` and
+`conduit-test editor-goto <path> [line] [column]` (MCP tools `editor_open` and `editor_goto`)
+drive the active workspace's editor pane the way `editor.open` and `editor.goto` do, resolving a
+relative path against the focused terminal's directory. Until TASK-79's second phase they answer
+`Unsupported`. `conduit-test launch` puts
 the run's control and instance sockets in its private run directory.

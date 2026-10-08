@@ -47,6 +47,8 @@ const usage =
     \\  conduit-test [global options] wait-for terminal-text <needle> [timeout-ms] [--target active|scratchpad]
     \\  conduit-test [global options] logs [max-bytes]
     \\  conduit-test [global options] screenshot|quit
+    \\  conduit-test [global options] editor-open <path> [line] [column] [--split right|down]
+    \\  conduit-test [global options] editor-goto <path> [line] [column]
     \\  conduit-test mcp
     \\
     \\  Global environment fallbacks: CONDUIT_TEST_RUN, CONDUIT_TEST_ROOT.
@@ -117,7 +119,15 @@ pub const Method = enum {
     get_logs,
     screenshot,
     quit,
+    editor_open,
+    editor_goto,
 };
+
+/// Where `editor-open` puts a new editor pane beside the focused pane.
+pub const EditorSplit = enum { right, down };
+
+/// The largest one-based line or column the editor commands accept.
+const max_editor_position: u32 = 10_000_000;
 
 /// Read-only terminal text destination. Input commands intentionally have no
 /// equivalent selector and always traverse Conduit's real active input path.
@@ -136,6 +146,9 @@ pub const Direct = struct {
     equals: bool = false,
     dx: f64 = 0,
     dy: f64 = 0,
+    /// The editor commands' one-based column (`number` holds the line).
+    column: ?u32 = null,
+    split: ?EditorSplit = null,
 };
 
 const Launch = struct {
@@ -346,7 +359,46 @@ fn parseDirect(name: []const u8, args: []const []const u8) CliError!Direct {
         return .{ .method = if (std.mem.eql(u8, name, "screenshot")) .screenshot else .quit };
     }
     if (std.mem.eql(u8, name, "wait-for")) return parseWait(args);
+    if (std.mem.eql(u8, name, "editor-open") or std.mem.eql(u8, name, "editor-goto")) {
+        return parseEditor(if (std.mem.eql(u8, name, "editor-open")) .editor_open else .editor_goto, args);
+    }
     return error.InvalidArguments;
+}
+
+/// `<path> [line] [column]`, plus `--split right|down` for `editor-open`.
+fn parseEditor(method: Method, args: []const []const u8) CliError!Direct {
+    var direct: Direct = .{ .method = method };
+    var positional: usize = 0;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (method == .editor_open and namesValue(arg, "--split")) {
+            if (direct.split != null) return error.InvalidArguments;
+            direct.split = std.meta.stringToEnum(EditorSplit, try takeValue(arg, "--split", args, &index)) orelse
+                return error.InvalidArguments;
+            continue;
+        }
+        // An unknown option is refused rather than taken as a path or number.
+        if (std.mem.startsWith(u8, arg, "--")) return error.InvalidArguments;
+        switch (positional) {
+            0 => {
+                if (arg.len == 0) return error.InvalidArguments;
+                direct.first = arg;
+            },
+            1 => direct.number = try parseEditorPosition(arg),
+            2 => direct.column = try parseEditorPosition(arg),
+            else => return error.InvalidArguments,
+        }
+        positional += 1;
+    }
+    if (positional == 0) return error.InvalidArguments;
+    return direct;
+}
+
+fn parseEditorPosition(text: []const u8) CliError!u32 {
+    const value = std.fmt.parseInt(u32, text, 10) catch return error.InvalidNumber;
+    if (value == 0 or value > max_editor_position) return error.InvalidNumber;
+    return value;
 }
 
 fn parseWait(args: []const []const u8) CliError!Direct {
@@ -553,6 +605,14 @@ pub fn buildRequest(allocator: Allocator, direct: Direct) (Allocator.Error || Cl
             writer.print("{{\"max_bytes\":{d}}}", .{max_bytes}) catch return error.RequestTooLarge
         else
             writer.writeAll("{}") catch return error.RequestTooLarge,
+        .editor_open, .editor_goto => {
+            writer.writeAll("{\"path\":") catch return error.RequestTooLarge;
+            writeJsonString(&writer, direct.first.?) catch return error.RequestTooLarge;
+            if (direct.number) |line| writer.print(",\"line\":{d}", .{line}) catch return error.RequestTooLarge;
+            if (direct.column) |column| writer.print(",\"column\":{d}", .{column}) catch return error.RequestTooLarge;
+            if (direct.split) |split| writer.print(",\"split\":\"{s}\"", .{@tagName(split)}) catch return error.RequestTooLarge;
+            writer.writeByte('}') catch return error.RequestTooLarge;
+        },
     }
     writer.writeByte('}') catch return error.RequestTooLarge;
     return allocator.realloc(bytes, writer.buffered().len);
@@ -583,6 +643,9 @@ pub fn decodeResponse(allocator: Allocator, response: []const u8, method: Method
         .inspect => if (result == .object) stringifyValue(allocator, result) else error.InvalidResponse,
         .terminal_text, .get_logs => objectString(allocator, result, "text"),
         .screenshot => objectString(allocator, result, "path"),
+        // The app answers with what it opened (pane and session ids), so the
+        // whole result object is the plain output.
+        .editor_open, .editor_goto => if (result == .object) stringifyValue(allocator, result) else error.InvalidResponse,
         else => blk: {
             if (result != .object or result.object.count() != 0) return error.InvalidResponse;
             break :blk allocator.dupe(u8, "ok");
@@ -910,6 +973,11 @@ const selector_properties =
     "\"root\":{\"type\":\"string\",\"description\":\"Absolute or working-directory-relative isolated test root\"}," ++
     "\"run\":{\"type\":\"string\",\"pattern\":\"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$\",\"description\":\"Explicit isolated run id; otherwise use the selected run\"}";
 
+const editor_location_properties =
+    "\"path\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4096,\"description\":\"File path, relative to the focused terminal's directory or absolute\"}," ++
+    "\"line\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":10000000}," ++
+    "\"column\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":10000000,\"description\":\"Only with line\"}";
+
 const terminal_target_property =
     "\"target\":{\"enum\":[\"active\",\"scratchpad\"],\"default\":\"active\",\"description\":\"Read-only terminal text target\"}";
 
@@ -946,6 +1014,18 @@ const tool_specs = [_]ToolSpec{
     .{ .name = "get_logs", .description = "Return a bounded log tail for the selected run.", .input_schema = "{\"type\":\"object\",\"properties\":{" ++ selector_properties ++ ",\"max_bytes\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":4194304}},\"additionalProperties\":false}", .read_only = true },
     .{ .name = "screenshot", .description = "Capture the selected run and return its PNG as MCP image content.", .input_schema = "{\"type\":\"object\",\"properties\":{" ++ selector_properties ++ "},\"additionalProperties\":false}", .read_only = true },
     .{ .name = "quit", .description = "Quit the selected isolated Conduit run.", .input_schema = "{\"type\":\"object\",\"properties\":{" ++ selector_properties ++ "},\"additionalProperties\":false}" },
+    .{
+        .name = "editor_open",
+        .description = "Open a file in the active workspace's VSCodium editor pane (a new split pane, or the open one), as the editor.open control method does.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{" ++ selector_properties ++ "," ++ editor_location_properties ++
+            ",\"split\":{\"enum\":[\"right\",\"down\"],\"description\":\"Where a new editor pane goes; default right\"}},\"required\":[\"path\"],\"additionalProperties\":false}",
+    },
+    .{
+        .name = "editor_goto",
+        .description = "Move the open VSCodium editor pane to a file, line and column, as the editor.goto control method does.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{" ++ selector_properties ++ "," ++ editor_location_properties ++
+            "},\"required\":[\"path\"],\"additionalProperties\":false}",
+    },
 };
 
 fn findTool(name: []const u8) ?ToolSpec {
@@ -1077,6 +1157,27 @@ fn parseToolInvocation(name: []const u8, arguments: std.json.Value) CliError!Too
         const dx = if (object.get("dx")) |value| try jsonNumber(value) else 0;
         if (@abs(dy) > 1_000_000 or @abs(dx) > 1_000_000) return error.InvalidMcpParams;
         direct = .{ .method = .scroll, .dy = dy, .dx = dx };
+    } else if (std.mem.eql(u8, name, "editor_open") or std.mem.eql(u8, name, "editor_goto")) {
+        const open = std.mem.eql(u8, name, "editor_open");
+        if (open) {
+            try onlyFields(object, &.{ "root", "run", "path", "line", "column", "split" });
+        } else {
+            try onlyFields(object, &.{ "root", "run", "path", "line", "column" });
+        }
+        const line = try optionalToolU32(object, "line", null, max_editor_position);
+        const column = try optionalToolU32(object, "column", null, max_editor_position);
+        if (line == 0 or column == 0 or (column != null and line == null)) return error.InvalidMcpParams;
+        const split: ?EditorSplit = if (try optionalToolString(object, "split", 8)) |text|
+            (std.meta.stringToEnum(EditorSplit, text) orelse return error.InvalidMcpParams)
+        else
+            null;
+        direct = .{
+            .method = if (open) .editor_open else .editor_goto,
+            .first = try requiredToolString(object, "path", 4096),
+            .number = line,
+            .column = column,
+            .split = split,
+        };
     } else if (std.mem.eql(u8, name, "get_logs")) {
         try onlyFields(object, &.{ "root", "run", "max_bytes" });
         direct = .{ .method = .get_logs, .number = try optionalToolU32(object, "max_bytes", null, @intCast(max_mcp_text_bytes)) };
@@ -1724,6 +1825,8 @@ test "request JSON escapes input and covers every driver method" {
         .{ .direct = .{ .method = .get_logs, .number = 100 }, .expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"get_logs\",\"params\":{\"max_bytes\":100}}" },
         .{ .direct = .{ .method = .screenshot }, .expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"screenshot\",\"params\":{}}" },
         .{ .direct = .{ .method = .quit }, .expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"quit\",\"params\":{}}" },
+        .{ .direct = .{ .method = .editor_open, .first = "src/a \"b\".zig", .number = 12, .column = 4, .split = .down }, .expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_open\",\"params\":{\"path\":\"src/a \\\"b\\\".zig\",\"line\":12,\"column\":4,\"split\":\"down\"}}" },
+        .{ .direct = .{ .method = .editor_goto, .first = "/x.zig" }, .expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_goto\",\"params\":{\"path\":\"/x.zig\"}}" },
     };
     for (cases) |case| {
         const request = try buildRequest(std.testing.allocator, case.direct);
@@ -1767,9 +1870,9 @@ test "run paths place all mutable state under one run directory" {
 
 test "MCP tool list covers every CLI capability with valid strict schemas" {
     const expected = [_][]const u8{
-        "launch", "inspect", "click",  "ctrl_click",    "double_click", "right_click", "drag",
-        "key",    "type",    "scroll", "terminal_text", "wait_for",     "get_logs",    "screenshot",
-        "quit",
+        "launch", "inspect",     "click",       "ctrl_click",    "double_click", "right_click", "drag",
+        "key",    "type",        "scroll",      "terminal_text", "wait_for",     "get_logs",    "screenshot",
+        "quit",   "editor_open", "editor_goto",
     };
     try std.testing.expectEqual(expected.len, tool_specs.len);
     for (tool_specs, expected) |spec, name| {
@@ -1807,6 +1910,51 @@ test "MCP tool list covers every CLI capability with valid strict schemas" {
     try std.testing.expectEqual(@as(usize, 2), targets.len);
     try std.testing.expectEqualStrings("active", targets[0].string);
     try std.testing.expectEqualStrings("scratchpad", targets[1].string);
+}
+
+test "editor commands parse paths, positions and splits strictly" {
+    const env = TestEnv{};
+    const open = try parseArgs(&.{ "conduit-test", "--run=r1", "editor-open", "src/a.zig", "12", "3", "--split=down" }, env.source());
+    try std.testing.expectEqual(Method.editor_open, open.command.?.direct.method);
+    try std.testing.expectEqualStrings("src/a.zig", open.command.?.direct.first.?);
+    try std.testing.expectEqual(@as(?u32, 12), open.command.?.direct.number);
+    try std.testing.expectEqual(@as(?u32, 3), open.command.?.direct.column);
+    try std.testing.expectEqual(@as(?EditorSplit, .down), open.command.?.direct.split);
+    const goto = try parseArgs(&.{ "conduit-test", "--run=r1", "editor-goto", "b.zig" }, env.source());
+    try std.testing.expectEqual(Method.editor_goto, goto.command.?.direct.method);
+    try std.testing.expectEqual(@as(?u32, null), goto.command.?.direct.number);
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "conduit-test", "--run=r1", "editor-open" }, env.source()));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "conduit-test", "--run=r1", "editor-goto", "a", "--split=right" }, env.source()));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "conduit-test", "--run=r1", "editor-open", "a", "--split=left" }, env.source()));
+    try std.testing.expectError(error.InvalidNumber, parseArgs(&.{ "conduit-test", "--run=r1", "editor-open", "a", "0" }, env.source()));
+    try std.testing.expectError(error.InvalidNumber, parseArgs(&.{ "conduit-test", "--run=r1", "editor-goto", "a", "1", "x" }, env.source()));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "conduit-test", "--run=r1", "editor-goto", "a", "1", "2", "3" }, env.source()));
+
+    const arguments = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"run\":\"r1\",\"path\":\"a.zig\",\"line\":4,\"split\":\"right\"}", .{});
+    defer arguments.deinit();
+    const invocation = try parseToolInvocation("editor_open", arguments.value);
+    try std.testing.expectEqual(Method.editor_open, invocation.command.direct.method);
+    try std.testing.expectEqual(@as(?u32, 4), invocation.command.direct.number);
+    try std.testing.expectEqual(@as(?EditorSplit, .right), invocation.command.direct.split);
+    for ([_][]const u8{
+        "{\"run\":\"r1\"}",
+        "{\"run\":\"r1\",\"path\":\"\"}",
+        "{\"run\":\"r1\",\"path\":\"a\",\"line\":0}",
+        "{\"run\":\"r1\",\"path\":\"a\",\"column\":2}",
+        "{\"run\":\"r1\",\"path\":\"a\",\"split\":\"up\"}",
+        "{\"run\":\"r1\",\"path\":\"a\",\"command\":\"rm\"}",
+    }) |text| {
+        const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer bad.deinit();
+        try std.testing.expectError(error.InvalidMcpParams, parseToolInvocation("editor_open", bad.value));
+    }
+    const goto_split = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"run\":\"r1\",\"path\":\"a\",\"split\":\"right\"}", .{});
+    defer goto_split.deinit();
+    try std.testing.expectError(error.InvalidMcpParams, parseToolInvocation("editor_goto", goto_split.value));
+
+    const opened = try decodeResponse(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"pane\":3}}", .editor_open);
+    defer std.testing.allocator.free(opened);
+    try std.testing.expectEqualStrings("{\"pane\":3}", opened);
 }
 
 test "MCP argument dispatch is strict and maps wait forms" {

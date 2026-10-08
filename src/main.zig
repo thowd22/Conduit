@@ -8009,6 +8009,8 @@ const App = struct {
             .instance_open_ssh => |open| self.controlOpenSsh(open.destination),
             .instance_open_workspace => |open| self.controlOpenWorkspace(open.name, open.path),
             .instance_agent => |launch| self.controlAgent(caller, launch.harness, launch.prompt),
+            // TASK-79 phase two wires the editor pane (decision-12).
+            .editor_open, .editor_goto, .editor_diff, .editor_reveal, .editor_close => controlFault(.unavailable),
         };
     }
 
@@ -19005,6 +19007,8 @@ const App = struct {
             // as are `restore.enabled` and `accessibility.enabled`.
             .shell => if (self.config_current.settings.shell.len == 0) "(default)" else self.config_current.settings.shell,
             .remote_profile, .remote_recent, .control_enabled, .restore_enabled, .accessibility_enabled, .profile, .keybind => "",
+            // TASK-79 phase two gives it a settings row.
+            .editor_command => if (self.config_current.settings.editor_command.len == 0) "(codium)" else self.config_current.settings.editor_command,
         };
     }
 
@@ -21152,6 +21156,11 @@ const App = struct {
             .quit => {
                 self.respondDriverResult(token, request.id, .ok);
                 self.driver_quit_deadline_ns = Io.Clock.real.now(self.io).nanoseconds + 50 * std.time.ns_per_ms;
+                return false;
+            },
+            // TASK-79 phase two wires the editor pane (decision-12).
+            .editor_open, .editor_goto => {
+                self.respondDriverFault(token, request.id, testdriver.Fault.unavailable("Unsupported: the editor pane is not wired yet"));
                 return false;
             },
         }

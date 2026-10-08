@@ -63,6 +63,8 @@ const modules = [_]ModuleSpec{
     .{ .name = "backlog", .source_file = "src/backlog.zig", .deps = &.{
         "config", "input", "theme", "ui", "workspace",
     } },
+    // TASK-79: the VSCodium editor pane's model (decision-12).
+    .{ .name = "editor", .source_file = "src/editor.zig", .deps = &.{"workspace"} },
     .{ .name = "testdriver", .source_file = "src/testdriver.zig", .deps = &.{
         "input", "render", "session", "ui", "workspace",
     } },
@@ -72,9 +74,9 @@ const modules = [_]ModuleSpec{
 
     // The composition root. Its root file is the executable entry point.
     .{ .name = "app", .source_file = "src/main.zig", .deps = &.{
-        "accessibility", "agent",   "backlog",  "config",  "control",    "font",      "input",
-        "link",          "palette", "platform", "pty",     "render",     "session",   "state",
-        "term",          "theme",   "ui",       "version", "testdriver", "workspace",
+        "accessibility", "agent",   "backlog",  "config",     "control",   "editor",  "font",  "input",
+        "link",          "palette", "platform", "pty",        "render",    "session", "state", "term",
+        "theme",         "ui",      "version",  "testdriver", "workspace",
     } },
 };
 

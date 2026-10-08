@@ -61,6 +61,11 @@ pub const Method = enum {
     get_logs,
     screenshot,
     quit,
+    /// TASK-79: open a file in the active workspace's editor pane, as the
+    /// `editor.open` control method does for a harness.
+    editor_open,
+    /// TASK-79: move the open editor pane to a file position (`editor.goto`).
+    editor_goto,
 
     /// Every method in deterministic protocol order.
     pub const all = [_]Method{
@@ -78,6 +83,8 @@ pub const Method = enum {
         .get_logs,
         .screenshot,
         .quit,
+        .editor_open,
+        .editor_goto,
     };
 
     /// Parse an exact method name; method names are never normalized.
@@ -137,6 +144,23 @@ pub const ElementState = enum {
     pressed,
 };
 
+/// Longest path an editor method accepts, matching the control API's bound.
+pub const max_editor_path_bytes: usize = 4096;
+
+/// Largest one-based line or column an editor method accepts.
+pub const max_editor_position: u32 = 10_000_000;
+
+/// Where a new editor pane goes beside the focused pane.
+pub const EditorSplit = enum { right, down };
+
+/// A file position for the editor methods. The app resolves `path` against
+/// the focused session's cwd through the workspace's ExecutionContext.
+pub const EditorLocation = struct {
+    path: []const u8,
+    line: ?u32 = null,
+    column: ?u32 = null,
+};
+
 /// A condition retained by the main loop until it matches or times out.
 pub const WaitCondition = union(enum) {
     element: struct {
@@ -184,6 +208,13 @@ pub const Params = union(Method) {
     },
     screenshot: void,
     quit: void,
+    editor_open: struct {
+        location: EditorLocation,
+        split: ?EditorSplit = null,
+    },
+    editor_goto: struct {
+        location: EditorLocation,
+    },
 };
 
 /// One validated request. All borrowed memory belongs to `ParsedRequest`.
@@ -354,7 +385,37 @@ fn parseParams(method: Method, value: JsonValue) ?Params {
         .get_logs => parseGetLogs(object),
         .screenshot => if (object.count() == 0) .{ .screenshot = {} } else null,
         .quit => if (object.count() == 0) .{ .quit = {} } else null,
+        .editor_open => parseEditorOpen(object),
+        .editor_goto => blk: {
+            if (!hasOnlyFields(object, &.{ "path", "line", "column" })) break :blk null;
+            break :blk .{ .editor_goto = .{ .location = parseEditorLocation(object) orelse break :blk null } };
+        },
     };
+}
+
+fn parseEditorOpen(object: std.json.ObjectMap) ?Params {
+    if (!hasOnlyFields(object, &.{ "path", "line", "column", "split" })) return null;
+    const location = parseEditorLocation(object) orelse return null;
+    const split: ?EditorSplit = if (object.get("split")) |value|
+        (std.meta.stringToEnum(EditorSplit, asString(value) orelse return null) orelse return null)
+    else
+        null;
+    return .{ .editor_open = .{ .location = location, .split = split } };
+}
+
+fn parseEditorLocation(object: std.json.ObjectMap) ?EditorLocation {
+    const path = asString(object.get("path") orelse return null) orelse return null;
+    if (path.len == 0 or path.len > max_editor_path_bytes) return null;
+    for (path) |byte| if (byte < 0x20 or byte == 0x7f) return null;
+    const line = if (object.get("line")) |value| (editorPosition(value) orelse return null) else null;
+    const column = if (object.get("column")) |value| (editorPosition(value) orelse return null) else null;
+    if (column != null and line == null) return null;
+    return .{ .path = path, .line = line, .column = column };
+}
+
+fn editorPosition(value: JsonValue) ?u32 {
+    const position = unsignedInteger(value, max_editor_position) orelse return null;
+    return if (position == 0) null else position;
 }
 
 fn parseTarget(value: JsonValue) ?Target {
@@ -834,6 +895,8 @@ test "every documented method parses to typed parameters" {
         .{ .method = .get_logs, .json = "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"get_logs\",\"params\":{\"max_bytes\":4096}}" },
         .{ .method = .screenshot, .json = "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"screenshot\",\"params\":{}}" },
         .{ .method = .quit, .json = "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"quit\",\"params\":{}}" },
+        .{ .method = .editor_open, .json = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"editor_open\",\"params\":{\"path\":\"src/a.zig\",\"line\":3,\"column\":7,\"split\":\"down\"}}" },
+        .{ .method = .editor_goto, .json = "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"editor_goto\",\"params\":{\"path\":\"/abs/b.zig\"}}" },
     };
     try std.testing.expectEqual(cases.len, Method.all.len);
     for (cases, Method.all) |case, method| {
@@ -1040,6 +1103,14 @@ test "strict params reject unknown fields bad bounds and missing pairs" {
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"terminal_text\",\"params\":{\"target\":\"unknown\"}}",
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"get_logs\",\"params\":{\"max_bytes\":4194305}}",
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"quit\",\"params\":{\"now\":true}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_open\",\"params\":{}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_open\",\"params\":{\"path\":\"\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_open\",\"params\":{\"path\":\"a\\nb\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_open\",\"params\":{\"path\":\"a\",\"line\":0}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_open\",\"params\":{\"path\":\"a\",\"column\":4}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_open\",\"params\":{\"path\":\"a\",\"split\":\"up\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_goto\",\"params\":{\"path\":\"a\",\"split\":\"down\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"editor_goto\",\"params\":{\"path\":\"a\",\"line\":10000001}}",
     };
     for (invalid) |frame| {
         var parsed = try expectFault(frame, .invalid_params);

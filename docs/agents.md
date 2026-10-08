@@ -83,6 +83,25 @@ in `backlog/docs/doc-3`. In short:
   may be edited, opens editable files in `vi`, and for Claude Code restarts the agent to apply an
   edit (TASK-59).
 
+### The editor tool (TASK-79, in progress)
+
+A harness running in a Conduit terminal can use VSCodium as its editor through the control API:
+`conduit control editor.open '{"path":"src/main.zig","line":120}'` opens the file in a VSCodium
+pane split beside the terminal, later `editor.open`/`editor.goto` calls reuse that pane, and
+`editor.diff`, `editor.reveal` and `editor.close` cover the rest. Conduit never installs VSCodium:
+it detects `codium` (or the `editor.command` setting) in the workspace's context, runs it with a
+per-workspace `--user-data-dir` under Conduit's state directory so your own VSCodium is never
+touched, and answers `EditorNotInstalled` with an install hint when it is missing. Remote (SSH)
+workspaces answer `EditorRemoteUnsupported` and use `vi` instead. On X11 the VSCodium window is
+hosted inside the pane; on Wayland, macOS and Windows it stays a separate window
+(`backlog/decisions/decision-12`).
+
+Per-harness setup (a `CLAUDE.md`/`AGENTS.md` instruction, a Claude Code `PostToolUse` hook that
+makes the editor follow every edit, a Pi tool and an OpenCode custom tool) is in
+[control-api.md](control-api.md#the-editor-tool). Status: the protocol, the CLI client and the
+`conduit-test`/MCP tools exist; the app answers `Unavailable` (and `conduit-test`
+`Unsupported`) until the pane itself is wired in TASK-79's second phase.
+
 ### Observed agents
 
 A harness you start yourself in an ordinary tab or pane is noticed and followed on that tab
@@ -171,8 +190,11 @@ directory:
 
 `conduit-test mcp` serves the same commands as MCP tools over stdio: `launch`, `inspect`,
 `click`, `ctrl_click`, `double_click`, `right_click`, `drag`, `key`, `type`, `scroll`,
-`terminal_text`, `wait_for`, `get_logs`, `screenshot` (returned as an image plus the file path)
-and `quit`. It opens no network listener. Run `zig build` first, and restart the client after
+`terminal_text`, `wait_for`, `get_logs`, `screenshot` (returned as an image plus the file path),
+`quit`, and `editor_open` / `editor_goto` (the CLI's `editor-open <path> [line] [column]
+[--split right|down]` and `editor-goto`), which drive the active workspace's VSCodium editor pane
+like the `editor.open` and `editor.goto` control methods and answer `Unsupported` until TASK-79's
+second phase. It opens no network listener. Run `zig build` first, and restart the client after
 rebuilding.
 
 **Claude Code.** The repository's `.mcp.json` registers it:
