@@ -59,24 +59,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  conpty-probe:
-    name: ConPTY probe (temporary)
-    runs-on: windows-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-      - run: echo "ZIG_VERSION=$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_ENV"
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-          use-cache: false
-      - run: bash .github/scripts/windows-sh-standin.sh
-      - run: zig test src/pty.zig
-      - run: powershell.exe -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber | Format-List"
-
   windows:
     name: Windows x86_64 platform checks and zip
     runs-on: windows-latest
@@ -256,9 +238,11 @@ jobs:
       # --clipboard-test pins SDL's offscreen driver, which needs EGL on Windows;
       # --ime-test's MSYS child cannot put a ConPTY console into raw mode;
       # --links-test opens `vi`, which the runner does not have as vi.exe;
-      # --panes-test and --search-test stop with "conduit stopped: Closed": a
-      # write to a pane whose shell has just drawn its prompt fails with
-      # ERROR_NO_DATA, so a live pseudoconsole's input pipe is closing.
+      # --panes-test and --search-test stop with "conduit stopped: Closed":
+      # their MSYS `sh` read loop ends on the SIGWINCH a pseudoconsole resize
+      # raises (bash in POSIX mode returns 128 from `read`), so the pane's
+      # child exits and owed input meets a closed terminal; the fixtures in
+      # src/main.zig need `trap '' WINCH`.
       - name: Built-in checks (survey)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         continue-on-error: true

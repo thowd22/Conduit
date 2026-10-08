@@ -266,9 +266,15 @@ step is the real proof), `--ime-test` (its fixed child is an MSYS `sh` script
 that cannot put a ConPTY console into raw mode; the smoke's Unicode text input
 through cmd.exe is the Windows proof of committed text), `--links-test` (it
 opens `vi`, which the runner has only as an MSYS script, not `vi.exe`), and
-`--panes-test` and `--search-test` (a write that reaches a ConPTY whose child
-has just exited fails with `ERROR_NO_DATA`, which `pty.zig` reports as
-`SystemError` rather than `Closed`, and the check stops).
+`--panes-test` and `--search-test` (their fixed child is a
+`while IFS= read -r line` loop under Git for Windows' `sh`, which is bash in
+POSIX mode: MSYS raises SIGWINCH for a pseudoconsole resize and `read` returns
+status 128, so the loop and its shell end at the first split or resize. The
+pane's terminal is then closed under input the app still owes it, and the
+write fails with `ERROR_NO_DATA`. The pseudoconsoles and pipes are sound:
+`pty.zig`'s tests show two consoles kept apart and the same loop surviving a
+resize once it runs `trap '' WINCH`, which the fixtures in `src/main.zig`
+still need before these two checks can gate).
 
 `publish-windows` uploads the zip and its `.sha256` to the release with
 `--clobber`. Like `publish-macos` it needs `publish` and nothing needs it.
