@@ -103,11 +103,12 @@ esac
 keep_screenshot claude-idle
 ct terminal-text > "$out/claude-terminal.txt" 2>&1 || true
 
-# Ctrl+C until Claude Code has left: it exits on a second Ctrl+C that follows
-# the first within a moment, so they go as a pair.
+# Ctrl+C until Claude Code has left: the first asks "Press Ctrl-C again to
+# exit", and a second within a moment of that ends it.
 left=""
 for attempt in 1 2 3; do
   ct key CTRL+c > /dev/null
+  ct wait-for terminal-text "Press Ctrl-C again" 3000 > /dev/null || true
   ct key CTRL+c > /dev/null
   if ct wait-for element workspace.1.tab.1.agent.done exists true 5000 > /dev/null; then
     left=ctrl-c
@@ -121,7 +122,7 @@ if [ -z "$left" ]; then
   # this Claude Code on the runner. What is gated is that its leaving the
   # foreground ends the observed agent, so it is ended from outside.
   echo "::warning::Ctrl+C did not end claude under ConPTY; ending it with taskkill"
-  taskkill //F //IM claude.exe || true
+  taskkill /F /IM claude.exe || true
   left=taskkill
 fi
 echo "INFO claude left by $left"

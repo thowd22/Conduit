@@ -28571,7 +28571,7 @@ const agent_test_script =
     // process, which leaves no Windows parent to find it through, while a
     // native program it runs keeps its parent waiting.
     "elif [ \"$line\" = fake ]; then f=\"${" ++ agent_test_trigger_env ++ "%/*}/conduit-fake-agent\"; " ++
-    "if command -v cmd.exe > /dev/null 2>&1; then CONDUIT_FAKE_AGENT=\"$f\" cmd.exe //c \"\\\\bin\\\\sh.exe %CONDUIT_FAKE_AGENT%\"; " ++
+    "if command -v cmd.exe > /dev/null 2>&1; then MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /d /c \"\\\\bin\\\\sh.exe $f\"; " ++
     "else set -m; sh \"$f\"; set +m; fi; printf 'FAKE-BACK\\r\\n'; " ++
     "else printf 'ECHO:%s\\r\\n' \"$line\"; fi; done";
 
