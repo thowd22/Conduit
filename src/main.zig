@@ -25545,8 +25545,10 @@ fn paletteTest(self: *App, io: Io, out: *Writer) !u8 {
     const new_id = try std.fmt.bufPrint(&new_id_storage, "palette.action.{d}", .{new_definition_index});
     const new_row = self.ui_tree.byId(.{ .value = new_id });
     const expected_chord = if (self.binding_profile == .macos) "Cmd+T" else "Ctrl+Shift+T";
+    // "newtab" also matches New tab with profile (TASK-46); the exact
+    // command ranks first and is selected.
     paletteCheck(out, &failures, std.mem.eql(u8, self.palette_query.text(), "newtab") and
-        self.palette_model.results().len == 1 and selected_new != null and
+        self.palette_model.results().len == 2 and selected_new != null and
         std.mem.eql(u8, selected_new.?.name, tab_new_action) and new_row != null and
         std.mem.indexOf(u8, new_row.?.label, expected_chord) != null, "fuzzy filtering selected New tab and displayed its bound key", .{});
 

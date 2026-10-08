@@ -612,6 +612,39 @@ nothing else is a legal dependency.
   sidebar glyphs and notifications), TASK-57 (the structured agent view), TASK-58 (the agent
   manager); M7 — TASK-63 (the backlog view), TASK-64 (agents started on tasks).
 
+- **Shell profiles (TASK-46).** `ResolvedProfile` is a profile ready to start in one workspace:
+  a configured `config.ShellProfile` or a built-in one. `BuiltinProfiles.detect` fills the
+  built-ins for a context kind through a `PathProbe` over the workspace context's `statPath`
+  (`ContextProbe`): Local POSIX `login` (`$SHELL`, else `passwdShell` over the context's
+  `/etc/passwd`, else `/bin/sh`, as a login shell), Local Windows `pwsh` (on the child's `PATH`,
+  else `%ProgramFiles%\PowerShell\7`), `powershell` and `cmd` when each exists (cmd always), and
+  a remote context's `login` with an empty argv (the remote login shell). It fills in place, since
+  its argv slices point into itself. `ProfileChoices` is heap-owned by `App` and listed before the
+  registry exists, so `tab.new-with-profile` and `pane.split-with-profile` (fixed choices named
+  `profile`, registry indices 82 and 83) validate a configured `keybind` against real names; it is
+  rebuilt for the active workspace when the palette opens and before a reload rebuilds the
+  bindings, never while the palette is open. `ChildSpec.buildProfile` builds the spawn: the
+  context's base environment with the profile's variables on top, the program, `loginFlag`
+  (`-l`; `--login` for bash, whose long options must precede the integration's `--posix`;
+  `-Login` for PowerShell 7 off Windows; nothing for cmd and Windows PowerShell), the profile's
+  arguments and, for a Local bare shell (`profileIntegrationAllowed`), its integration. `tab.new`
+  and `pane.split` became `openTab` / `splitFocusedPane` with an optional profile;
+  `defaultProfile` resolves `shell` (null keeps the app-level `spec`), and an interactive run's
+  first tab is built from that profile when no command or check peer is set
+  (`fixedChildCommand`). A profile's argv and environment move into the spawn `Load`
+  (`startTabChildProcess`, which hands the job exactly one owned environment: the control copy
+  when there is one, else the profile's); its cwd is `profile.cwd`, else the tracked directory
+  converted by `spawnDirectory` (`/C:/x` from PowerShell's OSC 7 becomes `C:\x` for a Windows
+  spawn). On Windows the default local shell (`defaultShellProgram`) is the first detected
+  built-in rather than `$SHELL`. `ShellKind.powershell` matches `pwsh`/`powershell` with or
+  without `.exe` on any platform; its integration is `-NoExit -Command` dot-sourcing
+  `[scriptblock]::Create` of the written `powershell/conduit.ps1`, which loads after the user's
+  profile and is not subject to a script-file execution policy. The Shells settings group holds
+  the `shell` row and a read-only `settings.row.profile.<name>` per profile that opens the file.
+  `--profiles-test` drives all of it against a private settings file; the Windows ConPTY test
+  (`PowerShell runs under ConPTY with its integration, colours and resize`) runs on the hosted
+  runner.
+
 ### `platform`
 
 - **Owns** window, input and clipboard OS calls. `platform.window`: window creation, the GL
@@ -695,6 +728,10 @@ nothing else is a legal dependency.
   closes Conduit's output end before `ClosePseudoConsole` for the same reason. Ctrl+C is the
   byte 0x03 on the input pipe; hangup/terminate/kill are `TerminateProcess` with 128+signal.
 - **Lands** M1 — TASK-8, TASK-16; TASK-75 (per-direction wake channels).
+- **PowerShell (TASK-46).** No backend change: PowerShell 7 and Windows PowerShell run over the
+  same ConPTY path. A pseudoconsole implies VT output processing, so SGR colours, OSC 7 and OSC 133
+  from the integration script reach `term`, and `resize` is what `$Host.UI.RawUI.WindowSize`
+  reports; the app-level Windows test proves the four together on the hosted runner.
 
 ### `term`
 
@@ -1282,6 +1319,21 @@ nothing else is a legal dependency.
   `<chord>=<action>` appended, every other line kept byte for byte; `writeActionKeybinds` applies
   it to the file with the same create-from-defaults, sibling write and rename (`replaceDocument`)
   as `writeDocumentValue`. `--settings-test` is the fourth check that reads a private file.
+- **TASK-46 additions (shell profiles).** `profile = <name> = <command> [arguments...]` repeats
+  (at most `max_shell_profiles` = 32; a later line for a name replaces its command in place) and
+  is split by `splitCommandLine` (blanks separate, `'...'` literal, `"..."` with only `\"` and
+  `\\`, every other backslash literal so Windows paths need no doubling; at most 32 words).
+  `profile.<name>.env` (repeats, `NAME=value`, at most 32), `.cwd` and `.login` are dynamic keys:
+  `parse` recognises them before `Key.fromName`, keeps them in file order and attaches them after
+  every `profile` line is known (`applyProfileAttributes`), so an attribute may precede its
+  profile; an attribute for an undefined name or with a bad value is a line diagnostic naming
+  `profile.<name>.<field>`. When every `profile` line was rejected the previous profiles stand
+  whole and this file's attributes are not stacked on them. `shell` names the default profile;
+  `checkShellName` reports one that is neither configured nor in `builtin_shell_profile_names`
+  (`login`, plus `pwsh`, `powershell` and `cmd` on Windows) and keeps the value. Everything sits
+  in its own block of the file; `Settings.shell_profiles` holds `ShellProfile` values owned by the
+  `Config` arena. `profile` is never a single value (`setDocumentValue` refuses it); `shell` is a
+  text row of the settings view.
 
 ### `state`
 

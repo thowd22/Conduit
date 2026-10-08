@@ -25,7 +25,7 @@ with a commented copy of every default, so it documents itself. **Reload config*
 
 **Settings** (`settings.open`; Ctrl+Shift+, on Linux and Windows, Cmd+Shift+, on macOS, or type
 `settings` in the command palette) opens a dialog over the window that lists every setting below,
-grouped under dim headings: Appearance, Fonts, Keys, Scratchpad, Mouse and Agents. Each row reads
+grouped under dim headings: Appearance, Fonts, Keys, Scratchpad, Mouse, Agents and Shells. Each row reads
 `<setting>  <value>`, the value being the one in effect. A `·` after the value means the settings
 file sets it; no mark means the built-in default (or a command-line flag) decides it. The last
 row, **Open config file**, closes the dialog and opens the file itself, as `config.open` does.
@@ -41,9 +41,12 @@ row, **Open config file**, closes the dialog and opens the file itself, as `conf
   - `theme` and `font.family` close the dialog and open the palette's theme or family chooser,
     with its live preview;
   - numbers (`font.size`, `scratchpad.size`, `scratchpad.large_size`) and text (`font.bold`,
-    `font.italic`, `font.bold_italic`, `font.fallbacks`) open a field on the row holding the
-    current value: Enter saves, Escape cancels. An empty style family means "derived from the
-    family".
+    `font.italic`, `font.bold_italic`, `font.fallbacks`, `shell`) open a field on the row holding
+    the current value: Enter saves, Escape cancels. An empty style family means "derived from the
+    family"; an empty `shell` means the built-in default;
+  - each shell profile has a read-only row, `<name>  <command>` (`…` when it also sets variables
+    or a directory). A profile is several lines, so Enter or a click on one closes the dialog and
+    opens the settings file, as **Open config file** does.
 
   Left and Right also flip a `true`/`false` row, switch `mouse.right_click`, and step a number by
   one (the size by whole points from 6 to 72, the scratchpad by one percent from 10 to 100).
@@ -122,6 +125,11 @@ keybind = ctrl+alt+p=palette.open
 | `control.enabled` | `true` or `false` | `true` in development (Debug) builds, `false` in release builds | Read at startup: whether this run starts the local control endpoint harnesses use and the single-instance endpoint `conduit` commands reuse ([control-api.md](control-api.md)). No settings-view row |
 | `restore.enabled` | `true` or `false` | `true` | Read at startup: whether Conduit saves its workspaces, tabs, pane layouts, working directories, theme and window size to the state file and restores them on the next launch ([user-guide.md](user-guide.md#sessions-are-restored)). `false` neither saves nor restores. No settings-view row |
 | `accessibility.enabled` | `true` or `false` | `true` | Read at startup: whether the interface is exposed to screen readers and other assistive technology (AT-SPI on Linux; [accessibility.md](accessibility.md)). No settings-view row |
+| `shell` | a profile name | `""` (the built-in default) | Applies to the next tab or pane, and to the first tab at startup; see [Shell profiles](#shell-profiles) |
+| `profile` | `<name> = <command> [arguments...]`, repeats | none | A shell profile listed by **New tab with profile**; see [Shell profiles](#shell-profiles) |
+| `profile.<name>.env` | `NAME=value`, repeats | none | A variable the profile's shell starts with |
+| `profile.<name>.cwd` | directory | `""` (the invoking terminal's) | Where the profile's shell starts |
+| `profile.<name>.login` | `true` or `false` | `false` | Start the profile's shell as a login shell |
 | `keybind` | see below | the shipped bindings | Applies |
 
 Command-line flags are a session layer above the file: `--font=<family>` wins over `font.family`
@@ -311,6 +319,65 @@ modifiers whatever the value, and the bindings always see Option as `alt`/`optio
 character or dead key arrives through macOS's text input exactly as in any other app. The
 setting is applied on save, like every other key; it has no row in the settings view yet.
 
+## Shell profiles
+
+A shell profile names what a new tab or pane runs. **New tab with profile**
+(`tab.new-with-profile`) and **Split with profile** (`pane.split-with-profile`, which splits the
+focused pane to the right) list every profile of the active workspace; Up and Down move, Enter or a
+click starts the highlighted one. A tab opened this way is named after its profile.
+
+```
+# One profile per line: profile = <name> = <command> [arguments...]
+profile = work = /bin/zsh
+profile.work.cwd = /home/me/src
+profile.work.env = EDITOR=nvim
+profile.work.env = GOFLAGS=-mod=mod
+profile = py = python3 -q
+profile = admin = "C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo
+profile = login-zsh = /bin/zsh
+profile.login-zsh.login = true
+# What New tab, a split and the first tab run when no profile is chosen.
+shell = work
+```
+
+- **Names** are 1 to 32 letters, digits, `-` and `_`. A later `profile` line with the same name
+  replaces that profile's command and keeps its place in the list; there may be at most 32.
+- **The command** is split into words like a shell would: blanks separate words, `'...'` is
+  literal, and inside `"..."` only `\"` (a quote) and `\\` (a backslash) are special. A backslash
+  anywhere else is an ordinary character, so a Windows path is written as it is. The command is
+  started directly, never through a shell, and nothing in it is expanded.
+- **`profile.<name>.env`** repeats, one `NAME=value` per line (at most 32), and is added on top of
+  the environment every terminal gets, replacing a variable of the same name.
+  **`profile.<name>.cwd`** is the directory the shell starts in; without it a profile starts in
+  the directory of the terminal it was opened from, like every new tab. **`profile.<name>.login`**
+  starts the program as a login shell: `-l` for most shells, `--login` for bash, `-Login` for
+  PowerShell 7 on Linux and macOS, and nothing for cmd and PowerShell on Windows, which have no
+  login mode. These lines may come before or after their `profile` line.
+- **Built-in profiles** are listed before your own and need no line. On Linux and macOS there is
+  one, `login`: your `$SHELL` (else the shell `/etc/passwd` names for you, else `/bin/sh`) as a
+  login shell. On Windows they are `pwsh` (PowerShell 7, found on `PATH` or in
+  `%ProgramFiles%\PowerShell\7`), `powershell` (Windows PowerShell) and `cmd`, each only when it
+  is installed. In an SSH workspace there is one, `login`, the remote user's own login shell, and
+  your profiles are offered as they are: their command runs on the remote host, so it should name
+  a program there. A profile with the same name as a built-in one replaces it.
+- **`shell`** names the profile a plain **New tab**, a split and, in an ordinary run, the first tab
+  start. When it is empty or names nothing (reported as `shell: no profile with that name`), the
+  built-in default runs: on Linux and macOS your `$SHELL` as an ordinary interactive shell, on
+  Windows the first of `pwsh`, `powershell` and `cmd` that is installed, over SSH the remote login
+  shell. The first tab starts in the workspace's directory even when its profile names another;
+  tabs and panes opened later honour `profile.<name>.cwd`. A run started with `--command` keeps
+  its command in its first tab.
+- **Shell integration** (the working directory and prompt marks that make new tabs open where you
+  are and close without asking at a prompt) is added to a profile that runs bash, zsh, fish or
+  PowerShell with no arguments of its own; PowerShell also keeps it with `-NoLogo`, `-NoProfile`
+  or `-Login`. A profile that runs a command (`bash -c ...`) or other arguments is started exactly
+  as written. See `assets/shell-integration/README.md`.
+- **Binding a profile to a key:** `keybind = ctrl+alt+1=tab.new-with-profile:work` (or
+  `pane.split-with-profile:work`). The name must be a profile the file defines, or a built-in one.
+
+A profile comes from your own settings file and is trusted like a keybinding; nothing a terminal
+prints can define or start one.
+
 ## Notifications
 
 An agent's state changes and terminal notification sequences become entries in the in-app list
@@ -407,6 +474,14 @@ the cells, has `99` points refused with its message and the file unchanged, cycl
 `mouse.right_click`, captures a new palette chord and uses it, has a taken chord reported,
 kept on Escape and taken on Enter, opens the raw file from its row, and proves keys, text and
 clicks behind the dialog do nothing, reading the file back after every change.
+`xvfb-run -a zig build run -- --profiles-test` writes two shell profiles into its own private
+settings file and drives them: it opens **New tab with profile** by keyboard and checks the
+listed rows (the built-in `login` profile first), starts `alpha` and proves its argv and
+directory and, by typing into the new shell, its variable and directory; clicks `beta`, a login
+profile, and proves it started with `-l`; splits with `alpha`; proves a plain **New tab** runs the
+check's own child until `shell = alpha` is written, and `alpha` afterwards; reads the Shells rows
+of the settings view; and has a malformed `profile` line reported as `config:9: profile: unbalanced
+quotes` while both good profiles stay.
 `xvfb-run -a zig build run -- --agent-test` writes its own private settings file too: it turns
 `notifications.permission` off by a rewrite and proves the next permission wait is neither listed
 nor sent to the desktop, then turns it back on through the settings view's Agents row. `conduit-test launch` isolates `XDG_CONFIG_HOME`, so an

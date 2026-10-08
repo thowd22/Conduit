@@ -718,6 +718,33 @@ const agent_prompts_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-46: a tab opened from the shell-profile chooser. The palette lists the
+// built-in profiles first, so choice 0 of `tab.new-with-profile` (registry
+// index 82; it shifts when an action is registered before it) is `login`, the
+// launch's `$SHELL` as a login shell under the isolated HOME. The new tab's
+// row appears, and the shell it runs answers a typed command with output its
+// spelling does not contain.
+const tab_profile_action_index = "82";
+const profile_tab_choice = "palette.choice." ++ tab_profile_action_index ++ ".0";
+const profile_tab_row = "workspace.1.tab.2";
+
+const profile_tab_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "New tab with profile" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = profile_tab_choice, .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .click = profile_tab_choice },
+    .{ .wait_element = .{ .id = profile_tab_row, .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "palette.dialog", .state = "exists", .equals = false } },
+    .{ .type_text = "printf 'PROFILE_%s\\n' 'TAB_READY'" },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = "PROFILE_TAB_READY", .timeout_ms = 15_000 } },
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -825,12 +852,39 @@ pub const all = [_]Scenario{
         .command = agent_prompts_command,
         .steps = &agent_prompts_steps,
     },
+    .{
+        .name = "profile-tab",
+        .command = deterministic_shell,
+        .steps = &profile_tab_steps,
+    },
 };
+
+test "the profile tab scenario opens the chooser by keyboard and clicks the built-in row" {
+    const scenario = all[20];
+    try std.testing.expectEqualStrings("profile-tab", scenario.name);
+    var clicked = false;
+    var typed_command = false;
+    for (scenario.steps) |step| switch (step) {
+        .click => |id| {
+            if (std.mem.eql(u8, id, profile_tab_choice)) clicked = true;
+        },
+        .type_text => |text| {
+            if (std.mem.startsWith(u8, text, "printf")) typed_command = true;
+        },
+        // The asserted output never appears in the typed command.
+        .wait_terminal_text => |wait| for (scenario.steps) |other| switch (other) {
+            .type_text => |text| try std.testing.expect(std.mem.indexOf(u8, text, wait.contains) == null),
+            else => {},
+        },
+        else => {},
+    };
+    try std.testing.expect(clicked and typed_command);
+}
 
 test "the agent prompts scenario opens the view from the palette and edits CLAUDE.md by a click" {
     const scenario = all[19];
     try std.testing.expectEqualStrings("agent-prompts", scenario.name);
-    try std.testing.expectEqual(@as(usize, 20), all.len);
+    try std.testing.expectEqual(@as(usize, 21), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
     var opened = false;
     var clicked = false;
@@ -857,7 +911,7 @@ test "the agent prompts scenario opens the view from the palette and edits CLAUD
 test "the control API scenario opens a tab and a pane from the terminal, then switches by mouse" {
     const scenario = all[18];
     try std.testing.expectEqualStrings("control-api", scenario.name);
-    try std.testing.expectEqual(@as(usize, 20), all.len);
+    try std.testing.expectEqual(@as(usize, 21), all.len);
     var opened = false;
     var split = false;
     var clicked = false;
@@ -877,7 +931,7 @@ test "the control API scenario opens a tab and a pane from the terminal, then sw
 test "the backlog scenario opens the view by chord, a card by click, and moves the task" {
     const scenario = all[17];
     try std.testing.expectEqualStrings("backlog-board", scenario.name);
-    try std.testing.expectEqual(@as(usize, 20), all.len);
+    try std.testing.expectEqual(@as(usize, 21), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_BACKLOG_CLI", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -902,7 +956,7 @@ test "the backlog scenario opens the view by chord, a card by click, and moves t
 test "the agent manager scenario opens the manager by chord and focuses by a click" {
     const scenario = all[16];
     try std.testing.expectEqualStrings("agent-manager", scenario.name);
-    try std.testing.expectEqual(@as(usize, 20), all.len);
+    try std.testing.expectEqual(@as(usize, 21), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -925,7 +979,7 @@ test "the agent manager scenario opens the manager by chord and focuses by a cli
 test "the agent view scenario opens the view by chord and answers by a click" {
     const scenario = all[15];
     try std.testing.expectEqualStrings("agent-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 20), all.len);
+    try std.testing.expectEqual(@as(usize, 21), all.len);
     var chords: usize = 0;
     var clicked = false;
     var outcome = false;
@@ -1193,7 +1247,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 20), all.len);
+    try std.testing.expectEqual(@as(usize, 21), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;

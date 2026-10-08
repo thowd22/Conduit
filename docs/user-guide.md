@@ -85,6 +85,9 @@ directory its creator's shell last reported (else the workspace's directory) and
 | Reorder | Alt+Shift+Up/Down | drag its row |
 | Close | Ctrl+Shift+W (Cmd+W) | palette: Close tab |
 
+**New tab with profile** in the palette lists your shell profiles and starts the one you pick
+in a new tab named after it; see [Shell profiles](#shell-profiles).
+
 Closing a tab whose shell is not sitting idle at a prompt asks first; Tab moves between the two
 answers, Enter chooses, Escape keeps the tab. Closing the last tab quits Conduit.
 
@@ -108,6 +111,42 @@ With the mouse: click a pane to focus it, drag the divider between two panes to 
 the context menu or palette to split. A zoomed pane's siblings keep running. Closing a pane gives
 its space to its sibling; closing a tab's last pane closes the tab, with the same running-program
 prompt as tab close.
+
+## Shell profiles
+
+A shell profile is a named command a new tab or pane runs, with its own environment variables,
+starting directory and login mode. **New tab with profile** and **Split with profile** (which
+splits the focused pane to the right) in the palette list them; Up/Down and Enter, or a click,
+start one.
+
+The list always begins with the built-in profiles, which need no setup:
+
+| Platform | Built-in profiles |
+|---|---|
+| Linux, macOS | `login`: your `$SHELL` as a login shell |
+| Windows | `pwsh` (PowerShell 7), `powershell` (Windows PowerShell) and `cmd`, whichever are installed |
+| SSH workspace | `login`: the remote user's login shell |
+
+Your own profiles come after them, from the settings file:
+
+```
+profile = work = /bin/zsh
+profile.work.cwd = /home/me/src
+profile.work.env = EDITOR=nvim
+profile = py = python3 -q
+shell = work
+```
+
+`shell` names the profile a plain **New tab** (Ctrl+Shift+T, Cmd+T), a split and the first tab
+run. Without it, Conduit starts your `$SHELL` on Linux and macOS and, on Windows, the first of
+PowerShell 7, Windows PowerShell and cmd that is installed. The settings view's Shells group shows
+`shell` (editable) and one row per profile; a profile row opens the settings file, where profiles
+are edited. [config.md, Shell profiles](config.md#shell-profiles) has the full grammar, including
+quoting and binding a profile to a key.
+
+PowerShell gets the same shell integration as bash, zsh and fish: Conduit adds
+`-NoExit -Command` with its script after your own PowerShell profile has loaded, so new tabs open
+in PowerShell's current directory and a tab at an idle prompt closes without asking.
 
 ## Scratchpad
 
@@ -380,7 +419,7 @@ and state live, and the [agent manager](#agent-manager) names the task in its ta
 ## Settings view
 
 Ctrl+Shift+, (Cmd+Shift+,) or the palette's **Settings** opens a dialog listing every setting,
-grouped under Appearance, Fonts, Keys, Scratchpad and Mouse, with the value in effect (`·` marks a
+grouped under Appearance, Fonts, Keys, Scratchpad, Mouse, Agents and Shells, with the value in effect (`·` marks a
 value the settings file sets). Enter or a click edits a row: true/false values flip, `theme` and
 `font.family` open their pickers, numbers and names open a field. Left/Right flip or step a value.
 Every change is written to the settings file immediately and applies at once.
