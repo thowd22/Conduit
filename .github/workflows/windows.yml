@@ -1,0 +1,269 @@
+# Windows platform evidence and the Windows release artifact (TASK-49,
+# TASK-47, TASK-69's Windows half).
+#
+# The dev box is Linux, so everything Windows-specific is proved here, on a
+# GitHub windows-latest runner, which has an interactive desktop session in
+# which SDL creates real Win32 windows with an OpenGL context:
+#
+#   build                     `zig build` for the explicit <arch>-windows-gnu
+#                             host target build.zig picks on Windows
+#   portable zip              `zig build portable`, zipped and verified
+#   smoke (TASK-49 AC1, AC4)  cmd.exe and PowerShell under ConPTY through
+#                             conduit-test: typed input, Unicode text input,
+#                             frames at scale 1 and 1.5
+#   built-in checks           real windows, hidden, as on Linux
+#   Windows clipboard         Ctrl+Shift+V from and Ctrl+Shift+C to it
+#   font discovery (AC2)      system and per-user families through DirectWrite
+#   WSL (TASK-47)             a real distribution when the image can run one,
+#                             otherwise a scripted wsl.exe stand-in
+#   unit tests                the same `zig build test` as ci.yml
+#
+# Triggers: a push to the task-49 branches (Debug, or ReleaseSafe and a fixed
+# prerelease version on `task-49-windows-release`), a manual dispatch once this
+# file is on main, and `workflow_call` from release.yml, which passes the tag's
+# version and ReleaseSafe and publishes the uploaded zip.
+# The Zig version is read from build.zig.zon exactly as ci.yml does.
+name: Windows
+
+on:
+  push:
+    branches: ["task-49-windows", "task-49-windows-release"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer stamped into the binaries and zip (no leading v); empty for 0.0.0-ci.<run>"
+        required: false
+        default: ""
+      optimize:
+        description: "Zig optimize mode"
+        required: false
+        default: "Debug"
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      optimize:
+        type: string
+        required: false
+        default: "ReleaseSafe"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x86_64 platform checks and zip
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      OPTIMIZE: ${{ inputs.optimize || (github.ref_name == 'task-49-windows-release' && 'ReleaseSafe') || 'Debug' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Resolve the pinned Zig version, the stamped version and the artifact root
+        run: |
+          zig_version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)"
+          [ -n "$zig_version" ] || { echo "::error::build.zig.zon declares no .minimum_zig_version" >&2; exit 1; }
+          version="${{ inputs.version }}"
+          if [ -z "$version" ] && [ "$GITHUB_REF_NAME" = task-49-windows-release ]; then
+            version="0.1.8-windows.dryrun.${{ github.run_number }}"
+          fi
+          [ -n "$version" ] || version="0.0.0-ci.${{ github.run_number }}"
+          {
+            echo "ZIG_VERSION=$zig_version"
+            echo "CONDUIT_VERSION=$version"
+            echo "ARTIFACT_ROOT=$RUNNER_TEMP/w"
+          } >> "$GITHUB_ENV"
+          echo "version $version, optimize $OPTIMIZE"
+          powershell.exe -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber | Format-List; Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,CurrentHorizontalResolution,CurrentVerticalResolution | Format-List" || true
+          mkdir -p "$RUNNER_TEMP/w"
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+
+      - name: Restore the Zig caches and the fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            zig-out
+            zig-pkg
+          key: conduit-${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            conduit-${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-
+            conduit-${{ runner.os }}-zig-
+
+      - name: Build
+        id: build
+        run: zig build -Doptimize="$OPTIMIZE" -Dversion="$CONDUIT_VERSION"
+
+      - name: Version
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          reported="$(./zig-out/bin/conduit.exe --version | tr -d '\r')"
+          echo "$reported"
+          [ "$reported" = "conduit $CONDUIT_VERSION" ] || { echo "::error::--version printed '$reported'"; exit 1; }
+
+      - name: Portable folder and zip (TASK-69)
+        id: zip
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          zig build portable -Doptimize="$OPTIMIZE" -Dversion="$CONDUIT_VERSION"
+          bash .github/scripts/windows-package.sh zig-out/Conduit "$CONDUIT_VERSION" "$ARTIFACT_ROOT/dist"
+
+      - name: Upload the zip
+        if: ${{ !cancelled() && steps.zip.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conduit-windows-x86_64-${{ env.CONDUIT_VERSION }}
+          path: ${{ runner.temp }}/w/dist
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stage /bin/sh for --command children (test fixture)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: bash .github/scripts/windows-sh-standin.sh
+
+      # After the zip, so the shipped folder never carries the fixture.
+      - name: Stage Mesa llvmpipe OpenGL beside conduit.exe (test fixture)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          bash .github/scripts/windows-mesa.sh zig-out/bin
+          echo "GALLIUM_DRIVER=llvmpipe" >> "$GITHUB_ENV"
+          # The first start of a fresh 50 MB executable pays for Defender's scan and
+          # llvmpipe's first compile, which can outlast conduit-test's readiness wait.
+          GALLIUM_DRIVER=llvmpipe timeout 300 ./zig-out/bin/conduit.exe --hidden --no-child --run-ms=1000 \
+            --log-file="$(cygpath -w "$ARTIFACT_ROOT/warm-up.log")" || true
+          grep -E "OpenGL|window backend" "$ARTIFACT_ROOT/warm-up.log" || true
+
+      - name: Smoke - cmd.exe and PowerShell through conduit-test (TASK-49 AC1, AC4)
+        id: smoke
+        timeout-minutes: 15
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          bash .github/scripts/windows-smoke.sh "$PWD/zig-out/bin/conduit.exe" "$PWD/zig-out/bin/conduit-test.exe" \
+            "$ARTIFACT_ROOT/smoke"
+
+      - name: Windows clipboard copy and paste
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          bash .github/scripts/windows-clipboard-check.sh "$PWD/zig-out/bin/conduit.exe" "$PWD/zig-out/bin/conduit-test.exe" \
+            "$ARTIFACT_ROOT/clipboard"
+
+      - name: Font discovery (TASK-49 AC2)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/dejavu.zip" \
+            https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip
+          unzip -o -q "$RUNNER_TEMP/dejavu.zip" -d "$RUNNER_TEMP/dejavu"
+          bash .github/scripts/windows-font-check.sh "$PWD/zig-out/bin/conduit.exe" "$ARTIFACT_ROOT/fonts" \
+            "$RUNNER_TEMP/dejavu/dejavu-fonts-ttf-2.37/ttf/DejaVuSansMono.ttf"
+
+      - name: Per-monitor DPI change (TASK-49 AC3)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          bash .github/scripts/windows-dpi-check.sh "$PWD/zig-out/bin/conduit.exe" "$ARTIFACT_ROOT/dpi"
+
+      # One bounded attempt at a real distribution. Hosted runners usually
+      # cannot finish it (the WSL optional components need a reboot), which the
+      # probe below then reports; nothing gates on it.
+      - name: Try to install a WSL distribution (TASK-47)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          timeout 420 wsl.exe --install -d Ubuntu --no-launch --web-download 2>&1 | tr -d '\000\r' | tail -n 20 || true
+          timeout 300 wsl.exe -d Ubuntu -u root -e sh -c 'uname -a' 2>&1 | tr -d '\000\r' | tail -n 5 || true
+
+      # A real distribution when the image has one; otherwise the WSL context's
+      # tests run against the stand-in launcher under Git for Windows' bash.
+      - name: WSL probe (TASK-47)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          echo "CONDUIT_TEST_WSL_SH=$(cygpath -w "$(command -v bash)")" >> "$GITHUB_ENV"
+          if command -v wsl.exe > /dev/null; then
+            timeout 60 wsl.exe --status 2>&1 | tr -d '\000\r' | head -n 20 || true
+            distros="$(timeout 60 wsl.exe --list --quiet 2>/dev/null | tr -d '\000\r' | sed '/^$/d' || true)"
+            echo "INFO wsl --list --quiet: ${distros:-<none>}"
+            first="$(printf '%s\n' "$distros" | head -n 1)"
+            if [ -n "$first" ] && timeout 120 wsl.exe -d "$first" -e sh -c 'uname -a' 2>&1; then
+              echo "CONDUIT_TEST_WSL_DISTRO=$first" >> "$GITHUB_ENV"
+              echo "INFO a real distribution ($first) runs; the WSL tests use it"
+            else
+              echo "INFO no runnable distribution; the WSL tests use the stand-in"
+            fi
+          else
+            echo "INFO no wsl.exe on this image; the WSL tests use the stand-in"
+          fi
+
+      - name: Built-in checks (required)
+        id: builtin
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 40
+        run: |
+          bash .github/scripts/windows-builtin-checks.sh ./zig-out/bin/conduit.exe "$ARTIFACT_ROOT/builtin" \
+            --self-test --grid-test --ui-test --driver-test --scroll-test --mouse-test --sidebar-test \
+            --scratchpad-test --menu-test --theme-test --font-test --tabs-test --palette-test --workspaces-test
+
+      # Reported, not gating (docs/release.md says why each fails):
+      # --clipboard-test pins SDL's offscreen driver, which needs EGL on Windows;
+      # --ime-test's MSYS child cannot put a ConPTY console into raw mode;
+      # --links-test opens `vi`, which the runner does not have as vi.exe;
+      # --panes-test and --search-test stop when a write reaches a ConPTY whose
+      # child has exited (ERROR_NO_DATA becomes SystemError in pty.zig).
+      - name: Built-in checks (survey)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          bash .github/scripts/windows-builtin-checks.sh ./zig-out/bin/conduit.exe "$ARTIFACT_ROOT/survey" \
+            --clipboard-test --ime-test --links-test --panes-test --search-test
+
+      - name: Unit tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 40
+        continue-on-error: true
+        run: zig build test -Doptimize="$OPTIMIZE" -Dversion="$CONDUIT_VERSION" --summary all
+
+      # The build runner reports only counts; run the font and workspace test
+      # binaries directly so every DirectWrite and WSL test names its outcome
+      # (OK, SKIP or FAIL) in the log and the evidence.
+      - name: Font and WSL tests, one line per test (TASK-49 AC2, TASK-47)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          status=0
+          for name in font workspace; do
+            bin="$(ls -t $(find .zig-cache -type f -name "$name-test.exe") | head -n 1)"
+            echo "== $name-test ($bin)"
+            "$bin" > "$ARTIFACT_ROOT/$name-test.txt" 2>&1 || status=1
+            grep -iE "wsl|directwrite|windows|passed|failed|skipped" "$ARTIFACT_ROOT/$name-test.txt" | head -n 60
+          done
+          exit $status
+
+      - name: Upload the evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conduit-windows-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/w
+          if-no-files-found: warn
+          retention-days: 14
