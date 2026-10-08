@@ -39,7 +39,7 @@ The OpenCode adapter uses the HTTP server that OpenCode's TUI starts when launch
 
 ## Consequences
 - Session files are not read: the server API is the only surface, so a server version change is the
-  compatibility risk; fixtures are hand-written from the documented shapes until a live run records
+  compatibility risk; fixtures were hand-written from the documented shapes until a live run recorded
   real ones.
 - The registry's "structured beats heuristic" latch needs a way to fall back when the structured
   channel is lost (TASK-56 wiring).
@@ -52,3 +52,13 @@ The OpenCode adapter uses the HTTP server that OpenCode's TUI starts when launch
   possible, but the server already exposes everything over one authenticated local port, and the
   plugin would need installing into the user's OpenCode config.
 - **Parsing the TUI's terminal output:** rejected by TASK-78 itself (structured events, not text).
+
+## Verification (2026-10-08)
+Verified live against npm `opencode-ai@1.18.35` in an ubuntu:24.04 container with a fixed local
+model (`scripts/opencode-container-check.sh`): the `/event` SSE framing, `session.status`/
+`session.idle`, `message.part.updated`/`message.part.delta`, `permission.asked`/
+`permission.replied` (the tool part is `running` before the ask), `POST /permission/:id/reply
+{"reply":"once"}` and `prompt_async` behave as read from the source. Not seen live:
+`question.asked`, child sessions, `session.error`, aborts, the v1 shapes and the deprecated
+permission route. A hand-started `opencode` without `--port` has no reachable server and is
+observed with the PTY baseline only.

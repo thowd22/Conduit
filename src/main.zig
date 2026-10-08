@@ -29056,15 +29056,15 @@ fn controlTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try Dir.cwd().createDirPathStatus(io, bin, .default_dir);
     var fake_cli_buffer: [path_capacity]u8 = undefined;
     const fake_cli = try std.fmt.bufPrint(&fake_cli_buffer, "{s}/backlog", .{bin});
-    try Dir.cwd().writeFile(io, .{ .sub_path = fake_cli, .data = backlog_fake_cli, .flags = .{ .permissions = .fromMode(0o700) } });
+    try Dir.cwd().writeFile(io, .{ .sub_path = fake_cli, .data = backlog_fake_cli, .flags = .{ .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o700) } });
     self.backlog_program = fake_cli;
     var ssh_dir_buffer: [path_capacity]u8 = undefined;
     const ssh_dir = try std.fmt.bufPrint(&ssh_dir_buffer, "{s}/home/.ssh", .{dir});
-    _ = try Dir.cwd().createDirPathStatus(io, ssh_dir, .fromMode(0o700));
+    _ = try Dir.cwd().createDirPathStatus(io, ssh_dir, (if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700)));
     var ssh_config_buffer: [path_capacity]u8 = undefined;
-    try Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&ssh_config_buffer, "{s}/config", .{ssh_dir}), .data = control_test_ssh_config, .flags = .{ .permissions = .fromMode(0o600) } });
+    try Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&ssh_config_buffer, "{s}/config", .{ssh_dir}), .data = control_test_ssh_config, .flags = .{ .permissions = (if (builtin.os.tag == .windows) .default_file else .fromMode(0o600)) } });
     // The SSH control sockets' private directory.
-    if (self.ssh_runtime_owned) |run_dir| _ = try Dir.cwd().createDirPathStatus(io, run_dir, .fromMode(0o700));
+    if (self.ssh_runtime_owned) |run_dir| _ = try Dir.cwd().createDirPathStatus(io, run_dir, (if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700)));
 
     // The single instance: four `conduit` commands as separate processes,
     // without this terminal's control variables, so each finds the private

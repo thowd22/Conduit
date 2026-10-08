@@ -1,11 +1,11 @@
 ---
 id: TASK-78
 title: OpenCode adapter
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-07 15:38'
-updated_date: '2026-10-08 02:24'
+updated_date: '2026-10-08 03:17'
 labels:
   - agents
   - opencode
@@ -25,9 +25,9 @@ The user runs OpenCode alongside Claude Code, Codex and omp (oh-my-pi) and wants
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 OpenCode launched from Conduit appears in the agent registry with live status (idle, working, waiting for input, waiting for approval, done), mapped from its structured events rather than terminal text
-- [ ] #2 Permission/approval requests, waiting-for-input and turn completion produce agent events that TASK-56 notifications and the sidebar agent state consume without any OpenCode-specific code outside agent/
-- [ ] #3 A manually started opencode process in a Conduit terminal is detected and attached
+- [x] #1 OpenCode launched from Conduit appears in the agent registry with live status (idle, working, waiting for input, waiting for approval, done), mapped from its structured events rather than terminal text
+- [x] #2 Permission/approval requests, waiting-for-input and turn completion produce agent events that TASK-56 notifications and the sidebar agent state consume without any OpenCode-specific code outside agent/
+- [x] #3 A manually started opencode process in a Conduit terminal is detected and attached
 - [x] #4 Harness-neutral tests cover the adapter through the common interface with recorded event fixtures, and an integration check runs against a real opencode binary where it is installed, skipping with a clear message where it is not
 - [x] #5 The integration surface used (server/API, event stream, session files) is recorded as a Backlog decision; AGENTS.md and docs/architecture.md list OpenCode beside the other harnesses
 <!-- AC:END -->
@@ -45,4 +45,12 @@ Live verification 2026-10-08: build a glibc-2.35 stage and run the agent-test bi
 
 <!-- SECTION:NOTES:BEGIN -->
 Adapter landed (8b67fd7, 003ac44 rebased onto main as 9cb1cf2): HTTP/1.1 + SSE client over a Transport vtable, event mapping, permission reply (current route with deprecated fallback), history replay, prompt_async/abort, backoff when unreachable; 34 agent tests + 1 skip (live check skips: opencode not installed). decision-9 records the server/SSE surface. Pending: detect via ExecutionContext.run (agent resumed), app wiring for AC1-3 via TASK-56/58, live verification needs an installed opencode.
+
+Live verification landed (5e91615, 011a52f merged as ee9874a; app patch fb1e36f): scripts/opencode-container-check.sh verified OpenCode 1.18.35 in an ubuntu:24.04 container with a local mock model: adapter live test (92 passed in-container), Agent: launch through the palette reaching working -> waiting_permission -> done, permission answered from the agent view (outcome allowed), a hand-started opencode observed on a human tab via the new harness-neutral foreground-process detection (pty.foregroundProcess, agent.recognize). Two live-found bugs fixed (Registry.setCapabilities refresh; SSE head timeout redial). Recorded fixtures added. Screenshots inspected (OpenCode's permission dialog with '! OpenCode' in the sidebar; agent view with '✓ Allow once: allowed').
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+OpenCode adapter over its HTTP/SSE server with live status, answerable permissions, transcript replay and documented gaps, verified against the real binary in a container, plus harness-neutral detection of hand-started agents through a PTY foreground-process query.
+<!-- SECTION:FINAL_SUMMARY:END -->

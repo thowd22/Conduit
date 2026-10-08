@@ -591,20 +591,37 @@ tmux run of the interactive TUI showed both answer paths. Still missing: `Launch
 extension file for the owner to write, installing the extension for manual starts (consent,
 TASK-60), and registry/owner wiring.
 
-TASK-78 is implemented at adapter level and unverified live (decision-9). `agent/opencode.zig`'s
-`OpenCodeAdapter` uses the HTTP server OpenCode's TUI starts with `--port`. `detect` runs
-`opencode --version` through the context. `launch` describes `opencode --port P --hostname
-127.0.0.1 [--prompt …]` (or `opencode serve …` headless) with `CONDUIT_AGENT_TOKEN` and the token
-as the server's basic-auth password. A bounded HTTP/1.1 + SSE client reads `GET /event` and maps
-`session.status`/`session.idle`/`session.error`, `permission.asked`/`permission.replied`,
-`question.asked`, message parts and child sessions onto `agent.Event`. `respondPermission` posts
-`{"reply":"once|always|reject"}` to `/permission/:id/reply` (falling back to the deprecated
-per-session route), `sendInput` uses `prompt_async`, `stop` uses `abort`, and attach replays `GET
-/session/:id/message`. Structured capabilities are reported only while the stream is live;
-otherwise the agent stays on the PTY baseline and the adapter retries. The protocol was read from
-the docs and the opencode `dev` source (v1.18.35) on 2026-10-07; the fixtures under
-`test/fixtures/agent/opencode/` are hand-written, and a fake TCP server test covers the round
-trip. OpenCode is not installed here, so the live check skips.
+TASK-78 is complete on Linux. OpenCode 1.18.35 was verified live, never installed on the host:
+`scripts/opencode-container-check.sh` installs npm `opencode-ai@1.18.35` in a throwaway
+ubuntu:24.04 image with a fixed local OpenAI-compatible model (`scripts/opencode-mock-provider.py`,
+`permission.bash = "ask"`). The adapter's live test drives a whole turn; Conduit under Xvfb, driven
+by `conduit-test`, launches OpenCode through `Agent: launch` (working → waiting_permission → done
+from structured SSE events), answers the bash permission by clicking the agent view's `Allow once`
+(outcome `allowed`), and observes an `opencode` started by hand in a plain tab. The fixtures
+`recorded-turn.sse` and `recorded-messages.json` are scrubbed recordings; the tool part is
+`running` before the ask. Live testing fixed two bugs: agents' capabilities now follow their
+adapter after registration (`Registry.setCapabilities`), and an event-stream head that never
+arrives is redialled. `agent/opencode.zig`'s `OpenCodeAdapter` uses the HTTP server OpenCode's TUI
+starts with `--port`: `detect` runs `opencode --version` through the context; `launch` describes
+`opencode --port P --hostname 127.0.0.1 [--prompt …]` (or `opencode serve …` headless) with
+`CONDUIT_AGENT_TOKEN` and the token as the server's basic-auth password; a bounded HTTP/1.1 + SSE
+client reads `GET /event` and maps `session.status`/`session.idle`/`session.error`,
+`permission.asked`/`permission.replied`, `question.asked`, message parts and child sessions onto
+`agent.Event`; `respondPermission` posts `{"reply":"once|always|reject"}` to
+`/permission/:id/reply`, `sendInput` uses `prompt_async`, `stop` uses `abort`, and attach replays
+`GET /session/:id/message`. Not seen live: `question.asked`, child sessions, `session.error`,
+aborts and the v1 shapes; OpenCode has no Windows read path (no timed socket receive in Zig 0.16)
+and stays terminal-only in SSH workspaces.
+
+Observed agents (TASK-56 follow-up) are harness-neutral: `pty.Pty.foregroundProcess` (Linux
+`TIOCGPGRP` plus `/proc`; macOS and Windows return null) is checked after terminal activity at
+most every 2 s, `agent.recognize` asks each adapter's `recognizeCommand` (`claude`, `codex`,
+`pi`/`omp`, `opencode`, the fake's `conduit-fake-agent` under checks), and a recognised program
+becomes an observed agent on that human tab. Claude Code attaches by registry pid or cwd, Codex by
+daemon thread cwd, and Pi, OpenCode and the fake keep the PTY baseline. The agent ends as done
+when the program leaves the foreground, and `agent.stop` on an observed agent ignores that pid
+while it stays in front. The scratchpad, agent and connection terminals and remote workspaces are
+never observed. `--agent-test` proves this with a hand-started `conduit-fake-agent`.
 
 TASK-76 is complete on Linux. A tab whose focused session's OSC 7 cwd is inside a git work tree
 shows its branch on a second, non-interactive sidebar row, `workspace.<k>.tab.<n>.branch` (role
