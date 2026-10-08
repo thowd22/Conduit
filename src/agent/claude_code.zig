@@ -1548,6 +1548,9 @@ const Scratch = struct {
     path: []const u8,
 
     fn init(self: *Scratch) !void {
+        // The scratch root is /tmp and the relays it holds are /bin/sh
+        // scripts: these tests are POSIX's.
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
         var random: [8]u8 = undefined;
         testing.io.random(&random);
         const hex = std.fmt.bytesToHex(random, .lower);

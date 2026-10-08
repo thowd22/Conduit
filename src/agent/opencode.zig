@@ -2450,6 +2450,11 @@ const FakeServer = struct {
 };
 
 test "end to end against a fake OpenCode server over real TCP" {
+    // Zig 0.16's threaded Io has no timed socket receive on Windows
+    // (`net_receive` under a timeout is `ConcurrencyUnavailable` there), and
+    // both `TcpConnection.read` and the fake server need one. Until the
+    // adapter has a Windows read path this end-to-end claim is POSIX-only.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const before = try readFixture("turn-before-permission.sse");
     defer testing.allocator.free(before);
     const after = try readFixture("turn-after-permission.sse");
