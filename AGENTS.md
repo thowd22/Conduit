@@ -878,7 +878,7 @@ agent.event --event=<Hook>`, falling back to `CONDUIT_AGENT_SINK`; remote sinks 
 refused stolen token; the nineteenth scenario `control-api` types `conduit control tab.open`,
 `pane.split` and `tab.status` into the terminal and switches tabs by mouse. `conduit-test` does
 not forward control requests (tokens exist only inside the app; documented in
-`docs/control-api.md`). Windows has no control transport.
+`docs/control-api.md`). Windows runs it over named pipes since TASK-82.
 
 TASK-66 is complete on Linux. `conduit .`/`<dir>`, `conduit ssh <host>`, `conduit workspace open
 <name>` and `conduit agent <harness> [prompt...]` forward `instance.*` requests. Inside a Conduit
@@ -1145,6 +1145,27 @@ row, and its frames were inspected. On this box a real hand-started `claude` sho
 idle`, and earlier the same day real Claude Code was verified launched (working → done, transcript
 and reply in the view, a notification) and hand-started (observed within 3 s, a turn, done on
 `/exit`), with hand-started `codex` and `omp` observed too. macOS and Windows are unverified.
+
+TASK-82 is complete. On Windows the control and instance endpoints are protected multi-instance
+named pipes (`platform.LocalSocketListener`/`LocalStream`, built on the driver's pipe seam:
+current-logon-SID-only descriptor, `PIPE_REJECT_REMOTE_CLIENTS`, a first instance refuses a held
+name), named `\\.\pipe\conduit-<user SID>[-x<hash of XDG_RUNTIME_DIR>]-r-<hex>` and
+`…-instance`; `CONDUIT_CONTROL_ENDPOINT` carries the pipe name, the instance token is
+`%LOCALAPPDATA%\conduit\instance.token` (or under `XDG_STATE_HOME`), and token scoping and the
+server are unchanged. Claude Code hooks on Windows need no `/bin/sh` (`HookStyle.windows`,
+decision-13): every hook runs `"<conduit.exe>" control agent.event --event=<Hook>` and
+PermissionRequest runs `"<conduit.exe>" control agent.permission --wait`, which sends the request
+line, waits up to 580 s for the agent view's answer in `<sink>/decisions/<id>`, sends
+PermissionEnd and prints Claude Code's allow/deny reply; on Windows the helper is set whether or
+not the endpoint runs, falling back to the sink through `platform.appendToFile`, and Windows agent
+sinks are under `%LOCALAPPDATA%\conduit\agents`. `--control-test` runs on Windows with PowerShell
+7 tabs and scratchpad and separate `conduit.exe` clients, gated in windows.yml (run 37843312128);
+on every OS it now launches a stand-in Claude Code (`conduit agent claude`) that runs the
+generated hooks, and a permission answered by clicking the view's Allow once returns the allow
+reply to the waiting hook. A platform test proves an anonymous token and a `\\localhost\pipe\…`
+client are refused. A real Claude Code on Windows (and which shell it uses for hook commands; the
+command reads the same in cmd.exe and Git Bash), Codex, Pi and OpenCode there, and Windows
+PowerShell 5.1 are unverified.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`

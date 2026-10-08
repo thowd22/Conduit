@@ -1,9 +1,10 @@
 ---
 id: TASK-82
 title: 'Windows: control API over named pipes and Claude Code hooks without /bin/sh'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-08 19:16'
+updated_date: '2026-10-08 21:11'
 labels:
   - agents
   - windows
@@ -25,8 +26,20 @@ On Windows a launched agent gets no structured events: the control endpoint does
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 On the hosted Windows runner the control endpoint starts in a plain run, local tab shells get CONDUIT_CONTROL_ENDPOINT/TOKEN/SESSION, and --control-test (ported: tab.open, pane.split, tab.status, notify, agent.event from a pwsh tab, the scratchpad exclusion, a stolen token refused, instance.ping from a separate process) passes and gates in windows.yml; a connection from another user or a remote client is refused
-- [ ] #2 On Windows the Claude Code launch spec registers hooks that invoke conduit.exe control agent.event for every hook and the blocking permission variant for PermissionRequest, with unit tests on every platform asserting the generated settings.json; the Linux relay path is unchanged and its tests still pass
-- [ ] #3 A deterministic check (extend --agent-test or --control-test on Windows) proves a launched fake agent on the runner delivers structured events through conduit control agent.event into the agent view, and a permission request answered in the view returns the allow decision to the waiting hook process
-- [ ] #4 A Backlog decision records the named-pipe control transport and the Windows hook strategy; docs/control-api.md, docs/agents.md and AGENTS.md drop the 'no Windows transport' statements
+- [x] #1 On the hosted Windows runner the control endpoint starts in a plain run, local tab shells get CONDUIT_CONTROL_ENDPOINT/TOKEN/SESSION, and --control-test (ported: tab.open, pane.split, tab.status, notify, agent.event from a pwsh tab, the scratchpad exclusion, a stolen token refused, instance.ping from a separate process) passes and gates in windows.yml; a connection from another user or a remote client is refused
+- [x] #2 On Windows the Claude Code launch spec registers hooks that invoke conduit.exe control agent.event for every hook and the blocking permission variant for PermissionRequest, with unit tests on every platform asserting the generated settings.json; the Linux relay path is unchanged and its tests still pass
+- [x] #3 A deterministic check (extend --agent-test or --control-test on Windows) proves a launched fake agent on the runner delivers structured events through conduit control agent.event into the agent view, and a permission request answered in the view returns the allow decision to the waiting hook process
+- [x] #4 A Backlog decision records the named-pipe control transport and the Windows hook strategy; docs/control-api.md, docs/agents.md and AGENTS.md drop the 'no Windows transport' statements
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Merged to main (fb38675). Evidence: windows.yml 37843312128 (15/15 required checks incl. --control-test; both endpoints as per-user named pipes; stand-in Claude Code's hooks via conduit.exe; permission answered in the agent view returned allow to the waiting hook; screenshots inspected by the agent), ci.yml 37843312002 green on three OSes, Linux gate 37843312098 green; decision-13 recorded; docs updated. Unverified: real Claude Code on Windows and its hook shell, Codex/Pi/OpenCode on Windows, Windows PowerShell 5.1.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Windows control transport over protected named pipes reusing the driver's pipe seam, Claude Code hooks that call conduit.exe directly with a blocking permission variant, --control-test gating on the Windows runner with a stand-in Claude Code whose permission round-trips through the agent view; decision-13.
+<!-- SECTION:FINAL_SUMMARY:END -->
