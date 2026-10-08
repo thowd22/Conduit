@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its twenty-six Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its twenty-seven Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its seventeen declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its eighteen declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -778,6 +778,40 @@ during its flood. `bench-check` is not yet in CI (hosted runners are not the ref
 Follow-ups noted for `app`: a 2048² atlas at scale ≥ 1.5, a driver wake when a `Load` finishes
 instead of waiting for the 16 ms poll, and region-only atlas uploads.
 
+TASK-63 is complete on Linux. `backlog.open` (Ctrl+Shift+K on Linux/Windows, Cmd+Shift+K on
+macOS, because Ctrl+Shift+B is the sidebar toggle; palette "Backlog") toggles a per-workspace
+view that covers the active tab's panes with an opaque `Surface` `backlog.view` over the
+workspace's Backlog.md project: `<focused session's OSC 7 cwd>/backlog`, else the workspace
+directory's, read through the workspace ExecutionContext and watched. Local workspaces only for
+now (loads and polls run on the owner thread; another context shows a problem row); a missing
+directory shows `no backlog/ here`. The model is in `src/backlog_view.zig` (`Board`, `State`,
+`detailRows`, `parseElement`, `CliJob`, `Panel`). The board has a column per configured status
+(`backlog.column.<n>`) of `InteractiveText` cards `backlog.task.<id>`, each with a small muted
+`.meta` row; list mode (`l`/`b`, `backlog.mode.list`/`.board`) shows every active task in ordinal
+order with its status. Arrows, Home/End, PageUp/PageDown and the wheel move and scroll; hover
+appears only after real pointer motion; Escape or `backlog.close` closes. Enter or a click on a
+card opens the modal detail `backlog.detail.<id>` with the task's fields, description, criteria
+(`.ac.<n>`) and notes; the status (`s`, Enter or a click on `.status`) cycles through the
+configured statuses and a criterion toggles, both through `backlog.Cli` on a worker with a
+bounded queue of 4, the view reloads the rewritten file through `Project.poll`, CLI errors appear
+in `backlog.message`, and `▶ open in vi` (`v`, `.raw`) opens the markdown through
+`openEditorTab`. Keys the view does not use still reach their bindings, never the hidden
+terminal; task text is only displayed. `--backlog-test` drives a copied
+`test/fixtures/backlog/valid` and a fake `backlog` CLI through real SDL events, and the eighteenth
+scenario `backlog-board` opens the view by chord, clicks a card and moves the task with a stand-in
+CLI that only a driven run accepts (`CONDUIT_TEST_BACKLOG_CLI`, never inherited by children). The
+board and detail frames were inspected. The real `backlog` CLI was never run by a check; remote
+backlogs and macOS/Windows are unverified.
+
+TASK-64 is complete on Linux. The detail's `▶ start agent` (`a`, `.agent`) lists the
+`agent.launch` harnesses (`.harness.<n>`) and starts the chosen one through `launchAgentWith` in
+the project directory with the initial prompt `backlog.taskPrompt` (`TASK-N: <title>`, the
+description and `Acceptance criteria:` items, controls stripped, at most 16 KiB, cut with a
+marker). `LaunchRequest.task_id` is kept on the `app_agents.Runner` (`taskId()`) across a manager
+restart; cards, list rows and the detail show that agent's glyph, harness and state live
+(semantic `backlog.task.<id>.agent.<state>`), and the agent manager's task column names the
+task. Changes an agent makes through the backlog CLI appear through the same watch.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -953,7 +987,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:

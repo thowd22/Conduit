@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 21:06'
+updated_date: '2026-10-08 00:00'
 labels:
   - agents
   - cli
@@ -39,6 +39,8 @@ Part 1 (protocol and server, no app wiring): 1. src/control.zig: a local-only co
 3. Documentation for harness configuration (docs/control-api.md): endpoint discovery, token, method reference, hook examples for Claude Code/Codex/Pi/OpenCode.
 4. Unit tests for parsing/encoding/validation/scoping; an integration test against a real socket with a client process.
 Part 2 (after main.zig frees): app wiring (handlers performing the actions, status/notify), conduit CLI subcommands (with TASK-66) and MCP tools, a --control-test.
+
+Part 2: app Handler (tab.open, pane.split, view.agent, view.backlog, tab.status, notify, agent.event into the adapters' sinks/runtime), ChildSpec injects CONDUIT_CONTROL_ENDPOINT/TOKEN/SESSION for every child except the scratchpad and the connection session, token revoke on workspace close, control.enabled setting, conduit-test MCP tools for the control methods, --control-test and an e2e scenario.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes

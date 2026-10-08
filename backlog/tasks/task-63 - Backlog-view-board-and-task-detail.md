@@ -1,11 +1,11 @@
 ---
 id: TASK-63
 title: 'Backlog view: board and task detail'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 23:19'
+updated_date: '2026-10-08 00:00'
 labels:
   - backlog
   - ui
@@ -25,10 +25,10 @@ Terminal-styled backlog view openable as a tab or pane: board by status and list
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Board and list views render the workspace backlog
-- [ ] #2 Clicking or pressing Enter on a task opens its detail
-- [ ] #3 Status and acceptance criteria can be changed from the view
-- [ ] #4 E2E scenario opens the backlog view and moves a task
+- [x] #1 Board and list views render the workspace backlog
+- [x] #2 Clicking or pressing Enter on a task opens its detail
+- [x] #3 Status and acceptance criteria can be changed from the view
+- [x] #4 E2E scenario opens the backlog view and moves a task
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -38,3 +38,15 @@ Terminal-styled backlog view openable as a tab or pane: board by status and list
 2. Task detail: Enter/click opens a detail Surface with description, acceptance criteria rows (toggle via backlog.Cli.checkAcceptance), status cycle (backlog.Cli.setStatus), notes; failures shown in a status line.
 3. --backlog-test against a fixture project copied into the isolated run plus an e2e scenario moving a task; docs.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Agent: src/backlog_view.zig board/list/detail model; backlog.open (Ctrl+Shift+K; B is the sidebar toggle); project at <OSC 7 cwd>/backlog read through the ExecutionContext and polled; status cycle and criteria toggles through backlog.Cli on a bounded worker with CLI failures shown in backlog.message; open-in-vi; --backlog-test with a copied fixture and a fake backlog CLI; eighteenth scenario backlog-board moving a task via CONDUIT_TEST_BACKLOG_CLI (driver-only, never inherited). Coordinator 2026-10-08: merged as b0cb8f0; full gate green (873/884 unit tests, 27 checks, 18 scenarios); board and detail screenshots inspected. Local workspaces only; the real backlog CLI is never run by a check.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Backlog view: a per-workspace board and list of the workspace's Backlog.md project with a task detail where status and acceptance criteria are changed through the backlog CLI and reflected live; verified by unit tests, the deterministic --backlog-test and the backlog-board scenario.
+<!-- SECTION:FINAL_SUMMARY:END -->
