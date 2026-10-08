@@ -1,0 +1,4 @@
+// Resources build.zig compiles into conduit.exe (TASK-49): the application
+// icon Explorer, the taskbar and Alt+Tab show. The manifest is embedded
+// separately through the executable's win32_manifest.
+1 ICON "conduit.ico"

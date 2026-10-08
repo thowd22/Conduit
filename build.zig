@@ -53,7 +53,7 @@ const modules = [_]ModuleSpec{
     // A session owns a PTY and terminal state; a workspace owns sessions.
     .{ .name = "session", .source_file = "src/session.zig", .deps = &.{ "config", "pty", "term", "theme" } },
     .{ .name = "workspace", .source_file = "src/workspace.zig", .deps = &.{
-        "config", "input", "pty", "render", "session", "state", "term", "theme", "ui",
+        "config", "input", "link", "pty", "render", "session", "state", "term", "theme", "ui",
     } },
 
     // Feature layers over the workspace, and the automation that drives them.
@@ -123,6 +123,7 @@ pub fn build(b: *std.Build) !void {
         .name = "conduit",
         .root_module = app,
     });
+    embedWindowsResources(b, target, exe);
     b.installArtifact(exe);
     installLinuxPayload(b, target, optimize);
     addMacosBundle(b, target, optimize, exe, build_options_version);
@@ -143,6 +144,7 @@ pub fn build(b: *std.Build) !void {
         .root_module = conduit_test,
     });
     b.installArtifact(conduit_test_exe);
+    addWindowsPortable(b, target, optimize, exe, conduit_test_exe);
 
     // TASK-25's runner is another composition root. It interacts only through
     // the installed conduit-test executable, so scenario code cannot acquire
@@ -390,6 +392,77 @@ fn addMacosBundle(
     };
     for (resources) |file| {
         bundle_step.dependOn(&b.addInstallFile(file.source, b.fmt("{s}/Resources/{s}", .{ contents, file.destination })).step);
+    }
+}
+
+/// TASK-49: what a Windows `conduit.exe` carries inside it. The application
+/// manifest (`assets/windows/conduit.manifest`) declares per-monitor-v2 DPI
+/// awareness, UTF-8 as the process code page and Windows 10/11 support; the
+/// resource script adds the icon Explorer and the taskbar show. Other targets
+/// are unchanged.
+fn embedWindowsResources(b: *std.Build, target: std.Build.ResolvedTarget, exe: *std.Build.Step.Compile) void {
+    if (target.result.os.tag != .windows) return;
+    exe.win32_manifest = b.path("assets/windows/conduit.manifest");
+    exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/windows/conduit.rc") });
+}
+
+/// TASK-49 and TASK-69: `zig build portable` stages the portable Windows
+/// layout under the install prefix (`zig-out/Conduit` by default), which the
+/// release workflow zips as `conduit-<version>-windows-x86_64.zip`:
+///
+///     Conduit/conduit.exe, Conduit/conduit-test.exe
+///     Conduit/share/conduit/fonts/       the bundled faces
+///     Conduit/share/conduit/shell-integration/
+///     Conduit/share/conduit/licenses/    every licence
+///
+/// Nothing is installed or registered: the folder runs from wherever it is
+/// unpacked. The executable embeds its fonts and scripts, so the copies are
+/// the shipped, inspectable payload, as in the Linux packages and the macOS
+/// bundle. The step exists only for a Windows target.
+fn addWindowsPortable(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    exe: *std.Build.Step.Compile,
+    conduit_test_exe: *std.Build.Step.Compile,
+) void {
+    if (target.result.os.tag != .windows) return;
+    const portable_step = b.step("portable", "Stage the portable Windows folder (Windows only) under the install prefix");
+    const root = "Conduit";
+    for ([_]*std.Build.Step.Compile{ exe, conduit_test_exe }) |artifact| {
+        const install = b.addInstallArtifact(artifact, .{
+            .dest_dir = .{ .override = .{ .custom = root } },
+            // The PDB is a debugging aid, not part of the shipped folder.
+            .pdb_dir = .disabled,
+            .implib_dir = .disabled,
+        });
+        portable_step.dependOn(&install.step);
+    }
+    const share = root ++ "/share/conduit";
+    const resources = [_]struct { source: std.Build.LazyPath, destination: []const u8 }{
+        .{ .source = b.path(bundled_face_asset), .destination = "fonts/JetBrainsMono-Regular.ttf" },
+        .{ .source = b.path(bundled_symbols_asset), .destination = "fonts/SymbolsNerdFontMono-Regular.ttf" },
+        .{ .source = b.path("assets/shell-integration/bash/conduit.bash"), .destination = "shell-integration/bash/conduit.bash" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zshenv"), .destination = "shell-integration/zsh/.zshenv" },
+        .{ .source = b.path("assets/shell-integration/zsh/conduit.zsh"), .destination = "shell-integration/zsh/conduit.zsh" },
+        .{ .source = b.path("assets/shell-integration/fish/vendor_conf.d/conduit.fish"), .destination = "shell-integration/fish/vendor_conf.d/conduit.fish" },
+        .{ .source = b.path("assets/themes/README.md"), .destination = "themes/README.md" },
+        .{ .source = b.path("LICENSE"), .destination = "licenses/LICENSE" },
+        .{ .source = b.path("assets/fonts/LICENSE-JetBrainsMono-OFL-1.1.txt"), .destination = "licenses/JetBrainsMono-OFL-1.1.txt" },
+        .{ .source = b.path("assets/fonts/LICENSE-NerdFonts.txt"), .destination = "licenses/NerdFonts-LICENSE.txt" },
+        .{ .source = b.path("assets/fonts/NerdFonts-license-audit.md"), .destination = "licenses/NerdFonts-license-audit.md" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/FreeType-FTL.txt"), .destination = "licenses/FreeType-FTL.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/FreeType-LICENSE.TXT"), .destination = "licenses/FreeType-LICENSE.TXT" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/HarfBuzz-COPYING.txt"), .destination = "licenses/HarfBuzz-COPYING.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/Oniguruma-COPYING.txt"), .destination = "licenses/Oniguruma-COPYING.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/zlib-LICENSE.txt"), .destination = "licenses/zlib-LICENSE.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/libpng-LICENSE.txt"), .destination = "licenses/libpng-LICENSE.txt" },
+        .{ .source = b.dependency("ghostty", ghosttyDependencyOptions(target, optimize)).path("LICENSE"), .destination = "licenses/Ghostty-LICENSE" },
+        .{ .source = b.dependency("sdl", .{ .target = target, .optimize = optimize }).path("LICENSE.txt"), .destination = "licenses/SDL-LICENSE.txt" },
+        .{ .source = b.dependency("zopengl", .{}).path("LICENSE"), .destination = "licenses/zopengl-LICENSE" },
+    };
+    for (resources) |file| {
+        portable_step.dependOn(&b.addInstallFile(file.source, b.fmt("{s}/{s}", .{ share, file.destination })).step);
     }
 }
 

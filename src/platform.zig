@@ -93,6 +93,96 @@ fn setWindowIcon(handle: *sdl.SDL_Window) void {
 }
 
 // ---------------------------------------------------------------------------
+// Windows window integration (TASK-49)
+// ---------------------------------------------------------------------------
+
+/// The Win32 calls behind the Windows-only window features: the dark title bar, the DPI
+/// awareness report and giving back a console nobody asked for.
+///
+/// SDL owns the window; this only borrows its HWND (`SDL_PROP_WINDOW_WIN32_HWND_POINTER`). DWM and
+/// the DPI query are looked up at run time, as SDL does, so a Windows without them (a Server Core
+/// image, Windows 10 before 1607) gets an ordinary window and a log line instead of a failed load.
+/// Main thread only, like every SDL window call.
+const windows_window = if (builtin.os.tag == .windows) struct {
+    const windows = std.os.windows;
+    const HWND = *anyopaque;
+    const HMODULE = *anyopaque;
+
+    extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?HMODULE;
+    extern "kernel32" fn GetProcAddress(module: HMODULE, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+    extern "kernel32" fn GetConsoleProcessList(list: [*]u32, count: u32) callconv(.winapi) u32;
+    extern "kernel32" fn FreeConsole() callconv(.winapi) windows.BOOL;
+
+    /// `DWMWA_USE_IMMERSIVE_DARK_MODE`: 20 since Windows 10 20H1 (19041); 19 before it.
+    const dwmwa_use_immersive_dark_mode: u32 = 20;
+    const dwmwa_use_immersive_dark_mode_legacy: u32 = 19;
+
+    const DwmSetWindowAttribute = *const fn (HWND, u32, *const anyopaque, u32) callconv(.winapi) i32;
+    const GetThreadDpiAwarenessContext = *const fn () callconv(.winapi) ?*anyopaque;
+    const GetAwarenessFromDpiAwarenessContext = *const fn (?*anyopaque) callconv(.winapi) i32;
+    const GetDpiForWindow = *const fn (HWND) callconv(.winapi) u32;
+
+    fn hwnd(handle: *sdl.SDL_Window) ?HWND {
+        const properties = sdl.SDL_GetWindowProperties(handle);
+        return sdl.SDL_GetPointerProperty(properties, "SDL.window.win32.hwnd", null);
+    }
+
+    fn function(comptime T: type, library: []const u8, name: [*:0]const u8) ?T {
+        var wide: [32:0]u16 = undefined;
+        const length = std.unicode.utf8ToUtf16Le(&wide, library) catch return null; // a fixed, short DLL name
+        wide[length] = 0;
+        const module = LoadLibraryW(wide[0..length :0]) orelse return null;
+        const address = GetProcAddress(module, name) orelse return null;
+        return @ptrCast(address);
+    }
+
+    /// Ask DWM to draw the title bar dark or light. Returns whether DWM accepted either spelling.
+    fn setDarkTitleBar(handle: *sdl.SDL_Window, dark: bool) bool {
+        const window = hwnd(handle) orelse return false;
+        const set = function(DwmSetWindowAttribute, "dwmapi.dll", "DwmSetWindowAttribute") orelse return false;
+        const value: windows.BOOL = if (dark) .TRUE else .FALSE;
+        if (set(window, dwmwa_use_immersive_dark_mode, &value, @sizeOf(windows.BOOL)) >= 0) return true;
+        return set(window, dwmwa_use_immersive_dark_mode_legacy, &value, @sizeOf(windows.BOOL)) >= 0;
+    }
+
+    /// The thread's DPI awareness as SDL left it (it declares per-monitor v2 when the manifest
+    /// has not), and the window's own DPI, for the log.
+    fn logDpi(handle: *sdl.SDL_Window) void {
+        const awareness: []const u8 = blk: {
+            const get_context = function(GetThreadDpiAwarenessContext, "user32.dll", "GetThreadDpiAwarenessContext") orelse break :blk "unknown";
+            const get_awareness = function(GetAwarenessFromDpiAwarenessContext, "user32.dll", "GetAwarenessFromDpiAwarenessContext") orelse break :blk "unknown";
+            break :blk switch (get_awareness(get_context())) {
+                0 => "unaware",
+                1 => "system",
+                2 => "per-monitor",
+                else => "invalid",
+            };
+        };
+        const dpi: u32 = blk: {
+            const window = hwnd(handle) orelse break :blk 0;
+            const get_dpi = function(GetDpiForWindow, "user32.dll", "GetDpiForWindow") orelse break :blk 0;
+            break :blk get_dpi(window);
+        };
+        log.info("windows dpi awareness {s}, window dpi {d}", .{ awareness, dpi });
+    }
+
+    /// Give back the console Windows made for this process, when nobody else is using it.
+    ///
+    /// `conduit.exe` is a console-subsystem program, so `conduit --version` prints in the shell
+    /// that ran it. Started from Explorer or a shortcut, though, Windows also creates a console
+    /// window for it, which would sit behind Conduit's own window for its whole life. A console
+    /// whose process list holds only this process is that one, and it is released once the window
+    /// exists; a console shared with a parent shell (or a test harness) is left alone.
+    fn releaseOwnConsole() void {
+        var processes: [2]u32 = undefined;
+        if (GetConsoleProcessList(&processes, processes.len) == 1) {
+            _ = FreeConsole();
+            log.info("released the console window Windows created for this process", .{});
+        }
+    }
+} else struct {};
+
+// ---------------------------------------------------------------------------
 // Clipboard
 // ---------------------------------------------------------------------------
 
@@ -1777,6 +1867,12 @@ pub const Window = struct {
         errdefer sdl.SDL_DestroyWindow(handle);
         setWindowIcon(handle);
         if (builtin.os.tag == .macos) macos_menu.releaseCommandW();
+        if (builtin.os.tag == .windows) {
+            // Conduit's default theme is dark; `setTitleBarDark` follows a light theme.
+            if (!windows_window.setDarkTitleBar(handle, true)) log.info("windows: DWM refused the dark title bar", .{});
+            windows_window.logDpi(handle);
+            windows_window.releaseOwnConsole();
+        }
 
         const context = sdl.SDL_GL_CreateContext(handle) orelse {
             var buffer: [256]u8 = undefined;
@@ -1848,6 +1944,16 @@ pub const Window = struct {
         }
         if (self.option_as_alt != mode) log.info("macOS Option as Alt: {s}", .{@tagName(mode)});
         self.option_as_alt = mode;
+    }
+
+    /// Draw the window's title bar dark or light to match the theme (TASK-49). Windows only: DWM's
+    /// `DWMWA_USE_IMMERSIVE_DARK_MODE` on the window's HWND; elsewhere the window manager decides
+    /// and this does nothing. Cosmetic, so a refusal is logged and ignored. Main thread only.
+    pub fn setTitleBarDark(self: *const Window, dark: bool) void {
+        if (builtin.os.tag != .windows) return;
+        if (!windows_window.setDarkTitleBar(self.handle.?, dark)) {
+            log.info("windows: DWM refused the {s} title bar", .{if (dark) "dark" else "light"});
+        }
     }
 
     /// The Option-as-Alt choice in force.

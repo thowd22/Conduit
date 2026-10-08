@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  The application manifest build.zig embeds in conduit.exe (TASK-49).
+
+  - Per-monitor DPI awareness (v2, falling back to per-monitor): Windows tells
+    Conduit each monitor's real DPI and sends WM_DPICHANGED when a window moves
+    between monitors or the scale changes, instead of bitmap-stretching a
+    96-DPI frame. SDL then reports SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED and
+    Conduit re-renders its fonts at the new scale.
+  - UTF-8 as the process code page (Windows 10 1903+), so the C libraries that
+    open files through the ANSI API (FreeType opens fonts with CreateFileA)
+    accept every path DirectWrite reports, including a per-user font under a
+    non-ASCII user name.
+  - supportedOS for Windows 10 and 11, so version and ConPTY queries are not
+    answered as for Windows 8.
+  - asInvoker: Conduit never asks for elevation.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="io.github.thowd22.Conduit" version="1.0.0.0" processorArchitecture="*"/>
+  <description>Conduit terminal workspace</description>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
