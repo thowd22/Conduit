@@ -1415,6 +1415,43 @@ const NameList = struct {
     }
 };
 
+/// The `/bin/sh` command `resolveConfigDir` runs: an absolute
+/// `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, printed without a newline.
+const config_dir_script =
+    \\d=${CLAUDE_CONFIG_DIR:-}; case "$d" in /?*) ;; *) case "${HOME:-}" in /?*) d=$HOME/.claude ;; *) exit 1 ;; esac ;; esac; printf '%s' "$d"
+;
+
+/// Claude Code's config directory (`Options.config_dir`) as `context` sees
+/// it, copied into `out`: `$CLAUDE_CONFIG_DIR` when absolute, else
+/// `$HOME/.claude`; null when neither is set to an absolute path. For a
+/// remote workspace, whose environment this process cannot read (TASK-61);
+/// the remote exec channel's environment is sshd's plus what the login
+/// shell's non-interactive startup exports. Runs one bounded command
+/// through the context, so it blocks: workers only.
+pub fn resolveConfigDir(context: workspace.ExecutionContext.Ref, allocator: Allocator, io: Io, out: []u8) api.Error!?[]const u8 {
+    var result = context.run(allocator, io, .{
+        .argv = &.{ "/bin/sh", "-c", config_dir_script },
+        .cwd = "",
+        .max_output = Dir.max_path_bytes,
+        .timeout_ms = 10_000,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => return error.Unsupported,
+        else => {
+            log.debug("cannot resolve the config directory: {t}", .{err});
+            return error.Disconnected;
+        },
+    };
+    defer result.deinit(allocator);
+    if (!result.succeeded()) return null;
+    const dir = std.mem.trimEnd(u8, result.stdout, "/");
+    if (dir.len == 0 or dir[0] != '/') return null;
+    for (dir) |c| if (c < 0x20 or c == 0x7f) return null;
+    if (dir.len > out.len) return error.NoSpaceLeft;
+    @memcpy(out[0..dir.len], dir);
+    return out[0..dir.len];
+}
+
 /// The version in `claude --version` output (`2.1.292 (Claude Code)`),
 /// copied into `out`; null when the output names no version.
 pub fn parseVersion(output: []const u8, out: []u8) api.Error!?[]const u8 {
@@ -2236,6 +2273,25 @@ test "a real interactive claude started by hand is found in the registry, attach
 
 // SSH workspaces (TASK-61) ------------------------------------------------------
 
+test "the config directory is resolved in the context's own environment" {
+    var context = try workspace.ExecutionContext.local(testing.allocator);
+    defer context.deinit();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const resolved = try resolveConfigDir(context.borrow(), testing.allocator, testing.io, &buffer);
+    var expected_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const configured = testing.environ.getPosix("CLAUDE_CONFIG_DIR") orelse "";
+    const home = testing.environ.getPosix("HOME") orelse "";
+    const expected: ?[]const u8 = if (configured.len > 1 and configured[0] == '/')
+        std.mem.trimEnd(u8, configured, "/")
+    else if (home.len > 1 and home[0] == '/')
+        try std.fmt.bufPrint(&expected_buffer, "{s}/.claude", .{std.mem.trimEnd(u8, home, "/")})
+    else
+        null;
+    if (expected) |want| try testing.expectEqualStrings(want, resolved.?) else try testing.expect(resolved == null);
+    var tiny: [2]u8 = undefined;
+    if (expected != null) try testing.expectError(error.NoSpaceLeft, resolveConfigDir(context.borrow(), testing.allocator, testing.io, &tiny));
+}
+
 /// The events of a remote agent, in order: `until` returns the next one of
 /// a kind, polling, bounded, when the drained batch has none. Each poll is
 /// one or two exec channels to the remote host, which bounds a round without
@@ -2278,6 +2334,8 @@ test "in an SSH workspace the sink lives on the remote host: launch writes it, t
     try testing.expectEqualStrings(workspace.ssh.TestRemote.home ++ "/.local/state/conduit/agents/run-1/agent-1", sink);
     try ref.makePrivateDir(io, sink);
     const config = workspace.ssh.TestRemote.home ++ "/.claude";
+    var config_buffer: [Dir.max_path_bytes]u8 = undefined;
+    try testing.expectEqualStrings(config, (try resolveConfigDir(ref, testing.allocator, io, &config_buffer)).?);
 
     var a = try ClaudeCodeAdapter.init(testing.allocator, io, .{
         .sink_dir = sink,
