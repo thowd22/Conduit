@@ -393,24 +393,42 @@ fn nonEmpty(text: ?[]const u8) ?[]const u8 {
     return if (value.len == 0) null else value;
 }
 
+/// `text` with every CRLF line ending turned into LF, in `arena`, or `text`
+/// itself when it has none. Only carriage returns are dropped, so line
+/// numbers are unchanged.
+fn normalizeLineEndings(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    if (std.mem.indexOf(u8, text, "\r\n") == null) return text;
+    const out = try arena.alloc(u8, text.len);
+    var len: usize = 0;
+    for (text, 0..) |byte, index| {
+        if (byte == '\r' and index + 1 < text.len and text[index + 1] == '\n') continue;
+        out[len] = byte;
+        len += 1;
+    }
+    return out[0..len];
+}
+
 /// Parse one backlog file. Pure: no IO, no state. Everything returned is
-/// allocated in `arena` or borrows `text` and `path`, which must outlive it.
+/// allocated in `arena` or borrows `raw_text` and `path`, which must outlive
+/// it. A file with CRLF line endings (a Windows checkout or editor) parses as
+/// its LF form, so a section's text never carries a carriage return.
 /// Allocation failure is the only error; a malformed file is a `Parsed` with
 /// diagnostics and, when the file names no usable id, no item.
 pub fn parseFile(
     arena: Allocator,
     location: Location,
     path: []const u8,
-    text: []const u8,
+    raw_text: []const u8,
     config: *const Config,
     limits: Limits,
 ) Allocator.Error!Parsed {
     var diagnostics: DiagnosticList = .{ .arena = arena, .path = path, .limit = limits.max_diagnostics_per_file };
 
-    if (!std.unicode.utf8ValidateSlice(text)) {
+    if (!std.unicode.utf8ValidateSlice(raw_text)) {
         try diagnostics.add(0, "not valid UTF-8");
         return .{ .item = null, .diagnostics = diagnostics.items.items };
     }
+    const text = try normalizeLineEndings(arena, raw_text);
     const front = splitFrontMatter(text) catch |err| {
         try diagnostics.add(1, switch (err) {
             error.Missing => "no front matter: the file must start with a `---` line",
@@ -1590,6 +1608,32 @@ test "the valid fixture parses every field of the model" {
     try testing.expectEqualStrings("TASK-2.1", tasks_in_order.next().?.id);
     try testing.expectEqualStrings("TASK-3", tasks_in_order.next().?.id);
     try testing.expectEqualStrings("DRAFT-1", tasks_in_order.next().?.id);
+}
+
+test "a CRLF file parses exactly as its LF form" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lf =
+        "---\nid: TASK-7\ntitle: Line endings\nstatus: To Do\nlabels: [a, b]\n---\n\n" ++
+        "## Description\n\n<!-- SECTION:DESCRIPTION:BEGIN -->\nFirst line.\nSecond line.\n<!-- SECTION:DESCRIPTION:END -->\n\n" ++
+        "## Acceptance Criteria\n<!-- AC:BEGIN -->\n- [ ] #1 One\n- [x] #2 Two\n<!-- AC:END -->\n\n" ++
+        "## Implementation Plan\n\n<!-- SECTION:PLAN:BEGIN -->\n1. Parse.\n2. Test.\n<!-- SECTION:PLAN:END -->\n";
+    const crlf = try std.mem.replaceOwned(u8, arena, lf, "\n", "\r\n");
+    const config: Config = .{};
+    const want = try parseFile(arena, .tasks, "lf.md", lf, &config, .{});
+    const got = try parseFile(arena, .tasks, "crlf.md", crlf, &config, .{});
+    try testing.expectEqual(@as(usize, 0), got.diagnostics.len);
+    const a = want.item.?.task;
+    const b = got.item.?.task;
+    try testing.expectEqualStrings("Line endings", b.title);
+    try testing.expectEqualStrings(a.description.?, b.description.?);
+    try testing.expectEqualStrings("First line.\nSecond line.", b.description.?);
+    try testing.expectEqualStrings("1. Parse.\n2. Test.", b.plan.?);
+    try testing.expectEqual(@as(usize, 2), b.labels.len);
+    try testing.expectEqual(@as(usize, 2), b.acceptance_criteria.len);
+    try testing.expectEqualStrings("Two", b.acceptance_criteria[1].text);
+    try testing.expect(b.acceptance_criteria[1].checked);
 }
 
 test "malformed files become diagnostics, never errors" {

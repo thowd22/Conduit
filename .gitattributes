@@ -8,3 +8,8 @@ build.zig.zon text eol=lf
 # Anything we require to keep its bytes.
 *.png binary
 *.ppm binary
+
+# Test fixtures are compared byte for byte (sizes, offsets, section text), so
+# a Windows checkout must not rewrite their line endings. The parsers accept
+# CRLF on their own; that is covered by unit tests, not by the fixtures.
+test/fixtures/** text eol=lf
