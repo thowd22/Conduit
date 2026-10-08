@@ -623,7 +623,7 @@ aborts and the v1 shapes; OpenCode has no Windows read path (no timed socket rec
 and stays terminal-only in SSH workspaces.
 
 Observed agents (TASK-56 follow-up) are harness-neutral: `pty.Pty.foregroundProcess` (Linux
-`TIOCGPGRP` plus `/proc`; macOS and Windows return null) is checked after terminal activity at
+`TIOCGPGRP` plus `/proc`; Windows walks the ConPTY process tree since TASK-81; macOS returns null) is checked after terminal activity at
 most every 2 s, `agent.recognize` asks each adapter's `recognizeCommand` (`claude`, `codex`,
 `pi`/`omp`, `opencode`, the fake's `conduit-fake-agent` under checks), and a recognised program
 becomes an observed agent on that human tab. Claude Code attaches by registry pid or cwd, Codex by
@@ -1166,6 +1166,25 @@ reply to the waiting hook. A platform test proves an anonymous token and a `\\lo
 client are refused. A real Claude Code on Windows (and which shell it uses for hook commands; the
 command reads the same in cmd.exe and Git Bash), Codex, Pi and OpenCode there, and Windows
 PowerShell 5.1 are unverified.
+
+TASK-81 is complete on the hosted Windows runner. The ConPTY backend now implements
+`foregroundProcess`: it takes one Toolhelp snapshot, cached for 250 ms and shared by every
+terminal, and from the terminal's child steps to the newest child while the process reached is a
+shell (cmd, PowerShell, MSYS sh/bash). The first program that is not a shell is the job, like a
+POSIX group leader, so a harness's own helpers never replace it (a deliberate departure from a
+deepest-leaf rule). Its command line comes from `NtQueryInformationProcess(ProcessCommandLine
+Information)` and its working directory from the PEB; `ForegroundProcess.argv1` now carries
+every later word, NUL-separated, on both backends. `agent.commandName` names the Windows
+spellings: it ignores case and strips `.exe/.cmd/.ps1/.js`, names a script inside
+`node_modules` by its npm package, and follows `cmd /c`, `pwsh -Command|-File` and `sh -c`; each
+adapter recognises its package name as well as its program name. `--agent-test` gates on
+windows.yml; on Windows its fake is started through `cmd /c`, because Git for Windows' sh execs
+MSYS programs by ending its own process, which leaves them without a Windows parent.
+`windows-claude-observe.sh` gates too (run 37849549953): an npm-installed, unauthenticated Claude
+Code started as `claude` in a PowerShell tab is observed as `· claude idle` and shows `✓ claude
+done` once it leaves. Two Ctrl+C presses have not yet ended Claude Code under ConPTY (it shows
+"Press Ctrl-C again to exit"), so that step ends it with taskkill and warns; TASK-83 tracks it.
+macOS still reports no foreground process.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
