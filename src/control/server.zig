@@ -359,6 +359,10 @@ pub const Server = struct {
                     // bounded tail until the client hangs up.
                     writeFrame(self.io, stream, null, .{ .fault = .invalid_request });
                     stream.shutdown(self.io, .send) catch {};
+                    // The buffer still holds the refused prefix, and a discard
+                    // that fits in the buffer returns without reading, so skip
+                    // it first; only then does the discard wait on the socket.
+                    reader.interface.toss(reader.interface.bufferedLen());
                     _ = reader.interface.discardShort(protocol.max_frame_bytes) catch {};
                     return;
                 },

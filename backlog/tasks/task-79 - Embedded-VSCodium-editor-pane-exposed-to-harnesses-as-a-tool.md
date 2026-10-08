@@ -1,9 +1,10 @@
 ---
 id: TASK-79
 title: Embedded VSCodium editor pane exposed to harnesses as a tool
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-08 03:39'
+updated_date: '2026-10-08 05:43'
 labels:
   - editor
   - agents
@@ -27,10 +28,16 @@ Design notes a future agent cannot recover from the code: (1) VSCodium is an Ele
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A Backlog decision records the per-platform embedding strategy (X11 reparenting into a pane-tracked child window, Wayland fallback, macOS and Windows native hosting) and which parts are implemented now
+- [x] #1 A Backlog decision records the per-platform embedding strategy (X11 reparenting into a pane-tracked child window, Wayland fallback, macOS and Windows native hosting) and which parts are implemented now
 - [ ] #2 With VSCodium installed, 'Editor: open file' from the palette and 'Open in editor' from the context menu over a file reference open VSCodium in a new split pane of the current tab at the referenced file and line; the pane follows focus, resize, zoom and close like any other pane, and Escape/close returns the space to the sibling
 - [ ] #3 A process inside a Conduit terminal (and therefore a harness) can call editor.open, editor.goto, editor.diff, editor.reveal and editor.close through the control API scoped to its workspace; a second editor.open or editor.goto reuses the open editor pane instead of spawning another; the scratchpad cannot be targeted
 - [ ] #4 The editor launches through the workspace ExecutionContext with a per-workspace user-data-dir and never touches the user's own VSCodium instance or settings; when VSCodium is not installed the actions are hidden and 'conduit control editor.open' replies with a clear fault naming how to install it
 - [ ] #5 The harness-facing documentation (docs/control-api.md and docs/agents.md) shows each harness how to use the editor tool, and a conduit-test/MCP tool mirrors editor.open and editor.goto for driving the app
 - [ ] #6 A deterministic Linux check (and an e2e scenario where the runner can provide a stand-in 'codium') proves open-at-line, goto in the open pane, diff, reveal and close through the real input and control paths, with an inspected screenshot of the editor pane beside a terminal pane; behaviour without VSCodium installed is covered too
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Phase one merged to main (94847f5): decision-12, src/editor.zig model, editor.* control methods and faults, conduit-test/MCP editor tools, docs, and the X11 foreign-window hosting seam in platform (dlopen'ed Xlib, tested under Xvfb with xlogo). The app answers Unavailable until phase two wires main.zig and the workspace pane leaf.
+<!-- SECTION:NOTES:END -->

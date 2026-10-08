@@ -1014,6 +1014,28 @@ payload, forward-slash entry names, embedded manifest, `--version` from the unpa
 waits for them. The ReleaseSafe dry run 37729065903 passed. The zip is unsigned and there is no
 installer; `docs/release.md` says why.
 
+TASK-79 phase one is on main (decision-12 records the editor pane's hosting strategy: X11
+reparents the VSCodium window into a container child that tracks the pane; Wayland keeps a
+separate window behind a placeholder pane; macOS and Windows native hosting are later work;
+VSCodium is detected, never bundled or installed, and launched through the workspace
+ExecutionContext with a per-workspace `--user-data-dir` under the state directory).
+`src/editor.zig` (depends only on `workspace`) has `detect` (`editor.command`, then `codium`,
+through `ExecutionContext.run`), `userDataDir`/`seedSettings` (the seeded window title carries
+the marker `conduit-editor-<id>`), lexical `resolvePath`, `checkTarget`, `buildLaunch`
+(`--new-window`/`--reuse-window`, `--goto p:l:c`, `--diff`, `-r`), the per-workspace `Editor`
+model that reuses one editor pane, and `elementId` (`workspace.<k>.pane.<n>.editor`). The
+control protocol has `editor.open {path, line?, column?, split?}`, `editor.goto`, `editor.diff
+{left, right}`, `editor.reveal {path}` and `editor.close` with bounded validated params and the
+faults `EditorNotInstalled` (-32005, install hint in `error.data.hint`) and
+`EditorRemoteUnsupported` (-32006, names the vi fallback); `conduit-test editor-open|editor-goto`
+and the MCP tools `editor_open`/`editor_goto` mirror them; `docs/control-api.md` has per-harness
+snippets (unrun against live harnesses). `platform.Window.embedForeignWindow(match, rect)`,
+`moveEmbedded`, `showEmbedded`, `closeEmbedded` and `unembed` host a foreign X11 window through
+a `dlopen`ed `libX11.so.6` on a private display connection (no link-time X11 dependency; tested
+under Xvfb with a real `xlogo`), and answer `error.Unsupported` elsewhere. The app still answers
+`Unavailable` to every editor request: phase two wires the pane leaf, the actions, hosting, the
+`--editor-test` check and the e2e scenario.
+
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
 attributes in any order, and `shell = <name>` for the default (32 profiles, 32 arguments and 32

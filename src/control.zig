@@ -549,6 +549,47 @@ test "the endpoint refuses a shared parent directory and a disabled setting in r
     }
 }
 
+test "an oversized frame's tail is still accepted after the refusal" {
+    // Regression: the server used to close right after the refusal, so a
+    // client still sending the rest of the line got EPIPE instead of the reply.
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const dir = try TestDir.create(0o700);
+    defer dir.remove();
+    var endpoint_buffer: [96]u8 = undefined;
+    const endpoint = try dir.join(&endpoint_buffer, endpoint_file_name);
+    var wake: TestWake = .{};
+    const control_server = try Server.start(testing.allocator, testing.io, .{
+        .endpoint = endpoint,
+        .enabled = true,
+        .waker = wake.waker(),
+    });
+    defer control_server.deinit();
+
+    const head = try testing.allocator.alloc(u8, protocol.max_frame_bytes + 1);
+    defer testing.allocator.free(head);
+    @memset(head, ' ');
+    var client = try platform.DriverClient.connect(endpoint);
+    defer client.deinit();
+    const io = testing.io;
+    var write_buffer: [4096]u8 = undefined;
+    var writer = client.stream.writer(io, &write_buffer);
+    try writer.interface.writeAll(head);
+    try writer.interface.flush();
+
+    // The refusal arrives while the line is still unfinished.
+    var read_buffer: [1024]u8 = undefined;
+    var reader = client.stream.reader(io, &read_buffer);
+    const framed = try reader.interface.takeDelimiterInclusive('\n');
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"InvalidRequest\"}}\n", framed);
+
+    // The tail of that line, sent after the refusal, is drained rather than
+    // refused with a broken pipe; the connection ends once the client hangs up.
+    try writer.interface.writeAll("the rest of the oversized line\n");
+    try writer.interface.flush();
+    try client.stream.shutdown(io, .send);
+    try testing.expectError(error.EndOfStream, reader.interface.takeDelimiterInclusive('\n'));
+}
+
 test "an oversized frame is refused and its connection closed" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const dir = try TestDir.create(0o700);
