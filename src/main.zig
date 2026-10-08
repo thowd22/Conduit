@@ -25889,7 +25889,7 @@ fn restoreTest(init: std.process.Init, env: EnvSource, window: *platform.Window,
             if (!std.mem.startsWith(u8, element.id.value, tab_prefix)) continue;
             _ = std.fmt.parseUnsigned(u32, element.id.value[tab_prefix.len..], 10) catch continue;
             tab_count += 1;
-            if (std.mem.eql(u8, std.mem.trimStart(u8, element.label, " *!"), "build") and element.state.selected) build_selected = true;
+            if (std.mem.eql(u8, element.label, "  build") and element.state.selected) build_selected = true;
         }
         restoreCheck(out, &failures, tab_count == 2 and build_selected, "both tabs came back with the renamed build tab selected ({d})", .{tab_count});
         var panes_buffer: [8]RestorePane = undefined;
