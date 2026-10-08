@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its thirty Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its thirty-one Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--agent-prompts-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its nineteen declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its twenty declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -897,6 +897,39 @@ from display scale 1.5 (`atlasSizeFor`, `App.atlas`), and debug logs `startup: w
 first frame|first child after <ms>`. Launch-to-prompt median went 242 → 240 ms, within noise.
 Region-only atlas uploads remain open.
 
+TASK-61 is complete on Linux. An agent launched in an SSH workspace runs on the remote host
+through the normal `agent.launch` flow. The workspace's detection worker resolves the remote
+`ExecutionContext.stateDir` and Claude Code's remote config directory
+(`claude_code.resolveConfigDir`); remote sinks live at `<remote state>/conduit/agents/<run>/<token16>`,
+and `createRunner` refuses with `NoSinkRoot` until that is resolved. `Runner.prepare`, Claude's
+hooks, Pi's `SinkTransport`, and the fake's steps and decisions all go through the runner's
+`agent.SinkIo` (TASK-61 part one: `ExecutionContext.readFileAt`/`writeFile`/`makePrivateDir`/
+`stateDir` with Local and SSH implementations, `agent/sink_io.zig` with 500 ms idle read
+throttling for remote tails). A closed agent's remote sink is removed by a `Cleanup` worker (`rm
+-rf --` through the context, guarded by `removableSinkPath`), and the run root is removed when the
+workspace closes or the app exits (a bounded 5 s wait). Codex and OpenCode run remotely as plain
+TUIs on the PTY baseline, labelled `(terminal only here)`; remote hooks keep the relay, and
+`ingestControlEvent` refuses remote agents. `--ssh-test` launches the fake remotely (its script
+staged as a remote launch file) and proves the remote host, the remote sink and no local one,
+glyphs, a notification, the agent view, a remote decision file, and cleanup at workspace close;
+part one's Docker tests ran the real Claude relay remotely. A real remote Claude Code or Pi was
+not run.
+
+TASK-59 is complete on Linux. Each adapter publishes an `InstructionProfile`
+(`agent.instructionProfile(harness)`). `src/agent_prompts.zig` discovers the profile's files
+through the workspace ExecutionContext on a `Job` worker: project files up the tree, home files,
+subagent `*.md` listings, and harness-owned settings; it adds the unexposed system prompt, the
+launch prompt and the human's sent prompts as read-only rows with reasons. `agent.prompts`
+(palette "Agent: prompts and instructions", or the `agent.view.<a>.prompts` row leading every
+agent view) opens a modal `Surface` `agent.prompts.<a>` with `item.<n>` rows, `refresh`, a
+preview, `apply`, a status line and a hint. Enter or a click opens `vi -- <path>` (or `vi -R` for
+harness-owned files) in a new tab via `openEditorTab`, so an SSH workspace edits on its host, and
+the list is re-read when the editor exits. Claude Code offers "restart with updated
+instructions" through the manager's restart (`App.relaunchAgent`); other harnesses say edits
+take effect on the next session. Discovery uses `~` paths, not `$CODEX_HOME`, `PI_CODING_AGENT_DIR`
+or `CLAUDE_CONFIG_DIR`. `--agent-prompts-test` and the twentieth scenario `agent-prompts` cover
+it; the frame was inspected.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -1072,7 +1105,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--restore-test` / `--a11y-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--restore-test` / `--a11y-test` / `--agent-prompts-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:
