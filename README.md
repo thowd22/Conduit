@@ -31,11 +31,28 @@ What works today (Linux):
 - **Scratchpad.** One persistent shell per workspace, shown as a bottom dock at 50% or 90% of the
   window and kept running while hidden.
 - **Workspaces.** Several named workspaces in one window, each with its own tabs, panes and
-  scratchpad. They are not saved across restarts yet.
+  scratchpad, saved on change and restored at the next launch.
+- **Remote workspaces.** SSH workspaces over the system OpenSSH client with one shared connection
+  per workspace, OpenSSH's own prompts shown verbatim, and reconnect; WSL workspaces on Windows
+  that run every tab, pane and the scratchpad inside a chosen distribution.
 - **Links and file references.** Ctrl+click (Cmd+click on macOS) opens URLs, OSC 8 hyperlinks and
   `path:line:col` references; files open in `vi` in a new tab.
 - **Search.** Find in scrollback with literal or regular-expression matching and a case toggle.
-- **Context menu.** Right click for copy, paste, open link, split and search.
+- **Context menu.** Right click for copy, paste, open link, open in editor, split and search.
+- **Coding agents.** Launch Claude Code, Codex, Pi or OpenCode into an agent tab, or start one by
+  hand in any tab: the sidebar shows its state, notifications collect waits, permission prompts
+  and finished runs, a structured view shows the transcript and answers permission prompts, an
+  agent manager lists every agent across workspaces, and agents can read and edit their own
+  instruction files. Agents reach Conduit through a local token-scoped control API (`conduit
+  control`), which also opens tabs, splits panes and drives the editor pane.
+- **Editor pane.** With VSCodium installed, "Editor: open file", the context menu or an agent's
+  `editor.open` request opens VSCodium in a split pane at a file and line; on X11 the window is
+  hosted inside the pane.
+- **Backlog.md.** A board or list of the workspace's Backlog.md tasks, with task details, status
+  changes and criteria toggles through the `backlog` CLI, and a "start agent" action per task.
+- **Shell profiles.** Named profiles (command, arguments, environment, login) with per-platform
+  built-in defaults, including PowerShell integration on Windows.
+- **Accessibility.** The UI is exposed over AT-SPI on Linux.
 - **Configuration.** A Ghostty-style settings file with hot reload, rebindable keys, and a
   settings view that edits it in place.
 - **Themes.** Fourteen bundled colour schemes, Ghostty-format user themes, automatic light/dark
@@ -44,10 +61,9 @@ What works today (Linux):
   fallback chains, colour emoji, programming ligatures, pixel-exact box drawing and Powerline
   glyphs, and size chords.
 
-Coming next (see [`CONDUIT.md`](CONDUIT.md) §4 and §6 and the [`backlog/`](backlog/) milestones):
-SSH and WSL workspaces, agent status, notifications and structured agent views for Claude Code,
-Codex, Pi and OpenCode, Backlog.md board integration, workspace persistence, a `conduit` CLI, and
-macOS/Windows releases.
+Still open (see [`CONDUIT.md`](CONDUIT.md) and the [`backlog/`](backlog/) milestones): signed
+and notarized macOS and Windows packages, macOS and Windows accessibility bridges, editor-pane
+hosting outside X11, and the Windows checks that are reported rather than gating.
 
 | Command palette | Theme picker previewing Catppuccin Latte | Settings view |
 |---|---|---|
