@@ -858,6 +858,12 @@ test "bridge serves sidebar, palette and settings over a private AT-SPI bus" {
         registry.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
         if (dbus.nowMs(io) > deadline) return error.TimedOut;
     }
+    // The registry flags the Embed call when it handles it; the bridge reports
+    // `connected` only once it has read the reply, so give it the same deadline.
+    while (bridge.currentStatus() == .starting) {
+        if (dbus.nowMs(io) > deadline) return error.TimedOut;
+        registry.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }) catch {};
+    }
     try testing.expectEqual(Status.connected, bridge.currentStatus());
 
     var client: Client = .{
