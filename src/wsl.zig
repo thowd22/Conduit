@@ -929,6 +929,19 @@ const StandIn = struct {
     /// `CONDUIT_TEST_WSL_SH` on Windows, or the stand-in under `/bin/sh` on
     /// POSIX. Null skips: Windows without either.
     fn init() !?StandIn {
+        // Which launcher is decided before anything is allocated, so a
+        // skipped test (Windows with neither) leaks nothing.
+        const real = testing.environ.getAlloc(testing.allocator, "CONDUIT_TEST_WSL_DISTRO") catch null;
+        defer if (real) |name| testing.allocator.free(name);
+        const use_real = builtin.os.tag == .windows and real != null;
+        const shell: ?[]const u8 = if (use_real)
+            null
+        else if (builtin.os.tag == .windows)
+            (testing.environ.getAlloc(testing.allocator, "CONDUIT_TEST_WSL_SH") catch return null)
+        else
+            try testing.allocator.dupe(u8, "/bin/sh");
+        defer if (shell) |program| testing.allocator.free(program);
+
         var self: StandIn = undefined;
         self.tmp = testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
@@ -937,21 +950,13 @@ const StandIn = struct {
         self.env = try testing.environ.createMap(testing.allocator);
         errdefer self.env.deinit();
 
-        const real = testing.environ.getAlloc(testing.allocator, "CONDUIT_TEST_WSL_DISTRO") catch null;
-        defer if (real) |name| testing.allocator.free(name);
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         const env_list = try envList(arena_state.allocator(), &self.env);
-        if (builtin.os.tag == .windows and real != null) {
+        if (use_real) {
             self.context = try WslContext.create(testing.allocator, .{ .distribution = real.?, .local_env = env_list });
             return self;
         }
-
-        const shell: []const u8 = if (builtin.os.tag == .windows)
-            (testing.environ.getAlloc(testing.allocator, "CONDUIT_TEST_WSL_SH") catch return null)
-        else
-            try testing.allocator.dupe(u8, "/bin/sh");
-        defer testing.allocator.free(shell);
 
         try self.tmp.dir.createDirPath(testing.io, "home/bin");
         try self.tmp.dir.writeFile(testing.io, .{ .sub_path = "wsl.sh", .data = stand_in_script });
@@ -960,7 +965,7 @@ const StandIn = struct {
         defer testing.allocator.free(script);
         self.context = try WslContext.create(testing.allocator, .{
             .distribution = "StandIn",
-            .program = shell,
+            .program = shell.?,
             .program_prefix = &.{script},
             .local_env = env_list,
         });
@@ -1029,7 +1034,16 @@ test "a WSL context runs commands, files, watches and sessions inside the distri
     // Files: a private directory, an atomic write, whole and partial reads, stat and listing.
     var path_buffer: [512]u8 = undefined;
     const dir = try std.fmt.bufPrint(&path_buffer, "{s}/conduit-wsl/state", .{home});
-    try ref.makePrivateDir(io, dir);
+    ref.makePrivateDir(io, dir) catch |err| {
+        // Name what the helper said, so a platform's shell or tools that
+        // disagree with the script are visible in the failure.
+        const script = try ssh.makePrivateDirScript(testing.allocator, dir);
+        defer testing.allocator.free(script);
+        var probe = try ref.run(testing.allocator, io, .{ .argv = &.{ "sh", "-xc", script }, .cwd = "" });
+        defer probe.deinit(testing.allocator);
+        log.err("makePrivateDir: {s}; exit {?d}; stderr: {s}", .{ @errorName(err), probe.exit_code, probe.stderr });
+        return err;
+    };
     var file_buffer: [512]u8 = undefined;
     const file = try std.fmt.bufPrint(&file_buffer, "{s}/sink.txt", .{dir});
     try ref.writeFile(io, file, "kestrel lantern\n", 0o600);
