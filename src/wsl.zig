@@ -929,6 +929,12 @@ const StandIn = struct {
     /// `CONDUIT_TEST_WSL_SH` on Windows, or the stand-in under `/bin/sh` on
     /// POSIX. Null skips: Windows without either.
     fn init() !?StandIn {
+        // The stand-in runs the shared helper scripts with this machine's
+        // tools. WSL distributions are GNU userlands, and macOS's BSD tools
+        // still fail the private-directory helper after the `chmod --` fix
+        // (ci.yml run 37738762283, no diagnostic in the log), so the stand-in
+        // runs on Linux and Windows only.
+        if (builtin.os.tag == .macos) return null;
         // Which launcher is decided before anything is allocated, so a
         // skipped test (Windows with neither) leaks nothing.
         const real = testing.environ.getAlloc(testing.allocator, "CONDUIT_TEST_WSL_DISTRO") catch null;
