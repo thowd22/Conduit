@@ -6578,6 +6578,7 @@ const App = struct {
             .driver_artifact_dir = options.run.test_artifact_dir,
         };
         app.agents.wake = .{ .context = app, .wake_fn = agentWake };
+        app.agents.probe = .{ .context = app, .probe_fn = agentSessionFacts };
         // A hidden window is headless automation: its agents notify the list,
         // never the desktop, unless a check installs its own seam.
         if (options.run.hidden) app.agents.notifier = .{ .notify_fn = discardOsNotification };
@@ -9851,6 +9852,24 @@ const App = struct {
     /// The OS notification seam of a hidden (headless) run: nothing reaches
     /// the desktop.
     fn discardOsNotification(_: ?*anyopaque, _: []const u8, _: []const u8) void {}
+
+    /// The agent runtime's look into one session (observed agents, TASK-56):
+    /// its binding, its context and the foreground process of its PTY. Null
+    /// once the session or its child is gone.
+    fn agentSessionFacts(context: ?*anyopaque, key: workspace.WorkspaceKey, id: session.SessionId, buffer: []u8) ?app_agents.SessionFacts {
+        const self: *App = @ptrCast(@alignCast(context.?));
+        const model = self.workspace_registry.byKey(key) orelse return null;
+        const live = model.sessionById(id) orelse return null;
+        const child = live.child() orelse return null;
+        return .{
+            .binding = .{ .workspace = key, .session = id, .session_kind = live.kind(), .scratchpad = model.scratchpadId() },
+            .context_kind = model.contextRef().kind(),
+            .process = child.foregroundProcess(buffer),
+            .home = self.home_dir,
+            .claude_config_dir = self.claude_config_dir,
+            .codex_home = self.codex_home,
+        };
+    }
 
     /// `--agent-test`'s private directory: the parent of the sink root.
     fn agentTestDir(self: *const App) ?[]const u8 {
@@ -26325,7 +26344,19 @@ const agent_test_script =
     "( while [ ! -e \"$" ++ agent_test_trigger_env ++ "\" ]; do sleep 0.05; done; " ++
     "printf '\\033]777;notify;Build;background finished\\033\\\\'; printf '\\007' ) & " ++
     "printf 'ARMED\\r\\n'; " ++
+    // `fake` starts the scripted fake by hand, as a person starts a harness:
+    // a foreground job of its own (job control), named
+    // `conduit-fake-agent` (TASK-56 observed agents).
+    "elif [ \"$line\" = fake ]; then " ++
+    "set -m; sh \"${" ++ agent_test_trigger_env ++ "%/*}/conduit-fake-agent\"; set +m; printf 'FAKE-BACK\\r\\n'; " ++
     "else printf 'ECHO:%s\\r\\n' \"$line\"; fi; done";
+
+/// The fake harness a person starts by hand in `--agent-test`'s first tab:
+/// it says it is ready, waits for one line and leaves.
+const observed_fake_script =
+    "printf 'OBSERVED-FAKE-READY\\r\\n'\n" ++
+    "IFS= read -r line\n" ++
+    "printf 'OBSERVED-FAKE-BYE\\r\\n'\n";
 
 const agent_test_initial_config = "# --agent-test\n";
 const agent_test_budget_ms: i64 = 8000;
@@ -27922,6 +27953,25 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element_absent = "notifications" }), "Escape closed the list", .{});
     _ = try runPaletteCommandByKeyboard(self, io, out, "Notifications: clear");
     agentCheck(out, &failures, self.agents.notifications.count() == 0, "Notifications: clear emptied the list", .{});
+
+    // A harness started by hand in the human's own terminal is detected from
+    // the PTY's foreground process and observed on that tab (TASK-56,
+    // TASK-78), and ends when it leaves the foreground.
+    var fake_path_buffer: [path_capacity]u8 = undefined;
+    const fake_path = try std.fmt.bufPrint(&fake_path_buffer, "{s}/{s}", .{ trigger_dir, agent.fake_command_name });
+    try Dir.cwd().writeFile(io, .{ .sub_path = fake_path, .data = observed_fake_script });
+    const first_session = first_model.focusedPaneSessionId(first_tab) orelse return 1;
+    agentCheck(out, &failures, !self.agents.hasAgent(first_key, first_session) and first_model.sessionKind(first_session) == .human_terminal, "the first tab is a human terminal without an agent", .{});
+    _ = try agentTypeLine(self, io, out, "fake");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "OBSERVED-FAKE-READY" }), "the hand-started conduit-fake-agent is running in the first tab", .{});
+    const observed_glyph = try waitForAgent(self, io, out, &os_trace, .{ .role_label = .{ .prefix = "workspace.1.tab.1.agent.", .text = "" } });
+    const observed = self.agents.agentForSession(first_key, first_session);
+    agentCheck(out, &failures, observed_glyph and observed != null and observed.?.ownership == .observed and
+        std.mem.eql(u8, self.agents.displayName(observed.?), "Fake agent"), "it was detected and attached as an observed agent with a glyph on the human tab", .{});
+    _ = try agentTypeLine(self, io, out, "bye");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-BACK" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.1.agent.done" }) and
+        !self.agents.hasAgent(first_key, first_session), "it ended when the script exited: the tab shows done and the session has no live agent", .{});
 
     var screenshot_path_buffer: [path_capacity]u8 = undefined;
     var id_buffer: [path_capacity]u8 = undefined;
