@@ -5,15 +5,17 @@
 # Usage: windows-smoke.sh <conduit.exe> <conduit-test.exe> <artifact-dir>
 #
 #   1. cmd.exe under ConPTY: a visible 640x360 window at scale 1 whose child is
-#      the real `cmd.exe` (selected through SHELL, the interactive-shell input
-#      Conduit reads today). Typed text crosses the real SDL event queue, cmd
+#      the real `cmd.exe`, opened by clicking the `cmd` row of New tab with
+#      profile, since the default shell is the first detected built-in
+#      profile (TASK-46). Typed text crosses the real SDL event queue, cmd
 #      runs it, and its output is asserted with wait-for.
 #   2. Unicode text input: a non-ASCII string typed through the driver (SDL
 #      text-input events, the path an IME commit takes) reaches cmd.exe and is
 #      echoed back exactly once.
 #   3. Frames: a screenshot at scale 1 (640x360) and one at scale 1.5 (960x540)
 #      are kept for visual inspection; their pixel sizes are checked here.
-#   4. PowerShell: the same round trip with PowerShell as the shell.
+#   4. PowerShell: the same round trip in the default shell a plain launch
+#      starts (the first detected profile, PowerShell on the runner).
 set -uo pipefail
 
 conduit="${1:?usage: windows-smoke.sh <conduit.exe> <conduit-test.exe> <artifact-dir>}"
@@ -62,6 +64,13 @@ for scale in 1 1.5; do
     continue
   }
   echo "INFO $tag run $run"
+  # The first tab runs the default shell (the first detected profile, pwsh
+  # on the runner); cmd.exe is asked for by name.
+  if open_profile_tab cmd; then
+    pass "$tag: opened a cmd tab through New tab with profile"
+  else
+    fail "$tag: could not open a cmd tab"
+  fi
   if ct wait-for terminal-text ">" 20000 > /dev/null; then
     pass "$tag: cmd.exe drew its prompt"
   else
