@@ -102,8 +102,10 @@ esac
 keep_screenshot claude-idle
 ct terminal-text > "$out/claude-terminal.txt" 2>&1 || true
 
-# Ctrl+C until Claude Code has left; its first Ctrl+C may only ask for a second.
+# Ctrl+C until Claude Code has left: it exits on a second Ctrl+C that follows
+# the first within a moment, so they go as a pair.
 for attempt in 1 2 3 4 5; do
+  ct key CTRL+c > /dev/null
   ct key CTRL+c > /dev/null
   if ct wait-for element workspace.1.tab.1.agent.done exists true 5000 > /dev/null; then
     break

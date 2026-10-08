@@ -139,6 +139,12 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: bash .github/scripts/windows-sh-standin.sh
 
+      - name: MSYS process tree diagnostic (TASK-81, temporary)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: bash .github/scripts/windows-msys-tree.sh
+
       # After the zip, so the shipped folder never carries the fixture.
       - name: Stage Mesa llvmpipe OpenGL beside conduit.exe (test fixture)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
