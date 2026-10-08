@@ -386,6 +386,19 @@ pub const ExecutionContext = struct {
         return LocalExecutionContext.createWithStateDir(allocator, state_dir);
     }
 
+    /// Create a local context whose polling watches (every OS but Linux, and
+    /// Linux while a watched directory does not exist) re-scan at most every
+    /// `interval_ms` instead of `watch_poll_interval_ms`. Zero scans on every
+    /// `pollChanges`, which makes a polling watch report a change on the very
+    /// next poll, as inotify does: tests use it so the polling backend is held
+    /// to the same claims without waiting out an interval.
+    pub fn localWithWatchInterval(allocator: Allocator, interval_ms: u32) Allocator.Error!ExecutionContext {
+        const context = try LocalExecutionContext.createWithStateDir(allocator, null);
+        const self: *LocalExecutionContext = @ptrCast(@alignCast(context.ptr));
+        self.watch_interval_ms = interval_ms;
+        return context;
+    }
+
     /// Borrow a capability handle without transferring destruction rights.
     pub fn borrow(self: *const ExecutionContext) Ref {
         return .{ .ptr = self.ptr, .vtable = self.vtable };
@@ -469,6 +482,8 @@ pub const LocalExecutionContext = struct {
     allocator: Allocator,
     /// Owned; what `stateDir` reports, when the owner supplied it.
     state_dir: ?[]u8 = null,
+    /// How often a polling watch from this context may re-scan its directory.
+    watch_interval_ms: i64 = watch_poll_interval_ms,
 
     const vtable: ExecutionContext.VTable = .{
         .spawn = spawn,
@@ -580,8 +595,9 @@ pub const LocalExecutionContext = struct {
         };
     }
 
-    fn watch(_: *anyopaque, allocator: Allocator, io: std.Io, path: []const u8) WatchError!WatchHandle {
-        return LocalWatch.create(allocator, io, path);
+    fn watch(ptr: *anyopaque, allocator: Allocator, io: std.Io, path: []const u8) WatchError!WatchHandle {
+        const self: *LocalExecutionContext = @ptrCast(@alignCast(ptr));
+        return LocalWatch.create(allocator, io, path, self.watch_interval_ms);
     }
 
     fn run(_: *anyopaque, allocator: Allocator, io: std.Io, request: RunRequest) RunError!RunResult {
@@ -748,17 +764,19 @@ const LocalWatch = struct {
     watching: bool = false,
     fingerprint: u64 = 0,
     last_scan_ms: i64 = 0,
+    /// The least time between two fingerprint scans.
+    interval_ms: i64,
 
     const handle_vtable: WatchHandle.VTable = .{
         .poll_changes = pollChanges,
         .destroy = destroy,
     };
 
-    fn create(allocator: Allocator, io: std.Io, path: []const u8) WatchError!WatchHandle {
+    fn create(allocator: Allocator, io: std.Io, path: []const u8, interval_ms: i64) WatchError!WatchHandle {
         const self = try allocator.create(LocalWatch);
         errdefer allocator.destroy(self);
         const owned = try allocator.dupeZ(u8, path);
-        self.* = .{ .allocator = allocator, .io = io, .path = owned };
+        self.* = .{ .allocator = allocator, .io = io, .path = owned, .interval_ms = interval_ms };
         if (comptime builtin.os.tag == .linux) {
             const linux = std.os.linux;
             const rc = linux.inotify_init1(linux.IN.CLOEXEC | linux.IN.NONBLOCK);
@@ -766,7 +784,7 @@ const LocalWatch = struct {
                 self.inotify_fd = @intCast(rc);
                 _ = self.addWatch();
             } else {
-                log.warn("inotify is unavailable; polling a watched directory every {d} ms", .{watch_poll_interval_ms});
+                log.warn("inotify is unavailable; polling a watched directory every {d} ms", .{interval_ms});
             }
         }
         if (!self.watching) {
@@ -821,7 +839,7 @@ const LocalWatch = struct {
         if (self.addWatch()) return true;
 
         const now = nowMs(self.io);
-        if (now - self.last_scan_ms < watch_poll_interval_ms) return false;
+        if (now - self.last_scan_ms < self.interval_ms) return false;
         self.last_scan_ms = now;
         const fingerprint = self.scan();
         if (fingerprint == self.fingerprint) return false;
@@ -5680,12 +5698,13 @@ test "the local context reads bounded files, lists and stats directories" {
 }
 
 test "a local watch flags creation, modification, removal and a late directory without a thread" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const testing = std.testing;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var context = try ExecutionContext.local(testing.allocator);
+    // inotify on Linux; elsewhere the fingerprint, told to scan on every poll
+    // so it is held to the same next-poll claims.
+    var context = try ExecutionContext.localWithWatchInterval(testing.allocator, 0);
     defer context.deinit();
     var path_buffer: [256]u8 = undefined;
 

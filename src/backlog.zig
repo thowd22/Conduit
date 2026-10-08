@@ -1463,8 +1463,11 @@ test {
 const testing = std.testing;
 
 /// A Local context for fixture tests, released by the caller.
+/// A Local context whose watches report a change on the next poll on every
+/// OS: inotify does on Linux, and the polling watch elsewhere is told to scan
+/// every time instead of once a second, so a test's write is seen at once.
 fn localContext() !workspace.ExecutionContext {
-    return workspace.ExecutionContext.local(testing.allocator);
+    return workspace.ExecutionContext.localWithWatchInterval(testing.allocator, 0);
 }
 
 fn countDiagnostics(project: *const Project, path_fragment: []const u8) usize {
