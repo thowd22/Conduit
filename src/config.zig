@@ -258,6 +258,8 @@ pub const Key = enum {
     control_enabled,
     restore_enabled,
     accessibility_enabled,
+    shell,
+    profile,
     keybind,
 
     /// The key's spelling in the file, which is also its `Name`.
@@ -292,6 +294,8 @@ pub const Key = enum {
             .control_enabled => "control.enabled",
             .restore_enabled => "restore.enabled",
             .accessibility_enabled => "accessibility.enabled",
+            .shell => "shell",
+            .profile => "profile",
             .keybind => "keybind",
         };
     }
@@ -357,6 +361,14 @@ pub const Settings = struct {
     /// exposes the semantic tree to the platform's assistive technologies
     /// (AT-SPI2 on Linux). Read at startup only.
     accessibility_enabled: bool = true,
+    /// `shell` (TASK-46): the name of the profile a new tab or pane runs
+    /// when none is chosen. Empty keeps the built-in default (the user's
+    /// shell on POSIX, the first of PowerShell 7, Windows PowerShell and cmd
+    /// on Windows, the remote login shell over SSH).
+    shell: []const u8 = "",
+    /// Shell profiles (TASK-46), in file order, one per name, with their
+    /// `profile.<name>.*` attributes applied.
+    shell_profiles: []const ShellProfile = &.{},
 };
 
 /// The built-in value of `control.enabled`: on in development builds, off in
@@ -495,6 +507,262 @@ pub fn formatRecent(buffer: []u8, newest: []const u8, existing: []const []const 
     return writer.buffered();
 }
 
+// ---------------------------------------------------------------------------
+// Shell profiles (TASK-46)
+// ---------------------------------------------------------------------------
+
+/// The most shell profiles one file may hold.
+pub const max_shell_profiles: usize = 32;
+/// The most words (program and arguments) one profile's command may have.
+pub const max_profile_args: usize = 32;
+/// The most `profile.<name>.env` lines one profile may carry.
+pub const max_profile_env: usize = 32;
+/// The longest shell profile name.
+pub const max_shell_profile_name_bytes: usize = 32;
+
+/// One `profile = <name> = <command> [arguments...]` line with its
+/// `profile.<name>.env`, `.cwd` and `.login` attributes (TASK-46).
+///
+/// A profile is the user's own configuration, trusted like a keybinding: it
+/// names a program to run, never text a terminal produced. Every slice is
+/// owned by the `Config` arena it came from.
+pub const ShellProfile = struct {
+    name: []const u8,
+    /// The program, then its arguments, already unquoted. Never empty.
+    argv: []const []const u8,
+    /// `NAME=value` entries added on top of the child's environment.
+    env: []const []const u8 = &.{},
+    /// The directory the child starts in, in the workspace's own path
+    /// syntax; null inherits the invoking terminal's directory.
+    cwd: ?[]const u8 = null,
+    /// Start the program as a login shell (`-l` for a POSIX shell).
+    login: bool = false,
+};
+
+/// The names Conduit's built-in profiles use on this platform, which
+/// `shell` may name without a `profile` line: `login` everywhere (the
+/// user's login shell, or the remote one over SSH) and, on Windows, `pwsh`,
+/// `powershell` and `cmd`.
+pub const builtin_shell_profile_names: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{ "pwsh", "powershell", "cmd", "login" }
+else
+    &.{"login"};
+
+/// Whether `name` can name a shell profile: 1 to 32 ASCII letters, digits,
+/// `-` and `_`, so it is also a single `profile.<name>.env` key segment and
+/// a palette choice value.
+pub fn validShellProfileName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_shell_profile_name_bytes) return false;
+    for (name) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_')) return false;
+    }
+    return true;
+}
+
+/// Whether `entry` is a `NAME=value` environment entry: a name of letters,
+/// digits and `_` that does not start with a digit, and a value without
+/// control characters.
+pub fn validEnvEntry(entry: []const u8) bool {
+    const equals = std.mem.indexOfScalar(u8, entry, '=') orelse return false;
+    const name = entry[0..equals];
+    if (name.len == 0 or std.ascii.isDigit(name[0])) return false;
+    for (name) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    }
+    return !hasControl(entry[equals + 1 ..]);
+}
+
+/// Split a command line into words, shell style, unquoting into `storage`
+/// (at least `text.len` bytes) and pointing `out` at the words.
+///
+/// Blanks separate words. `'...'` is literal. `"..."` is literal except
+/// that `\"` is a quote and `\\` a backslash. A backslash anywhere else is
+/// an ordinary byte, so a Windows path needs no doubling. An unterminated
+/// quote, a control character, no words, or more than `out.len` words is an
+/// error.
+pub fn splitCommandLine(text: []const u8, storage: []u8, out: [][]const u8) ValueError![]const []const u8 {
+    if (hasControl(text)) return error.ControlCharacter;
+    if (text.len > storage.len) return error.TooLong;
+    var count: usize = 0;
+    var used: usize = 0;
+    var index: usize = 0;
+    while (true) {
+        while (index < text.len and (text[index] == ' ' or text[index] == '\t')) index += 1;
+        if (index == text.len) break;
+        if (count == out.len) return error.ShellProfileShape;
+        const start = used;
+        while (index < text.len and text[index] != ' ' and text[index] != '\t') {
+            switch (text[index]) {
+                '\'' => {
+                    const close = std.mem.indexOfScalarPos(u8, text, index + 1, '\'') orelse return error.Unquoted;
+                    const inner = text[index + 1 .. close];
+                    @memcpy(storage[used..][0..inner.len], inner);
+                    used += inner.len;
+                    index = close + 1;
+                },
+                '"' => {
+                    index += 1;
+                    while (true) {
+                        if (index == text.len) return error.Unquoted;
+                        const byte = text[index];
+                        if (byte == '"') break;
+                        if (byte == '\\' and index + 1 < text.len and (text[index + 1] == '"' or text[index + 1] == '\\')) {
+                            storage[used] = text[index + 1];
+                            index += 2;
+                        } else {
+                            storage[used] = byte;
+                            index += 1;
+                        }
+                        used += 1;
+                    }
+                    index += 1;
+                },
+                else => |byte| {
+                    storage[used] = byte;
+                    used += 1;
+                    index += 1;
+                },
+            }
+        }
+        out[count] = storage[start..used];
+        count += 1;
+    }
+    if (count == 0 or out[0].len == 0) return error.ShellProfileShape;
+    return out[0..count];
+}
+
+const SplitShellProfile = struct {
+    name: []const u8,
+    argv: []const []const u8,
+};
+
+/// Split one `profile` value, `<name> = <command> [arguments...]`. The words
+/// borrow `storage` (at least `max_line_bytes`) and `args`.
+fn splitShellProfile(value: []const u8, storage: []u8, args: *[max_profile_args][]const u8) ValueError!SplitShellProfile {
+    const equals = std.mem.indexOfScalar(u8, value, '=') orelse return error.ShellProfileShape;
+    const name = std.mem.trim(u8, value[0..equals], " \t");
+    if (!validShellProfileName(name)) return error.ShellProfileName;
+    const command = std.mem.trim(u8, value[equals + 1 ..], " \t");
+    const argv = try splitCommandLine(command, storage, args);
+    return .{ .name = name, .argv = argv };
+}
+
+/// Apply one `profile` line: a later line for the same name replaces the
+/// earlier one's command and keeps its place.
+fn applyShellProfile(settings: *Settings, allocator: Allocator, value: []const u8) (ValueError || Allocator.Error)!void {
+    var storage: [max_line_bytes]u8 = undefined;
+    var args: [max_profile_args][]const u8 = undefined;
+    const split = try splitShellProfile(value, &storage, &args);
+    const argv = try allocator.alloc([]const u8, split.argv.len);
+    for (argv, split.argv) |*slot, word| slot.* = try allocator.dupe(u8, word);
+    const owned: ShellProfile = .{ .name = try allocator.dupe(u8, split.name), .argv = argv };
+    for (settings.shell_profiles, 0..) |existing, index| {
+        if (std.mem.eql(u8, existing.name, owned.name)) {
+            const list = try allocator.dupe(ShellProfile, settings.shell_profiles);
+            list[index] = owned;
+            settings.shell_profiles = list;
+            return;
+        }
+    }
+    if (settings.shell_profiles.len >= max_shell_profiles) return error.TooManyShellProfiles;
+    const list = try allocator.alloc(ShellProfile, settings.shell_profiles.len + 1);
+    @memcpy(list[0..settings.shell_profiles.len], settings.shell_profiles);
+    list[settings.shell_profiles.len] = owned;
+    settings.shell_profiles = list;
+}
+
+/// One `profile.<name>.<field> = <value>` line, kept until every `profile`
+/// line has been read.
+const ProfileAttribute = struct {
+    line: u32,
+    name: []const u8,
+    field: Field,
+    value: []const u8,
+
+    const Field = enum { env, cwd, login };
+
+    /// The attribute `key` names, or null when `key` is not
+    /// `profile.<name>.env|cwd|login` with a valid profile name. Borrows
+    /// `key` and `value`.
+    fn parse(key: []const u8, value: []const u8, line: u32) ?ProfileAttribute {
+        const prefix = "profile.";
+        if (!std.mem.startsWith(u8, key, prefix)) return null;
+        const rest = key[prefix.len..];
+        const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return null;
+        const name = rest[0..dot];
+        if (!validShellProfileName(name)) return null;
+        const field = std.meta.stringToEnum(Field, rest[dot + 1 ..]) orelse return null;
+        return .{ .line = line, .name = name, .field = field, .value = value };
+    }
+};
+
+/// Attach each `profile.<name>.*` line to its profile, in file order. A line
+/// for a name no `profile` line defines, or with a value its field rejects,
+/// is reported on its own line and skipped; the profile keeps the rest.
+fn applyProfileAttributes(result: *Config, attributes: []const ProfileAttribute) Allocator.Error!void {
+    if (attributes.len == 0) return;
+    const allocator = result.arena.allocator();
+    const profiles = try allocator.dupe(ShellProfile, result.settings.shell_profiles);
+    result.settings.shell_profiles = profiles;
+    for (attributes) |attribute| {
+        const field = @tagName(attribute.field);
+        const profile = for (profiles) |*candidate| {
+            if (std.mem.eql(u8, candidate.name, attribute.name)) break candidate;
+        } else {
+            result.addDiagnostic(attribute.line, "profile.{s}.{s}: no profile with that name", .{ attribute.name, field });
+            continue;
+        };
+        switch (attribute.field) {
+            .env => {
+                if (!validEnvEntry(attribute.value)) {
+                    result.addDiagnostic(attribute.line, "profile.{s}.env: expected `NAME=value`", .{attribute.name});
+                    continue;
+                }
+                if (profile.env.len >= max_profile_env) {
+                    result.addDiagnostic(attribute.line, "profile.{s}.env: more than {d} variables; the rest are ignored", .{ attribute.name, max_profile_env });
+                    continue;
+                }
+                const list = try allocator.alloc([]const u8, profile.env.len + 1);
+                @memcpy(list[0..profile.env.len], profile.env);
+                list[profile.env.len] = attribute.value;
+                profile.env = list;
+            },
+            .cwd => {
+                const path = parseString(attribute.value) catch |err| {
+                    result.addDiagnostic(attribute.line, "profile.{s}.cwd: {s}", .{ attribute.name, valueMessage(.profile, err) });
+                    continue;
+                };
+                profile.cwd = if (path.len == 0) null else path;
+            },
+            .login => profile.login = parseBool(attribute.value) catch {
+                result.addDiagnostic(attribute.line, "profile.{s}.login: expected `true` or `false`", .{attribute.name});
+                continue;
+            },
+        }
+    }
+}
+
+/// Report a `shell` that names neither a configured nor a built-in profile.
+/// The value stays: the app falls back to the built-in default, and the
+/// message says why the named one is not used.
+fn checkShellName(result: *Config) void {
+    const name = result.settings.shell;
+    if (name.len == 0) return;
+    if (findShellProfile(result.settings.shell_profiles, name) != null) return;
+    for (builtin_shell_profile_names) |known| {
+        if (std.mem.eql(u8, known, name)) return;
+    }
+    result.addDiagnostic(result.lines.get(.shell), "shell: no profile with that name", .{});
+}
+
+/// The configured profile called `name`, if any.
+pub fn findShellProfile(profiles: []const ShellProfile, name: []const u8) ?ShellProfile {
+    for (profiles) |profile| {
+        if (std.mem.eql(u8, profile.name, name)) return profile;
+    }
+    return null;
+}
+
 /// The `notifications.*` switches (TASK-56). Every one defaults to on. `enabled` gates the whole
 /// in-app list and every OS notification; `os` gates only the OS notification when the window is
 /// unfocused; the per-type switches name what an entry is about, and the per-harness switches
@@ -623,6 +891,25 @@ pub const Config = struct {
         return self.arena.allocator().dupe(u8, text);
     }
 
+    fn dupeList(self: *Config, items: []const []const u8) Allocator.Error![]const []const u8 {
+        const list = try self.arena.allocator().alloc([]const u8, items.len);
+        for (list, items) |*slot, item| slot.* = try self.dupe(item);
+        return list;
+    }
+
+    /// A deep copy of `profiles` in this config's arena.
+    fn dupeShellProfiles(self: *Config, profiles: []const ShellProfile) Allocator.Error![]const ShellProfile {
+        const list = try self.arena.allocator().alloc(ShellProfile, profiles.len);
+        for (list, profiles) |*slot, profile| slot.* = .{
+            .name = try self.dupe(profile.name),
+            .argv = try self.dupeList(profile.argv),
+            .env = try self.dupeList(profile.env),
+            .cwd = if (profile.cwd) |cwd| try self.dupe(cwd) else null,
+            .login = profile.login,
+        };
+        return list;
+    }
+
     /// Copy `previous`'s value for `key` into this config, so it outlives `previous`.
     fn keepPrevious(self: *Config, key: Key, previous: *const Config) Allocator.Error!void {
         const from = &previous.settings;
@@ -673,6 +960,8 @@ pub const Config = struct {
             .control_enabled => to.control_enabled = from.control_enabled,
             .restore_enabled => to.restore_enabled = from.restore_enabled,
             .accessibility_enabled => to.accessibility_enabled = from.accessibility_enabled,
+            .shell => to.shell = try self.dupe(from.shell),
+            .profile => to.shell_profiles = try self.dupeShellProfiles(from.shell_profiles),
             // Keybind lines are resolved against the previous binding table by `app`, which is
             // the only place that knows what a rejected chord used to do.
             .keybind => {},
@@ -722,6 +1011,9 @@ const ValueError = error{
     NotDestination,
     TooManyRecent,
     TooManyProfiles,
+    ShellProfileShape,
+    ShellProfileName,
+    TooManyShellProfiles,
 };
 
 /// Parse `text` as a settings file.
@@ -739,6 +1031,9 @@ pub fn parse(gpa: Allocator, text: []const u8, previous: ?*const Config) Allocat
     var accepted: std.EnumSet(Key) = .initEmpty();
     var rejected: std.EnumSet(Key) = .initEmpty();
     var keybind_overflow_reported = false;
+    // `profile.<name>.*` lines, applied once every `profile` line is known so
+    // an attribute may come before the profile it describes.
+    var profile_attributes: std.ArrayList(ProfileAttribute) = .empty;
 
     var body = text;
     // A UTF-8 byte order mark is an editor's habit, not part of the first key.
@@ -767,6 +1062,15 @@ pub fn parse(gpa: Allocator, text: []const u8, previous: ?*const Config) Allocat
         };
         const key_text = std.mem.trim(u8, trimmed[0..equals], " \t");
         const value = std.mem.trim(u8, trimmed[equals + 1 ..], " \t");
+        if (ProfileAttribute.parse(key_text, value, line_number)) |attribute| {
+            try profile_attributes.append(allocator, .{
+                .line = attribute.line,
+                .name = try allocator.dupe(u8, attribute.name),
+                .field = attribute.field,
+                .value = try allocator.dupe(u8, attribute.value),
+            });
+            continue;
+        }
         const key = Key.fromName(key_text) orelse {
             if (key_text.len == 0) {
                 result.addDiagnostic(line_number, "expected `key = value`", .{});
@@ -802,6 +1106,11 @@ pub fn parse(gpa: Allocator, text: []const u8, previous: ?*const Config) Allocat
         var kept = rejected.differenceWith(accepted).iterator();
         while (kept.next()) |key| try result.keepPrevious(key, before);
     }
+    // When every `profile` line was rejected the previous profiles stand
+    // whole, attributes included, so this file's attributes are not stacked
+    // on top of them.
+    if (!result.kept_previous.contains(.profile)) try applyProfileAttributes(&result, profile_attributes.items);
+    checkShellName(&result);
     return result;
 }
 
@@ -828,6 +1137,9 @@ fn valueMessage(key: Key, err: ValueError) []const u8 {
         error.NotDestination => "expected `[user@]host[:port]`",
         error.TooManyRecent => "expected at most 10 comma-separated destinations",
         error.TooManyProfiles => "more than 32 profiles; the rest are ignored",
+        error.ShellProfileShape => "expected `<name> = <command> [arguments...]`",
+        error.ShellProfileName => "expected a profile name: letters, digits, `-` and `_`",
+        error.TooManyShellProfiles => "more than 32 shell profiles; the rest are ignored",
     };
 }
 
@@ -896,6 +1208,12 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
         .control_enabled => settings.control_enabled = try parseBool(value),
         .restore_enabled => settings.restore_enabled = try parseBool(value),
         .accessibility_enabled => settings.accessibility_enabled = try parseBool(value),
+        .shell => {
+            const name = try parseString(value);
+            if (name.len != 0 and !validShellProfileName(name)) return error.ShellProfileName;
+            settings.shell = try allocator.dupe(u8, name);
+        },
+        .profile => try applyShellProfile(settings, allocator, value),
         .keybind => {
             const split = try splitKeybind(value);
             try result.keybinds.append(allocator, .{
@@ -1194,6 +1512,14 @@ pub const defaults_document =
     "# Expose the interface to screen readers and other assistive technologies. Read at startup.\n" ++
     "# accessibility.enabled = true\n" ++
     "\n" ++
+    "# Shell profiles: what a new tab or pane runs. Each is one line,\n" ++
+    "# `profile = <name> = <command> [arguments...]`,\n" ++
+    "# with optional profile.<name>.env = NAME=value (repeats), profile.<name>.cwd = <dir>\n" ++
+    "# and profile.<name>.login = true. New tab with profile lists them. `shell` names the\n" ++
+    "# profile new tabs use; empty is the built-in default (your login shell, or on\n" ++
+    "# Windows the first of pwsh, powershell and cmd that is installed).\n" ++
+    "# shell = \"\"\n" ++
+    "\n" ++
     "# Keybindings: keybind = <chord>=<action>[:<argument>], or <chord>=unbind.\n" ++
     "# Modifiers are ctrl, shift, alt and super (cmd). These lines repeat some defaults.\n" ++
     keybind_examples;
@@ -1218,7 +1544,7 @@ pub const EditError = error{
 /// is written bare when that reads back unchanged, otherwise in double quotes. Only string values
 /// without control characters or double quotes are accepted, and never `keybind`, which repeats.
 pub fn setDocumentValue(gpa: Allocator, document: []const u8, key: Key, value: []const u8) EditError![]u8 {
-    if (key == .keybind or key == .remote_profile) return error.InvalidValue;
+    if (key == .keybind or key == .remote_profile or key == .profile) return error.InvalidValue;
     if (value.len > max_string_bytes or !std.unicode.utf8ValidateSlice(value) or hasControl(value) or
         std.mem.indexOfScalar(u8, value, '"') != null) return error.InvalidValue;
     const quoted = value.len == 0 or std.mem.trim(u8, value, " \t").len != value.len;
@@ -1313,6 +1639,18 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
                 if (std.mem.indexOfScalar(u8, value, '"') != null) break :check error.Unquoted;
                 var items: [max_remote_recent][]const u8 = undefined;
                 _ = splitRecent(parseString(value) catch |err| break :check err, &items) catch |err| break :check err;
+                return null;
+            },
+            .shell => {
+                if (std.mem.indexOfScalar(u8, value, '"') != null) break :check error.Unquoted;
+                const name = parseString(value) catch |err| break :check err;
+                if (name.len != 0 and !validShellProfileName(name)) break :check error.ShellProfileName;
+                return null;
+            },
+            .profile => {
+                var storage: [max_line_bytes]u8 = undefined;
+                var args: [max_profile_args][]const u8 = undefined;
+                _ = splitShellProfile(value, &storage, &args) catch |err| break :check err;
                 return null;
             },
             .keybind => break :check error.KeybindShape,
@@ -2128,8 +2466,9 @@ test "the defaults document round-trips: uncommented, it changes nothing and rep
         try uncommented.append(testing.allocator, '\n');
     }
     // Every key appears in the document, keybind four times; `remote.profile`
-    // repeats and is described in prose rather than as a setting line.
-    try testing.expectEqual(std.enums.values(Key).len - 2 + 4, settings_lines);
+    // and `profile` repeat and are described in prose rather than as setting
+    // lines.
+    try testing.expectEqual(std.enums.values(Key).len - 3 + 4, settings_lines);
 
     var config = try parse(testing.allocator, uncommented.items, null);
     defer config.deinit();
@@ -2708,4 +3047,187 @@ test "macos.option_as_alt parses its four spellings and rejects the rest" {
     var empty = try parse(testing.allocator, "", null);
     defer empty.deinit();
     try testing.expectEqual(OptionAsAlt.false, empty.settings.macos_option_as_alt);
+}
+
+// ---------------------------------------------------------------------------
+// Shell profile tests (TASK-46)
+// ---------------------------------------------------------------------------
+
+test "shell profiles parse with quoting, attributes in any order, and a default" {
+    const text =
+        \\profile.alpha.env = PROFILE_VAR=alpha value
+        \\profile = alpha = sh -c 'echo "A:$PROFILE_VAR"; exec sh'
+        \\profile.alpha.env = SECOND=2
+        \\profile.alpha.cwd = "/tmp/a dir"
+        \\profile = beta = /bin/bash
+        \\profile.beta.login = true
+        \\profile = win = "C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo "a \"quoted\" word"
+        \\shell = beta
+    ;
+    var config = try parse(testing.allocator, text, null);
+    defer config.deinit();
+    try testing.expect(!config.hasDiagnostics());
+    const profiles = config.settings.shell_profiles;
+    try testing.expectEqual(@as(usize, 3), profiles.len);
+
+    try testing.expectEqualStrings("alpha", profiles[0].name);
+    try testing.expectEqual(@as(usize, 3), profiles[0].argv.len);
+    try testing.expectEqualStrings("sh", profiles[0].argv[0]);
+    try testing.expectEqualStrings("-c", profiles[0].argv[1]);
+    try testing.expectEqualStrings("echo \"A:$PROFILE_VAR\"; exec sh", profiles[0].argv[2]);
+    try testing.expectEqual(@as(usize, 2), profiles[0].env.len);
+    try testing.expectEqualStrings("PROFILE_VAR=alpha value", profiles[0].env[0]);
+    try testing.expectEqualStrings("SECOND=2", profiles[0].env[1]);
+    try testing.expectEqualStrings("/tmp/a dir", profiles[0].cwd.?);
+    try testing.expect(!profiles[0].login);
+
+    try testing.expectEqualStrings("beta", profiles[1].name);
+    try testing.expect(profiles[1].login);
+    try testing.expectEqual(@as(?[]const u8, null), profiles[1].cwd);
+
+    // A backslash outside `\"` and `\\` is an ordinary byte: Windows paths need no doubling.
+    try testing.expectEqualStrings("C:\\Program Files\\PowerShell\\7\\pwsh.exe", profiles[2].argv[0]);
+    try testing.expectEqualStrings("-NoLogo", profiles[2].argv[1]);
+    try testing.expectEqualStrings("a \"quoted\" word", profiles[2].argv[2]);
+
+    try testing.expectEqualStrings("beta", config.settings.shell);
+    try testing.expectEqual(@as(u32, 8), config.lines.get(.shell));
+    try testing.expectEqualStrings("beta", findShellProfile(profiles, "beta").?.name);
+    try testing.expectEqual(@as(?ShellProfile, null), findShellProfile(profiles, "gamma"));
+}
+
+test "a later profile line replaces its command in place and profiles are bounded" {
+    var config = try parse(testing.allocator,
+        \\profile = one = sh
+        \\profile = two = bash
+        \\profile = one = zsh -i
+    , null);
+    defer config.deinit();
+    try testing.expect(!config.hasDiagnostics());
+    try testing.expectEqual(@as(usize, 2), config.settings.shell_profiles.len);
+    try testing.expectEqualStrings("one", config.settings.shell_profiles[0].name);
+    try testing.expectEqualStrings("zsh", config.settings.shell_profiles[0].argv[0]);
+    try testing.expectEqualStrings("-i", config.settings.shell_profiles[0].argv[1]);
+
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(testing.allocator);
+    for (0..max_shell_profiles + 1) |index| {
+        var line: [64]u8 = undefined;
+        try many.appendSlice(testing.allocator, try std.fmt.bufPrint(&line, "profile = p{d} = sh\n", .{index}));
+    }
+    var full = try parse(testing.allocator, many.items, null);
+    defer full.deinit();
+    try testing.expectEqual(max_shell_profiles, full.settings.shell_profiles.len);
+    try testing.expectEqual(@as(u32, max_shell_profiles + 1), full.firstDiagnostic().?.line);
+    try testing.expectEqualStrings("profile: more than 32 shell profiles; the rest are ignored", full.firstDiagnostic().?.message);
+}
+
+test "malformed profile lines are reported on their own line and the rest apply" {
+    const text =
+        \\profile = good = sh
+        \\profile = bad name = sh
+        \\profile = open = sh -c 'unterminated
+        \\profile = empty =
+        \\profile.ghost.env = A=1
+        \\profile.good.env = 1BAD=x
+        \\profile.good.login = yes
+        \\profile.good.cwd = "unbalanced
+        \\shell = nobody
+        \\profile = nameless
+    ;
+    var config = try parse(testing.allocator, text, null);
+    defer config.deinit();
+    try testing.expectEqual(@as(usize, 1), config.settings.shell_profiles.len);
+    try testing.expectEqualStrings("good", config.settings.shell_profiles[0].name);
+    try testing.expectEqual(@as(usize, 0), config.settings.shell_profiles[0].env.len);
+    try testing.expect(!config.settings.shell_profiles[0].login);
+    const expected = [_]struct { line: u32, message: []const u8 }{
+        .{ .line = 2, .message = "profile: expected a profile name: letters, digits, `-` and `_`" },
+        .{ .line = 3, .message = "profile: unbalanced quotes" },
+        .{ .line = 4, .message = "profile: expected `<name> = <command> [arguments...]`" },
+        .{ .line = 5, .message = "profile.ghost.env: no profile with that name" },
+        .{ .line = 6, .message = "profile.good.env: expected `NAME=value`" },
+        .{ .line = 7, .message = "profile.good.login: expected `true` or `false`" },
+        .{ .line = 8, .message = "profile.good.cwd: unbalanced quotes" },
+        .{ .line = 9, .message = "shell: no profile with that name" },
+        .{ .line = 10, .message = "profile: expected `<name> = <command> [arguments...]`" },
+    };
+    try testing.expectEqual(expected.len, config.diagnostics.items.len);
+    for (expected) |want| {
+        var found = false;
+        for (config.diagnostics.items) |diagnostic| {
+            if (diagnostic.line == want.line and std.mem.eql(u8, diagnostic.message, want.message)) found = true;
+        }
+        if (!found) {
+            std.log.err("missing diagnostic {d}: {s}", .{ want.line, want.message });
+            return error.TestExpectedDiagnostic;
+        }
+    }
+    // The value stays even when it names nothing; the app falls back.
+    try testing.expectEqualStrings("nobody", config.settings.shell);
+    // A built-in profile name is not reported.
+    var builtin_name = try parse(testing.allocator, "shell = login\n", null);
+    defer builtin_name.deinit();
+    try testing.expect(!builtin_name.hasDiagnostics());
+}
+
+test "when every profile line is rejected the previous profiles stand whole" {
+    var first = try parse(testing.allocator,
+        \\profile = keep = sh
+        \\profile.keep.env = A=1
+        \\shell = keep
+    , null);
+    var second = try parse(testing.allocator,
+        \\profile = keep = 'broken
+        \\profile.keep.env = B=2
+        \\shell = "bad name"
+    , &first);
+    defer second.deinit();
+    // The kept values were copied: they outlive the config they came from.
+    first.deinit();
+    try testing.expectEqual(@as(usize, 1), second.settings.shell_profiles.len);
+    try testing.expectEqualStrings("keep", second.settings.shell_profiles[0].name);
+    try testing.expectEqualStrings("sh", second.settings.shell_profiles[0].argv[0]);
+    try testing.expectEqual(@as(usize, 1), second.settings.shell_profiles[0].env.len);
+    try testing.expectEqualStrings("A=1", second.settings.shell_profiles[0].env[0]);
+    try testing.expectEqualStrings("keep", second.settings.shell);
+}
+
+test "command lines split shell style and refuse what cannot be one" {
+    var storage: [max_line_bytes]u8 = undefined;
+    var words: [4][]const u8 = undefined;
+    const split = try splitCommandLine("  a 'b c'd \"e \\\\ \\\" f\\g\"  ", &storage, &words);
+    try testing.expectEqual(@as(usize, 3), split.len);
+    try testing.expectEqualStrings("a", split[0]);
+    try testing.expectEqualStrings("b cd", split[1]);
+    try testing.expectEqualStrings("e \\ \" f\\g", split[2]);
+    try testing.expectError(error.ShellProfileShape, splitCommandLine("   ", &storage, &words));
+    try testing.expectError(error.ShellProfileShape, splitCommandLine("'' x", &storage, &words));
+    try testing.expectError(error.ShellProfileShape, splitCommandLine("a b c d e", &storage, &words));
+    try testing.expectError(error.Unquoted, splitCommandLine("a \"b", &storage, &words));
+    try testing.expectError(error.ControlCharacter, splitCommandLine("a\x07", &storage, &words));
+    var short: [2]u8 = undefined;
+    try testing.expectError(error.TooLong, splitCommandLine("abc", &short, &words));
+
+    try testing.expect(validShellProfileName("pwsh-7_x"));
+    try testing.expect(!validShellProfileName("has space"));
+    try testing.expect(!validShellProfileName("dot.ted"));
+    try testing.expect(!validShellProfileName(""));
+    try testing.expect(validEnvEntry("_A1=x=y"));
+    try testing.expect(validEnvEntry("EMPTY="));
+    try testing.expect(!validEnvEntry("NOVALUE"));
+    try testing.expect(!validEnvEntry("A-B=1"));
+}
+
+test "a typed shell or profile value is checked the way its file line would be" {
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.shell, "pwsh"));
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.shell, ""));
+    try testing.expectEqualStrings("expected a profile name: letters, digits, `-` and `_`", checkValue(.shell, "two words").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.profile, "x = sh -l"));
+    try testing.expect(checkValue(.profile, "x =") != null);
+    // A profile repeats, so it is never set as one value.
+    try testing.expectError(error.InvalidValue, setDocumentValue(testing.allocator, "", .profile, "x = sh"));
+    const edited = try setDocumentValue(testing.allocator, "# a\n", .shell, "alpha");
+    defer testing.allocator.free(edited);
+    try testing.expectEqualStrings("# a\nshell = alpha\n", edited);
 }

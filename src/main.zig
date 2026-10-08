@@ -390,6 +390,11 @@ pub const Run = struct {
     /// every editor kind by keyboard and mouse with file readback, keybinding
     /// capture and conflicts, the raw-file row and modal isolation, then exit.
     settings_test: bool = false,
+    /// Exercise TASK-46's shell profiles against a private settings file:
+    /// the chooser by keyboard and mouse, a new tab's and a split's argv,
+    /// environment and directory through real input, `shell` as the
+    /// default, the Shells settings rows and a malformed line, then exit.
+    profiles_test: bool = false,
     /// Exercise TASK-76's branch rows against real repositories in a private
     /// temporary directory through real PTYs and SDL events, then exit.
     git_test: bool = false,
@@ -576,7 +581,7 @@ fn optionsForRun(options: Options) Options {
         !options.run.workspaces_test and !options.run.links_test and
         !options.run.search_test and !options.run.menu_test and !options.run.config_test and
         !options.run.theme_test and !options.run.font_test and !options.run.settings_test and
-        !options.run.git_test and !options.run.agent_test and !options.run.ssh_test and
+        !options.run.profiles_test and !options.run.git_test and !options.run.agent_test and !options.run.ssh_test and
         !options.run.restore_test and !options.run.a11y_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
@@ -742,6 +747,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.theme_test = true;
         } else if (std.mem.eql(u8, arg, "--settings-test")) {
             run.settings_test = true;
+        } else if (std.mem.eql(u8, arg, "--profiles-test")) {
+            run.profiles_test = true;
         } else if (std.mem.eql(u8, arg, "--git-test")) {
             run.git_test = true;
         } else if (std.mem.eql(u8, arg, "--agent-test")) {
@@ -1660,6 +1667,62 @@ const GitTrack = struct {
     }
 };
 
+/// The fixed line a run's tabs execute instead of an interactive shell: a
+/// PTY check's deterministic peer, or `--command`. Null for an interactive
+/// run. The PTY checks run fixed children, so what the program receives is
+/// known and nothing of the user's shell configuration is involved.
+fn fixedChildCommand(options: Options) ?[]const u8 {
+    return if (options.run.clipboard_test)
+        clipboard_test_script
+    else if (options.run.ime_test)
+        ime_test_script
+    else if (options.run.tabs_test)
+        tabs_test_script
+    else if (options.run.panes_test)
+        panes_test_script
+    else if (options.run.palette_test)
+        palette_test_script
+    else if (options.run.workspaces_test)
+        workspaces_test_script
+    else if (options.run.restore_test)
+        restore_test_script
+    else if (options.run.links_test)
+        links_test_script
+    else if (options.run.search_test)
+        search_test_script
+    else if (options.run.menu_test)
+        menu_test_script
+    else if (options.run.config_test)
+        config_test_script
+    else if (options.run.theme_test)
+        theme_test_script
+    else if (options.run.font_test)
+        font_test_script
+    else if (options.run.settings_test)
+        settings_test_script
+    else if (options.run.profiles_test)
+        profiles_test_script
+    else if (options.run.git_test)
+        git_test_script
+    else if (options.run.control_test)
+        control_test_script
+    else if (options.run.agent_prompts_test)
+        agent_prompts_test_script
+    else if (options.run.agent_test)
+        agent_test_script
+    else
+        options.run.command;
+}
+
+/// The profile `name` resolves to: a configured one, else a built-in one,
+/// else null (an empty name, or one that names nothing, keeps the built-in
+/// default). The result borrows `profiles` and `builtins`.
+fn resolveNamedProfile(name: []const u8, profiles: []const config.ShellProfile, builtins: *const BuiltinProfiles) ?ResolvedProfile {
+    if (name.len == 0) return null;
+    if (config.findShellProfile(profiles, name)) |profile| return .fromConfig(profile);
+    return builtins.find(name);
+}
+
 /// What a child process is started with: its program, its environment and its
 /// size.
 ///
@@ -1765,7 +1828,8 @@ const ChildSpec = struct {
         var variables = try baseEnvironment(allocator, env, context);
         defer variables.deinit();
 
-        const shell = shell_override orelse env.get("SHELL") orelse "/bin/sh";
+        var default_buffer: [path_capacity]u8 = undefined;
+        const shell = shell_override orelse defaultShellProgram(io, env, &default_buffer);
         try put(allocator, &argv, shell);
 
         if (!no_shell_integration) {
@@ -1793,46 +1857,7 @@ const ChildSpec = struct {
         var variables = try baseEnvironment(allocator, env, context);
         defer variables.deinit();
 
-        // The PTY checks run fixed children, so what the program receives is
-        // known and nothing of the user's shell configuration is involved.
-        const command = if (options.run.clipboard_test)
-            clipboard_test_script
-        else if (options.run.ime_test)
-            ime_test_script
-        else if (options.run.tabs_test)
-            tabs_test_script
-        else if (options.run.panes_test)
-            panes_test_script
-        else if (options.run.palette_test)
-            palette_test_script
-        else if (options.run.workspaces_test)
-            workspaces_test_script
-        else if (options.run.restore_test)
-            restore_test_script
-        else if (options.run.links_test)
-            links_test_script
-        else if (options.run.search_test)
-            search_test_script
-        else if (options.run.menu_test)
-            menu_test_script
-        else if (options.run.config_test)
-            config_test_script
-        else if (options.run.theme_test)
-            theme_test_script
-        else if (options.run.font_test)
-            font_test_script
-        else if (options.run.settings_test)
-            settings_test_script
-        else if (options.run.git_test)
-            git_test_script
-        else if (options.run.control_test)
-            control_test_script
-        else if (options.run.agent_prompts_test)
-            agent_prompts_test_script
-        else if (options.run.agent_test)
-            agent_test_script
-        else
-            options.run.command;
+        const command = fixedChildCommand(options);
         // `--control-test`'s tabs see the check's private runtime and state
         // directories, so the `conduit` commands they run reach this run's
         // instance endpoint and never the user's.
@@ -1846,6 +1871,7 @@ const ChildSpec = struct {
             var trigger_buffer: [path_capacity]u8 = undefined;
             try variables.put(agent_test_trigger_env, try std.fmt.bufPrint(&trigger_buffer, "{s}/trigger", .{dir}));
         }
+        var default_buffer: [path_capacity]u8 = undefined;
         const shell: ?[]const u8 = if (command) |line| blk: {
             // `/bin/sh` rather than `$SHELL`: a line to run is a script, and a
             // script should not depend on which login shell the person running
@@ -1855,7 +1881,7 @@ const ChildSpec = struct {
             try put(allocator, &argv, "-c");
             try put(allocator, &argv, line);
             break :blk null;
-        } else env.get("SHELL") orelse "/bin/sh";
+        } else defaultShellProgram(io, env, &default_buffer);
         if (shell) |program| try put(allocator, &argv, program);
 
         if (shell) |program| if (!options.run.no_shell_integration) {
@@ -1864,6 +1890,47 @@ const ChildSpec = struct {
             }
         };
 
+        return finish(allocator, &argv, &variables);
+    }
+
+    /// What `profile` runs in a workspace of `context` (TASK-46): the
+    /// context's environment with the profile's `NAME=value` entries on top,
+    /// the program, `loginFlag` when the profile asks for a login shell, the
+    /// profile's own arguments and, for a Local bare shell Conduit has a
+    /// script for, its integration. A remote context gets no local
+    /// integration: its shell runs elsewhere. An empty argv (the remote
+    /// login shell) stays empty.
+    fn buildProfile(
+        allocator: Allocator,
+        io: Io,
+        env: EnvSource,
+        context: workspace.ExecutionContextKind,
+        profile: ResolvedProfile,
+        no_shell_integration: bool,
+        integration_root: ?[]const u8,
+    ) !ChildSpec {
+        var argv: std.ArrayList([]const u8) = .empty;
+        errdefer freeEntries(allocator, argv.items);
+        var variables = try baseEnvironment(allocator, env, context);
+        defer variables.deinit();
+        for (profile.env) |entry| {
+            const equals = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            if (!Variables.validateKeyForPut(entry[0..equals])) continue;
+            try variables.put(entry[0..equals], entry[equals + 1 ..]);
+        }
+        if (profile.argv.len != 0) {
+            const program = profile.argv[0];
+            try put(allocator, &argv, program);
+            if (profile.login) if (loginFlag(program, builtin.os.tag)) |flag| try put(allocator, &argv, flag);
+            for (profile.argv[1..]) |arg| try put(allocator, &argv, arg);
+            if (context == .local and !no_shell_integration) {
+                if (ShellKind.detect(program)) |kind| {
+                    if (profileIntegrationAllowed(kind, profile.argv[1..])) {
+                        try injectShellIntegration(allocator, io, env, kind, integration_root, &argv, &variables);
+                    }
+                }
+            }
+        }
         return finish(allocator, &argv, &variables);
     }
 
@@ -2090,14 +2157,21 @@ const ShellKind = enum {
     bash,
     zsh,
     fish,
+    /// PowerShell 7 (`pwsh`) and Windows PowerShell (`powershell`), on any
+    /// platform (TASK-46).
+    powershell,
 
     /// The shell a program path names, judged by its file name only. A login
-    /// shell's leading `-` is not stripped because Conduit never starts one.
+    /// shell's leading `-` is not stripped because Conduit never starts one
+    /// that way (a login profile passes `-l`). PowerShell is matched
+    /// ignoring case and an `.exe` suffix, as Windows names it.
     fn detect(program: []const u8) ?ShellKind {
-        const name = std.fs.path.basename(program);
+        const name = programName(program);
         if (std.mem.eql(u8, name, "bash")) return .bash;
         if (std.mem.eql(u8, name, "zsh")) return .zsh;
         if (std.mem.eql(u8, name, "fish")) return .fish;
+        const stem = if (std.ascii.endsWithIgnoreCase(name, ".exe")) name[0 .. name.len - 4] else name;
+        if (std.ascii.eqlIgnoreCase(stem, "pwsh") or std.ascii.eqlIgnoreCase(stem, "powershell")) return .powershell;
         return null;
     }
 };
@@ -2111,8 +2185,9 @@ fn shellIntegrationDir(buffer: []u8, env: EnvSource) ![]const u8 {
 }
 
 /// Write the embedded scripts under `root`, in the layout each shell expects:
-/// `bash/conduit.bash`, `zsh/.zshenv` + `zsh/conduit.zsh`, and
-/// `fish/vendor_conf.d/conduit.fish` (fish finds that through `XDG_DATA_DIRS`).
+/// `bash/conduit.bash`, `zsh/.zshenv` + `zsh/conduit.zsh`,
+/// `fish/vendor_conf.d/conduit.fish` (fish finds that through `XDG_DATA_DIRS`)
+/// and `powershell/conduit.ps1`.
 fn writeShellScripts(io: Io, root: []const u8) !void {
     var path: [path_capacity]u8 = undefined;
     const files = [_]struct { dir: []const u8, name: []const u8, data: []const u8 }{
@@ -2120,6 +2195,7 @@ fn writeShellScripts(io: Io, root: []const u8) !void {
         .{ .dir = "zsh", .name = ".zshenv", .data = shell_scripts.zsh_env },
         .{ .dir = "zsh", .name = "conduit.zsh", .data = shell_scripts.zsh },
         .{ .dir = "fish" ++ std.fs.path.sep_str ++ "vendor_conf.d", .name = "conduit.fish", .data = shell_scripts.fish },
+        .{ .dir = "powershell", .name = "conduit.ps1", .data = shell_scripts.powershell },
     };
     for (files) |file| {
         const dir = try std.fmt.bufPrint(&path, "{s}{c}{s}", .{ root, std.fs.path.sep, file.dir });
@@ -2189,7 +2265,354 @@ fn injectShellIntegration(
             const joined = try std.fmt.bufPrint(&data_dirs, "{s}:{s}", .{ dir, existing });
             try variables.put("XDG_DATA_DIRS", joined);
         },
+        // TASK-46. `-Command` runs after PowerShell has loaded the user's own
+        // profile, and `-NoExit` keeps the shell interactive afterwards, so
+        // loading the script here changes nothing else about startup. The
+        // file's text is dot-sourced as a script block rather than as a
+        // script file, so an execution policy that forbids unsigned script
+        // files (Windows PowerShell's default on client Windows) does not
+        // stop it, and the command holds no double quote for Windows'
+        // command-line parsing to disagree about. Single quotes keep the path
+        // literal; a quote in it is doubled.
+        .powershell => {
+            const script = try std.fmt.bufPrint(&path, "{s}{c}powershell{c}conduit.ps1", .{ root, std.fs.path.sep, std.fs.path.sep });
+            var command: std.ArrayList(u8) = .empty;
+            defer command.deinit(allocator);
+            try command.appendSlice(allocator, ". ([scriptblock]::Create([System.IO.File]::ReadAllText('");
+            for (script) |byte| {
+                if (byte == '\'') try command.append(allocator, '\'');
+                try command.append(allocator, byte);
+            }
+            try command.appendSlice(allocator, "')))");
+            try ChildSpec.put(allocator, argv, "-NoExit");
+            try ChildSpec.put(allocator, argv, "-Command");
+            try ChildSpec.put(allocator, argv, command.items);
+        },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shell profiles (TASK-46)
+// ---------------------------------------------------------------------------
+
+/// A profile ready to start in one workspace: a configured `profile` line
+/// or one of the built-in profiles detected for that workspace's context.
+/// Every slice is borrowed from the config or from `BuiltinProfiles`.
+const ResolvedProfile = struct {
+    name: []const u8,
+    /// Empty only for the built-in `login` profile of a remote workspace,
+    /// which is the remote user's own login shell.
+    argv: []const []const u8,
+    env: []const []const u8 = &.{},
+    cwd: ?[]const u8 = null,
+    login: bool = false,
+    builtin: bool = false,
+
+    fn fromConfig(profile: config.ShellProfile) ResolvedProfile {
+        return .{ .name = profile.name, .argv = profile.argv, .env = profile.env, .cwd = profile.cwd, .login = profile.login };
+    }
+};
+
+/// Whether a file exists, asked of a workspace's execution context so a
+/// remote workspace would be asked on its own host.
+const PathProbe = struct {
+    ctx: *const anyopaque,
+    exists_fn: *const fn (ctx: *const anyopaque, path: []const u8) bool,
+
+    fn exists(self: PathProbe, path: []const u8) bool {
+        return self.exists_fn(self.ctx, path);
+    }
+};
+
+/// A `PathProbe` over an execution context's `statPath`.
+const ContextProbe = struct {
+    ref: workspace.ExecutionContext.Ref,
+    io: Io,
+
+    fn probe(self: *const ContextProbe) PathProbe {
+        return .{ .ctx = self, .exists_fn = exists };
+    }
+
+    fn exists(ctx: *const anyopaque, path: []const u8) bool {
+        const self: *const ContextProbe = @ptrCast(@alignCast(ctx));
+        const stat = self.ref.statPath(self.io, path) catch return false;
+        return stat.kind == .file;
+    }
+};
+
+/// The built-in profiles of one workspace, detected when a chooser opens or
+/// a default is needed (AC3):
+///
+/// - a Local POSIX workspace: `login`, the user's `$SHELL` (else the shell
+///   `/etc/passwd` names for this user, else `/bin/sh`) as a login shell;
+/// - a Local Windows workspace: `pwsh` (PowerShell 7, on `PATH` or in
+///   `%ProgramFiles%\PowerShell\7`), `powershell` (Windows PowerShell) and
+///   `cmd`, each only when it exists; the first is the default;
+/// - a remote workspace: `login`, the remote user's own login shell.
+///
+/// Filled in place: `argv` slices point into this value, so it lives in a
+/// stable place (the app) and is never copied while in use.
+const BuiltinProfiles = struct {
+    const capacity = 4;
+
+    names: [capacity][]const u8 = undefined,
+    programs: [capacity][path_capacity]u8 = undefined,
+    argv: [capacity][1][]const u8 = undefined,
+    program_lens: [capacity]usize = undefined,
+    login: [capacity]bool = undefined,
+    count: usize = 0,
+
+    fn add(self: *BuiltinProfiles, name: []const u8, program: []const u8, login: bool) void {
+        if (self.count == capacity or program.len > path_capacity) return;
+        const index = self.count;
+        self.names[index] = name;
+        @memcpy(self.programs[index][0..program.len], program);
+        self.program_lens[index] = program.len;
+        self.argv[index][0] = self.programs[index][0..program.len];
+        self.login[index] = login;
+        self.count += 1;
+    }
+
+    fn at(self: *const BuiltinProfiles, index: usize) ResolvedProfile {
+        return .{
+            .name = self.names[index],
+            .argv = if (self.program_lens[index] == 0) &.{} else self.argv[index][0..1],
+            .login = self.login[index],
+            .builtin = true,
+        };
+    }
+
+    fn find(self: *const BuiltinProfiles, name: []const u8) ?ResolvedProfile {
+        for (0..self.count) |index| {
+            if (std.mem.eql(u8, self.names[index], name)) return self.at(index);
+        }
+        return null;
+    }
+
+    /// Detect the built-in profiles for a workspace of `kind` whose files
+    /// `probe` answers for, on `os`. `passwd` is the context's
+    /// `/etc/passwd`, when it could be read.
+    fn detect(self: *BuiltinProfiles, kind: workspace.ExecutionContextKind, os: std.Target.Os.Tag, env: EnvSource, probe: PathProbe, passwd: ?[]const u8) void {
+        self.count = 0;
+        if (kind.isRemote()) return self.add("login", "", true);
+        if (os == .windows) return self.detectWindows(env, probe);
+        const shell = env.get("SHELL") orelse
+            (if (passwd) |text| passwdShell(text, currentUid()) else null) orelse "/bin/sh";
+        self.add("login", shell, true);
+    }
+
+    fn detectWindows(self: *BuiltinProfiles, env: EnvSource, probe: PathProbe) void {
+        var buffer: [path_capacity]u8 = undefined;
+        if (findOnWindowsPath(&buffer, firstEnv(env, &.{ "PATH", "Path" }), "pwsh.exe", probe)) |found| {
+            self.add("pwsh", found, false);
+        } else if (env.get("ProgramFiles") orelse env.get("PROGRAMFILES")) |program_files| {
+            if (std.fmt.bufPrint(&buffer, "{s}\\PowerShell\\7\\pwsh.exe", .{std.mem.trimEnd(u8, program_files, "\\")})) |path| {
+                if (probe.exists(path)) self.add("pwsh", path, false);
+            } else |_| {}
+        }
+        const system_root = std.mem.trimEnd(u8, firstEnv(env, &.{ "SystemRoot", "SYSTEMROOT", "windir" }) orelse "C:\\Windows", "\\");
+        if (std.fmt.bufPrint(&buffer, "{s}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", .{system_root})) |path| {
+            if (probe.exists(path)) self.add("powershell", path, false);
+        } else |_| {}
+        // cmd is always offered: it is part of every Windows install, and a
+        // bare name is still found on the child's PATH if the probe missed it.
+        const comspec = firstEnv(env, &.{ "ComSpec", "COMSPEC" });
+        if (comspec != null and probe.exists(comspec.?)) {
+            self.add("cmd", comspec.?, false);
+        } else if (std.fmt.bufPrint(&buffer, "{s}\\System32\\cmd.exe", .{system_root})) |path| {
+            self.add("cmd", if (probe.exists(path)) path else "cmd.exe", false);
+        } else |_| self.add("cmd", "cmd.exe", false);
+    }
+};
+
+/// The first `<dir>\<program>` that exists among the `;`-separated `path`
+/// entries, written into `buffer`. At most 64 entries are tried.
+fn findOnWindowsPath(buffer: []u8, path: ?[]const u8, program: []const u8, probe: PathProbe) ?[]const u8 {
+    var entries = std.mem.splitScalar(u8, path orelse return null, ';');
+    var tried: usize = 0;
+    while (entries.next()) |raw| {
+        if (tried == 64) return null;
+        tried += 1;
+        const dir = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \""), "\\");
+        if (dir.len == 0) continue;
+        const candidate = std.fmt.bufPrint(buffer, "{s}\\{s}", .{ dir, program }) catch continue;
+        if (probe.exists(candidate)) return candidate;
+    }
+    return null;
+}
+
+/// The login shell `/etc/passwd` text names for `uid`, or null. Only the
+/// seventh field of the first line with that uid is read.
+fn passwdShell(text: []const u8, uid: u32) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        var values: [7][]const u8 = undefined;
+        var count: usize = 0;
+        while (fields.next()) |field| {
+            if (count == values.len) break;
+            values[count] = field;
+            count += 1;
+        }
+        if (count < 7) continue;
+        const line_uid = std.fmt.parseUnsigned(u32, values[2], 10) catch continue;
+        if (line_uid != uid) continue;
+        const shell = std.mem.trimEnd(u8, values[6], "\r");
+        return if (shell.len != 0 and shell[0] == '/') shell else null;
+    }
+    return null;
+}
+
+/// The program a default local shell runs: the user's `$SHELL` (else
+/// `/bin/sh`) on POSIX; on Windows, the first built-in profile that exists,
+/// probed on this machine. `buffer` holds a detected path.
+fn defaultShellProgram(io: Io, env: EnvSource, buffer: *[path_capacity]u8) []const u8 {
+    if (comptime builtin.os.tag != .windows) return env.get("SHELL") orelse "/bin/sh";
+    var probe_state: ContextProbe = .{ .ref = workspace.localFiles(), .io = io };
+    var detected: BuiltinProfiles = .{};
+    detected.detect(.local, .windows, env, probe_state.probe(), null);
+    if (detected.count == 0) return "cmd.exe";
+    const program = detected.at(0).argv[0];
+    @memcpy(buffer[0..program.len], program);
+    return buffer[0..program.len];
+}
+
+/// What `login` adds to a profile's program: `-l` for a POSIX shell,
+/// `--login` for bash (whose long options must precede the `--posix` its
+/// integration adds), `-Login` for PowerShell 7 off Windows, and nothing for
+/// Windows PowerShell, cmd or PowerShell on Windows, which have no login
+/// mode.
+fn loginFlag(program: []const u8, os: std.Target.Os.Tag) ?[]const u8 {
+    const name = programName(program);
+    if (ShellKind.detect(program) == .bash) return "--login";
+    if (std.ascii.eqlIgnoreCase(name, "cmd") or std.ascii.eqlIgnoreCase(name, "cmd.exe")) return null;
+    if (ShellKind.detect(program) == .powershell) {
+        if (os == .windows) return null;
+        return if (std.ascii.startsWithIgnoreCase(name, "pwsh")) "-Login" else null;
+    }
+    return "-l";
+}
+
+/// The file name of a program path, split at either separator so a Windows
+/// path names its program on any host.
+fn programName(program: []const u8) []const u8 {
+    const index = std.mem.lastIndexOfAny(u8, program, "/\\") orelse return program;
+    return program[index + 1 ..];
+}
+
+/// Whether Conduit may add its integration to `kind` started with the
+/// profile's own `args`. A shell given a script or a command is not an
+/// interactive shell, so only a bare shell qualifies; PowerShell also keeps
+/// it with `-NoLogo`, `-NoProfile` or `-Login`, which change nothing the
+/// integration's `-NoExit -Command` relies on.
+fn profileIntegrationAllowed(kind: ShellKind, args: []const []const u8) bool {
+    if (args.len == 0) return true;
+    if (kind != .powershell) return false;
+    for (args) |arg| {
+        const harmless = std.ascii.eqlIgnoreCase(arg, "-NoLogo") or std.ascii.eqlIgnoreCase(arg, "-NoProfile") or
+            std.ascii.eqlIgnoreCase(arg, "-Login") or std.ascii.eqlIgnoreCase(arg, "-l");
+        if (!harmless) return false;
+    }
+    return true;
+}
+
+/// A tracked working directory as a spawn on `os` takes it. PowerShell
+/// reports `C:\Users` as OSC 7 `file://localhost/C:/Users`, which the
+/// terminal keeps as `/C:/Users`; a Windows spawn needs `C:\Users`, written
+/// into `buffer`. Every other directory is returned unchanged.
+fn spawnDirectory(buffer: []u8, tracked: []const u8, os: std.Target.Os.Tag) []const u8 {
+    if (os != .windows) return tracked;
+    if (tracked.len < 3 or tracked[0] != '/' or !std.ascii.isAlphabetic(tracked[1]) or tracked[2] != ':') return tracked;
+    const rest = tracked[1..];
+    if (rest.len > buffer.len) return tracked;
+    for (rest, 0..) |byte, index| buffer[index] = if (byte == '/') '\\' else byte;
+    // `C:` alone is the drive's current directory, not its root.
+    if (rest.len == 2) {
+        if (buffer.len < 3) return tracked;
+        buffer[2] = '\\';
+        return buffer[0..3];
+    }
+    return buffer[0..rest.len];
+}
+
+/// The profile choosers' list (TASK-46): the built-in profiles detected for
+/// the active workspace, then every configured profile not named like one.
+/// Heap-owned by the app so the registry can borrow `slice()` from before
+/// the app exists; rebuilt in place only while the palette is closed, since
+/// an open chooser's rows are indices into it.
+const ProfileChoices = struct {
+    const capacity = config.max_shell_profiles + BuiltinProfiles.capacity;
+
+    choices: [capacity]inputmod.PaletteChoice = undefined,
+    labels: [capacity][palette_label_capacity]u8 = undefined,
+    values: [capacity][config.max_shell_profile_name_bytes]u8 = undefined,
+    count: usize = 0,
+    builtins: BuiltinProfiles = .{},
+
+    /// Detect the built-ins for a workspace whose context is `ref`, and
+    /// list them with `profiles`.
+    fn rebuild(self: *ProfileChoices, io: Io, env: EnvSource, ref: workspace.ExecutionContext.Ref, profiles: []const config.ShellProfile) void {
+        detectBuiltins(&self.builtins, io, env, ref);
+        self.count = 0;
+        for (0..self.builtins.count) |index| {
+            const builtin_profile = self.builtins.at(index);
+            if (config.findShellProfile(profiles, builtin_profile.name) != null) continue;
+            self.add(builtin_profile);
+        }
+        for (profiles) |profile| self.add(.fromConfig(profile));
+    }
+
+    fn add(self: *ProfileChoices, profile: ResolvedProfile) void {
+        if (self.count == capacity or profile.name.len > config.max_shell_profile_name_bytes) return;
+        const index = self.count;
+        @memcpy(self.values[index][0..profile.name.len], profile.name);
+        self.choices[index] = .{
+            .label = profileChoiceLabel(&self.labels[index], profile),
+            .value = self.values[index][0..profile.name.len],
+        };
+        self.count += 1;
+    }
+
+    fn slice(self: *const ProfileChoices) []const inputmod.PaletteChoice {
+        return self.choices[0..self.count];
+    }
+};
+
+/// Detect `builtins` for a workspace whose context is `ref`: the context
+/// answers whether a file exists and, on a Local POSIX host without
+/// `$SHELL`, what `/etc/passwd` says.
+fn detectBuiltins(builtins: *BuiltinProfiles, io: Io, env: EnvSource, ref: workspace.ExecutionContext.Ref) void {
+    var probe: ContextProbe = .{ .ref = ref, .io = io };
+    var passwd_buffer: [64 * 1024]u8 = undefined;
+    const passwd: ?[]const u8 = if (builtin.os.tag != .windows and !ref.kind().isRemote() and env.get("SHELL") == null)
+        ref.readFile(io, "/etc/passwd", &passwd_buffer) catch null
+    else
+        null;
+    builtins.detect(ref.kind(), builtin.os.tag, env, probe.probe(), passwd);
+}
+
+/// A profile's label in the chooser: its name, the command it runs and
+/// where it comes from.
+fn profileChoiceLabel(buffer: []u8, profile: ResolvedProfile) []const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    writer.writeAll(profile.name) catch return writer.buffered();
+    writer.writeAll("  ") catch return writer.buffered();
+    if (profile.argv.len == 0) {
+        writer.writeAll("remote login shell") catch return writer.buffered();
+    } else {
+        for (profile.argv, 0..) |arg, index| {
+            if (index != 0) writer.writeByte(' ') catch return writer.buffered();
+            writer.writeAll(arg) catch return writer.buffered();
+            if (index == 0 and profile.login) {
+                if (loginFlag(arg, builtin.os.tag)) |flag| writer.print(" {s}", .{flag}) catch return writer.buffered();
+            }
+        }
+    }
+    writer.writeAll(if (profile.builtin) "  built-in" else "  profile") catch return writer.buffered();
+    // A clipped label never ends inside a UTF-8 sequence.
+    var len = writer.end;
+    while (len != 0 and !std.unicode.utf8ValidateSlice(buffer[0..len])) len -= 1;
+    return buffer[0..len];
 }
 
 /// The grid that fits a surface of `size` at a given cell size, in whole
@@ -2276,7 +2699,7 @@ fn wantsChild(options: Options) bool {
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
         options.run.links_test or options.run.search_test or options.run.menu_test or
         options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
-        options.run.git_test or options.run.agent_test) return true;
+        options.run.profiles_test or options.run.git_test or options.run.agent_test) return true;
     return !options.run.no_child and !options.run.self_test and !options.run.grid_test and
         !options.run.scroll_test and !options.run.mouse_test and !options.run.ui_test and
         !options.run.sidebar_test;
@@ -2293,7 +2716,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
         run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test or run.git_test or
-        run.agent_test or run.ssh_test or run.restore_test or run.a11y_test;
+        run.profiles_test or run.agent_test or run.ssh_test or run.restore_test or run.a11y_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -2357,6 +2780,9 @@ const notifications_open_action = "notifications.open";
 const notifications_clear_action = "notifications.clear";
 const notifications_activate_action = "notifications.activate";
 const remote_connect_action = "remote.connect";
+/// TASK-46: a tab, or a split to the right, running a chosen shell profile.
+const tab_new_profile_action = "tab.new-with-profile";
+const pane_split_profile_action = "pane.split-with-profile";
 const remote_connect_address_action = "remote.connect-address";
 const remote_save_profile_action = "remote.save-profile";
 const remote_reconnect_action = "remote.reconnect";
@@ -2508,7 +2934,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 82;
+const action_capacity_base: usize = 84;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 const settings_open_action = "settings.open";
@@ -2558,6 +2984,10 @@ const settings_scratchpad_fields = [_]SettingsField{
     settingsField(.scratchpad_large_size, .number),
 };
 const settings_mouse_fields = [_]SettingsField{settingsField(.mouse_right_click, .cycle)};
+/// TASK-46: the default profile's name is typed; each profile is a read-only
+/// summary row that opens the settings file, since a profile is several
+/// repeating lines rather than one value.
+const settings_shell_fields = [_]SettingsField{settingsField(.shell, .text)};
 const settings_agents_fields = [_]SettingsField{
     settingsField(.notifications_enabled, .toggle),
     settingsField(.notifications_os, .toggle),
@@ -2580,6 +3010,9 @@ const SettingsRow = union(enum) {
     /// The registry index of the command whose chords the row edits, and the
     /// row's id, formatted into `App.settings_row_ids` when the rows are built.
     keybind: struct { definition: usize, id: []const u8 },
+    /// A configured shell profile (TASK-46): its index in the settings, and
+    /// the row's id, formatted into `App.settings_row_ids`.
+    profile: struct { index: usize, id: []const u8 },
     raw,
 };
 
@@ -2596,8 +3029,9 @@ const SettingsMode = enum {
 };
 
 /// Every settings row: headings, the fields, every bindable command and the raw row.
-const settings_row_capacity: usize = 6 + settings_appearance_fields.len + settings_font_fields.len +
-    settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len + action_capacity_base + 1;
+const settings_row_capacity: usize = 7 + settings_appearance_fields.len + settings_font_fields.len +
+    settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len +
+    settings_shell_fields.len + config.max_shell_profiles + action_capacity_base + 1;
 /// The most list rows one frame registers; the list scrolls past this.
 const settings_visible_capacity: usize = 48;
 const settings_semantic_capacity: usize = 96;
@@ -5386,6 +5820,18 @@ const App = struct {
     /// client's inherited environment (TASK-43 part two).
     remote_spec: ChildSpec,
     ssh_client_spec: ChildSpec,
+    /// TASK-46: the profile choosers' registry indices, their shared list
+    /// (owned), the built-ins a spawn resolves against, and what a spawn's
+    /// environment and integration start from.
+    tab_profile_index: usize,
+    pane_profile_index: usize,
+    profile_choices: *ProfileChoices,
+    spawn_builtins: BuiltinProfiles = .{},
+    process_env: EnvSource,
+    no_shell_integration: bool,
+    /// Sees each profile spawn's argv and cwd before its worker starts; the
+    /// deterministic `--profiles-test` records them here.
+    profile_spawn_observer: EditorSpawnObserver = .{},
     /// `$XDG_RUNTIME_DIR` for control sockets, borrowed from the process
     /// environment, or `--ssh-test`'s private directory (owned).
     ssh_runtime_dir: ?[]const u8 = null,
@@ -5868,6 +6314,13 @@ const App = struct {
         errdefer ui_canvas.deinit();
         var ui_tree = try ui.Tree.init(allocator, semantic_element_capacity, semantic_run_capacity);
         errdefer ui_tree.deinit();
+
+        // TASK-46: listed before the actions are registered, so a configured
+        // `keybind = …=tab.new-with-profile:<name>` validates against them.
+        const profile_choices = try allocator.create(ProfileChoices);
+        errdefer allocator.destroy(profile_choices);
+        profile_choices.* = .{};
+        profile_choices.rebuild(io, env, workspace_state.contextRef(), loaded_config.settings.shell_profiles);
 
         const action_capacity: usize = if (options.run.ui_test or options.run.driver_test) action_capacity_base + 1 else action_capacity_base;
         const action_definitions = try allocator.alloc(inputmod.ActionDefinition, action_capacity);
@@ -6390,6 +6843,29 @@ const App = struct {
             .handler = agentPromptsActivateAction,
             .palette = null,
         });
+        // TASK-46: the chosen profile's argv, environment and directory.
+        const tab_profile_index = actions.definitions().len;
+        try actions.register(.{
+            .name = tab_new_profile_action,
+            .label = "New tab with profile",
+            .handler = tabNewProfileAction,
+            .palette = .{ .argument = .{ .choices = .{
+                .name = "profile",
+                .prompt = "Shell profile",
+                .values = profile_choices.slice(),
+            } } },
+        });
+        const pane_profile_index = actions.definitions().len;
+        try actions.register(.{
+            .name = pane_split_profile_action,
+            .label = "Split with profile",
+            .handler = paneSplitProfileAction,
+            .palette = .{ .argument = .{ .choices = .{
+                .name = "profile",
+                .prompt = "Shell profile",
+                .values = profile_choices.slice(),
+            } } },
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -6424,7 +6900,16 @@ const App = struct {
         var spec: ChildSpec = .{ .allocator = allocator, .argv = &.{}, .env = &.{} };
         errdefer spec.deinit();
         if (wantsChild(options)) {
-            spec = try ChildSpec.build(allocator, io, env, workspace_state.contextKind(), options);
+            // TASK-46: an interactive run's first tab starts the profile
+            // `shell` names; a command or a check's fixed peer is unaffected.
+            const startup_profile = if (fixedChildCommand(options) == null)
+                resolveNamedProfile(loaded_config.settings.shell, loaded_config.settings.shell_profiles, &profile_choices.builtins)
+            else
+                null;
+            spec = if (startup_profile) |profile|
+                try ChildSpec.buildProfile(allocator, io, env, workspace_state.contextKind(), profile, options.run.no_shell_integration, null)
+            else
+                try ChildSpec.build(allocator, io, env, workspace_state.contextKind(), options);
         }
         const deterministic_scratchpad = usesDeterministicScratchpad(options);
         var scratchpad_spec = try ChildSpec.buildInteractive(
@@ -6497,6 +6982,11 @@ const App = struct {
             .remote_connect_index = remote_connect_index,
             .remote_address_index = remote_address_index,
             .remote_save_index = remote_save_index,
+            .tab_profile_index = tab_profile_index,
+            .pane_profile_index = pane_profile_index,
+            .profile_choices = profile_choices,
+            .process_env = env,
+            .no_shell_integration = options.run.no_shell_integration,
             .remote_spec = remote_spec,
             .ssh_client_spec = ssh_client_spec,
             .ssh_runtime_dir = if (ssh_runtime_owned) |dir| dir else env.get("XDG_RUNTIME_DIR"),
@@ -8330,6 +8820,83 @@ const App = struct {
         } } };
     }
 
+    /// Relist the profile choosers (TASK-46) for the active workspace. Only
+    /// while the palette is closed: an open chooser's rows index this list.
+    fn rebuildProfileChoices(self: *App, profiles: []const config.ShellProfile) void {
+        if (self.paletteVisible()) return;
+        self.profile_choices.rebuild(self.io, self.process_env, self.activeWorkspace().contextRef(), profiles);
+        for ([_]usize{ self.tab_profile_index, self.pane_profile_index }) |index| {
+            self.action_definitions[index].palette = .{ .argument = .{ .choices = .{
+                .name = "profile",
+                .prompt = "Shell profile",
+                .values = self.profile_choices.slice(),
+            } } };
+        }
+    }
+
+    /// The profile `name` resolves to in the active workspace: a configured
+    /// one, else a built-in one detected for that workspace's context. The
+    /// result borrows the config and `spawn_builtins` until the next call.
+    fn resolveProfile(self: *App, name: []const u8) ?ResolvedProfile {
+        detectBuiltins(&self.spawn_builtins, self.io, self.process_env, self.activeWorkspace().contextRef());
+        return resolveNamedProfile(name, self.config_current.settings.shell_profiles, &self.spawn_builtins);
+    }
+
+    /// What a new tab or pane runs when none is chosen: the profile `shell`
+    /// names, or null for the built-in default.
+    fn defaultProfile(self: *App) ?ResolvedProfile {
+        const name = self.config_current.settings.shell;
+        if (name.len == 0) return null;
+        return self.resolveProfile(name) orelse {
+            log.debug("shell names no profile; the built-in default runs", .{});
+            return null;
+        };
+    }
+
+    /// The spec `profile` runs with in the active workspace.
+    fn profileSpec(self: *App, profile: ResolvedProfile) !ChildSpec {
+        return ChildSpec.buildProfile(
+            self.allocator,
+            self.io,
+            self.process_env,
+            self.activeWorkspace().contextKind(),
+            profile,
+            self.no_shell_integration,
+            null,
+        );
+    }
+
+    fn tabNewProfileAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const name = argument(invocation, "profile") orelse return self.openPaletteAt(self.tab_profile_index);
+        const profile = self.resolveProfile(name) orelse {
+            self.setWorkspaceStatus("profile: no profile with that name");
+            return;
+        };
+        try self.openTab(profile.name, profile);
+    }
+
+    fn paneSplitProfileAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const name = argument(invocation, "profile") orelse return self.openPaletteAt(self.pane_profile_index);
+        const profile = self.resolveProfile(name) orelse {
+            self.setWorkspaceStatus("profile: no profile with that name");
+            return;
+        };
+        try self.splitFocusedPane(.right, profile);
+    }
+
+    /// The directory a new terminal starts in: the profile's own, else the
+    /// invoking terminal's tracked one, else the workspace's, as a spawn on
+    /// this platform takes it. Owned by the caller.
+    fn newTerminalCwd(self: *App, profile: ?ResolvedProfile) ![]u8 {
+        if (profile) |chosen| if (chosen.cwd) |cwd| return self.allocator.dupe(u8, cwd);
+        const inherited = self.activeLive().workingDirectory() orelse self.activeWorkspace().workingDirectory();
+        var buffer: [path_capacity]u8 = undefined;
+        const local = !self.activeWorkspace().contextKind().isRemote();
+        return self.allocator.dupe(u8, if (local) spawnDirectory(&buffer, inherited, builtin.os.tag) else inherited);
+    }
+
     fn addRemoteChoice(self: *App, count: *usize, choice: remote.Choice, comptime format: []const u8, args: anytype) void {
         if (count.* == remote_choice_capacity) return;
         const value = choice.format(&self.remote_choice_values[count.*]) catch return;
@@ -8816,6 +9383,7 @@ const App = struct {
         }
         self.remote_spec.deinit();
         self.ssh_client_spec.deinit();
+        self.allocator.destroy(self.profile_choices);
         self.local_files.deinit();
         if (self.ssh_config_override) |path| self.allocator.free(path);
         if (self.ssh_runtime_owned) |path| self.allocator.free(path);
@@ -9113,40 +9681,58 @@ const App = struct {
     /// of `cwd` and `argv` transfers on entry and remains with the Load until
     /// its worker has joined, including every failure path.
     fn startTabChildWith(self: *App, session_id: session.SessionId, cwd: []u8, argv: ?[][]const u8) void {
+        self.startTabChildProcess(session_id, cwd, argv, null);
+    }
+
+    /// `startTabChildWith`, with an owned environment (a profile's) in place
+    /// of the app-level spec's when `owned_env` is not null. Ownership of
+    /// `cwd`, `argv` and `owned_env` transfers on entry.
+    fn startTabChildProcess(self: *App, session_id: session.SessionId, cwd: []u8, argv: ?[][]const u8, owned_env: ?[][]const u8) void {
         const presentation = self.activePresentation();
         const model = self.workspace_registry.byKey(presentation.key) orelse unreachable;
         const process = self.processFor(model, &self.spec);
         const program = argv orelse process.argv;
+        const base_env: []const []const u8 = owned_env orelse process.env;
         // An empty program is "no child" locally and the remote login shell
         // in an SSH workspace.
         if (program.len == 0 and model.contextKind() != .ssh) {
             self.allocator.free(cwd);
             if (argv) |owned| freeEntries(self.allocator, owned);
+            if (owned_env) |owned| freeEntries(self.allocator, owned);
             return;
         }
         if (presentation.load != null) {
             log.warn("a tab child was not started because another load is still in flight", .{});
             self.allocator.free(cwd);
             if (argv) |owned| freeEntries(self.allocator, owned);
+            if (owned_env) |owned| freeEntries(self.allocator, owned);
             return;
         }
         var request = model.spawnRequest(session_id, .{
             .argv = program,
-            .env = process.env,
+            .env = base_env,
         }) catch |err| {
             log.warn("could not prepare the new tab child: {s}", .{@errorName(err)});
             self.allocator.free(cwd);
             if (argv) |owned| freeEntries(self.allocator, owned);
+            if (owned_env) |owned| freeEntries(self.allocator, owned);
             return;
         };
         request.cwd = cwd;
-        const control_env = self.controlEnvFor(presentation, model, session_id, process.env);
-        if (control_env) |env| request.env = env;
+        const control_env = self.controlEnvFor(presentation, model, session_id, base_env);
+        // The job owns exactly one environment: the control copy when there
+        // is one (built from the profile's), else the profile's own.
+        var spawn_env = owned_env;
+        if (control_env) |env| {
+            request.env = env;
+            if (owned_env) |owned| freeEntries(self.allocator, owned);
+            spawn_env = control_env;
+        }
         const job = self.allocator.create(Load) catch |err| {
             log.warn("no memory to start the new tab child: {s}", .{@errorName(err)});
             self.allocator.free(cwd);
             if (argv) |owned| freeEntries(self.allocator, owned);
-            if (control_env) |env| freeEntries(self.allocator, env);
+            if (spawn_env) |env| freeEntries(self.allocator, env);
             return;
         };
         job.* = .{
@@ -9155,7 +9741,7 @@ const App = struct {
             .spawn = request,
             .spawn_cwd = cwd,
             .spawn_argv = argv,
-            .spawn_env = control_env,
+            .spawn_env = spawn_env,
             .spawn_session_id = session_id,
             .workspace_key = presentation.key,
             .execution_context = model.contextRef(),
@@ -16201,6 +16787,10 @@ const App = struct {
             log.warn("the config file could not be reloaded: {s}", .{@errorName(err)});
             return;
         };
+        // A `keybind` naming a profile validates against the new profiles.
+        // The list borrows nothing from the config, so `next` may replace
+        // `config_current` afterwards.
+        self.rebuildProfileChoices(next.settings.shell_profiles);
         const table = buildConfiguredBindings(self.allocator, &self.actions, self.binding_profile, &next, &self.binding_table) catch |err| {
             log.warn("the configured keybindings could not be rebuilt: {s}", .{@errorName(err)});
             next.deinit();
@@ -17385,6 +17975,12 @@ const App = struct {
     fn tabNewAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
         _ = invocation;
         const self: *App = @ptrCast(@alignCast(context));
+        try self.openTab(null, self.defaultProfile());
+    }
+
+    /// Create and select a tab named `label` (else `Terminal <n>`) running
+    /// `profile`, or the app's default child when `profile` is null.
+    fn openTab(self: *App, label: ?[]const u8, profile: ?ResolvedProfile) !void {
         if (self.activePresentation().load != null) {
             log.warn("new tab deferred while another load is in flight", .{});
             return;
@@ -17392,8 +17988,11 @@ const App = struct {
         if (self.remoteNotReady()) return;
         if (!try self.prepareToLeaveActiveSession()) return;
 
-        const inherited = self.activeLive().workingDirectory() orelse self.activeWorkspace().workingDirectory();
-        const cwd = try self.allocator.dupe(u8, inherited);
+        // The profile's process is built before anything changes, so a
+        // failure leaves no empty tab behind.
+        var profile_spec: ?ChildSpec = if (profile) |chosen| try self.profileSpec(chosen) else null;
+        defer if (profile_spec) |*spec| spec.deinit();
+        const cwd = try self.newTerminalCwd(profile);
         errdefer self.allocator.free(cwd);
         try self.activePresentation().pane_renderers.ensureUnusedCapacity(self.allocator, 1);
         const expected_session = session.SessionId.fromOrdinal(@intCast(self.activeWorkspace().registeredSessionCount()));
@@ -17401,7 +18000,7 @@ const App = struct {
         var renderer_owned = true;
         errdefer if (renderer_owned) pane_renderer.deinit();
         var name_buffer: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(
+        const name = label orelse try std.fmt.bufPrint(
             &name_buffer,
             "Terminal {d}",
             .{self.activeWorkspace().registeredSessionCount()},
@@ -17411,7 +18010,20 @@ const App = struct {
         self.activePresentation().pane_renderers.appendAssumeCapacity(pane_renderer);
         renderer_owned = false;
         try self.adoptActiveTab();
-        self.startTabChild(created.session_id, cwd);
+        self.startProfileChild(created.session_id, cwd, &profile_spec);
+    }
+
+    /// Start a new tab's or pane's child: `spec`'s process when a profile
+    /// chose one (its argv and environment move to the job, leaving `spec`
+    /// empty), else the app's default. Takes ownership of `cwd`.
+    fn startProfileChild(self: *App, session_id: session.SessionId, cwd: []u8, spec: *?ChildSpec) void {
+        const chosen = if (spec.*) |*value| value else return self.startTabChild(session_id, cwd);
+        self.profile_spawn_observer.observe(chosen.argv, cwd);
+        const argv = chosen.argv;
+        const env = chosen.env;
+        chosen.argv = &.{};
+        chosen.env = &.{};
+        self.startTabChildProcess(session_id, cwd, argv, env);
     }
 
     fn sessionNeedsCloseConfirmation(live: *session.Session) bool {
@@ -17674,6 +18286,19 @@ const App = struct {
 
     fn paneSplitAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));
+        const split_text = argument(invocation, "direction") orelse return;
+        const split: workspace.PaneSplit = if (std.mem.eql(u8, split_text, "right"))
+            .right
+        else if (std.mem.eql(u8, split_text, "down"))
+            .down
+        else
+            return;
+        try self.splitFocusedPane(split, self.defaultProfile());
+    }
+
+    /// Split the focused pane towards `split` with a new terminal running
+    /// `profile`, or the app's default child when `profile` is null.
+    fn splitFocusedPane(self: *App, split: workspace.PaneSplit, profile: ?ResolvedProfile) !void {
         if (self.activePresentation().load != null) {
             log.warn("pane split deferred while another load is in flight", .{});
             return;
@@ -17687,16 +18312,10 @@ const App = struct {
             return;
         }
         const focused_pane = self.activeWorkspace().focusedPaneId(tab_id) orelse return;
-        const split_text = argument(invocation, "direction") orelse return;
-        const split: workspace.PaneSplit = if (std.mem.eql(u8, split_text, "right"))
-            .right
-        else if (std.mem.eql(u8, split_text, "down"))
-            .down
-        else
-            return;
         const bounds = self.terminalCellBounds() orelse return;
-        const inherited = self.activeLive().workingDirectory() orelse self.activeWorkspace().workingDirectory();
-        const cwd = try self.allocator.dupe(u8, inherited);
+        var profile_spec: ?ChildSpec = if (profile) |chosen| try self.profileSpec(chosen) else null;
+        defer if (profile_spec) |*spec| spec.deinit();
+        const cwd = try self.newTerminalCwd(profile);
         errdefer self.allocator.free(cwd);
         try self.activePresentation().pane_renderers.ensureUnusedCapacity(self.allocator, 1);
         const expected_session = session.SessionId.fromOrdinal(@intCast(self.activeWorkspace().registeredSessionCount()));
@@ -17718,7 +18337,7 @@ const App = struct {
         self.activePresentation().pane_renderers.appendAssumeCapacity(pane_renderer);
         renderer_owned = false;
         try self.adoptFocusedPane();
-        self.startTabChild(created.session_id, cwd);
+        self.startProfileChild(created.session_id, cwd, &profile_spec);
     }
 
     fn paneFocusAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
@@ -18272,7 +18891,8 @@ const App = struct {
         }
         rows[count] = .{ .heading = .{ .id = "settings.heading.keys", .label = "Keys" } };
         count += 1;
-        const reserved = 5 + settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len;
+        const reserved = 6 + settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len +
+            settings_shell_fields.len + config.max_shell_profiles;
         for (self.actions.definitions(), 0..) |*definition, definition_index| {
             if (!settingsBindable(definition)) continue;
             if (count + reserved >= rows.len) break;
@@ -18298,6 +18918,18 @@ const App = struct {
             rows[count] = .{ .field = field };
             count += 1;
         }
+        rows[count] = .{ .heading = .{ .id = "settings.heading.shells", .label = "Shells" } };
+        count += 1;
+        for (settings_shell_fields) |field| {
+            rows[count] = .{ .field = field };
+            count += 1;
+        }
+        for (self.config_current.settings.shell_profiles, 0..) |profile, index| {
+            if (count + 1 >= rows.len) break;
+            const id = std.fmt.bufPrint(&self.settings_row_ids[count], "settings.row.profile.{s}", .{profile.name}) catch continue;
+            rows[count] = .{ .profile = .{ .index = index, .id = id } };
+            count += 1;
+        }
         rows[count] = .raw;
         count += 1;
         self.settings_row_count = count;
@@ -18308,6 +18940,7 @@ const App = struct {
             .heading => |heading| heading.id,
             .field => |field| field.id,
             .keybind => |keybind| keybind.id,
+            .profile => |profile| profile.id,
             .raw => "settings.raw",
         };
     }
@@ -18369,7 +19002,8 @@ const App = struct {
             // manager edits them (TASK-44). `control.enabled` applies at
             // startup only, so it is a file setting without a row (TASK-60),
             // as are `restore.enabled` and `accessibility.enabled`.
-            .remote_profile, .remote_recent, .control_enabled, .restore_enabled, .accessibility_enabled, .keybind => "",
+            .shell => if (self.config_current.settings.shell.len == 0) "(default)" else self.config_current.settings.shell,
+            .remote_profile, .remote_recent, .control_enabled, .restore_enabled, .accessibility_enabled, .profile, .keybind => "",
         };
     }
 
@@ -18385,6 +19019,7 @@ const App = struct {
             .font_size => std.fmt.bufPrint(buffer, "{d}", .{values.points}) catch "",
             .scratchpad_size => std.fmt.bufPrint(buffer, "{d}", .{self.scratchpad_percent_small}) catch "",
             .scratchpad_large_size => std.fmt.bufPrint(buffer, "{d}", .{self.scratchpad_percent_large}) catch "",
+            .shell => self.config_current.settings.shell,
             else => self.settingsValueText(key, buffer),
         };
     }
@@ -18401,8 +19036,29 @@ const App = struct {
                 }
                 break :file false;
             },
+            .profile => true,
             else => false,
         };
+    }
+
+    /// A profile row's value: the command it runs, `-l` when it is a login
+    /// shell, and `…` when it also sets variables or a directory.
+    fn settingsProfileValue(self: *const App, index: usize, buffer: []u8) []const u8 {
+        const profiles = self.config_current.settings.shell_profiles;
+        if (index >= profiles.len) return "";
+        const profile = profiles[index];
+        var writer: std.Io.Writer = .fixed(buffer);
+        for (profile.argv, 0..) |arg, position| {
+            if (position != 0) writer.writeByte(' ') catch break;
+            writer.writeAll(arg) catch break;
+            if (position == 0 and profile.login) {
+                if (loginFlag(arg, builtin.os.tag)) |flag| writer.print(" {s}", .{flag}) catch break;
+            }
+        }
+        if (profile.env.len != 0 or profile.cwd != null) writer.writeAll(" …") catch {};
+        var len = writer.end;
+        while (len != 0 and !std.unicode.utf8ValidateSlice(buffer[0..len])) len -= 1;
+        return buffer[0..len];
     }
 
     /// `<name>  <value> ·`: the value right-aligned to `width` cells, then a
@@ -18415,6 +19071,10 @@ const App = struct {
             .heading => |heading| .{ heading.label, "" },
             .raw => .{ settings_raw_label, "" },
             .field => |field| .{ field.key.name(), self.settingsValueText(field.key, &value_buffer) },
+            .profile => |profile| .{
+                if (profile.index < self.config_current.settings.shell_profiles.len) self.config_current.settings.shell_profiles[profile.index].name else "",
+                self.settingsProfileValue(profile.index, &value_buffer),
+            },
             .keybind => |keybind| blk: {
                 const definition = &self.actions.definitions()[keybind.definition];
                 if (selected and self.settings_mode == .capture) break :blk .{ definition.label, settings_capture_text };
@@ -18450,6 +19110,8 @@ const App = struct {
             const cells: u32 = switch (row) {
                 .heading => |heading| labelCellWidth(heading.label),
                 .raw => labelCellWidth(settings_raw_label),
+                // A long command clips rather than widening the dialog.
+                .profile => @as(u32, 16) + 2 + settings_value_cells + 2,
                 .field => |field| labelCellWidth(field.key.name()) + 2 + settings_value_cells + 2,
                 .keybind => |keybind| cells: {
                     const definition = &self.actions.definitions()[keybind.definition];
@@ -18710,7 +19372,8 @@ const App = struct {
         self.ui_tree.clearFocus();
         switch (row) {
             .heading => {},
-            .raw => {
+            // A profile is several lines in the file, edited there.
+            .raw, .profile => {
                 try self.closeSettings();
                 try self.dispatchAction(config_open_action, .{ .source = source });
                 return;
@@ -19102,6 +19765,8 @@ const App = struct {
         // Hosts, profiles and recent destinations can change between
         // openings (TASK-44); the list is fixed while the palette is open.
         self.rebuildRemoteChoices();
+        // Profiles depend on the active workspace's context and the file.
+        self.rebuildProfileChoices(self.config_current.settings.shell_profiles);
         self.palette_content_width = self.paletteContentWidth();
         self.palette_step = .commands;
         self.ui_tree.clearFocus();
@@ -23075,7 +23740,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 83 and
+    failures += reportCheck(out, registered_actions.len == 85 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -23158,7 +23823,9 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[79].name, backlog_activate_action) and
         std.mem.eql(u8, registered_actions[80].name, agent_prompts_action) and
         std.mem.eql(u8, registered_actions[81].name, agent_prompts_activate_action) and
-        std.mem.eql(u8, registered_actions[82].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager, backlog, prompts and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[82].name, tab_new_profile_action) and
+        std.mem.eql(u8, registered_actions[83].name, pane_split_profile_action) and
+        std.mem.eql(u8, registered_actions[84].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager, backlog, prompts, shell-profile and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -30176,6 +30843,212 @@ fn fontTest(self: *App, io: Io, out: *Writer) !u8 {
     return if (failures == 0) 0 else 1;
 }
 
+/// The deterministic peer behind `--profiles-test`'s first tab, and behind
+/// a plain new tab until `shell` names a profile.
+const profiles_test_script =
+    "stty -echo; " ++
+    "printf 'PROFILES-READY\\r\\n'; " ++
+    "while IFS= read -r line; do printf 'PROFILES-ECHO:%s\\r\\n' \"$line\"; done";
+
+/// A private absolute path for `--profiles-test`'s settings file.
+fn profilesTestPath(io: Io, env: EnvSource, buffer: []u8) ![]const u8 {
+    const base = firstEnv(env, temp_dir_vars[0..]) orelse "/tmp";
+    const root = if (base.len != 0 and base[0] == '/') base else "/tmp";
+    var id_buffer: [path_capacity]u8 = undefined;
+    const id = try generateRunId(io, &id_buffer);
+    return std.fmt.bufPrint(buffer, "{s}/conduit-profiles-test-{s}/conduit/config", .{ root, id });
+}
+
+/// The check's private directory, two levels above its settings file: the
+/// directory profile `alpha` starts in.
+fn profilesTestRoot(path: []const u8) ?[]const u8 {
+    const conduit_dir = config.directoryOf(path) orelse return null;
+    return config.directoryOf(conduit_dir);
+}
+
+/// Remove `--profiles-test`'s private directory.
+fn removeProfilesTestDir(io: Io, path: []const u8) void {
+    const root = profilesTestRoot(path) orelse return;
+    if (std.mem.indexOf(u8, root, "conduit-profiles-test-") == null) return;
+    Dir.cwd().deleteTree(io, root) catch |err| {
+        log.warn("could not remove the profiles-test directory: {s}", .{@errorName(err)});
+    };
+}
+
+/// The check's settings: `alpha` reports its variable and directory, `beta`
+/// is a login shell reporting its `$0`, both then hand over to an
+/// interactive `/bin/sh` that reads what the check types. `beta`'s HOME is
+/// the private directory, so a login `sh` reads no `~/.profile` of the
+/// person running the check. `extra` is appended.
+fn profilesTestConfig(buffer: []u8, root: []const u8, extra: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer,
+        \\# --profiles-test settings
+        \\profile = alpha = /bin/sh -c 'printf "PROFILE-A:%s\r\n" "$PROFILE_VAR"; exec /bin/sh'
+        \\profile.alpha.env = PROFILE_VAR=alpha-env
+        \\profile.alpha.cwd = {s}
+        \\profile = beta = /bin/sh -c 'printf "PROFILE-B:%s\r\n" "$0"; exec /bin/sh'
+        \\profile.beta.login = true
+        \\profile.beta.env = HOME={s}
+        \\{s}
+    , .{ root, root, extra });
+}
+
+fn profilesCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("profiles-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// Type `line` into whatever has keyboard focus and press Enter, through
+/// SDL's text and key events.
+fn typeLine(self: *App, io: Io, out: *Writer, line: [:0]const u8) !bool {
+    return try postPaletteText(self, io, out, line) and try postNamedKey(self, io, out, .enter, .{});
+}
+
+/// The label of choice `choice` of the open chooser for `definition`.
+fn profileChoiceRowLabel(self: *const App, definition: usize, choice: usize) []const u8 {
+    var buffer: [palette_semantic_capacity]u8 = undefined;
+    const id = choiceRowId(&buffer, definition, choice) catch return "";
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return "";
+    return element.label;
+}
+
+/// Exercise TASK-46 end to end through real SDL keys and pointer events,
+/// real PTYs and real child processes: the profile chooser lists the
+/// built-in and configured profiles; a tab opened from it by keyboard runs
+/// the profile's argv with its environment in its directory (read back by
+/// typing into the child); a login profile clicked with the mouse gets `-l`;
+/// a split runs a profile in a new pane; `shell` makes a profile the
+/// default for New tab; the Shells settings group shows the profiles; and a
+/// malformed profile line is reported in `config.error`.
+fn profilesTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    const path_copy = self.config_path orelse {
+        out.writeAll("profiles-test: FAIL no settings path\n") catch {};
+        return 1;
+    };
+    var path_buffer: [path_capacity]u8 = undefined;
+    @memcpy(path_buffer[0..path_copy.len], path_copy);
+    const path = path_buffer[0..path_copy.len];
+    const root = profilesTestRoot(path) orelse return 1;
+    var trace: EditorSpawnTrace = .{};
+    self.profile_spawn_observer = .{ .context = &trace, .observe_fn = recordEditorSpawn };
+    defer self.profile_spawn_observer = .{};
+
+    try self.drawFrame();
+    profilesCheck(out, &failures, try waitForPanes(self, io, out, .{ .focused_text = "PROFILES-READY" }), "the real profiles-test child became ready", .{});
+    profilesCheck(out, &failures, self.configErrorText() == null and self.config_current.settings.shell_profiles.len == 2, "the two configured profiles loaded cleanly", .{});
+
+    // The chooser by keyboard: the palette, the command, then the list.
+    profilesCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "New tab with profile") and self.paletteVisible(), "New tab with profile opened its chooser from the palette by keyboard", .{});
+    const tab_index = self.tab_profile_index;
+    const login_row = profileChoiceRowLabel(self, tab_index, 0);
+    const alpha_row = profileChoiceRowLabel(self, tab_index, 1);
+    const beta_row = profileChoiceRowLabel(self, tab_index, 2);
+    profilesCheck(out, &failures, std.mem.startsWith(u8, login_row, "login  /") and std.mem.endsWith(u8, login_row, "  built-in") and
+        (std.mem.indexOf(u8, login_row, " -l  ") != null or std.mem.indexOf(u8, login_row, " --login  ") != null), "the built-in login profile is listed first: '{s}'", .{login_row});
+    profilesCheck(out, &failures, std.mem.startsWith(u8, alpha_row, "alpha  /bin/sh -c ") and std.mem.endsWith(u8, alpha_row, "  profile"), "the configured alpha profile is listed: '{s}'", .{alpha_row});
+    profilesCheck(out, &failures, std.mem.startsWith(u8, beta_row, "beta  /bin/sh -l -c ") and std.mem.endsWith(u8, beta_row, "  profile"), "the login beta profile is listed with -l: '{s}'", .{beta_row});
+    try self.drawFrame();
+    const chooser_pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(chooser_pixels);
+
+    const tabs_before_keyboard = self.activeWorkspace().tabCount();
+    _ = try postNamedKey(self, io, out, .down, .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    // The directory is checked by the shell, not printed: a long path wraps
+    // across rows. The answer is computed, so the echoed line never matches.
+    const expected_a = "PROFILE-A:alpha-env";
+    var cwd_probe_buffer: [path_capacity + 64]u8 = undefined;
+    const cwd_probe = try std.fmt.bufPrintZ(&cwd_probe_buffer, "test \"$(pwd)\" = '{s}' && echo \"CWD-$((40+2))\"", .{root});
+    var home_probe_buffer: [path_capacity + 64]u8 = undefined;
+    const home_probe = try std.fmt.bufPrintZ(&home_probe_buffer, "test \"$HOME\" = '{s}' && echo \"HOME-$((40+2))\"", .{root});
+    const keyboard_tab = self.activeWorkspace().activeTabId();
+    profilesCheck(out, &failures, !self.paletteVisible() and self.activeWorkspace().tabCount() == tabs_before_keyboard + 1 and
+        keyboard_tab != null and std.mem.eql(u8, self.activeWorkspace().tab(keyboard_tab.?).?.name(), "alpha"), "Down and Enter opened a tab named alpha", .{});
+    profilesCheck(out, &failures, trace.calls == 1 and std.mem.startsWith(u8, trace.argv(), "/bin/sh -c printf ") and
+        std.mem.eql(u8, trace.cwd(), root), "alpha spawned its argv in its directory: '{s}' in '{s}'", .{ trace.argv(), trace.cwd() });
+    profilesCheck(out, &failures, try waitForPanes(self, io, out, .{ .focused_text = expected_a }), "the alpha child printed its variable", .{});
+    profilesCheck(out, &failures, try typeLine(self, io, out, "echo \"E-$PROFILE_VAR\"") and
+        try waitForPanes(self, io, out, .{ .focused_text = "E-alpha-env" }) and try typeLine(self, io, out, cwd_probe) and
+        try waitForPanes(self, io, out, .{ .focused_text = "CWD-42" }), "typed input read the profile's variable and directory back from the shell", .{});
+
+    // The chooser by mouse: the Palette hint, the command row, the beta row.
+    const tabs_before_mouse = self.activeWorkspace().tabCount();
+    profilesCheck(out, &failures, try clickPaletteCommand(self, io, out, tab_new_profile_action, 2) and
+        self.activeWorkspace().tabCount() == tabs_before_mouse + 1, "clicking the beta row opened a tab", .{});
+    profilesCheck(out, &failures, trace.calls == 2 and std.mem.startsWith(u8, trace.argv(), "/bin/sh -l -c printf "), "the login profile was started with -l: '{s}'", .{trace.argv()});
+    profilesCheck(out, &failures, try waitForPanes(self, io, out, .{ .focused_text = "PROFILE-B:/bin/sh" }), "the beta child ran", .{});
+    profilesCheck(out, &failures, try typeLine(self, io, out, home_probe) and
+        try waitForPanes(self, io, out, .{ .focused_text = "HOME-42" }), "typed input read the login profile's HOME back from the shell", .{});
+
+    // Split with profile, by keyboard.
+    const split_tab = self.activeWorkspace().activeTabId() orelse return 1;
+    profilesCheck(out, &failures, try runPaletteCommandByKeyboard(self, io, out, "Split with profile") and self.paletteVisible(), "Split with profile opened its chooser", .{});
+    _ = try postNamedKey(self, io, out, .down, .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    profilesCheck(out, &failures, self.activeWorkspace().tab(split_tab).?.paneCount() == 2 and trace.calls == 3 and
+        std.mem.eql(u8, trace.cwd(), root), "the split added a pane running alpha in its directory", .{});
+    profilesCheck(out, &failures, try waitForPanes(self, io, out, .{ .focused_text = expected_a }), "the split pane's alpha child ran", .{});
+
+    // Before `shell`, New tab runs the run's own child; after, the profile.
+    const plain_tab_mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    _ = try postKey(self, io, out, 't', plain_tab_mods);
+    profilesCheck(out, &failures, trace.calls == 3 and try waitForPanes(self, io, out, .{ .focused_text = "PROFILES-READY" }), "with shell unset, New tab ran the default child", .{});
+    var config_buffer: [4096]u8 = undefined;
+    const reloads_before_shell = self.config_reload_count;
+    try writeConfigTestFile(io, path, try profilesTestConfig(&config_buffer, root, "shell = alpha\n"));
+    profilesCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_shell + 1 }) and
+        std.mem.eql(u8, self.config_current.settings.shell, "alpha") and self.configErrorText() == null, "shell = alpha was reloaded without a restart", .{});
+    _ = try postKey(self, io, out, 't', plain_tab_mods);
+    const default_tab = self.activeWorkspace().activeTabId() orelse return 1;
+    profilesCheck(out, &failures, trace.calls == 4 and std.mem.startsWith(u8, self.activeWorkspace().tab(default_tab).?.name(), "Terminal ") and
+        try waitForPanes(self, io, out, .{ .focused_text = expected_a }), "with shell = alpha, the New tab chord ran alpha", .{});
+
+    // The Shells group of the settings view.
+    profilesCheck(out, &failures, try settingsChord(self, io, out) and self.settingsVisible(), "the settings chord opened the view", .{});
+    profilesCheck(out, &failures, try selectSettingsRow(self, io, out, "settings.row.shell"), "Down reached the shell row", .{});
+    const shell_label = settingsLabel(self, "settings.row.shell");
+    profilesCheck(out, &failures, self.ui_tree.byId(.{ .value = "settings.heading.shells" }) != null and
+        std.mem.startsWith(u8, shell_label, "shell") and std.mem.indexOf(u8, shell_label, "alpha ·") != null, "the Shells group shows shell = alpha from the file: '{s}'", .{shell_label});
+    profilesCheck(out, &failures, try selectSettingsRow(self, io, out, "settings.row.profile.beta"), "Down reached the beta profile row", .{});
+    const alpha_label = settingsLabel(self, "settings.row.profile.alpha");
+    const beta_label = settingsLabel(self, "settings.row.profile.beta");
+    profilesCheck(out, &failures, std.mem.startsWith(u8, alpha_label, "alpha") and std.mem.indexOf(u8, alpha_label, "/bin/sh -c printf") != null and
+        std.mem.indexOf(u8, alpha_label, "…") != null, "the alpha row summarises its command: '{s}'", .{alpha_label});
+    profilesCheck(out, &failures, std.mem.startsWith(u8, beta_label, "beta") and std.mem.indexOf(u8, beta_label, "/bin/sh -l -c") != null, "the beta row shows its login flag: '{s}'", .{beta_label});
+    try self.drawFrame();
+    const settings_pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(settings_pixels);
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    profilesCheck(out, &failures, !self.settingsVisible(), "Escape closed the settings view", .{});
+
+    // A malformed profile line is reported and the rest of the file applies.
+    const reloads_before_bad = self.config_reload_count;
+    try writeConfigTestFile(io, path, try profilesTestConfig(&config_buffer, root, "shell = alpha\nprofile = broken = sh -c 'oops\n"));
+    profilesCheck(out, &failures, try waitForConfig(self, io, out, .{ .reloads = reloads_before_bad + 1 }) and
+        try waitForConfig(self, io, out, .{ .element = "config.error" }), "the malformed line showed config.error", .{});
+    const error_label = settingsLabel(self, "config.error");
+    profilesCheck(out, &failures, std.mem.eql(u8, error_label, "config:9: profile: unbalanced quotes") and
+        self.config_current.settings.shell_profiles.len == 2, "config.error names the line and the key, and both good profiles stayed: '{s}'", .{error_label});
+
+    var id_buffer: [path_capacity]u8 = undefined;
+    const run_id = try generateRunId(io, &id_buffer);
+    var chooser_path_buffer: [path_capacity]u8 = undefined;
+    const chooser_path = try std.fmt.bufPrint(&chooser_path_buffer, "{s}{c}profiles-test-{s}-chooser.png", .{ fallback_log_dir, std.fs.path.sep, run_id });
+    try writePngOffThread(self.allocator, io, chooser_path, chooser_pixels, self.size);
+    var settings_path_buffer: [path_capacity]u8 = undefined;
+    const settings_path = try std.fmt.bufPrint(&settings_path_buffer, "{s}{c}profiles-test-{s}-settings.png", .{ fallback_log_dir, std.fs.path.sep, run_id });
+    try writePngOffThread(self.allocator, io, settings_path, settings_pixels, self.size);
+    out.print("profiles-test: screenshot {s}\n", .{chooser_path}) catch {};
+    out.print("profiles-test: screenshot {s}\n", .{settings_path}) catch {};
+    out.print("profiles-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
 /// The deterministic peer behind `--settings-test`'s terminal.
 const settings_test_script =
     "stty -echo; " ++
@@ -31699,6 +32572,9 @@ const usage =
     \\  --settings-test                    drive the settings view: every row kind by key
     \\                                    and mouse, keybinding capture and conflicts,
     \\                                    the raw-file row and modal isolation, then exit
+    \\  --profiles-test                    drive shell profiles: the chooser by key and
+    \\                                    mouse, a tab's and a split's argv, env and cwd,
+    \\                                    the shell default, settings rows, then exit
     \\  --git-test                         drive the sidebar branch rows against real
     \\                                    repositories: checkout, watch, cwd changes,
     \\                                    detached HEAD and two-row tab behaviour, then exit
@@ -32183,6 +33059,13 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         try writeConfigTestFile(init.io, options.run.config_path.?, settings_test_initial);
     }
     defer if (options.run.settings_test) removeSettingsTestDir(init.io, options.run.config_path.?);
+    if (options.run.profiles_test) {
+        options.run.config_path = try profilesTestPath(init.io, env, &config_path_buffer);
+        var initial_buffer: [4096]u8 = undefined;
+        const root = profilesTestRoot(options.run.config_path.?) orelse return error.InvalidPath;
+        try writeConfigTestFile(init.io, options.run.config_path.?, try profilesTestConfig(&initial_buffer, root, ""));
+    }
+    defer if (options.run.profiles_test) removeProfilesTestDir(init.io, options.run.config_path.?);
     var agent_test_dir_buffer: [path_capacity]u8 = undefined;
     if (options.run.agent_test) {
         const dir = try agentTestDir(init.io, env, &agent_test_dir_buffer);
@@ -32241,7 +33124,7 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.scratchpad_test or options.run.palette_test or options.run.workspaces_test or
                 options.run.links_test or options.run.search_test or options.run.menu_test or
                 options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
-                options.run.git_test or options.run.agent_test or options.run.ssh_test or options.run.driver_test or
+                options.run.profiles_test or options.run.git_test or options.run.agent_test or options.run.ssh_test or options.run.driver_test or
                 options.run.restore_test or options.run.a11y_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
@@ -32396,6 +33279,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try fontTest(app, init.io, out);
     } else if (options.run.settings_test) {
         check_status = try settingsTest(app, init.io, out);
+    } else if (options.run.profiles_test) {
+        check_status = try profilesTest(app, init.io, out);
     } else if (options.run.git_test) {
         check_status = try gitTest(app, init.io, out);
     } else if (options.run.control_test) {
@@ -35170,4 +36055,445 @@ test "a tab.status label leads with the attention mark and the status text" {
     mark.text_len = 0;
     mark.attention = true;
     try std.testing.expectEqualStrings("! api", controlTabLabel(&buffer, "  api", "api", &mark));
+}
+
+// ---------------------------------------------------------------------------
+// Shell profile tests (TASK-46)
+// ---------------------------------------------------------------------------
+
+/// A `PathProbe` that answers from a fixed list of existing paths.
+const FakeProbe = struct {
+    existing: []const []const u8,
+
+    fn probe(self: *const FakeProbe) PathProbe {
+        return .{ .ctx = self, .exists_fn = exists };
+    }
+
+    fn exists(ctx: *const anyopaque, path: []const u8) bool {
+        const self: *const FakeProbe = @ptrCast(@alignCast(ctx));
+        for (self.existing) |candidate| {
+            if (std.mem.eql(u8, candidate, path)) return true;
+        }
+        return false;
+    }
+};
+
+test "PowerShell is recognised by name on any platform, with or without .exe" {
+    try std.testing.expectEqual(ShellKind.powershell, ShellKind.detect("pwsh").?);
+    try std.testing.expectEqual(ShellKind.powershell, ShellKind.detect("/usr/bin/pwsh").?);
+    try std.testing.expectEqual(ShellKind.powershell, ShellKind.detect("C:\\Program Files\\PowerShell\\7\\pwsh.exe").?);
+    try std.testing.expectEqual(ShellKind.powershell, ShellKind.detect("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE").?);
+    try std.testing.expectEqual(ShellKind.bash, ShellKind.detect("/usr/bin/bash").?);
+    try std.testing.expectEqual(@as(?ShellKind, null), ShellKind.detect("C:\\Windows\\System32\\cmd.exe"));
+    try std.testing.expectEqual(@as(?ShellKind, null), ShellKind.detect("/usr/bin/pwshx"));
+    try std.testing.expectEqualStrings("cmd.exe", programName("C:\\Windows\\System32\\cmd.exe"));
+}
+
+test "a login profile gets the flag its shell understands" {
+    try std.testing.expectEqualStrings("-l", loginFlag("/bin/sh", .linux).?);
+    try std.testing.expectEqualStrings("-l", loginFlag("/usr/bin/zsh", .macos).?);
+    try std.testing.expectEqualStrings("--login", loginFlag("/usr/bin/bash", .linux).?);
+    try std.testing.expectEqualStrings("-Login", loginFlag("/usr/bin/pwsh", .linux).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), loginFlag("pwsh.exe", .windows));
+    try std.testing.expectEqual(@as(?[]const u8, null), loginFlag("powershell", .linux));
+    try std.testing.expectEqual(@as(?[]const u8, null), loginFlag("C:\\Windows\\System32\\cmd.exe", .windows));
+}
+
+test "the passwd fallback reads the login shell of this user's line only" {
+    const passwd =
+        \\root:x:0:0:root:/root:/bin/bash
+        \\# a comment
+        \\short:line
+        \\me:x:1000:1000:Me,,,:/home/me:/usr/bin/zsh
+        \\nologin:x:1001:1001::/:
+        \\relative:x:1002:1002::/:zsh
+    ;
+    try std.testing.expectEqualStrings("/bin/bash", passwdShell(passwd, 0).?);
+    try std.testing.expectEqualStrings("/usr/bin/zsh", passwdShell(passwd, 1000).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdShell(passwd, 1001));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdShell(passwd, 1002));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdShell(passwd, 4242));
+}
+
+test "built-in profiles: a POSIX login shell, the Windows shells that exist, the remote login shell" {
+    const fake: FakeProbe = .{ .existing = &.{} };
+
+    var posix: BuiltinProfiles = .{};
+    const with_shell = test_env{ .vars = &.{.{ "SHELL", "/usr/bin/fish" }} };
+    posix.detect(.local, .linux, with_shell.source(), fake.probe(), null);
+    try std.testing.expectEqual(@as(usize, 1), posix.count);
+    try std.testing.expectEqualStrings("login", posix.at(0).name);
+    try std.testing.expectEqualStrings("/usr/bin/fish", posix.at(0).argv[0]);
+    try std.testing.expect(posix.at(0).login and posix.at(0).builtin);
+
+    const no_shell = test_env{ .vars = &.{} };
+    var line_buffer: [64]u8 = undefined;
+    const passwd = try std.fmt.bufPrint(&line_buffer, "me:x:{d}:1:me:/home/me:/bin/zsh\n", .{currentUid()});
+    posix.detect(.local, .linux, no_shell.source(), fake.probe(), passwd);
+    try std.testing.expectEqualStrings("/bin/zsh", posix.at(0).argv[0]);
+    posix.detect(.local, .linux, no_shell.source(), fake.probe(), null);
+    try std.testing.expectEqualStrings("/bin/sh", posix.at(0).argv[0]);
+
+    // A remote workspace's built-in is its own login shell: no local program.
+    posix.detect(.ssh, .linux, with_shell.source(), fake.probe(), null);
+    try std.testing.expectEqual(@as(usize, 1), posix.count);
+    try std.testing.expectEqual(@as(usize, 0), posix.at(0).argv.len);
+    try std.testing.expectEqualStrings("login", posix.find("login").?.name);
+
+    const windows_env = test_env{ .vars = &.{
+        .{ "Path", "C:\\Windows\\System32;C:\\Tools\\pwsh;C:\\Other" },
+        .{ "ProgramFiles", "C:\\Program Files" },
+        .{ "SystemRoot", "C:\\Windows" },
+        .{ "ComSpec", "C:\\Windows\\System32\\cmd.exe" },
+    } };
+    // pwsh is found on PATH before the default install location.
+    const everything: FakeProbe = .{ .existing = &.{
+        "C:\\Tools\\pwsh\\pwsh.exe",
+        "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "C:\\Windows\\System32\\cmd.exe",
+    } };
+    var windows: BuiltinProfiles = .{};
+    windows.detect(.local, .windows, windows_env.source(), everything.probe(), null);
+    try std.testing.expectEqual(@as(usize, 3), windows.count);
+    try std.testing.expectEqualStrings("pwsh", windows.at(0).name);
+    try std.testing.expectEqualStrings("C:\\Tools\\pwsh\\pwsh.exe", windows.at(0).argv[0]);
+    try std.testing.expectEqualStrings("powershell", windows.at(1).name);
+    try std.testing.expectEqualStrings("cmd", windows.at(2).name);
+    try std.testing.expectEqualStrings("C:\\Windows\\System32\\cmd.exe", windows.at(2).argv[0]);
+    try std.testing.expect(!windows.at(0).login);
+
+    // Without PowerShell 7 on PATH, its default location is probed; without
+    // it at all, Windows PowerShell is the default; cmd is always offered.
+    const installed: FakeProbe = .{ .existing = &.{"C:\\Program Files\\PowerShell\\7\\pwsh.exe"} };
+    windows.detect(.local, .windows, windows_env.source(), installed.probe(), null);
+    try std.testing.expectEqualStrings("C:\\Program Files\\PowerShell\\7\\pwsh.exe", windows.at(0).argv[0]);
+    try std.testing.expectEqualStrings("cmd", windows.at(1).name);
+    try std.testing.expectEqualStrings("cmd.exe", windows.at(1).argv[0]);
+    const legacy: FakeProbe = .{ .existing = &.{"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"} };
+    windows.detect(.local, .windows, windows_env.source(), legacy.probe(), null);
+    try std.testing.expectEqual(@as(usize, 2), windows.count);
+    try std.testing.expectEqualStrings("powershell", windows.at(0).name);
+}
+
+test "a Windows directory tracked from OSC 7 becomes one a spawn takes" {
+    var buffer: [path_capacity]u8 = undefined;
+    try std.testing.expectEqualStrings("C:\\Users\\me", spawnDirectory(&buffer, "/C:/Users/me", .windows));
+    try std.testing.expectEqualStrings("D:\\", spawnDirectory(&buffer, "/D:", .windows));
+    try std.testing.expectEqualStrings("C:\\", spawnDirectory(&buffer, "/C:/", .windows));
+    try std.testing.expectEqualStrings("/C:/Users/me", spawnDirectory(&buffer, "/C:/Users/me", .linux));
+    try std.testing.expectEqualStrings("/home/me", spawnDirectory(&buffer, "/home/me", .windows));
+    try std.testing.expectEqualStrings("C:\\x", spawnDirectory(&buffer, "C:\\x", .windows));
+}
+
+test "a profile spec layers its variables, login flag and integration on the context's base" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [path_capacity]u8 = undefined;
+    const root = try tmpPath(&tmp, "integration", &root_buffer);
+    const env = test_env{ .vars = &.{
+        .{ "PATH", "/usr/bin:/bin" },
+        .{ "HOME", "/home/me" },
+        .{ "KEEP", "inherited" },
+        .{ "OVERRIDE", "inherited" },
+    } };
+
+    // A command profile: argv verbatim, variables on top, no integration.
+    const command_profile: ResolvedProfile = .{
+        .name = "work",
+        .argv = &.{ "/bin/bash", "-c", "echo hi" },
+        .env = &.{ "OVERRIDE=profile", "EXTRA=1" },
+    };
+    var command_spec = try ChildSpec.buildProfile(gpa, std.testing.io, env.source(), .local, command_profile, false, root);
+    defer command_spec.deinit();
+    try std.testing.expectEqual(@as(usize, 3), command_spec.argv.len);
+    try std.testing.expectEqualStrings("-c", command_spec.argv[1]);
+    try std.testing.expect(hasEntry(command_spec.env, "KEEP=inherited"));
+    try std.testing.expect(hasEntry(command_spec.env, "OVERRIDE=profile"));
+    try std.testing.expect(hasEntry(command_spec.env, "EXTRA=1"));
+    try std.testing.expect(hasEntry(command_spec.env, "TERM_PROGRAM=conduit"));
+    for (command_spec.env) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry, "CONDUIT_BASH_INJECT="));
+
+    // A bare login bash: --login before the integration's --posix.
+    const login_bash: ResolvedProfile = .{ .name = "login", .argv = &.{"/usr/bin/bash"}, .login = true, .builtin = true };
+    var login_spec = try ChildSpec.buildProfile(gpa, std.testing.io, env.source(), .local, login_bash, false, root);
+    defer login_spec.deinit();
+    try std.testing.expectEqual(@as(usize, 3), login_spec.argv.len);
+    try std.testing.expectEqualStrings("--login", login_spec.argv[1]);
+    try std.testing.expectEqualStrings("--posix", login_spec.argv[2]);
+    try std.testing.expect(hasEntry(login_spec.env, "CONDUIT_BASH_INJECT=1"));
+
+    // PowerShell keeps its integration with -NoLogo, as one -Command.
+    const pwsh: ResolvedProfile = .{ .name = "pwsh", .argv = &.{ "pwsh", "-NoLogo" } };
+    var pwsh_spec = try ChildSpec.buildProfile(gpa, std.testing.io, env.source(), .local, pwsh, false, root);
+    defer pwsh_spec.deinit();
+    try std.testing.expectEqual(@as(usize, 5), pwsh_spec.argv.len);
+    try std.testing.expectEqualStrings("-NoLogo", pwsh_spec.argv[1]);
+    try std.testing.expectEqualStrings("-NoExit", pwsh_spec.argv[2]);
+    try std.testing.expectEqualStrings("-Command", pwsh_spec.argv[3]);
+    try std.testing.expect(std.mem.startsWith(u8, pwsh_spec.argv[4], ". ([scriptblock]::Create([System.IO.File]::ReadAllText('/"));
+    try std.testing.expect(std.mem.endsWith(u8, pwsh_spec.argv[4], "conduit.ps1')))"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, pwsh_spec.argv[4], '"') == null);
+    var script_buffer: [16 * 1024]u8 = undefined;
+    const script_path = pwsh_spec.argv[4][". ([scriptblock]::Create([System.IO.File]::ReadAllText('".len .. pwsh_spec.argv[4].len - "')))".len];
+    const written = try Dir.cwd().readFile(std.testing.io, script_path, &script_buffer);
+    try std.testing.expectEqualStrings(shell_scripts.powershell, written);
+    const scripted: ResolvedProfile = .{ .name = "pwsh", .argv = &.{ "pwsh", "-File", "x.ps1" } };
+    var scripted_spec = try ChildSpec.buildProfile(gpa, std.testing.io, env.source(), .local, scripted, false, root);
+    defer scripted_spec.deinit();
+    try std.testing.expectEqual(@as(usize, 3), scripted_spec.argv.len);
+    var off = try ChildSpec.buildProfile(gpa, std.testing.io, env.source(), .local, pwsh, true, root);
+    defer off.deinit();
+    try std.testing.expectEqual(@as(usize, 2), off.argv.len);
+
+    // Over SSH: the remote overlay, the profile's variables, no local
+    // integration, and an empty argv stays the remote login shell.
+    var remote_spec = try ChildSpec.buildProfile(gpa, std.testing.io, env.source(), .ssh, login_bash, false, root);
+    defer remote_spec.deinit();
+    try std.testing.expectEqual(@as(usize, 2), remote_spec.argv.len);
+    try std.testing.expect(!hasEntry(remote_spec.env, "KEEP=inherited"));
+    try std.testing.expect(!hasEntry(remote_spec.env, "PATH=/usr/bin:/bin"));
+    const remote_login: ResolvedProfile = .{ .name = "login", .argv = &.{}, .env = &.{"EXTRA=1"}, .login = true, .builtin = true };
+    var empty_spec = try ChildSpec.buildProfile(gpa, std.testing.io, env.source(), .ssh, remote_login, false, root);
+    defer empty_spec.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_spec.argv.len);
+    try std.testing.expect(hasEntry(empty_spec.env, "EXTRA=1"));
+}
+
+test "the chooser lists built-ins first, then profiles, and a profile shadows a built-in of its name" {
+    const env = test_env{ .vars = &.{.{ "SHELL", "/bin/bash" }} };
+    var choices: ProfileChoices = .{};
+    const configured = [_]config.ShellProfile{
+        .{ .name = "work", .argv = &.{ "/bin/sh", "-c", "exec sh" }, .cwd = "/srv" },
+    };
+    choices.rebuild(std.testing.io, env.source(), workspace.localFiles(), &configured);
+    if (builtin.os.tag != .windows) {
+        try std.testing.expectEqual(@as(usize, 2), choices.count);
+        try std.testing.expectEqualStrings("login", choices.slice()[0].value);
+        try std.testing.expectEqualStrings("login  /bin/bash --login  built-in", choices.slice()[0].label);
+        try std.testing.expectEqualStrings("work", choices.slice()[1].value);
+        try std.testing.expectEqualStrings("work  /bin/sh -c exec sh  profile", choices.slice()[1].label);
+
+        const shadowing = [_]config.ShellProfile{.{ .name = "login", .argv = &.{"/bin/zsh"}, .login = true }};
+        choices.rebuild(std.testing.io, env.source(), workspace.localFiles(), &shadowing);
+        try std.testing.expectEqual(@as(usize, 1), choices.count);
+        try std.testing.expectEqualStrings("login  /bin/zsh -l  profile", choices.slice()[0].label);
+        try std.testing.expectEqualStrings("/bin/zsh", resolveNamedProfile("login", &shadowing, &choices.builtins).?.argv[0]);
+    }
+    try std.testing.expectEqual(@as(?ResolvedProfile, null), resolveNamedProfile("", &configured, &choices.builtins));
+    try std.testing.expectEqual(@as(?ResolvedProfile, null), resolveNamedProfile("nobody", &configured, &choices.builtins));
+    try std.testing.expectEqualStrings("/srv", resolveNamedProfile("work", &configured, &choices.builtins).?.cwd.?);
+}
+
+test "a real login bash started from a profile replays the login startup files and marks its prompts" {
+    try requireShell("/usr/bin/bash");
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [path_capacity]u8 = undefined;
+    const home_relative = try tmpPath(&tmp, "", &home_buffer);
+    const home = try Dir.cwd().realPathFileAlloc(std.testing.io, home_relative, gpa);
+    defer gpa.free(home);
+    var root_buffer: [path_capacity]u8 = undefined;
+    const root = try tmpPath(&tmp, "integration", &root_buffer);
+    // A login bash reads ~/.bash_profile, never ~/.bashrc by itself.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".bash_profile", .data = ": > \"$HOME/profile-read\"\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".bashrc", .data = ": > \"$HOME/bashrc-read\"\n" });
+    const env = test_env{ .vars = &.{
+        .{ "HOME", home },
+        .{ "PATH", "/usr/bin:/bin" },
+        .{ "LANG", "C.UTF-8" },
+    } };
+    const profile: ResolvedProfile = .{ .name = "login", .argv = &.{"/usr/bin/bash"}, .login = true, .builtin = true };
+    var spec = try ChildSpec.buildProfile(gpa, std.testing.io, env.source(), .local, profile, false, root);
+    defer spec.deinit();
+
+    const run = try runShellInConduit(gpa, spec);
+    defer if (run.cwd) |dir| gpa.free(dir);
+    try std.testing.expectEqualStrings("/tmp", run.cwd orelse return error.NoWorkingDirectory);
+    try std.testing.expect(run.prompt_starts >= 2);
+    try std.testing.expectEqual(@as(?i32, 1), run.first_exit);
+    _ = try tmp.dir.statFile(std.testing.io, "profile-read", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "bashrc-read", .{}));
+}
+
+test "--profiles-test owns a fixed viewport, its own child and a private settings file" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--profiles-test" }, env.source());
+    const resolved = optionsForRun(parsed);
+    try std.testing.expect(parsed.run.profiles_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--profiles-test") != null);
+    try std.testing.expectEqual(ui_test_width, resolved.run.width);
+    try std.testing.expect(resolved.run.hidden);
+    try std.testing.expect(wantsChild(resolved));
+    try std.testing.expect(usesDeterministicScratchpad(resolved));
+    try std.testing.expectEqualStrings(profiles_test_script, fixedChildCommand(resolved).?);
+    var config_buffer: [4096]u8 = undefined;
+    const text = try profilesTestConfig(&config_buffer, "/tmp/root", "");
+    var parsed_config = try config.parse(std.testing.allocator, text, null);
+    defer parsed_config.deinit();
+    try std.testing.expect(!parsed_config.hasDiagnostics());
+    try std.testing.expectEqual(@as(usize, 2), parsed_config.settings.shell_profiles.len);
+    try std.testing.expectEqualStrings("/tmp/root", parsed_config.settings.shell_profiles[0].cwd.?);
+    try std.testing.expect(parsed_config.settings.shell_profiles[1].login);
+    try std.testing.expectEqualStrings("/tmp/root", profilesTestRoot("/tmp/root/conduit/config").?);
+}
+
+test "PowerShell runs under ConPTY with its integration, colours and resize" {
+    // TASK-46 AC2 and AC3 on a real Windows runtime: the default profile is
+    // detected on this machine, started through Conduit's own profile spec
+    // over the ConPTY backend, and its output read by Conduit's terminal.
+    // There is no pseudoconsole elsewhere, so the test says so rather than
+    // passing without proof.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var map = try std.testing.environ.createMap(gpa);
+    defer map.deinit();
+    const env: EnvSource = .{ .ctx = &map, .getFn = environGet, .entryFn = environEntry };
+
+    // AC3: the first of pwsh, powershell and cmd that exists, cmd last.
+    var probe_state: ContextProbe = .{ .ref = workspace.localFiles(), .io = io };
+    var builtins: BuiltinProfiles = .{};
+    builtins.detect(.local, .windows, env, probe_state.probe(), null);
+    for (0..builtins.count) |index| {
+        std.debug.print("profiles: built-in {s} = {s}\n", .{ builtins.at(index).name, builtins.at(index).argv[0] });
+    }
+    try std.testing.expect(builtins.count >= 2);
+    try std.testing.expectEqualStrings("cmd", builtins.at(builtins.count - 1).name);
+    const profile = builtins.at(0);
+    try std.testing.expectEqual(ShellKind.powershell, ShellKind.detect(profile.argv[0]).?);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [path_capacity]u8 = undefined;
+    const root = try tmpPath(&tmp, "integration", &root_buffer);
+    var spec = try ChildSpec.buildProfile(gpa, io, env, .local, profile, false, root);
+    defer spec.deinit();
+    for (spec.argv) |arg| std.debug.print("profiles: argv {s}\n", .{arg});
+
+    var terminal: term.Terminal = undefined;
+    try terminal.init(io, gpa, .{ .cols = 80, .rows = 24 });
+    defer terminal.deinit(gpa);
+    var execution = try workspace.ExecutionContext.local(gpa);
+    defer execution.deinit();
+    const child = try execution.borrow().spawn(.{
+        .argv = spec.argv,
+        .env = spec.env,
+        .cwd = "C:\\Windows",
+        .size = .init(24, 80),
+    });
+    defer child.destroy();
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+    var cwd: [path_capacity]u8 = undefined;
+    var cwd_len: usize = 0;
+    var prompt_starts: usize = 0;
+    var input_starts: usize = 0;
+    var output_starts: usize = 0;
+    var command_ends: usize = 0;
+    var step: enum { starting, cd, color, resize, exit, done } = .starting;
+    var red_found = false;
+    var buffer: [8192]u8 = undefined;
+    const started = Io.Clock.real.now(io).nanoseconds;
+    const deadline = started + 90 * std.time.ns_per_s;
+    var next_ask = started;
+    while (step != .done) {
+        const now = Io.Clock.real.now(io).nanoseconds;
+        if (now >= deadline) break;
+        const got = child.takeBytes(&buffer);
+        if (got != 0) {
+            terminal.feed(buffer[0..got]);
+            try seen.appendSlice(gpa, buffer[0..got]);
+            for (terminal.takeEvents()) |event| switch (event) {
+                .working_directory => |dir| {
+                    cwd_len = @min(dir.len, cwd.len);
+                    @memcpy(cwd[0..cwd_len], dir[0..cwd_len]);
+                },
+                .prompt => |mark| switch (mark.kind) {
+                    .prompt_start => prompt_starts += 1,
+                    .input_start => input_starts += 1,
+                    .output_start => output_starts += 1,
+                    .command_end => command_ends += 1,
+                },
+                else => {},
+            };
+            continue;
+        }
+        try terminal.refresh(gpa);
+        switch (step) {
+            .starting => if (input_starts >= 1) {
+                _ = try child.write("Set-Location C:\\Windows\\System32\r");
+                step = .cd;
+            },
+            .cd => if (std.mem.eql(u8, cwd[0..cwd_len], "/C:/Windows/System32") and input_starts >= 2) {
+                _ = try child.write("Write-Host -ForegroundColor Red CONDUIT-RED\r");
+                step = .color;
+            },
+            .color => {
+                // The output row starts with the word; the echoed command
+                // line has the prompt in front of it.
+                var row: u16 = 0;
+                while (row < terminal.gridSize().rows) : (row += 1) {
+                    const first = terminal.cell(.{ .row = row, .col = 0 }) orelse continue;
+                    if (first.codepoint != 'C') continue;
+                    const second = terminal.cell(.{ .row = row, .col = 7 }) orelse continue;
+                    if (second.codepoint != 'R') continue;
+                    const fg = first.style.fg;
+                    switch (fg) {
+                        .default => std.debug.print("profiles: CONDUIT-RED foreground default\n", .{}),
+                        .palette => |index| std.debug.print("profiles: CONDUIT-RED foreground palette({d})\n", .{index}),
+                        .rgb => |rgb| std.debug.print("profiles: CONDUIT-RED foreground rgb({d},{d},{d})\n", .{ rgb.r, rgb.g, rgb.b }),
+                    }
+                    red_found = switch (fg) {
+                        .palette => |index| index == 1 or index == 9,
+                        .rgb => |rgb| rgb.r >= 0x80 and rgb.g < 0x60 and rgb.b < 0x60,
+                        .default => false,
+                    };
+                    break;
+                }
+                if (red_found) {
+                    try child.resize(pty.WindowSize.init(40, 100));
+                    try terminal.resize(gpa, try term.GridSize.init(100, 40));
+                    step = .resize;
+                }
+            },
+            .resize => {
+                if (terminal.visibleTextContains("SIZE=100x40")) {
+                    _ = try child.write("exit\r");
+                    step = .exit;
+                } else if (now >= next_ask) {
+                    _ = try child.write("'SIZE=' + $Host.UI.RawUI.WindowSize.Width + 'x' + $Host.UI.RawUI.WindowSize.Height\r");
+                    next_ask = now + 2 * std.time.ns_per_s;
+                }
+            },
+            .exit => if (child.state() != .running) {
+                step = .done;
+            },
+            .done => {},
+        }
+        _ = child.waitReadable(100);
+    }
+    std.debug.print("profiles: step {s}, cwd '{s}', marks A={d} B={d} C={d} D={d}, red {}\n", .{
+        @tagName(step), cwd[0..cwd_len], prompt_starts, input_starts, output_starts, command_ends, red_found,
+    });
+    if (step != .done) {
+        const tail = seen.items[seen.items.len -| 4096..];
+        std.debug.print("profiles: last output: ", .{});
+        for (tail) |byte| {
+            if (byte >= 0x20 and byte < 0x7f) std.debug.print("{c}", .{byte}) else std.debug.print("\\x{x:0>2}", .{byte});
+        }
+        std.debug.print("\n", .{});
+        return error.TimedOut;
+    }
+    // OSC 7 after `cd`, OSC 133 around every prompt and command, SGR red
+    // cells, and the new size seen by PowerShell through the pseudoconsole.
+    try std.testing.expectEqualStrings("/C:/Windows/System32", cwd[0..cwd_len]);
+    try std.testing.expect(prompt_starts >= 3);
+    try std.testing.expect(input_starts >= 3);
+    try std.testing.expect(command_ends >= 2);
+    try std.testing.expect(output_starts >= 2);
+    try std.testing.expect(red_found);
 }

@@ -287,6 +287,7 @@ fn installLinuxPayload(
         .{ .source = b.path("assets/shell-integration/zsh/.zshenv"), .destination = "share/conduit/shell-integration/zsh/.zshenv" },
         .{ .source = b.path("assets/shell-integration/zsh/conduit.zsh"), .destination = "share/conduit/shell-integration/zsh/conduit.zsh" },
         .{ .source = b.path("assets/shell-integration/fish/vendor_conf.d/conduit.fish"), .destination = "share/conduit/shell-integration/fish/vendor_conf.d/conduit.fish" },
+        .{ .source = b.path("assets/shell-integration/powershell/conduit.ps1"), .destination = "share/conduit/shell-integration/powershell/conduit.ps1" },
         .{ .source = b.path("assets/fonts/LICENSE-JetBrainsMono-OFL-1.1.txt"), .destination = "share/licenses/conduit/JetBrainsMono-OFL-1.1.txt" },
         .{ .source = b.path("assets/THIRD-PARTY-LICENSES/FreeType-FTL.txt"), .destination = "share/licenses/conduit/FreeType-FTL.txt" },
         .{ .source = b.path("assets/THIRD-PARTY-LICENSES/FreeType-LICENSE.TXT"), .destination = "share/licenses/conduit/FreeType-LICENSE.TXT" },
@@ -529,6 +530,7 @@ fn wireThirdPartySeams(
                 \\pub const zsh_env: []const u8 = @embedFile("zshenv");
                 \\pub const zsh: []const u8 = @embedFile("conduit.zsh");
                 \\pub const fish: []const u8 = @embedFile("conduit.fish");
+                \\pub const powershell: []const u8 = @embedFile("conduit.ps1");
             ),
         });
     }
@@ -661,6 +663,7 @@ const shell_integration_assets = [_]struct { source: []const u8, name: []const u
     .{ .source = "assets/shell-integration/zsh/.zshenv", .name = "zshenv" },
     .{ .source = "assets/shell-integration/zsh/conduit.zsh", .name = "conduit.zsh" },
     .{ .source = "assets/shell-integration/fish/vendor_conf.d/conduit.fish", .name = "conduit.fish" },
+    .{ .source = "assets/shell-integration/powershell/conduit.ps1", .name = "conduit.ps1" },
 };
 
 /// Build the exact Oniguruma source set and configuration used by the pinned

@@ -23,9 +23,23 @@ __conduit_loaded=1
 if [[ -n ${CONDUIT_BASH_INJECT-} ]]; then
     builtin unset CONDUIT_BASH_INJECT ENV
     builtin set +o posix
-    # The startup a non-login interactive bash runs, which POSIX mode skipped.
-    if [[ -r /etc/bash.bashrc ]]; then builtin source /etc/bash.bashrc; fi
-    if [[ -r ~/.bashrc ]]; then builtin source ~/.bashrc; fi
+    if builtin shopt -q login_shell; then
+        # The startup a login bash runs (a login shell profile, TASK-46), which
+        # POSIX mode skipped: /etc/profile, then the first of the three
+        # personal files that exists.
+        if [[ -r /etc/profile ]]; then builtin source /etc/profile; fi
+        for __conduit_file in ~/.bash_profile ~/.bash_login ~/.profile; do
+            if [[ -r $__conduit_file ]]; then
+                builtin source "$__conduit_file"
+                break
+            fi
+        done
+        builtin unset __conduit_file
+    else
+        # The startup a non-login interactive bash runs, which POSIX mode skipped.
+        if [[ -r /etc/bash.bashrc ]]; then builtin source /etc/bash.bashrc; fi
+        if [[ -r ~/.bashrc ]]; then builtin source ~/.bashrc; fi
+    fi
 fi
 
 # The prompt is about to be drawn: close the previous command with its status,
