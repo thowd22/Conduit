@@ -1,11 +1,11 @@
 ---
 id: TASK-68
 title: Accessibility bridge from the semantic tree
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-08 00:07'
+updated_date: '2026-10-08 01:36'
 labels:
   - accessibility
 milestone: m-8
@@ -23,7 +23,7 @@ Expose the semantic element tree to platform accessibility APIs (AT-SPI, NSAcces
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Sidebar, palette and settings elements are exposed with roles and labels on at least one platform
+- [x] #1 Sidebar, palette and settings elements are exposed with roles and labels on at least one platform
 - [x] #2 Plan for the remaining platforms is documented
 <!-- AC:END -->
 
@@ -39,4 +39,12 @@ Expose the semantic element tree to platform accessibility APIs (AT-SPI, NSAcces
 
 <!-- SECTION:NOTES:BEGIN -->
 Module landed (a84e3f7, ca03cef rebased onto main as 9394ecc): src/accessibility.zig + accessibility/{dbus,snapshot,atspi}.zig, no C dependency; worker thread serves the semantic-tree snapshot over AT-SPI2 (Accessible/Component/Action/Application/Cache, role mapping, state and property signals from diffs), requests back to the owner through a bounded queue; build.zig module; docs/accessibility.md with the macOS/Windows plan. 25 unit tests + private dbus-daemon integration test with a fake registry; opt-in real-stack probe (CONDUIT_A11Y_PROBE) passed against at-spi2-core/libatspi in an ubuntu:26.04 container. Pending for AC1: the three-call main.zig wiring (publish after endFrame, drainRequests on the loop, init with the session bus address) once TASK-60/66 frees main.zig, plus an accessibility.enabled config key; no real screen reader was available.
+
+App wiring landed (b289711): App.a11y publishes the live tree after endFrame and serves activate/focus requests; accessibility.enabled; --a11y-test walks the live app's sidebar, palette and settings over a private bus and runs Settings by DoAction; added to CI with dbus. Coordinator 2026-10-08: gate green.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Accessibility bridge: the live semantic tree is exposed over AT-SPI2 on Linux with roles, labels, states and actions through an in-tree D-Bus client (verified against a real at-spi2-core stack in a container and by the deterministic --a11y-test), with the macOS and Windows plans documented.
+<!-- SECTION:FINAL_SUMMARY:END -->

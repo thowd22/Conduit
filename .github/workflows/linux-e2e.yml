@@ -172,6 +172,8 @@ jobs:
             --agent-manager-test
             --backlog-test
             --control-test
+            --restore-test
+            --a11y-test
             --driver-test
           )
           for check in "${checks[@]}"; do

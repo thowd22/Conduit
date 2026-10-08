@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its twenty-eight Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its thirty Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -858,6 +858,45 @@ run directory, so test runs never reach the person's instance. `--control-test` 
 commands as separate processes against a private instance endpoint (each exits 0 in under 100 ms)
 and that a bad token exits non-zero. macOS is unverified; Windows always starts a new window.
 
+TASK-65 is complete on Linux. `app` persists through `Persistence`: a plain run with
+`restore.enabled` on (default) saves to `state.statePath` two seconds after `layoutFingerprint`
+(registry layout and tracked cwds, theme, window size, scratchpad presentations) last changed and
+again in `deinit`, encoding on the owner thread and writing with `state.save` on a worker. Checks,
+`--command` runs and driven runs never save or restore. On launch, unless `--no-restore`,
+`restoreAtLaunch` loads the file; a corrupt, unreadable or newer one is quarantined to
+`state.json.corrupt-<unix>` with the status line `previous state was unreadable; starting clean`.
+`executeRestore` replays the plan before anything spawns: empty workspaces, then
+`Workspace.applyRestoreStep` per tab step, a renderer and a `restore_queue` entry per session, the
+saved selection, and the default workspace closed. `driveRestoreQueues` starts one shell per
+workspace slot in its saved directory, falling back to the workspace's with a status line when it
+is gone. SSH workspaces come back with target and `-o` options but no master: the view reads
+`ssh <host> ─ saved session; press Enter or click reconnect to connect`, Enter or `reconnect`
+connects, then the queue starts the remote shells. The saved theme applies while the settings
+file names none, and the size while no `--width`/`--height` is given; position and maximized
+state are not applied because `platform` has no placement calls yet. The deterministic
+`--restore-test` runs two apps on one window and proves workspaces, tab names, pane bounds and
+ratios, focus, zoom, selection, theme, `pwd` per pane, the saved SSH view, and clean starts for
+corrupt and newer files; its restored frame was inspected. Restore has no e2e scenario because a
+scenario is one launch; the restored-SSH reconnect path is covered only by `--ssh-test`'s
+reconnect machinery.
+
+TASK-68 is complete on Linux. `App.a11y` is started after the window with
+`DBUS_SESSION_BUS_ADDRESS`, `accessibility.enabled` (default true) and a driver-wake waker; checks
+and driven runs start none. `composeUiTree` publishes after `endFrame`; `poll` maps `activate` to
+a real `postDriverClick` and `focus` to `ui_tree.focus`; `deinit` stops it first.
+`accessibility.check` (private `dbus-daemon`, stand-in registry, bus client) backs both the module
+test and the deterministic `--a11y-test`, which walks the sidebar, palette and settings over
+D-Bus, runs Settings by `DoAction`, and moves focus by `GrabFocus`; it is skipped without
+`dbus-daemon`. The module itself (`src/accessibility.zig`, `src/accessibility/{dbus,atspi,
+snapshot}.zig`, no C dependency) was also verified against at-spi2-core and libatspi in an
+`ubuntu:26.04` container. Terminal contents are not exposed as text; macOS NSAccessibility and
+Windows UI Automation are planned in `docs/accessibility.md`; no real screen reader was run.
+
+TASK-67's app follow-ups landed: `Load` jobs post a driver wake when done, the atlas is 2048²
+from display scale 1.5 (`atlasSizeFor`, `App.atlas`), and debug logs `startup: window|fonts|theme|
+first frame|first child after <ms>`. Launch-to-prompt median went 242 → 240 ms, within noise.
+Region-only atlas uploads remain open.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -1033,7 +1072,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--restore-test` / `--a11y-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:

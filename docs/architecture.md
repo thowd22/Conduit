@@ -2223,13 +2223,13 @@ Which level proves what, by concern:
 
 Rules that apply to all levels:
 
-- The twenty-eight verified Linux headless app checks are `--grid-test`, `--self-test`,
+- The thirty verified Linux headless app checks are `--grid-test`, `--self-test`,
   `--scroll-test`, `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`,
   `--sidebar-test`, `--tabs-test`, `--panes-test`, `--palette-test`, `--scratchpad-test`,
   `--workspaces-test`, `--links-test`, `--search-test`, `--menu-test`, `--config-test`,
   `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`,
-  `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--ssh-test`, `--control-test`
-  and `--driver-test`; the scripted `zig build e2e` runner has nineteen scenarios, the latest being
+  `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--ssh-test`, `--control-test`,
+  `--restore-test`, `--a11y-test` and `--driver-test`; the scripted `zig build e2e` runner has nineteen scenarios, the latest being
   `font-coverage`, `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch`,
   `agent-notifications`, `agent-view`, `agent-manager`, `backlog-board` and `control-api`. Real-window checks use
   Xvfb locally; `--clipboard-test` deliberately uses SDL's offscreen driver.

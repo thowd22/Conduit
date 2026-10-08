@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-08 00:32'
+updated_date: '2026-10-08 01:36'
 labels:
   - agents
   - ssh
@@ -37,6 +37,8 @@ Part 1 (context and adapters): 1. ExecutionContext.writeFile (bounded, mode) for
 2. Adapters read sinks/transcripts/decision files through the context (readFile/watch/writeFile) instead of the local filesystem, so hooks and extensions running remotely report into a remote sink that Conduit tails over the connection; Codex daemon socket and OpenCode port forwarding documented as unsupported remotely for now (PTY baseline).
 3. Integration test against the sshd container: launch the fake-shaped hook relay remotely and tail its sink through the SshContext.
 Part 2 (app): Runtime uses the context for sink IO per workspace kind; --ssh-test launches a fake agent in the SSH workspace and proves status, notifications and the agent view.
+
+Part two dispatched 2026-10-08 with TASK-59: Runner.prepare writes files through the workspace context, remote sink root from stateDir on the detection worker, Pi SinkTransport, remote cleanup on a worker, --ssh-test launches a fake-shaped agent in the SSH workspace proving status, notifications and the agent view.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
