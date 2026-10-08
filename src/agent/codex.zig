@@ -1038,6 +1038,10 @@ pub const CodexAdapter = struct {
     /// The app-server's version is outside the tested range (or the probe
     /// output named none): heuristics only.
     gated: bool = false,
+    /// `launch` targeted a remote context (SSH, WSL): the daemon's control
+    /// socket is on that host, so there is no structured channel and the
+    /// agent keeps the PTY baseline (see `remote_capabilities`).
+    remote: bool = false,
     server_version: ?Version = null,
     connected: bool = false,
     attached: bool = false,
@@ -1087,6 +1091,14 @@ pub const CodexAdapter = struct {
     /// PTY and rely on the heuristic baseline. `attach` stays callable so it
     /// can report `error.Protocol` rather than a silent `Unsupported`.
     pub const gated_capabilities: adapter_mod.Capabilities = .{ .detect = true, .launch = true, .attach = true };
+    /// A TUI launched in an SSH or WSL workspace (TASK-61). Its app-server
+    /// daemon listens on a Unix socket on the remote host, which this
+    /// adapter's `.daemon` transport (`FdStream.connectUnix`) can only reach
+    /// on this machine; it must not dial the local socket, which would be
+    /// another codex's daemon. Without `attach` the owner stops at the PTY
+    /// baseline instead of retrying. Forwarding the remote socket over the
+    /// connection (decision-8's `ssh -O forward`) is not implemented.
+    pub const remote_capabilities: adapter_mod.Capabilities = .{ .detect = true, .launch = true };
 
     pub fn init(allocator: Allocator, io: std.Io, options: Options) InitError!CodexAdapter {
         const cwd = try allocator.dupe(u8, options.cwd);
@@ -1158,7 +1170,9 @@ pub const CodexAdapter = struct {
     }
 
     fn capabilitiesFn(ptr: *const anyopaque) adapter_mod.Capabilities {
-        return if (castConst(ptr).gated) gated_capabilities else structured_capabilities;
+        const self = castConst(ptr);
+        if (self.remote) return remote_capabilities;
+        return if (self.gated) gated_capabilities else structured_capabilities;
     }
 
     fn destroyFn(ptr: *anyopaque) void {
@@ -1217,7 +1231,14 @@ pub const CodexAdapter = struct {
             error.NoSpaceLeft;
     }
 
-    fn launchFn(_: *anyopaque, allocator: Allocator, request: adapter_mod.LaunchRequest) adapter_mod.Error!adapter_mod.LaunchSpec {
+    fn launchFn(ptr: *anyopaque, allocator: Allocator, request: adapter_mod.LaunchRequest) adapter_mod.Error!adapter_mod.LaunchSpec {
+        const self = cast(ptr);
+        if (request.context_kind.isRemote()) {
+            // A headless app-server speaks over pipes the owner holds; a
+            // remote one would need them carried over the connection.
+            if (request.headless) return error.Unsupported;
+            self.remote = true;
+        }
         var argv: std.ArrayList([]const u8) = .empty;
         if (request.headless) {
             try argv.appendSlice(allocator, &.{ "codex", "app-server", "--listen", "stdio://" });
@@ -3236,6 +3257,30 @@ test "launch describes the TUI or the headless app-server" {
 
     var path: [128]u8 = undefined;
     try testing.expectEqualStrings("/h/.codex/app-server-control/app-server-control.sock", try daemonSocketPath(&path, "/h/.codex/"));
+}
+
+test "a TUI launched in a remote workspace keeps the PTY baseline and never dials a local daemon" {
+    var stream: MemoryStream = .{ .allocator = testing.allocator };
+    defer stream.deinit();
+    var line = LineTransport.init(testing.allocator, stream.stream(), 1024);
+    defer line.deinit();
+    var codex = try CodexAdapter.init(testing.allocator, testing.io, .{ .transport = line.transport(), .cwd = "/srv" });
+    defer codex.deinit();
+    const a = codex.adapter();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const token = adapter_mod.CorrelationToken.fromBytes(@splat(0xcd));
+    try testing.expectError(error.Unsupported, a.launch(arena_state.allocator(), .{ .context_kind = .ssh, .cwd = "/srv", .token = token, .headless = true }));
+    try testing.expect(a.capabilities().attach);
+    const tui = try a.launch(arena_state.allocator(), .{ .context_kind = .ssh, .cwd = "/srv", .token = token });
+    try testing.expectEqualStrings("codex", tui.argv[0]);
+    try testing.expectEqualStrings("/srv", tui.argv[2]);
+    try testing.expectEqual(CodexAdapter.remote_capabilities, a.capabilities());
+    // The owner's attach is refused as unsupported, so it stops polling
+    // instead of connecting the transport.
+    try testing.expectError(error.Unsupported, a.attach(.{ .session = @enumFromInt(1), .token = token }));
+    try testing.expect(!codex.connected);
+    try testing.expectEqual(@as(usize, 0), stream.output.items.len);
 }
 
 test "rollout transcripts parse incrementally into events" {

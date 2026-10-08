@@ -75,10 +75,14 @@
 //! path a hook reports is followed only inside Claude's own projects
 //! directory. Payload text is never logged; debug logs carry structure only.
 //!
-//! Remote contexts: detection spawns through the workspace ExecutionContext;
-//! the sink, transcript and registry are read from this machine's file
-//! system, so this adapter serves Local workspaces until TASK-61 moves those
-//! reads behind the context.
+//! Remote contexts (TASK-61): detection spawns through the workspace
+//! ExecutionContext, and every sink, transcript and registry access goes
+//! through `Options.sink_io` (`sink_io.zig`): this machine's files for a Local
+//! workspace, the workspace's context for an SSH one. In an SSH workspace the
+//! sink directory is a path on the remote host, so `launch` writes the relay
+//! and settings there, the remote `claude` runs `/bin/sh <sink>/hook.sh`
+//! there, and `poll` tails the remote `events.jsonl` over the connection; the
+//! relay is plain POSIX sh and needs nothing else on the host.
 //!
 //! Threads: every method but `harness` and `capabilities` runs on one IO
 //! worker at a time (adapter.zig). Memory: the adapter owns copies of its
@@ -90,11 +94,13 @@ const api = @import("adapter.zig");
 const event = @import("event.zig");
 const state_model = @import("state.zig");
 const Harness = @import("harness.zig").Harness;
+const sink_io = @import("sink_io.zig");
+const workspace = @import("workspace");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = std.Io.Dir;
-const File = std.Io.File;
+const SinkIo = sink_io.SinkIo;
 const Value = std.json.Value;
 const Event = event.Event;
 const State = state_model.State;
@@ -563,11 +569,11 @@ pub fn mapTranscriptRecord(arena: Allocator, line: []const u8, include_tools: bo
 /// consumer that could not deliver all of a line's events (a full queue)
 /// sees the same line again on the next poll and resumes at `resume_index`.
 /// A partial last line waits for its newline; a line longer than the buffer
-/// is skipped whole.
+/// is skipped whole. The file is read through the adapter's `SinkIo`, from
+/// the offset the previous read stopped at.
 const LineTail = struct {
     path: []u8,
     buffer: []u8,
-    file: ?File = null,
     offset: u64 = 0,
     start: usize = 0,
     end: usize = 0,
@@ -583,8 +589,7 @@ const LineTail = struct {
         return .{ .path = owned_path, .buffer = try allocator.alloc(u8, capacity) };
     }
 
-    fn deinit(self: *LineTail, allocator: Allocator, io: Io) void {
-        if (self.file) |file| file.close(io);
+    fn deinit(self: *LineTail, allocator: Allocator) void {
         allocator.free(self.buffer);
         allocator.free(self.path);
         self.* = undefined;
@@ -592,7 +597,7 @@ const LineTail = struct {
 
     /// The next complete line, without its newline, or null when none is
     /// available yet (including when the file does not exist yet).
-    fn peek(self: *LineTail, io: Io) ReadError!?[]const u8 {
+    fn peek(self: *LineTail, sink: *SinkIo, io: Io) ReadError!?[]const u8 {
         while (true) {
             if (std.mem.indexOfScalarPos(u8, self.buffer[0..self.end], self.start, '\n')) |newline| {
                 if (self.discarding) {
@@ -613,21 +618,10 @@ const LineTail = struct {
                 self.end = 0;
             }
             if (self.bytes_this_poll >= max_bytes_per_poll) return null;
-            const file = self.file orelse open: {
-                const opened = Dir.cwd().openFile(io, self.path, .{}) catch |err| switch (err) {
-                    error.FileNotFound => return null,
-                    else => {
-                        log.debug("cannot open a followed file: {t}", .{err});
-                        return error.Disconnected;
-                    },
-                };
-                self.file = opened;
-                break :open opened;
-            };
-            const read = file.readPositional(io, &.{self.buffer[self.end..]}, self.offset) catch |err| {
+            const read = (sink.readAt(io, self.path, self.offset, self.buffer[self.end..]) catch |err| {
                 log.debug("cannot read a followed file: {t}", .{err});
                 return error.Disconnected;
-            };
+            }) orelse return null;
             if (read == 0) return null;
             self.end += read;
             self.offset += read;
@@ -678,21 +672,22 @@ pub const TranscriptReader = struct {
         return .{ .tail = try .init(allocator, transcript_path, max_transcript_line_bytes), .include_tools = include_tools };
     }
 
-    pub fn deinit(self: *TranscriptReader, allocator: Allocator, io: Io) void {
-        self.tail.deinit(allocator, io);
+    pub fn deinit(self: *TranscriptReader, allocator: Allocator) void {
+        self.tail.deinit(allocator);
     }
 
     pub fn path(self: *const TranscriptReader) []const u8 {
         return self.tail.path;
     }
 
-    /// Push the events of up to `max_lines_per_poll` new records.
-    pub fn poll(self: *TranscriptReader, io: Io, arena: *std.heap.ArenaAllocator, queue: *event.EventQueue) LineTail.ReadError!Drained {
+    /// Push the events of up to `max_lines_per_poll` new records, read
+    /// through `sink` (this machine's files or a remote workspace's).
+    pub fn poll(self: *TranscriptReader, sink: *SinkIo, io: Io, arena: *std.heap.ArenaAllocator, queue: *event.EventQueue) LineTail.ReadError!Drained {
         var drained: Drained = .{};
         self.tail.bytes_this_poll = 0;
         var lines: usize = 0;
         while (lines < max_lines_per_poll) : (lines += 1) {
-            const line = (try self.tail.peek(io)) orelse break;
+            const line = (try self.tail.peek(sink, io)) orelse break;
             _ = arena.reset(.retain_capacity);
             var out: EventBuf = .{};
             mapTranscriptRecord(arena.allocator(), line, self.include_tools, &out);
@@ -770,6 +765,10 @@ pub const Options = struct {
     /// The environment the `--version` probe runs with (the workspace's
     /// child environment; it needs PATH). Borrowed for the adapter's life.
     probe_env: []const []const u8 = &.{},
+    /// Where `sink_dir` and `config_dir` are: this machine's file system when
+    /// null, else the workspace's context (`SinkIo.forContext`). Copied; a
+    /// borrowed context in it must outlive the adapter.
+    sink_io: ?SinkIo = null,
 };
 
 const Mode = enum { unbound, owned, observed };
@@ -788,6 +787,8 @@ pub const ClaudeCodeAdapter = struct {
     config_dir: ?[]u8,
     program: []u8,
     probe_env: []const []const u8,
+    /// Every file access: the sink, the transcript, the registry.
+    sink: SinkIo,
     mode: Mode = .unbound,
     token: ?api.CorrelationToken = null,
     session_id: ?SessionId = null,
@@ -817,13 +818,14 @@ pub const ClaudeCodeAdapter = struct {
             .config_dir = config_dir,
             .program = program,
             .probe_env = options.probe_env,
+            .sink = options.sink_io orelse .local(),
             .arena = .init(allocator),
         };
     }
 
     pub fn deinit(self: *ClaudeCodeAdapter) void {
-        if (self.hooks) |*tail| tail.deinit(self.allocator, self.io);
-        if (self.transcript) |*reader| reader.deinit(self.allocator, self.io);
+        if (self.hooks) |*tail| tail.deinit(self.allocator);
+        if (self.transcript) |*reader| reader.deinit(self.allocator);
         if (self.sink_dir) |sink| self.allocator.free(sink);
         if (self.config_dir) |config| self.allocator.free(config);
         self.allocator.free(self.program);
@@ -968,27 +970,32 @@ pub const ClaudeCodeAdapter = struct {
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.sink_dir.?, name });
     }
 
-    /// Create the sink layout: `decisions/`, `tmp/`, the relay, the settings
-    /// file and an empty `events.jsonl`.
+    /// Create the sink layout, through `self.sink` (so on the remote host in
+    /// an SSH workspace): `decisions/`, `tmp/`, the relay, the settings file
+    /// and an empty `events.jsonl`. The relay and settings name `sink` itself,
+    /// a path in the agent's own context.
     fn prepareSink(self: *ClaudeCodeAdapter, sink: []const u8) api.Error!void {
         const io = self.io;
         var path_buffer: [max_sink_path_bytes + 32]u8 = undefined;
         for ([_][]const u8{ "decisions", "tmp" }) |name| {
             // The sink is at most max_sink_path_bytes (init) and the names are short.
             const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ sink, name }) catch unreachable;
-            _ = Dir.cwd().createDirPathStatus(io, path, private_dir) catch |err| {
-                log.debug("cannot create the sink: {t}", .{err});
-                return error.Disconnected;
-            };
+            try self.sink.makePrivateDir(io, path);
         }
         var content: Io.Writer.Allocating = .init(self.allocator);
         defer content.deinit();
         writeHookScript(&content.writer, sink) catch return error.OutOfMemory;
-        try writeSinkFile(io, &path_buffer, sink, "hook.sh", content.written());
+        try self.writeSinkFile(&path_buffer, sink, "hook.sh", content.written());
         content.clearRetainingCapacity();
         writeSettings(&content.writer, sink) catch return error.OutOfMemory;
-        try writeSinkFile(io, &path_buffer, sink, "settings.json", content.written());
-        try writeSinkFile(io, &path_buffer, sink, "events.jsonl", "");
+        try self.writeSinkFile(&path_buffer, sink, "settings.json", content.written());
+        try self.writeSinkFile(&path_buffer, sink, "events.jsonl", "");
+    }
+
+    fn writeSinkFile(self: *ClaudeCodeAdapter, path_buffer: []u8, sink: []const u8, name: []const u8, data: []const u8) api.Error!void {
+        // Callers pass a buffer of the sink's bound plus room for these names.
+        const path = std.fmt.bufPrint(path_buffer, "{s}/{s}", .{ sink, name }) catch unreachable;
+        try self.sink.writeFile(self.io, path, data, sink_io.private_file_mode);
     }
 
     // attach and detection of hand-started sessions --------------------------
@@ -1034,7 +1041,7 @@ pub const ClaudeCodeAdapter = struct {
 
         if (match == .pid) {
             const path = std.fmt.bufPrint(&path_buffer, "{s}/sessions/{d}.json", .{ config, match.pid }) catch return error.NoSpaceLeft;
-            const bytes = Dir.cwd().readFile(io, path, read_buffer) catch return false;
+            const bytes = (self.sink.readFile(io, path, read_buffer) catch return false) orelse return false;
             const record = parseRegisteredSession(self.arena.allocator(), bytes, null) orelse return false;
             if (record.pid != match.pid) return false;
             out.* = record;
@@ -1042,15 +1049,17 @@ pub const ClaudeCodeAdapter = struct {
         }
 
         const sessions = std.fmt.bufPrint(&path_buffer, "{s}/sessions", .{config}) catch return error.NoSpaceLeft;
-        var dir = Dir.cwd().openDir(io, sessions, .{ .iterate = true }) catch return false;
-        defer dir.close(io);
-        var iterator = dir.iterate();
+        var names: NameList = .{ .allocator = self.allocator, .suffix = ".json", .kind = .file };
+        defer names.deinit();
+        if (!(self.sink.listDir(io, sessions, names.visitor()) catch return false)) return false;
+        if (names.failed) return error.OutOfMemory;
         var found = false;
-        var seen: usize = 0;
-        while (seen < max_scan_entries) : (seen += 1) {
-            const entry = (iterator.next(io) catch break) orelse break;
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
-            const bytes = dir.readFile(io, entry.name, read_buffer) catch continue;
+        var rest = names.bytes.items;
+        while (std.mem.indexOfScalar(u8, rest, 0)) |end| {
+            const name = rest[0..end];
+            rest = rest[end + 1 ..];
+            const path = std.fmt.bufPrint(&path_buffer, "{s}/sessions/{s}", .{ config, name }) catch continue;
+            const bytes = (self.sink.readFile(io, path, read_buffer) catch continue) orelse continue;
             _ = self.arena.reset(.retain_capacity);
             var cwd: []const u8 = "";
             const record = parseRegisteredSession(self.arena.allocator(), bytes, &cwd) orelse continue;
@@ -1073,17 +1082,17 @@ pub const ClaudeCodeAdapter = struct {
         const io = self.io;
         var path_buffer: [Dir.max_path_bytes]u8 = undefined;
         const projects = std.fmt.bufPrint(&path_buffer, "{s}/projects", .{config}) catch return error.NoSpaceLeft;
-        var dir = Dir.cwd().openDir(io, projects, .{ .iterate = true }) catch return;
-        defer dir.close(io);
-        var iterator = dir.iterate();
-        var name_buffer: [Dir.max_path_bytes]u8 = undefined;
-        var seen: usize = 0;
-        while (seen < max_scan_entries) : (seen += 1) {
-            const entry = (iterator.next(io) catch return) orelse return;
-            if (entry.kind != .directory) continue;
-            const relative = std.fmt.bufPrint(&name_buffer, "{s}/{s}.jsonl", .{ entry.name, id.text() }) catch continue;
-            _ = dir.statFile(io, relative, .{}) catch continue;
-            const full = std.fmt.bufPrint(&path_buffer, "{s}/projects/{s}", .{ config, relative }) catch return error.NoSpaceLeft;
+        var names: NameList = .{ .allocator = self.allocator, .suffix = "", .kind = .directory };
+        defer names.deinit();
+        if (!(self.sink.listDir(io, projects, names.visitor()) catch return)) return;
+        if (names.failed) return error.OutOfMemory;
+        var rest = names.bytes.items;
+        while (std.mem.indexOfScalar(u8, rest, 0)) |end| {
+            const name = rest[0..end];
+            rest = rest[end + 1 ..];
+            const full = std.fmt.bufPrint(&path_buffer, "{s}/projects/{s}/{s}.jsonl", .{ config, name, id.text() }) catch continue;
+            const found = (self.sink.stat(io, full) catch return) orelse continue;
+            if (found.kind != .file) continue;
             try self.followTranscript(full);
             return;
         }
@@ -1092,7 +1101,7 @@ pub const ClaudeCodeAdapter = struct {
     fn followTranscript(self: *ClaudeCodeAdapter, path: []const u8) Allocator.Error!void {
         if (self.transcript) |*current| {
             if (std.mem.eql(u8, current.path(), path)) return;
-            current.deinit(self.allocator, self.io);
+            current.deinit(self.allocator);
             self.transcript = null;
         }
         // A launched agent has hooks, whose PreToolUse reports tool uses
@@ -1133,7 +1142,7 @@ pub const ClaudeCodeAdapter = struct {
 
         if (self.transcript == null and self.transcript_lookup) try self.locateTranscript();
         if (self.transcript) |*reader| {
-            const drained = try reader.poll(self.io, &self.arena, queue);
+            const drained = try reader.poll(&self.sink, self.io, &self.arena, queue);
             pushed += drained.pushed;
             if (drained.full) return pushed;
         }
@@ -1147,7 +1156,7 @@ pub const ClaudeCodeAdapter = struct {
                         // the new session's transcript from now on.
                         log.debug("the observed process switched sessions", .{});
                         self.session_id = record.session_id;
-                        if (self.transcript) |*reader| reader.deinit(self.allocator, self.io);
+                        if (self.transcript) |*reader| reader.deinit(self.allocator);
                         self.transcript = null;
                         self.transcript_lookup = true;
                     }
@@ -1176,7 +1185,7 @@ pub const ClaudeCodeAdapter = struct {
         tail.bytes_this_poll = 0;
         var lines: usize = 0;
         while (lines < max_lines_per_poll) : (lines += 1) {
-            const line = (try tail.peek(self.io)) orelse break;
+            const line = (try tail.peek(&self.sink, self.io)) orelse break;
             _ = self.arena.reset(.retain_capacity);
             var out: EventBuf = .{};
             try self.mapHookLine(self.arena.allocator(), line, &out);
@@ -1357,41 +1366,54 @@ pub const ClaudeCodeAdapter = struct {
         const answer = std.meta.stringToEnum(Answer, decision_id) orelse return error.UnknownTarget;
         if (self.pendingIndex(request_id) == null) return error.UnknownTarget;
 
-        var temporary_buffer: [max_sink_path_bytes + 96]u8 = undefined;
         var final_buffer: [max_sink_path_bytes + 96]u8 = undefined;
         // The sink is at most max_sink_path_bytes and a request id at most 64.
-        const temporary = std.fmt.bufPrint(&temporary_buffer, "{s}/decisions/.{s}.tmp", .{ sink, request_id }) catch unreachable;
         const final = std.fmt.bufPrint(&final_buffer, "{s}/decisions/{s}", .{ sink, request_id }) catch unreachable;
-        // Written aside and renamed, so the relay never reads half an answer.
-        Dir.cwd().writeFile(self.io, .{
-            .sub_path = temporary,
-            .data = @tagName(answer),
-            .flags = .{ .permissions = private_file },
-        }) catch |err| {
-            log.debug("cannot write a permission answer: {t}", .{err});
-            return error.Disconnected;
-        };
-        Dir.cwd().rename(temporary, Dir.cwd(), final, self.io) catch |err| {
+        // `writeFile` stages aside and renames, so the relay never reads half
+        // an answer; in an SSH workspace the relay waits on the remote host.
+        self.sink.writeFile(self.io, final, @tagName(answer), sink_io.private_file_mode) catch |err| {
             log.debug("cannot publish a permission answer: {t}", .{err});
-            return error.Disconnected;
+            return err;
         };
         log.debug("permission answered: {t}", .{answer});
     }
 };
 
-/// Owner-only permissions where the platform has modes; the platform
-/// default (inside the private run directory) elsewhere.
-const private_dir: File.Permissions = if (@hasDecl(File.Permissions, "fromMode")) .fromMode(0o700) else .default_dir;
-const private_file: File.Permissions = if (@hasDecl(File.Permissions, "fromMode")) .fromMode(0o600) else .default_file;
+/// Collects the names of a bounded directory listing (`SinkIo.listDir`),
+/// NUL-separated, so each can be read after the listing ends: a remote
+/// listing is one exec channel and cannot be read from inside its visit.
+const NameList = struct {
+    allocator: Allocator,
+    /// Only names ending in this, of this kind, are kept.
+    suffix: []const u8,
+    kind: workspace.PathKind,
+    bytes: std.ArrayList(u8) = .empty,
+    seen: usize = 0,
+    failed: bool = false,
 
-fn writeSinkFile(io: Io, path_buffer: []u8, sink: []const u8, name: []const u8, data: []const u8) api.Error!void {
-    // Callers pass a buffer of the sink's bound plus room for these names.
-    const path = std.fmt.bufPrint(path_buffer, "{s}/{s}", .{ sink, name }) catch unreachable;
-    Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data, .flags = .{ .permissions = private_file } }) catch |err| {
-        log.debug("cannot write the sink: {t}", .{err});
-        return error.Disconnected;
-    };
-}
+    fn visitor(self: *NameList) workspace.DirVisitor {
+        return .{ .context = self, .visit_fn = visit };
+    }
+
+    fn visit(ptr: *anyopaque, entry: workspace.DirEntry) bool {
+        const self: *NameList = @ptrCast(@alignCast(ptr));
+        self.seen += 1;
+        if (self.seen > max_scan_entries) return false;
+        if (entry.kind != self.kind or !std.mem.endsWith(u8, entry.name, self.suffix)) return true;
+        if (std.mem.indexOfScalar(u8, entry.name, 0) != null or std.mem.indexOfScalar(u8, entry.name, '/') != null) return true;
+        self.bytes.ensureUnusedCapacity(self.allocator, entry.name.len + 1) catch {
+            self.failed = true;
+            return false;
+        };
+        self.bytes.appendSliceAssumeCapacity(entry.name);
+        self.bytes.appendAssumeCapacity(0);
+        return true;
+    }
+
+    fn deinit(self: *NameList) void {
+        self.bytes.deinit(self.allocator);
+    }
+};
 
 /// The version in `claude --version` output (`2.1.292 (Claude Code)`),
 /// copied into `out`; null when the output names no version.
@@ -1412,7 +1434,7 @@ pub fn parseVersion(output: []const u8, out: []u8) api.Error!?[]const u8 {
 // Tests ------------------------------------------------------------------------
 
 const testing = std.testing;
-const workspace = @import("workspace");
+const File = std.Io.File;
 const registry_mod = @import("registry.zig");
 
 const fixture_hooks = @embedFile("claude_code/fixtures/hooks.jsonl");
@@ -1755,7 +1777,8 @@ test "the transcript reader is incremental, bounded and resumes after a full que
     const path = scratch.join(&buffer, "t.jsonl");
 
     var reader = try TranscriptReader.init(testing.allocator, path, true);
-    defer reader.deinit(testing.allocator, testing.io);
+    defer reader.deinit(testing.allocator);
+    var sink = SinkIo.local();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var queue = try event.EventQueue.init(testing.allocator, testing.io, 3);
@@ -1764,12 +1787,12 @@ test "the transcript reader is incremental, bounded and resumes after a full que
     defer testing.allocator.free(out);
 
     // No file yet: nothing, and no error.
-    try testing.expectEqual(@as(usize, 0), (try reader.poll(testing.io, &arena, &queue)).pushed);
+    try testing.expectEqual(@as(usize, 0), (try reader.poll(&sink, testing.io, &arena, &queue)).pushed);
 
     // A complete record and a partial one.
     const first = fixture_transcript[0 .. std.mem.indexOf(u8, fixture_transcript, "I'll read").? + 40];
     try scratch.tmp.dir.writeFile(testing.io, .{ .sub_path = "t.jsonl", .data = first });
-    var drained = try reader.poll(testing.io, &arena, &queue);
+    var drained = try reader.poll(&sink, testing.io, &arena, &queue);
     try testing.expectEqual(@as(usize, 1), drained.pushed);
     try testing.expectEqual(@as(usize, 1), queue.drain(out));
     try testing.expectEqualStrings("read the build", out[0].event.message.text);
@@ -1781,7 +1804,7 @@ test "the transcript reader is incremental, bounded and resumes after a full que
     defer kinds.deinit(testing.allocator);
     var polls: usize = 0;
     while (polls < 10) : (polls += 1) {
-        drained = try reader.poll(testing.io, &arena, &queue);
+        drained = try reader.poll(&sink, testing.io, &arena, &queue);
         const n = queue.drain(out);
         for (out[0..n]) |*stored| try kinds.append(testing.allocator, std.meta.activeTag(stored.event));
         if (!drained.full and n == 0) break;
@@ -1801,7 +1824,7 @@ test "the transcript reader is incremental, bounded and resumes after a full que
     polls = 0;
     var after: ?[]const u8 = null;
     while (polls < 4 and after == null) : (polls += 1) {
-        _ = try reader.poll(testing.io, &arena, &queue);
+        _ = try reader.poll(&sink, testing.io, &arena, &queue);
         const n = queue.drain(out);
         if (n != 0) after = out[0].event.message.text;
     }
@@ -2209,4 +2232,146 @@ test "a real interactive claude started by hand is found in the registry, attach
         _ = child.waitReadable(50);
     }
     try testing.expect(disconnected);
+}
+
+// SSH workspaces (TASK-61) ------------------------------------------------------
+
+/// The events of a remote agent, in order: `until` returns the next one of
+/// a kind, polling, bounded, when the drained batch has none. Each poll is
+/// one or two exec channels to the remote host, which bounds a round without
+/// a sleep. A returned event is valid until the next `until`.
+const RemoteFeed = struct {
+    iface: api.Adapter,
+    queue: *event.EventQueue,
+    out: []event.StoredEvent,
+    len: usize = 0,
+    pos: usize = 0,
+
+    fn until(self: *RemoteFeed, want: Event.Kind) !?*event.StoredEvent {
+        const deadline: Deadline = .in(30);
+        while (true) {
+            while (self.pos < self.len) {
+                const stored = &self.out[self.pos];
+                self.pos += 1;
+                if (std.meta.activeTag(stored.event) == want) return stored;
+            }
+            if (!deadline.pending()) return null;
+            _ = try self.iface.poll(self.queue);
+            self.len = self.queue.drain(self.out);
+            self.pos = 0;
+        }
+    }
+};
+
+test "in an SSH workspace the sink lives on the remote host: launch writes it, the remote relay reports through it, and an answer unblocks the relay there" {
+    const remote = (try workspace.ssh.TestRemote.start()) orelse return error.SkipZigTest;
+    defer remote.stop();
+    const ref = remote.ref();
+    const io = testing.io;
+
+    // The sink is under the remote user's state directory, as part two of
+    // TASK-61 places it; the owner creates it private before `launch`.
+    var state_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const state = try ref.stateDir(io, &state_buffer);
+    var sink_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const sink = try std.fmt.bufPrint(&sink_buffer, "{s}/conduit/agents/run-1/agent-1", .{state});
+    try testing.expectEqualStrings(workspace.ssh.TestRemote.home ++ "/.local/state/conduit/agents/run-1/agent-1", sink);
+    try ref.makePrivateDir(io, sink);
+    const config = workspace.ssh.TestRemote.home ++ "/.claude";
+
+    var a = try ClaudeCodeAdapter.init(testing.allocator, io, .{
+        .sink_dir = sink,
+        .config_dir = config,
+        .sink_io = SinkIo.forContext(ref, .{ .idle_read_interval_ms = 0 }),
+    });
+    const iface = a.adapter();
+    defer iface.destroy();
+    try testing.expect(a.sink.isRemote());
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const spec = try iface.launch(arena.allocator(), .{ .context_kind = .ssh, .cwd = workspace.ssh.TestRemote.project, .token = fixtureToken() });
+    var settings_buffer: [Dir.max_path_bytes]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&settings_buffer, "{s}/settings.json", .{sink}), spec.argv[2]);
+
+    // The launch files exist on the remote host, private, and nowhere here.
+    var modes = try remote.run(&.{ "sh", "-c", "cd \"$0\" && stat -c '%a %n' . decisions tmp hook.sh settings.json events.jsonl", sink }, null);
+    defer modes.deinit(testing.allocator);
+    try testing.expectEqualStrings("700 .\n700 decisions\n700 tmp\n600 hook.sh\n600 settings.json\n600 events.jsonl\n", modes.stdout);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, sink, .{}));
+    var file_buffer: [16 * 1024]u8 = undefined;
+    var expected_settings: Io.Writer.Allocating = .init(testing.allocator);
+    defer expected_settings.deinit();
+    try writeSettings(&expected_settings.writer, sink);
+    try testing.expectEqualStrings(expected_settings.written(), try ref.readFile(io, settings_buffer[0 .. sink.len + "/settings.json".len], &file_buffer));
+
+    // A transcript where Claude Code keeps it, and a SessionStart hook run
+    // remotely exactly as the settings say: the relay appends to the remote
+    // sink, `poll` reads it over the connection and follows the transcript
+    // the hook names, also over the connection (AC2, AC3).
+    const session = SessionId.fromToken(fixtureToken());
+    var transcript_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const transcript = try std.fmt.bufPrint(&transcript_buffer, config ++ "/projects/-home-conduit-project/{s}.jsonl", .{session.text()});
+    try ref.writeFile(io, transcript, fixture_transcript, sink_io.private_file_mode);
+    var payload_buffer: [2048]u8 = undefined;
+    const start_payload = try std.fmt.bufPrint(&payload_buffer, "{{\"session_id\":\"{s}\",\"transcript_path\":\"{s}\",\"source\":\"startup\",\"hook_event_name\":\"SessionStart\"}}", .{ session.text(), transcript });
+    var relay_path_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const relay = try std.fmt.bufPrint(&relay_path_buffer, "{s}/hook.sh", .{sink});
+    var started = try remote.run(&.{ "env", "CONDUIT_AGENT_TOKEN=" ++ fixture_token, "/bin/sh", relay, "SessionStart" }, start_payload);
+    defer started.deinit(testing.allocator);
+    try testing.expect(started.succeeded());
+
+    var queue = try event.EventQueue.init(testing.allocator, io, 16);
+    defer queue.deinit(testing.allocator);
+    const out = try testing.allocator.alloc(event.StoredEvent, 16);
+    defer testing.allocator.free(out);
+    var feed: RemoteFeed = .{ .iface = iface, .queue = &queue, .out = out };
+    const idle = (try feed.until(.status_change)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(State.idle, idle.event.status_change.state);
+    const message = (try feed.until(.message)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("read the build", message.event.message.text);
+    try testing.expectEqualStrings(transcript, a.transcriptPath().?);
+
+    // A permission request from the remote relay, which then waits on the
+    // remote host for the answer: run it in a remote session the way Claude
+    // Code runs a hook, with the hook input on stdin.
+    var payload_path_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const payload_path = try std.fmt.bufPrint(&payload_path_buffer, "{s}/tmp/payload.json", .{sink});
+    try ref.writeFile(io, payload_path, fixture_permission, sink_io.private_file_mode);
+    var command_buffer: [Dir.max_path_bytes * 2]u8 = undefined;
+    var command: Io.Writer = .fixed(&command_buffer);
+    try writeHookCommand(&command, sink, .permission_request);
+    try command.print(" < '{s}'", .{payload_path});
+    const child = try ref.spawn(.{
+        .argv = &.{ "/bin/sh", "-c", command.buffered() },
+        .env = &.{"CONDUIT_AGENT_TOKEN=" ++ fixture_token},
+        .cwd = workspace.ssh.TestRemote.project,
+        .size = .{ .rows = 24, .cols = 200 },
+    });
+    defer child.destroy();
+
+    const request = (try feed.until(.permission_request)) orelse return error.TestUnexpectedResult;
+    var id_buffer: [64]u8 = undefined;
+    const id = id_buffer[0..request.event.permission_request.id.len];
+    @memcpy(id, request.event.permission_request.id);
+    try testing.expectEqualStrings("Bash: touch probe_file", request.event.permission_request.title);
+    // Still blocked on the remote host.
+    var output: [1024]u8 = undefined;
+    var len = child.takeBytes(&output);
+    try testing.expect(child.state() == .running);
+
+    // The answer crosses the connection atomically, the remote relay takes
+    // it, prints Claude Code's reply and reports the outcome to the sink.
+    try iface.respondPermission(id, "allow");
+    const resolved = (try feed.until(.permission_resolved)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(event.PermissionOutcome.allowed, resolved.event.permission_resolved.outcome);
+    const deadline: Deadline = .in(20);
+    while (deadline.pending() and len < output.len) {
+        const took = child.takeBytes(output[len..]);
+        len += took;
+        if (took == 0 and child.state() != .running) break;
+        if (took == 0) _ = child.waitReadable(50);
+    }
+    try testing.expect(std.mem.indexOf(u8, output[0..len], permissionReply(.allow)) != null);
+    var answer_buffer: [Dir.max_path_bytes]u8 = undefined;
+    try testing.expectError(error.NotFound, ref.statPath(io, try std.fmt.bufPrint(&answer_buffer, "{s}/decisions/{s}", .{ sink, id })));
 }

@@ -890,6 +890,21 @@ nothing else is a legal dependency.
   environment, no shell, stdin capped at 16 KiB, each output stream capped (`OutputTooLarge`)
   and a whole-run timeout that kills the child (`Timeout`); a missing program is
   `CommandNotFound`, and a non-zero exit is a `RunResult`, not an error.
+- **Sink capabilities (TASK-61).** Four more optional entries carry an agent's side channel to
+  wherever the agent runs: `readFileAt(io, path, offset, buffer) FsError!usize` (up to
+  `buffer.len` bytes from `offset`, 0 at or past the end, so an append-only file is followed
+  without rereading it), `writeFile(io, path, bytes, mode) FsError!void` (at most
+  `max_write_bytes` = 1 MiB, else `TooLarge`; atomic temporary-and-rename, missing parents
+  created 0700, exact mode bits), `makePrivateDir(io, path) FsError!void` (the directory and its
+  missing parents 0700, an existing one tightened to 0700) and `stateDir(io, buffer)
+  FsError![]u8` (the context's `$XDG_STATE_HOME`, else `$HOME/.local/state`). Local implements
+  them with `std.Io` (`createFileAtomic` + `setPermissions` + `replace`); its `stateDir` reports
+  what `ExecutionContext.localWithStateDir` was given (the context reads no environment) and is
+  `Unsupported` from plain `local()`. `workspace.localFiles()` lends the Local file functions as
+  a stateless `Ref` for code that must address this machine's files through the same seam as a
+  remote context without owning one (`agent/sink_io.zig`). The writes are made only from
+  workers: an agent's spawn worker stages its launch files and its IO worker publishes
+  permission answers.
 - **Watch threads.** A `WatchHandle` starts no thread and never calls back. The Local handle
   drains a non-blocking inotify descriptor on Linux at `pollChanges`; elsewhere, and while the
   watched directory does not exist yet, it compares a bounded fingerprint of the entries' names,
@@ -941,7 +956,8 @@ nothing else is a legal dependency.
     inside single quotes as escapes and csh-family shells cannot carry a newline in quotes. The
     round trip is unit-tested through sh, dash, bash and zsh and was checked once in a container
     through fish and tcsh. NUL is refused.
-  - **Exec channels.** `readFile`, `listDir`, `statPath` and `run` run
+  - **Exec channels.** `readFile`, `readFileAt`, `listDir`, `statPath`, `writeFile`,
+    `makePrivateDir`, `stateDir` and `run` run
     `ssh -T -o BatchMode=yes -o ControlMaster=no -o ControlPath=…` over pipes through
     `workspace.runLocalProcess` (the Local `run`, now shared; an empty `RunRequest.cwd` keeps
     Conduit's own directory), refuse with `Unavailable` unless `connected`, and use small POSIX-sh
@@ -953,6 +969,19 @@ nothing else is a legal dependency.
     (`ls -lan` with full timestamps, `cksum`) every `watch_interval_s` (2 s) and streams `c`/`h`
     lines; `watch` blocks until the loop's baseline exists, `pollChanges` reads without blocking,
     and an ended channel reports a change and restarts at most every 2 s while connected.
+  - **Remote sink writes (TASK-61).** `readFileAt` is `tail -c +<offset+1> | head -c <len>`.
+    `writeFile` sends the bytes on the exec channel's stdin in `write_chunk_bytes` (16 KiB, the
+    `RunRequest` stdin cap) pieces: under `umask 077` each step creates missing parents and
+    appends to a hidden temporary beside the destination (`.<name>.conduit-<pid>-<serial>`), and
+    the last step `chmod`s it and `mv`s it over the destination, so a remote poller never sees a
+    prefix; a directory destination is refused, and a failed step removes the temporary.
+    `makePrivateDir` is `mkdir -p` under `umask 077` plus `chmod 700`, refusing a symlink in its
+    place. `stateDir` prints an absolute `$XDG_STATE_HOME`, else `$HOME/.local/state`, as the
+    exec channel's environment has them. These are the only remote writes besides decision-8's
+    integration directory, and they stay inside an agent's private sink. The helpers are
+    unit-tested by running the exact remote command under the local `/bin/sh`, and the sshd
+    container test (through the test-only `ssh.TestRemote` harness, which other modules' tests
+    reuse) proves a multi-chunk write, modes, offset reads and the state directory.
   - **Control directory.** `$XDG_RUNTIME_DIR/conduit/ssh` (from `Options.runtime_dir`), else
     `/tmp/conduit-<uid>/ssh`. Each level Conduit names is created 0700 and `lstat`-checked: a real
     directory, owned by the effective uid, mode exactly 0700, never a symlink. Socket names are
@@ -1260,7 +1289,8 @@ nothing else is a legal dependency.
     agent's cwd. Structured capabilities are reported only while the event stream is live; an
     unreachable server leaves the PTY baseline and is retried with backoff. Gaps: `detect`
     is unsupported until the ExecutionContext can run a probe; the channel is Local-only (SSH and
-    WSL get the plain TUI, TASK-61); an `opencode` started by hand without `--port` has no
+    WSL get the plain TUI and the PTY baseline: TASK-61 carries file sinks over the context, but
+    no TCP port forwarding); an `opencode` started by hand without `--port` has no
     external server; prompts are files, so read/update prompt are unsupported; events over
     1 MiB are dropped. The protocol was read from opencode.ai/docs/server and the
     anomalyco/opencode `dev` source (a697115, v1.18.35) on 2026-10-07 and is unverified against
@@ -1277,7 +1307,11 @@ nothing else is a legal dependency.
     agents; the confirm arrives as `extension_ui_request` and is answered with
     `extension_ui_response`, input is `prompt`/`steer`, stop is `abort`. All IO goes through an
     owner-supplied `Transport` (non-blocking `read`, plus `write` for RPC or `decide` for the
-    decision file), so the adapter makes no OS calls and a remote context can carry it. Mapping:
+    decision file), so the adapter makes no OS calls and a remote context can carry it. The
+    production `SinkTransport` (TASK-61) is that transport for `tui`: it follows
+    `<sink>/events.jsonl` from its last offset and publishes `<sink>/decisions/<id>` atomically,
+    both through a `SinkIo`, so in an SSH workspace the extension writes on the remote host and
+    the transport reads over the connection. Mapping:
     `agent_start` → working, `agent_end` → done/errored/idle by `stopReason`, user and assistant
     `message_end` → message, `tool_execution_start` → tool_use plus file_reference for a `path`,
     confirm → permission_request with decisions `yes`/`no`, RPC `select`/`input`/`editor` →
@@ -1315,7 +1349,12 @@ nothing else is a legal dependency.
     attached by its session id. `Stop` maps to `done`; an owned agent's exit comes from its PTY
     child, an observed one's from `SessionEnd`. `send_input`, `read_prompt`/`update_prompt`
     (TASK-59), `stop` and headless launch are unsupported. The interim sink is replaced by the
-    TASK-60 control endpoint; sink, transcript and registry reads are local until TASK-61.
+    TASK-60 control endpoint. Every sink, transcript and registry access goes through
+    `Options.sink_io` (TASK-61): `launch` creates `decisions/` and `tmp/` and writes the relay,
+    the settings file and an empty `events.jsonl` there, and `poll`, `respondPermission`,
+    `findRunningSession` and the transcript lookup read and write through it, so an SSH
+    workspace's sink is a remote directory, the remote `claude` runs the remote relay, and the
+    adapter tails it over the connection.
     Fixtures live in `src/agent/claude_code/fixtures/` because `@embedFile` cannot leave the
     module's directory.
   - `codex.zig` (TASK-54): `CodexAdapter`, the Codex app-server client. JSON-RPC (without the
@@ -1342,6 +1381,22 @@ nothing else is a legal dependency.
     message, tool-use and status events (approvals are never in rollouts). Fixtures under
     `test/fixtures/agent/codex/` hold the 0.160.1 schema's method list, an approval round trip
     recorded from the real binary against a local mock provider, and a trimmed mock rollout.
+    In an SSH or WSL workspace (TASK-61) `launch` describes the plain TUI and the adapter
+    reports `remote_capabilities` (detect and launch only), so the owner never dials this
+    machine's daemon socket for a remote agent and keeps the PTY baseline; a headless remote
+    launch is `Unsupported`. Forwarding the remote daemon socket is not implemented.
+  - `sink_io.zig` (TASK-61): `SinkIo`, the harness-neutral IO under the sink channels:
+    `readAt` (follow a file from an offset), `readFile`, `stat`, `listDir`, `writeFile`
+    (atomic) and `makePrivateDir`, with a missing path as `null` and every other failure as
+    `Disconnected`. `SinkIo.local()` is this machine (`workspace.localFiles()`);
+    `SinkIo.forContext(ref, options)` is the workspace's context for a remote kind and Local
+    otherwise. A remote `readAt` that found nothing skips that path for
+    `idle_read_interval_ms` (500 ms) while a read that found bytes is never held back, so an
+    idle remote agent costs about two exec channels per second per followed file rather than
+    one per 50 ms worker tick. One adapter's worker uses a `SinkIo` at a time. The Claude Code
+    and Pi tests drive the real relay and sink over the sshd container (`ssh.TestRemote`);
+    Pi's `conduit.js` needs Node.js, which the container lacks, so that test appends the
+    extension's lines by hand.
 
 ### `backlog`
 

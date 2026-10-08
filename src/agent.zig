@@ -19,8 +19,9 @@
 //! `agent/event.zig` (events and the bounded hand-over queue),
 //! `agent/adapter.zig` (the interface), `agent/registry.zig` (agents per
 //! workspace), `agent/heuristics.zig` (the PTY baseline),
-//! `agent/harness.zig` (the closed harness set) and `agent/fake.zig` (the
-//! scripted adapter tests use).
+//! `agent/harness.zig` (the closed harness set), `agent/fake.zig` (the
+//! scripted adapter tests use) and `agent/sink_io.zig` (the harness-neutral
+//! IO under the sink channels, Local or through a remote context, TASK-61).
 //!
 //! It may depend on `config`, `input`, `session`, `theme`, `ui` and
 //! `workspace` (`build.zig`); today it imports only `session` and `workspace`,
@@ -94,6 +95,11 @@ pub const codex = @import("agent/codex.zig");
 pub const pi = @import("agent/pi.zig");
 pub const opencode = @import("agent/opencode.zig");
 
+/// The harness-neutral IO under the sink-based side channels: this machine's
+/// files, or a remote workspace's through its ExecutionContext (TASK-61).
+pub const sink_io = @import("agent/sink_io.zig");
+pub const SinkIo = sink_io.SinkIo;
+
 test {
     _ = @import("agent/harness.zig");
     _ = state;
@@ -106,4 +112,5 @@ test {
     _ = codex;
     _ = pi;
     _ = opencode;
+    _ = sink_io;
 }

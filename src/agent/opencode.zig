@@ -50,8 +50,9 @@
 //!     was not observed; the parser takes the last word of the first line.
 //!   - The server is reached at 127.0.0.1 only, so the structured channel is
 //!     Local-only. In SSH and WSL workspaces `launch` starts the plain TUI and
-//!     the agent stays on the PTY baseline until the ExecutionContext can
-//!     forward a port (TASK-61).
+//!     the agent stays on the PTY baseline: TASK-61 carries file-based sinks
+//!     over the ExecutionContext, but forwarding a TCP port is not
+//!     implemented.
 //!   - A manually started `opencode` without `--port` has no external server
 //!     (the TUI talks to its worker in-process), so it can be attached only by
 //!     the PTY heuristics. With `--port` it can be attached by port.
@@ -1259,7 +1260,10 @@ pub const OpenCodeAdapter = struct {
         try env.append(allocator, try allocator.dupe(u8, request.token.envEntry(&token_entry)));
 
         if (request.context_kind.isRemote()) {
-            // TODO(TASK-61): forward the server port through the context.
+            // The server would listen on the remote host's loopback, which
+            // this adapter's loopback transport cannot reach; forwarding the
+            // port over the connection is not implemented (TASK-61 keeps the
+            // PTY baseline here).
             self.remote = true;
             if (request.headless) return error.Unsupported;
             if (request.initial_prompt) |prompt| {

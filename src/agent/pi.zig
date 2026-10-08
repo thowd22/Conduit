@@ -74,6 +74,13 @@
 //! `recognizeCommand` lets the agent core classify a foreground `pi`/`omp`
 //! process it found itself.
 //!
+//! Remote contexts (TASK-61): the extension appends to whatever directory
+//! `CONDUIT_AGENT_SINK` names, so in an SSH workspace the sink is a directory
+//! on the remote host, the owner writes `conduit.js` there through the
+//! workspace's ExecutionContext before the spawn, and `SinkTransport` over a
+//! context-backed `SinkIo` reads `events.jsonl` and publishes decisions over
+//! the connection. The remote host needs the Pi (or omp) runtime only.
+//!
 //! Threads: as `adapter.zig` says, every method but `harness` and
 //! `capabilities` runs on one IO worker at a time. The adapter makes no OS
 //! calls itself: all IO goes through the owner-supplied `Transport` or the
@@ -90,6 +97,8 @@ const event = @import("event.zig");
 const state = @import("state.zig");
 const Harness = @import("harness.zig").Harness;
 const workspace = @import("workspace");
+const sink_io = @import("sink_io.zig");
+const SinkIo = sink_io.SinkIo;
 
 const Allocator = std.mem.Allocator;
 const Error = iface.Error;
@@ -199,6 +208,48 @@ pub const Transport = struct {
         write: ?*const fn (*anyopaque, []const u8) Error!void = null,
         decide: ?*const fn (*anyopaque, []const u8, []const u8) Error!void = null,
     };
+};
+
+/// The owner half of the `tui` sink channel as a `Transport`: `read` follows
+/// `<sink>/events.jsonl` from where the last read stopped and `decide`
+/// publishes `<sink>/decisions/<id>` atomically, both through a `SinkIo`, so
+/// the same transport serves a Local workspace (this machine's files) and an
+/// SSH one (the remote host's, over the workspace's connection; TASK-61).
+/// Heap-stable: the `Transport` it lends points at it. Used by the adapter's
+/// one IO worker at a time, like the adapter itself.
+pub const SinkTransport = struct {
+    io: std.Io,
+    /// Borrowed: the sink directory in the agent's context.
+    dir_path: []const u8,
+    sink: SinkIo,
+    offset: u64 = 0,
+
+    const vtable: Transport.VTable = .{ .read = read, .decide = decide };
+
+    pub fn init(io: std.Io, dir_path: []const u8, sink: SinkIo) SinkTransport {
+        return .{ .io = io, .dir_path = std.mem.trimEnd(u8, dir_path, "/"), .sink = sink };
+    }
+
+    pub fn transport(self: *SinkTransport) Transport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn read(ptr: *anyopaque, out: []u8) Error!usize {
+        const self: *SinkTransport = @ptrCast(@alignCast(ptr));
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buffer, "{s}/" ++ events_file_name, .{self.dir_path}) catch return error.NoSpaceLeft;
+        // A sink the extension has not written yet has nothing to read.
+        const n = (try self.sink.readAt(self.io, path, self.offset, out)) orelse return 0;
+        self.offset += n;
+        return n;
+    }
+
+    fn decide(ptr: *anyopaque, id: []const u8, decision: []const u8) Error!void {
+        const self: *SinkTransport = @ptrCast(@alignCast(ptr));
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buffer, "{s}/" ++ decisions_dir_name ++ "/{s}", .{ self.dir_path, id }) catch return error.NoSpaceLeft;
+        try self.sink.writeFile(self.io, path, decision, sink_io.private_file_mode);
+    }
 };
 
 pub const Options = struct {
@@ -1971,40 +2022,6 @@ const PipeTransport = struct {
     }
 };
 
-/// The sink directory as a `Transport`: tails `events.jsonl`, publishes
-/// decisions by rename.
-const SinkTransport = struct {
-    dir: std.Io.Dir,
-    offset: u64 = 0,
-
-    const vtable: Transport.VTable = .{ .read = read, .decide = decide };
-
-    fn transport(self: *SinkTransport) Transport {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    fn read(ptr: *anyopaque, out: []u8) Error!usize {
-        const self: *SinkTransport = @ptrCast(@alignCast(ptr));
-        const io = testing.io;
-        const file = self.dir.openFile(io, events_file_name, .{}) catch return 0;
-        defer file.close(io);
-        const n = file.readPositional(io, &.{out}, self.offset) catch return error.Disconnected;
-        self.offset += n;
-        return n;
-    }
-
-    fn decide(ptr: *anyopaque, id: []const u8, decision: []const u8) Error!void {
-        const self: *SinkTransport = @ptrCast(@alignCast(ptr));
-        const io = testing.io;
-        var tmp_buf: [max_request_id_bytes + 32]u8 = undefined;
-        var final_buf: [max_request_id_bytes + 32]u8 = undefined;
-        const tmp_name = std.fmt.bufPrint(&tmp_buf, decisions_dir_name ++ "/.{s}.tmp", .{id}) catch return error.NoSpaceLeft;
-        const final_name = std.fmt.bufPrint(&final_buf, decisions_dir_name ++ "/{s}", .{id}) catch return error.NoSpaceLeft;
-        self.dir.writeFile(io, .{ .sub_path = tmp_name, .data = decision }) catch return error.Disconnected;
-        self.dir.rename(tmp_name, self.dir, final_name, io) catch return error.Disconnected;
-    }
-};
-
 fn spawnPi(fixture: *IntegrationFixture, env: *const std.process.Environ.Map) !std.process.Child {
     var ext_buf: [std.fs.max_path_bytes]u8 = undefined;
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2167,9 +2184,8 @@ test "integration: the extension's sink and decision file, as a TUI session uses
     var pipe: PipeTransport = .{ .child = &child };
     try PipeTransport.write(&pipe, "{\"type\":\"prompt\",\"message\":\"RUNTOOL\"}\n");
 
-    var sink_dir = try fixture.tmp.dir.openDir(testing.io, "sink", .{});
-    defer sink_dir.close(testing.io);
-    var sink: SinkTransport = .{ .dir = sink_dir };
+    var sink_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sink: SinkTransport = .init(testing.io, try fixture.path(&sink_path_buf, "sink"), .local());
     var pi = try PiAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "unused", .transport = sink.transport() });
     defer pi.deinit();
     const a = pi.adapter();
@@ -2200,4 +2216,77 @@ test "integration: the extension's sink and decision file, as a TUI session uses
     try testing.expectEqual(@as(usize, 1), countKind(seen.items(), .tool_use));
     try fixture.tmp.dir.access(testing.io, "proj/probe_file", .{});
     try testing.expect(pi.sessionFile() != null);
+}
+
+// SSH workspaces (TASK-61). The test container has no Node.js, so `conduit.js`
+// cannot run there; the extension's lines are appended to the remote sink by
+// hand, from the same fixture the mapping tests use, and the extension file is
+// only checked to arrive intact.
+
+test "in an SSH workspace the sink transport follows the remote events file and publishes decisions there" {
+    const remote = (try workspace.ssh.TestRemote.start()) orelse return error.SkipZigTest;
+    defer remote.stop();
+    const ref = remote.ref();
+    const io = testing.io;
+
+    var state_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_dir = try ref.stateDir(io, &state_buffer);
+    var sink_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const sink_dir = try std.fmt.bufPrint(&sink_buffer, "{s}/conduit/agents/run-1/pi-1", .{state_dir});
+    try ref.makePrivateDir(io, sink_dir);
+
+    // The owner stages the extension through the context before the spawn.
+    var extension_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const extension = try std.fmt.bufPrint(&extension_buffer, "{s}/" ++ extension_file_name, .{sink_dir});
+    try ref.writeFile(io, extension, extension_source, sink_io.private_file_mode);
+    const copy = try testing.allocator.alloc(u8, extension_source.len);
+    defer testing.allocator.free(copy);
+    try testing.expectEqualStrings(extension_source, try ref.readFile(io, extension, copy));
+
+    var sink: SinkTransport = .init(io, sink_dir, SinkIo.forContext(ref, .{ .idle_read_interval_ms = 0 }));
+    var pi = try PiAdapter.init(testing.allocator, io, .{ .sink_dir = sink_dir, .transport = sink.transport() });
+    defer pi.deinit();
+    const a = pi.adapter();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const spec = try a.launch(arena_state.allocator(), .{ .context_kind = .ssh, .cwd = workspace.ssh.TestRemote.project, .token = test_token });
+    try testing.expectEqualStrings(extension, spec.argv[spec.argv.len - 1]);
+
+    var queue = try event.EventQueue.init(testing.allocator, io, 64);
+    defer queue.deinit(testing.allocator);
+    const out = try testing.allocator.alloc(event.StoredEvent, 64);
+    defer testing.allocator.free(out);
+    // Nothing written yet: no events, no error.
+    try testing.expectEqual(@as(usize, 0), try a.poll(&queue));
+
+    // The lines up to the first permission request, appended remotely.
+    const fixture = @embedFile("pi/testdata/sink_events.jsonl");
+    var cut: usize = 0;
+    var lines: usize = 0;
+    while (lines < 6) : (lines += 1) cut = std.mem.indexOfScalarPos(u8, fixture, cut, '\n').? + 1;
+    var appended = try remote.run(&.{ "sh", "-c", "cat >> \"$0/" ++ events_file_name ++ "\"", sink_dir }, fixture[0..cut]);
+    defer appended.deinit(testing.allocator);
+    try testing.expect(appended.succeeded());
+
+    var request_id: ?[]const u8 = null;
+    var id_buffer: [max_request_id_bytes]u8 = undefined;
+    const deadline_ns = std.Io.Clock.awake.now(io).nanoseconds + 30 * std.time.ns_per_s;
+    while (request_id == null and std.Io.Clock.awake.now(io).nanoseconds < deadline_ns) {
+        _ = try a.poll(&queue);
+        for (out[0..drainAll(&queue, out)]) |*stored| switch (stored.event) {
+            .permission_request => |request| {
+                @memcpy(id_buffer[0..request.id.len], request.id);
+                request_id = id_buffer[0..request.id.len];
+            },
+            else => {},
+        };
+    }
+    try testing.expectEqualStrings("c2398549-1", request_id.?);
+
+    // The answer is published on the remote host, where the extension polls.
+    try a.respondPermission("c2398549-1", decision_yes);
+    var decision_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var answer: [8]u8 = undefined;
+    try testing.expectEqualStrings(decision_yes, try ref.readFile(io, try std.fmt.bufPrint(&decision_buffer, "{s}/" ++ decisions_dir_name ++ "/c2398549-1", .{sink_dir}), &answer));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, sink_dir, .{}));
 }
