@@ -914,6 +914,7 @@ const stand_in_script =
 const wslpath_script =
     \\#!/bin/sh
     \\[ "$1" = -u ] && [ "$2" = 'C:\' ] && { printf '/mnt/c/\n'; exit 0; }
+    \\[ "$1" = -w ] && { printf '\\\\wsl.localhost\\StandIn%s\n' "$(printf '%s' "$2" | tr / '\\')"; exit 0; }
     \\exit 1
     \\
 ;
@@ -1011,7 +1012,8 @@ test "a WSL context runs commands, files, watches and sessions inside the distri
     const io = testing.io;
 
     // Where `--cd ~` lands is the distribution's home, in its own path syntax.
-    var pwd = try ref.run(testing.allocator, io, .{ .argv = &.{"pwd"}, .cwd = "" });
+    // A cold distribution boots on its first command; WSL2 can take tens of seconds.
+    var pwd = try ref.run(testing.allocator, io, .{ .argv = &.{"pwd"}, .cwd = "", .timeout_ms = 120_000 });
     defer pwd.deinit(testing.allocator);
     try testing.expect(pwd.succeeded());
     const home = std.mem.trimEnd(u8, pwd.stdout, "\r\n");
@@ -1076,29 +1078,47 @@ test "a WSL context runs commands, files, watches and sessions inside the distri
     wsl.learnMountRoot(io);
     var translated: [256]u8 = undefined;
     try testing.expectEqualStrings("/mnt/c/Users/me/a.txt", wsl.toContextPath("C:\\Users\\me\\a.txt", &translated).?);
+    // The reverse spelling agrees with the distribution's own `wslpath -w`.
+    var windows_form = try ref.run(testing.allocator, io, .{ .argv = &.{ "wslpath", "-w", file }, .cwd = "" });
+    defer windows_form.deinit(testing.allocator);
+    try testing.expect(windows_form.succeeded());
+    try testing.expectEqualStrings(std.mem.trimEnd(u8, windows_form.stdout, "\r\n"), wsl.toLocalPath(file, &translated).?);
 
-    // spawn: an interactive session starts in the requested directory with the overlay exported.
-    var session = try ref.spawn(.{
-        .argv = &.{ "sh", "-c", "printf 'WSLDIR=%s TERMIS=%s\\n' \"$(pwd)\" \"$TERM\"; sleep 2" },
-        .env = &.{ "TERM=xterm-256color", "PATH=C:\\not\\crossing" },
-        .cwd = dir,
-        .size = .{ .rows = 24, .cols = 120 },
-    });
-    defer session.destroy();
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(testing.allocator);
-    var expected_buffer: [600]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buffer, "WSLDIR={s} TERMIS=xterm-256color", .{dir});
-    var waited: usize = 0;
-    while (std.mem.indexOf(u8, output.items, expected) == null and waited < 400) : (waited += 1) {
-        _ = session.waitReadable(25);
-        var chunk: [1024]u8 = undefined;
-        const n = session.takeBytes(&chunk);
-        try output.appendSlice(testing.allocator, chunk[0..n]);
+    // spawn: three concurrent sessions (a tab, a pane and the scratchpad of a
+    // WSL workspace) each start in their requested directory inside the
+    // distribution with the overlay exported.
+    const distro_check = if (std.mem.eql(u8, wsl.distribution, "StandIn")) "stand-in" else wsl.distribution;
+    var sessions: [3]pty.Pty = undefined;
+    var started: usize = 0;
+    defer for (sessions[0..started]) |session| session.destroy();
+    const cwds = [_][]const u8{ dir, home, "/" };
+    for (cwds, 0..) |cwd, index| {
+        var script_buffer: [256]u8 = undefined;
+        const script = try std.fmt.bufPrint(&script_buffer, "printf 'S{d} DIR=%s TERMIS=%s DISTRO=%s\\n' \"$(pwd)\" \"$TERM\" \"${{WSL_DISTRO_NAME:-stand-in}}\"; sleep 5", .{index});
+        sessions[index] = try ref.spawn(.{
+            .argv = &.{ "sh", "-c", script },
+            .env = &.{ "TERM=xterm-256color", "PATH=C:\\not\\crossing" },
+            .cwd = cwd,
+            .size = .{ .rows = 24, .cols = 160 },
+        });
+        started += 1;
     }
-    if (std.mem.indexOf(u8, output.items, expected) == null) {
-        log.err("session output: {s}", .{output.items});
-        return error.SessionOutputMissing;
+    for (sessions, cwds, 0..) |session, cwd, index| {
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(testing.allocator);
+        var expected_buffer: [700]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buffer, "S{d} DIR={s} TERMIS=xterm-256color DISTRO={s}", .{ index, cwd, distro_check });
+        var waited: usize = 0;
+        while (std.mem.indexOf(u8, output.items, expected) == null and waited < 1200) : (waited += 1) {
+            _ = session.waitReadable(25);
+            var chunk: [1024]u8 = undefined;
+            const n = session.takeBytes(&chunk);
+            try output.appendSlice(testing.allocator, chunk[0..n]);
+        }
+        if (std.mem.indexOf(u8, output.items, expected) == null) {
+            log.err("session {d} output: {s}", .{ index, output.items });
+            return error.SessionOutputMissing;
+        }
     }
 }
 
