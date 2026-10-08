@@ -312,15 +312,32 @@ pub fn writeHookCommand(writer: *Io.Writer, sink: []const u8, hook: Hook) Io.Wri
     try writer.print("/bin/sh '{s}/hook.sh' {s}", .{ sink, hook.name() });
 }
 
+/// The hook command when Conduit's control endpoint is up (TASK-60): every
+/// hook but `PermissionRequest` runs `conduit control agent.event` with the
+/// hook name, which wraps stdin exactly as the relay would and sends it over
+/// the endpoint, falling back to the sink when the endpoint does not answer.
+/// `PermissionRequest` keeps the relay, whose answer comes back through
+/// `decisions/`. `helper` must satisfy `isValidSinkPath` (absolute, quotable).
+pub fn writeHookCommandVia(writer: *Io.Writer, sink: []const u8, helper: ?[]const u8, hook: Hook) Io.Writer.Error!void {
+    const program = helper orelse return writeHookCommand(writer, sink, hook);
+    if (hook == .permission_request) return writeHookCommand(writer, sink, hook);
+    try writer.print("'{s}' control agent.event --event={s}", .{ program, hook.name() });
+}
+
 /// The `--settings` file: one command hook per registered event, no matcher
 /// (every tool), each running the relay.
 pub fn writeSettings(writer: *Io.Writer, sink: []const u8) Io.Writer.Error!void {
-    var command_buffer: [max_sink_path_bytes + 64]u8 = undefined;
+    return writeSettingsVia(writer, sink, null);
+}
+
+/// `writeSettings` with `writeHookCommandVia`'s command choice.
+pub fn writeSettingsVia(writer: *Io.Writer, sink: []const u8, helper: ?[]const u8) Io.Writer.Error!void {
+    var command_buffer: [2 * max_sink_path_bytes + 64]u8 = undefined;
     try writer.writeAll("{\"hooks\":{");
     for (Hook.registered, 0..) |hook, i| {
         if (i != 0) try writer.writeByte(',');
         var command: Io.Writer = .fixed(&command_buffer);
-        try writeHookCommand(&command, sink, hook);
+        try writeHookCommandVia(&command, sink, helper, hook);
         try writer.print("\"{s}\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":", .{hook.name()});
         try std.json.Stringify.encodeJsonString(command.buffered(), .{}, writer);
         try writer.print(",\"timeout\":{d}}}]}}]", .{hook.timeoutSeconds()});
@@ -769,6 +786,13 @@ pub const Options = struct {
     /// null, else the workspace's context (`SinkIo.forContext`). Copied; a
     /// borrowed context in it must outlive the adapter.
     sink_io: ?SinkIo = null,
+    /// The `conduit` executable the hooks run as `conduit control
+    /// agent.event` while the control endpoint is up (TASK-60); null keeps
+    /// every hook on the sink relay. Ignored unless it satisfies
+    /// `isValidSinkPath`, and for a remote sink, whose hooks run on another
+    /// machine where this path and the local endpoint do not exist.
+    /// Borrowed for the adapter's life.
+    control_helper: ?[]const u8 = null,
 };
 
 const Mode = enum { unbound, owned, observed };
@@ -789,6 +813,7 @@ pub const ClaudeCodeAdapter = struct {
     probe_env: []const []const u8,
     /// Every file access: the sink, the transcript, the registry.
     sink: SinkIo,
+    control_helper: ?[]const u8 = null,
     mode: Mode = .unbound,
     token: ?api.CorrelationToken = null,
     session_id: ?SessionId = null,
@@ -819,6 +844,10 @@ pub const ClaudeCodeAdapter = struct {
             .program = program,
             .probe_env = options.probe_env,
             .sink = options.sink_io orelse .local(),
+            .control_helper = if (options.control_helper) |helper|
+                (if (isValidSinkPath(helper) and !(options.sink_io orelse SinkIo.local()).isRemote()) helper else null)
+            else
+                null,
             .arena = .init(allocator),
         };
     }
@@ -987,7 +1016,7 @@ pub const ClaudeCodeAdapter = struct {
         writeHookScript(&content.writer, sink) catch return error.OutOfMemory;
         try self.writeSinkFile(&path_buffer, sink, "hook.sh", content.written());
         content.clearRetainingCapacity();
-        writeSettings(&content.writer, sink) catch return error.OutOfMemory;
+        writeSettingsVia(&content.writer, sink, self.control_helper) catch return error.OutOfMemory;
         try self.writeSinkFile(&path_buffer, sink, "settings.json", content.written());
         try self.writeSinkFile(&path_buffer, sink, "events.jsonl", "");
     }
@@ -1541,6 +1570,30 @@ test "identifiers: session ids, request ids, sink paths, versions" {
     try testing.expect((try parseVersion("command not found", &version)) == null);
     var tiny: [3]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, parseVersion("2.1.292", &tiny));
+}
+
+test "with the control helper every hook but PermissionRequest goes through conduit control" {
+    const sink = "/run/conduit/agent-1";
+    var content: Io.Writer.Allocating = .init(testing.allocator);
+    defer content.deinit();
+    try writeSettingsVia(&content.writer, sink, "/opt/conduit/bin/conduit");
+    const parsed = try std.json.parseFromSlice(Value, testing.allocator, content.written(), .{});
+    defer parsed.deinit();
+    const hooks = field(parsed.value, "hooks").?.object;
+    try testing.expectEqual(Hook.registered.len, hooks.count());
+    for (Hook.registered) |hook| {
+        const entries = field(hooks.get(hook.name()).?.array.items[0], "hooks").?.array;
+        var expected: [128]u8 = undefined;
+        const command = if (hook == .permission_request)
+            try std.fmt.bufPrint(&expected, "/bin/sh '/run/conduit/agent-1/hook.sh' {s}", .{hook.name()})
+        else
+            try std.fmt.bufPrint(&expected, "'/opt/conduit/bin/conduit' control agent.event --event={s}", .{hook.name()});
+        try testing.expectEqualStrings(command, string(entries.items[0], "command").?);
+    }
+    // An unquotable helper is ignored by the adapter, which keeps the relay.
+    var a = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .sink_dir = sink, .control_helper = "/opt/it's/conduit" });
+    defer a.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), a.control_helper);
 }
 
 test "the settings file registers every hook with the exact relay command" {

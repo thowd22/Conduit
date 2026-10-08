@@ -477,11 +477,34 @@ nothing else is a legal dependency.
   one before an exited one, then the newest); the manager's task column reads the same field.
   Test seam: `backlog_program` (the CLI name; `--backlog-test` points it at a fake, and a driven
   run takes `CONDUIT_TEST_BACKLOG_CLI`, which children never inherit).
+- **Control API and the `conduit` command (TASK-60 part two, TASK-66).** `App` implements
+  `control.Handler` for both servers (see [`control`](#control)) and services them in `poll`
+  (`pollControl`); the servers' connection threads only post a driver wake. A workspace token's
+  request runs in that workspace, with `session` checked to belong to it and never to be the
+  scratchpad or an SSH connection terminal: `tab.open` and `pane.split` focus the caller's pane
+  (`controlFocus`, switching workspace when needed), create the tab or pane exactly as
+  `tab.new`/`pane.split` do with the request's cwd, argv and title, spawn through the workspace's
+  ExecutionContext and reply once the spawn job reports back (`controlSpawnFinished` from
+  `pollPresentationLoad`); `view.agent` opens the agent's view and focuses its pane, `view.backlog`
+  calls `openBacklog`, `tab.status` keeps a `ControlTabStatus` mark (text plus an attention mark
+  cleared when the person activates the tab) that the sidebar label shows as `<mark><text> <name>`,
+  `notify` is `Runtime.raiseTerminal`, and `agent.event` is `Runtime.ingestControlEvent`. A request
+  that would move focus while the person holds a key or pointer, a modal or the palette is open, or
+  the workspace's spawn slot is busy waits in `control_pending` (in arrival order, at most 4 s, then
+  `Unavailable`). `appendControlEnv` adds `CONDUIT_CONTROL_ENDPOINT`, `CONDUIT_CONTROL_TOKEN` and
+  `CONDUIT_CONTROL_SESSION` per spawn (owned by the `Load` job) to Local human and agent terminals
+  only (`controlEnvAllowed`); `ChildSpec.inherited_exclusions` drops an enclosing Conduit's three,
+  so a scratchpad has none. Claude Code hooks run `conduit control agent.event --event=<Hook>`
+  (the adapter's `control_helper`, this executable) while the endpoint is up, falling back to the
+  sink. `parseArgs` takes a subcommand as the first non-flag word (`CliCommand`); `main` forwards
+  it before any log file or window exists (`runCommand`: the terminal's own endpoint when its
+  control variables are set, else the instance endpoint and token) and, when nothing answers,
+  starts the app and queues it as the startup request.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
-- **May depend on** `agent`, `backlog`, `config`, `font`, `input`, `link`, `palette`, `platform`, `pty`,
-  `render`, `session`, `term`, `testdriver`, `theme`, `ui`, and `workspace` — every other Conduit
+- **May depend on** `agent`, `backlog`, `config`, `control`, `font`, `input`, `link`, `palette`, `platform`, `pty`,
+  `render`, `session`, `state`, `term`, `testdriver`, `theme`, `ui`, and `workspace` — every other Conduit
   module.
 - **Root** `src/main.zig` — this module *is* the executable's root module, so there is no
   `src/app.zig`.
@@ -1716,17 +1739,29 @@ runners exercise it.
   an `agent.event` payload; the agent subsystem owns that (invariant 9).
 - **May depend on** `platform` only (`LocalSocketListener` for the private socket endpoint).
   Ids cross as plain integers, so it needs neither `workspace` nor `agent`; `app` maps them.
-- **Lands** M6 — TASK-60 part one (protocol, server, docs); part two wires `app`, the
-  `control.enabled` setting, the `conduit` CLI subcommands and MCP tools, and an E2E check.
+- **Lands** M6 — TASK-60 part one (protocol, server, docs) and part two (the `app` handler,
+  `control.enabled`, the `conduit control` helper, `--control-test`), and M8 — TASK-66 (the
+  `instance.*` methods, `control.runtimeDirectory` and the single-instance endpoint).
 
-The endpoint is one 0600 AF_UNIX socket per run inside the run's private 0700 directory
-(`platform.LocalSocketListener` refuses a parent with any group or other permission bit); it
-starts in Debug builds and in release builds only when `control.enabled` is set. Each workspace
-gets a random 128-bit token (owner-supplied entropy) that resolves to that workspace only;
-rotation or workspace close expires it at once, and a request already queued under an expired
-token is refused at `service`. Frames are newline-delimited JSON objects of at most 64 KiB; the
-eight methods are `ping`, `tab.open`, `pane.split`, `view.agent`, `view.backlog`, `tab.status`,
-`notify` and `agent.event`. Windows has no control transport yet: `LocalSocketListener` reports
+`app` starts two `control.Server`s when `control.enabled` resolves on (`--control` /
+`--no-control`, then the file, then on in Debug and off in release builds) and the run is not a
+built-in check other than `--control-test`. Both sockets live in the per-user runtime directory
+(`$XDG_RUNTIME_DIR/conduit`, else `/tmp/conduit-<uid>`; `$TMPDIR/conduit` on macOS), created
+0700: the run's endpoint `r-<8 hex>.sock`, whose workspace tokens are issued on a workspace's
+first spawn and revoked when it closes, and the instance endpoint `instance.sock`, whose one token
+(`control.instance_workspace`) is written 0600 to `<state dir>/instance.token`. A live instance
+already at `instance.sock` keeps it (`EndpointOccupied`). Each workspace token resolves to the
+workspace key (one-based, as in the semantic ids); the instance token names no workspace and
+accepts only `ping` and the four `instance.*` methods. Twelve methods exist: `ping`, `tab.open`,
+`pane.split`, `view.agent`, `view.backlog`, `tab.status`, `notify`, `agent.event`,
+`instance.open_directory`, `instance.open_ssh`, `instance.open_workspace` and `instance.agent`.
+
+The endpoint is one 0600 AF_UNIX socket per server inside a private 0700 directory
+(`platform.LocalSocketListener` refuses a parent with any group or other permission bit). Each
+workspace gets a random 128-bit token (owner-supplied entropy from `Io.randomSecure`) that
+resolves to that workspace only; rotation or workspace close expires it at once, and a request
+already queued under an expired token is refused at `service`. Frames are newline-delimited JSON
+objects of at most 64 KiB. Windows has no control transport yet: `LocalSocketListener` reports
 `UnsupportedPlatform` until a multi-instance protected named-pipe listener exists.
 
 ---

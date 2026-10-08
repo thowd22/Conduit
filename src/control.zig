@@ -16,6 +16,11 @@
 //! and revokes the token when the workspace closes. The scratchpad is never
 //! addressable: its child gets no control environment and the server refuses
 //! its session id. See `docs/control-api.md`.
+//!
+//! The single-instance endpoint (TASK-66) is a second `Server` the app runs
+//! at `instanceEndpoint` with one token, `instance_workspace`, kept 0600 in
+//! the state directory's `instance.token`. A `conduit <command>` reads that
+//! token and forwards its command as one of the `instance.*` methods.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,6 +34,52 @@ pub const token_env_name = protocol.token_env_name;
 pub const session_env_name = protocol.session_env_name;
 /// The endpoint's file name inside the run's private state directory.
 pub const endpoint_file_name = "control.sock";
+/// The single-instance endpoint's file name inside `runtimeDirectory`.
+pub const instance_endpoint_file_name = "instance.sock";
+/// The instance token's file name inside the state directory.
+pub const instance_token_file_name = "instance.token";
+/// The scope the instance token resolves to. Workspace refs are workspace
+/// keys (one-based), which never reach this value.
+pub const instance_workspace: WorkspaceRef = std.math.maxInt(WorkspaceRef);
+
+/// What `runtimeDirectory` reads from the environment. Each is null when unset.
+pub const RuntimeEnv = struct {
+    xdg_runtime_dir: ?[]const u8 = null,
+    tmpdir: ?[]const u8 = null,
+    /// The real user id, for the shared-`/tmp` fallback's name.
+    uid: u32 = 0,
+};
+
+/// The per-user directory Conduit's local sockets live in, written into
+/// `buffer`:
+///
+/// - Linux and other Unix: `$XDG_RUNTIME_DIR/conduit` (an absolute
+///   `XDG_RUNTIME_DIR` only), else `/tmp/conduit-<uid>`.
+/// - macOS: `$XDG_RUNTIME_DIR/conduit` when set, else `$TMPDIR/conduit`
+///   (the per-user temporary directory), else `/tmp/conduit-<uid>`.
+/// - Windows: null; there is no control transport there yet.
+///
+/// The caller creates it 0700; `platform.LocalSocketListener` refuses one
+/// with group or other permissions. `conduit-test launch` and `--control-test`
+/// set an isolated `XDG_RUNTIME_DIR`, so a test never reaches the user's
+/// instance.
+pub fn runtimeDirectory(buffer: []u8, os: std.Target.Os.Tag, env: RuntimeEnv) ?[]const u8 {
+    if (os == .windows) return null;
+    if (env.xdg_runtime_dir) |dir| {
+        if (dir.len != 0 and dir[0] == '/') return std.fmt.bufPrint(buffer, "{s}/conduit", .{std.mem.trimEnd(u8, dir, "/")}) catch null;
+    }
+    if (os == .macos) if (env.tmpdir) |dir| {
+        if (dir.len != 0 and dir[0] == '/') return std.fmt.bufPrint(buffer, "{s}/conduit", .{std.mem.trimEnd(u8, dir, "/")}) catch null;
+    };
+    return std.fmt.bufPrint(buffer, "/tmp/conduit-{d}", .{env.uid}) catch null;
+}
+
+/// `<runtimeDirectory>/instance.sock`, or null.
+pub fn instanceEndpoint(buffer: []u8, os: std.Target.Os.Tag, env: RuntimeEnv) ?[]const u8 {
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = runtimeDirectory(&dir_buffer, os, env) orelse return null;
+    return std.fmt.bufPrint(buffer, "{s}/{s}", .{ dir, instance_endpoint_file_name }) catch null;
+}
 
 pub const Token = protocol.Token;
 pub const Method = protocol.Method;
@@ -69,6 +120,60 @@ test "the endpoint is on in Debug builds and in release builds only when enabled
     try testing.expect(!enabledIn(.ReleaseSafe, false));
     try testing.expect(!enabledIn(.ReleaseFast, false));
     try testing.expect(enabledIn(.ReleaseSafe, true));
+}
+
+test "the runtime directory follows XDG_RUNTIME_DIR, then the platform's private fallback" {
+    var buffer: [256]u8 = undefined;
+    try testing.expectEqualStrings("/run/user/1000/conduit", runtimeDirectory(&buffer, .linux, .{ .xdg_runtime_dir = "/run/user/1000/", .uid = 1000 }).?);
+    // A relative XDG_RUNTIME_DIR is invalid by specification and ignored.
+    try testing.expectEqualStrings("/tmp/conduit-1000", runtimeDirectory(&buffer, .linux, .{ .xdg_runtime_dir = "run", .uid = 1000 }).?);
+    try testing.expectEqualStrings("/tmp/conduit-501", runtimeDirectory(&buffer, .linux, .{ .tmpdir = "/var/tmp", .uid = 501 }).?);
+    try testing.expectEqualStrings("/var/folders/x/T/conduit", runtimeDirectory(&buffer, .macos, .{ .tmpdir = "/var/folders/x/T/", .uid = 501 }).?);
+    try testing.expectEqual(@as(?[]const u8, null), runtimeDirectory(&buffer, .windows, .{ .tmpdir = "C:\\t" }));
+    try testing.expectEqualStrings("/run/user/7/conduit/instance.sock", instanceEndpoint(&buffer, .linux, .{ .xdg_runtime_dir = "/run/user/7" }).?);
+}
+
+test "the instance endpoint takes only the instance token and reaches the owner with instance methods" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const dir = try TestDir.create(0o700);
+    defer dir.remove();
+    var endpoint_buffer: [96]u8 = undefined;
+    const endpoint = try dir.join(&endpoint_buffer, instance_endpoint_file_name);
+
+    var wake: TestWake = .{};
+    const instance = try Server.start(testing.allocator, testing.io, .{
+        .endpoint = endpoint,
+        .enabled = true,
+        .waker = wake.waker(),
+        .reply_timeout_ms = 2000,
+    });
+    defer instance.deinit();
+    const token = try instance.issueToken(.{ .workspace = instance_workspace, .scratchpad_session = 0 }, @splat(0x42));
+    var owner: FakeOwner = .{ .workspace = instance_workspace };
+
+    var buffers: [4][512]u8 = undefined;
+    const frames = [_][]const u8{
+        try frameFor(&buffers[0], 1, "instance.open_directory", token.text(), ",\"params\":{\"path\":\"/srv/app\"}"),
+        try frameFor(&buffers[1], 2, "instance.agent", token.text(), ",\"params\":{\"harness\":\"claude\"}"),
+        // A workspace token is not registered here at all.
+        try frameFor(&buffers[2], 3, "instance.open_ssh", "0123456789abcdef0123456789abcdef", ",\"params\":{\"destination\":\"h\"}"),
+    };
+    var script: ClientScript = .{ .endpoint = endpoint, .frames = &frames };
+    defer script.deinit();
+    const thread = try std.Thread.spawn(.{}, ClientScript.run, .{&script});
+    serviceUntilDone(instance, &wake, &owner, &script) catch |err| {
+        instance.queue.stop();
+        thread.join();
+        return err;
+    };
+    thread.join();
+    // The fake owner answers only `ping`, `tab.open` and `agent.event`; the
+    // point is that both instance methods reached it with the instance scope.
+    try testing.expectEqualSlices(Method, &.{ .instance_open_directory, .instance_agent }, owner.methods[0..owner.method_count]);
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32001,\"message\":\"Unauthorized\"}}",
+        script.replies[2] orelse return error.TestMissingReply,
+    );
 }
 
 /// A private directory under /tmp: worktree paths are too long for sun_path.

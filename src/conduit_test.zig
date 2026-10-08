@@ -709,6 +709,12 @@ fn launchConduit(init: std.process.Init, argv0: []const u8, launch: Launch, root
     try child_env.put("TMPDIR", paths.temp);
     try child_env.put("TEMP", paths.temp);
     try child_env.put("TMP", paths.temp);
+    // The run's control and single-instance sockets (TASK-60, TASK-66) live
+    // under `$XDG_RUNTIME_DIR/conduit`, so a launched run never answers, or
+    // reaches, the person's own Conduit. The private 0700 run directory
+    // itself, rather than a subdirectory, keeps those socket paths inside
+    // `sockaddr_un` beside `driver.sock`.
+    try child_env.put("XDG_RUNTIME_DIR", paths.run_dir);
     _ = child_env.swapRemove("CONDUIT_LOG_FILE");
     _ = child_env.swapRemove("CONDUIT_LOG_DIR");
     if (builtin.os.tag == .windows) {

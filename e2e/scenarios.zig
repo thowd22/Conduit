@@ -634,6 +634,42 @@ const backlog_board_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-60/TASK-66: a shell whose PATH starts with the directory of the
+// Conduit it runs in (its parent process), so the typed `conduit control`
+// is the installed client talking to this run's own control endpoint.
+const control_api_command =
+    "d=$(dirname \"$(readlink /proc/$PPID/exe)\"); PATH=\"$d:$PATH\"; " ++
+    "PS1='CONDUIT_E2E> '; ENV=/dev/null; export PATH PS1 ENV; exec /bin/sh -i";
+
+// The first tab is tab 1 with pane 1; the API-opened tab is tab 2 with pane
+// 2, and the split it then asks for is pane 3.
+const control_api_tab_id = "workspace.1.tab.2";
+const control_api_split_id = "workspace.1.pane.3";
+
+const control_api_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .type_text = "conduit control tab.open '{\"title\":\"api\"}'" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = control_api_tab_id, .state = "exists", .equals = true } },
+    // The new tab's own shell, reached through the same command line.
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .type_text = "conduit control pane.split '{\"direction\":\"right\"}'" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = control_api_split_id, .state = "exists", .equals = true } },
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    // The marker is spelled whole only by the shell after an exit status of
+    // 0, so a refused request (which exits 1) can never satisfy the wait.
+    .{ .type_text = "conduit control tab.status '{\"text\":\"busy\",\"attention\":true}' && printf 'STATUS_%s\\n' SET" },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = "STATUS_SET" } },
+    // The opened tab is an ordinary tab: the mouse switches away and back.
+    .{ .click = "workspace.1.tab.1" },
+    .{ .wait_element = .{ .id = "workspace.1.pane.1", .state = "exists", .equals = true } },
+    .{ .click = control_api_tab_id },
+    .{ .wait_element = .{ .id = control_api_split_id, .state = "exists", .equals = true } },
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -730,12 +766,37 @@ pub const all = [_]Scenario{
         .command = backlog_board_command,
         .steps = &backlog_board_steps,
     },
+    .{
+        .name = "control-api",
+        .command = control_api_command,
+        .steps = &control_api_steps,
+    },
 };
+
+test "the control API scenario opens a tab and a pane from the terminal, then switches by mouse" {
+    const scenario = all[18];
+    try std.testing.expectEqualStrings("control-api", scenario.name);
+    try std.testing.expectEqual(@as(usize, 19), all.len);
+    var opened = false;
+    var split = false;
+    var clicked = false;
+    for (scenario.steps) |step| switch (step) {
+        .type_text => |text| {
+            if (std.mem.startsWith(u8, text, "conduit control tab.open")) opened = true;
+            if (std.mem.startsWith(u8, text, "conduit control pane.split")) split = true;
+        },
+        .click => |id| if (std.mem.eql(u8, id, control_api_tab_id)) {
+            clicked = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(opened and split and clicked);
+}
 
 test "the backlog scenario opens the view by chord, a card by click, and moves the task" {
     const scenario = all[17];
     try std.testing.expectEqualStrings("backlog-board", scenario.name);
-    try std.testing.expectEqual(@as(usize, 18), all.len);
+    try std.testing.expectEqual(@as(usize, 19), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_BACKLOG_CLI", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -760,7 +821,7 @@ test "the backlog scenario opens the view by chord, a card by click, and moves t
 test "the agent manager scenario opens the manager by chord and focuses by a click" {
     const scenario = all[16];
     try std.testing.expectEqualStrings("agent-manager", scenario.name);
-    try std.testing.expectEqual(@as(usize, 18), all.len);
+    try std.testing.expectEqual(@as(usize, 19), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -783,7 +844,7 @@ test "the agent manager scenario opens the manager by chord and focuses by a cli
 test "the agent view scenario opens the view by chord and answers by a click" {
     const scenario = all[15];
     try std.testing.expectEqualStrings("agent-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 18), all.len);
+    try std.testing.expectEqual(@as(usize, 19), all.len);
     var chords: usize = 0;
     var clicked = false;
     var outcome = false;
@@ -1051,7 +1112,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 18), all.len);
+    try std.testing.expectEqual(@as(usize, 19), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;

@@ -101,6 +101,11 @@ const agent_view = @import("agent_view.zig");
 /// The backlog view's board, list, detail and write-queue model (TASK-63).
 const backlog_view = @import("backlog_view.zig");
 const backlog = @import("backlog");
+/// The token-scoped local control API and the single-instance endpoint
+/// (TASK-60, TASK-66).
+const control_api = @import("control");
+/// Only for the state directory the instance token is kept in.
+const state_mod = @import("state");
 const ssh = workspace.ssh;
 
 test {
@@ -240,6 +245,50 @@ pub const Options = struct {
     print_version: bool = false,
     /// The window to open and how long to run, from the window flags.
     run: Run = .{},
+    /// A `conduit <command>` (TASK-66): forwarded to a running instance, or,
+    /// when none answers, executed by this run once it has started. Null for
+    /// a plain `conduit`.
+    command: ?CliCommand = null,
+    /// The directory `command` was typed in, absolute; set by `main` when
+    /// this run executes the command itself.
+    command_cwd: ?[]const u8 = null,
+};
+
+/// One `conduit` subcommand, as typed. Every slice borrows the command line.
+pub const CliCommand = union(enum) {
+    /// `conduit .` or `conduit <dir>`: open or focus a workspace there. The
+    /// path is resolved against the caller's working directory before it is
+    /// sent, because the running instance has a working directory of its own.
+    open_directory: []const u8,
+    /// `conduit ssh <host>`: open an SSH workspace.
+    open_ssh: []const u8,
+    /// `conduit workspace open <name>`: focus that workspace, or open one of
+    /// that name in the caller's working directory.
+    open_workspace: []const u8,
+    /// `conduit agent <harness> [prompt...]`: launch a harness in the current
+    /// workspace.
+    agent: struct { harness: []const u8, prompt: []const []const u8 },
+    /// `conduit control <method> [params-json]`: one raw request to this
+    /// terminal's control endpoint (the hook helper).
+    control: struct {
+        method: []const u8,
+        params: ?[]const u8 = null,
+        /// `--event=<Hook>`: wrap stdin as a Claude Code hook line.
+        event: ?[]const u8 = null,
+        /// `--agent=<token>`: the agent token instead of `$CONDUIT_AGENT_TOKEN`.
+        agent: ?[]const u8 = null,
+    },
+
+    /// The instance method this command forwards, or null for `control`.
+    pub fn method(self: CliCommand) ?control_api.Method {
+        return switch (self) {
+            .open_directory => .instance_open_directory,
+            .open_ssh => .instance_open_ssh,
+            .open_workspace => .instance_open_workspace,
+            .agent => .instance_agent,
+            .control => null,
+        };
+    }
 };
 
 /// The window the run opens and how long it runs for.
@@ -413,6 +462,23 @@ pub const Run = struct {
     /// this on unless a `--command` says otherwise, because a shell's output
     /// arriving mid-measurement would make the measurement about the shell.
     no_child: bool = false,
+    /// The session layer of `control.enabled` (TASK-60): `--control` or
+    /// `--no-control`. Null leaves the file and the build default standing.
+    control: ?bool = null,
+    /// Exercise TASK-60 part two and TASK-66: the control endpoint from a
+    /// real tab's shell, the scratchpad's exclusion and the single-instance
+    /// commands as separate processes, against a private runtime and state
+    /// directory. Runs in `--agent-test`'s environment (the flag sets
+    /// `agent_test` too).
+    control_test: bool = false,
+    /// The runtime directory the control and instance sockets live in instead
+    /// of `$XDG_RUNTIME_DIR`. Not a command-line flag: `runApp` sets it for
+    /// `--control-test`.
+    runtime_dir: ?[]const u8 = null,
+    /// The state directory the instance token is written to instead of the
+    /// platform one. Not a command-line flag: `runApp` sets it for
+    /// `--control-test`.
+    state_dir: ?[]const u8 = null,
     /// Start the shell exactly as it would start without Conduit: no `--posix`,
     /// no `ENV`, no `ZDOTDIR` swap, and therefore no working-directory or prompt
     /// reports from Conduit's scripts. The settings file has no shell key yet, so
@@ -497,6 +563,12 @@ pub const ConfigError = error{
     InvalidSize,
     InvalidScale,
     InvalidRightClick,
+    /// `conduit workspace <verb>` with a verb other than `open`.
+    UnknownCommand,
+    /// A subcommand without its required argument.
+    MissingArgument,
+    /// A subcommand followed by more than it takes.
+    UnexpectedArgument,
 };
 
 /// A window dimension: at least one pixel, because a window of no pixels is not a
@@ -551,10 +623,17 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
     var help = false;
     var print_version = false;
     var run: Run = .{};
+    var command: ?CliCommand = null;
 
     var i: usize = if (args.len == 0) 0 else 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        // The first word that is not a flag starts a subcommand, which takes
+        // the rest of the line (TASK-66).
+        if (arg.len != 0 and arg[0] != '-') {
+            command = try parseCommand(args[i..]);
+            break;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             help = true;
             break;
@@ -630,6 +709,13 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
         } else if (std.mem.eql(u8, arg, "--backlog-test")) {
             run.agent_test = true;
             run.backlog_test = true;
+        } else if (std.mem.eql(u8, arg, "--control-test")) {
+            run.agent_test = true;
+            run.control_test = true;
+        } else if (std.mem.eql(u8, arg, "--control")) {
+            run.control = true;
+        } else if (std.mem.eql(u8, arg, "--no-control")) {
+            run.control = false;
         } else if (std.mem.eql(u8, arg, "--ssh-test")) {
             run.ssh_test = true;
         } else if (std.mem.eql(u8, arg, "--font-test")) {
@@ -674,7 +760,52 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
         .help = help,
         .print_version = print_version,
         .run = run,
+        .command = command,
     };
+}
+
+/// Parse a subcommand: `words[0]` is its first word. Pure, like `parseArgs`.
+///
+/// `ssh`, `workspace`, `agent` and `control` are commands; any other word is
+/// a directory (`./ssh` names a directory called `ssh`).
+pub fn parseCommand(words: []const []const u8) ConfigError!CliCommand {
+    std.debug.assert(words.len != 0);
+    const first = words[0];
+    const rest = words[1..];
+    if (std.mem.eql(u8, first, "ssh")) {
+        if (rest.len == 0 or rest[0].len == 0) return error.MissingArgument;
+        if (rest.len > 1) return error.UnexpectedArgument;
+        return .{ .open_ssh = rest[0] };
+    }
+    if (std.mem.eql(u8, first, "workspace")) {
+        if (rest.len == 0) return error.MissingArgument;
+        if (!std.mem.eql(u8, rest[0], "open")) return error.UnknownCommand;
+        if (rest.len < 2 or rest[1].len == 0) return error.MissingArgument;
+        if (rest.len > 2) return error.UnexpectedArgument;
+        return .{ .open_workspace = rest[1] };
+    }
+    if (std.mem.eql(u8, first, "agent")) {
+        if (rest.len == 0 or rest[0].len == 0) return error.MissingArgument;
+        return .{ .agent = .{ .harness = rest[0], .prompt = rest[1..] } };
+    }
+    if (std.mem.eql(u8, first, "control")) {
+        if (rest.len == 0 or rest[0].len == 0 or rest[0][0] == '-') return error.MissingArgument;
+        var parsed: @FieldType(CliCommand, "control") = .{ .method = rest[0] };
+        for (rest[1..]) |word| {
+            if (std.mem.startsWith(u8, word, "--event=")) {
+                parsed.event = word["--event=".len..];
+                if (parsed.event.?.len == 0) return error.MissingValue;
+            } else if (std.mem.startsWith(u8, word, "--agent=")) {
+                parsed.agent = word["--agent=".len..];
+                if (parsed.agent.?.len == 0) return error.MissingValue;
+            } else if (parsed.params == null and (word.len == 0 or word[0] != '-')) {
+                parsed.params = word;
+            } else return error.UnexpectedArgument;
+        }
+        return .{ .control = parsed };
+    }
+    if (rest.len != 0) return error.UnexpectedArgument;
+    return .{ .open_directory = first };
 }
 
 /// The value of the first of `keys` that the environment sets.
@@ -1331,6 +1462,10 @@ const Load = struct {
     /// when the request borrows that stable spec. A file-reference editor is
     /// built per job from terminal-derived text and dies with the job.
     spawn_argv: ?[][]const u8 = null,
+    /// Owned environment used by `spawn` instead of the app-level child spec:
+    /// that spec plus this session's control variables (TASK-60). Null when
+    /// the request borrows the stable spec.
+    spawn_env: ?[][]const u8 = null,
     /// The stable session that requested `spawn`. Selection may change while
     /// the worker runs, but ownership of its result may not.
     spawn_session_id: ?session.SessionId = null,
@@ -1378,6 +1513,8 @@ const Load = struct {
         self.spawn_cwd = null;
         if (self.spawn_argv) |argv| freeEntries(self.allocator, argv);
         self.spawn_argv = null;
+        if (self.spawn_env) |env| freeEntries(self.allocator, env);
+        self.spawn_env = null;
     }
 
     fn work(worker_context: *anyopaque) void {
@@ -1529,6 +1666,14 @@ const ChildSpec = struct {
         fake_agent_env,
         // The backlog view's test stand-in (TASK-63) is the app's, not a child's.
         backlog_cli_env,
+        // An enclosing Conduit's control endpoint, token and session (TASK-60)
+        // name that Conduit's workspace and terminal. They are added per spawn
+        // by `appendControlEnv` for this run's own non-scratchpad children
+        // only, so a scratchpad (or a nested Conduit's child) never inherits a
+        // way to address an endpoint.
+        control_api.endpoint_env_name,
+        control_api.token_env_name,
+        control_api.session_env_name,
     };
 
     /// A child's environment while it is being built: the key-replacing map
@@ -1614,10 +1759,19 @@ const ChildSpec = struct {
             settings_test_script
         else if (options.run.git_test)
             git_test_script
+        else if (options.run.control_test)
+            control_test_script
         else if (options.run.agent_test)
             agent_test_script
         else
             options.run.command;
+        // `--control-test`'s tabs see the check's private runtime and state
+        // directories, so the `conduit` commands they run reach this run's
+        // instance endpoint and never the user's.
+        if (options.run.control_test) {
+            if (options.run.runtime_dir) |dir| try variables.put("XDG_RUNTIME_DIR", dir);
+            if (options.run.state_dir) |dir| try variables.put("XDG_STATE_HOME", dir);
+        }
         // `--agent-test`'s first tab arms a background notification that a
         // file in the check's private directory releases.
         if (options.run.agent_test_dir) |dir| {
@@ -1739,6 +1893,117 @@ const ChildSpec = struct {
         try list.append(allocator, try allocator.dupe(u8, text));
     }
 };
+
+/// Whether a child of `kind` in a workspace of `context` gets this run's
+/// control variables (TASK-60). Only a Local context's terminals can reach a
+/// local socket, and the scratchpad and an SSH connection terminal never get
+/// a way to address the endpoint at all.
+fn controlEnvAllowed(kind: session.Session.Kind, context: workspace.ExecutionContextKind) bool {
+    if (context != .local) return false;
+    return switch (kind) {
+        .human_terminal, .agent_terminal => true,
+        .scratchpad, .connection => false,
+    };
+}
+
+/// `base` plus `CONDUIT_CONTROL_ENDPOINT`, `CONDUIT_CONTROL_TOKEN` and
+/// `CONDUIT_CONTROL_SESSION`, as a new owned list of owned strings (free with
+/// `freeEntries`). Any control variable already in `base` is dropped first, so
+/// the child sees exactly these three.
+fn appendControlEnv(
+    allocator: Allocator,
+    base: []const []const u8,
+    endpoint: []const u8,
+    token: []const u8,
+    session_id: session.SessionId,
+) Allocator.Error![][]const u8 {
+    var entries: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (entries.items) |entry| allocator.free(entry);
+        entries.deinit(allocator);
+    }
+    try entries.ensureTotalCapacity(allocator, base.len + 3);
+    for (base) |entry| {
+        const name = entry[0 .. std.mem.indexOfScalar(u8, entry, '=') orelse entry.len];
+        if (std.mem.eql(u8, name, control_api.endpoint_env_name) or std.mem.eql(u8, name, control_api.token_env_name) or
+            std.mem.eql(u8, name, control_api.session_env_name)) continue;
+        entries.appendAssumeCapacity(try allocator.dupe(u8, entry));
+    }
+    entries.appendAssumeCapacity(try std.fmt.allocPrint(allocator, "{s}={s}", .{ control_api.endpoint_env_name, endpoint }));
+    entries.appendAssumeCapacity(try std.fmt.allocPrint(allocator, "{s}={s}", .{ control_api.token_env_name, token }));
+    entries.appendAssumeCapacity(try std.fmt.allocPrint(allocator, "{s}={d}", .{ control_api.session_env_name, @intFromEnum(session_id) }));
+    return entries.toOwnedSlice(allocator);
+}
+
+/// An owned copy of `argv` (free with `freeEntries`).
+fn dupeArgv(allocator: Allocator, argv: []const []const u8) Allocator.Error![][]const u8 {
+    const out = try allocator.alloc([]const u8, argv.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |arg| allocator.free(arg);
+        allocator.free(out);
+    }
+    for (argv) |arg| {
+        out[filled] = try allocator.dupe(u8, arg);
+        filled += 1;
+    }
+    return out;
+}
+
+/// The harness `conduit agent <name>` names: `claude` is Claude Code; every
+/// other name is the harness's own (`codex`, `pi`, `opencode`, or the
+/// spelling `agent.launch` takes), and `fake` the scripted test harness.
+fn controlHarnessChoice(name: []const u8) ?app_agents.Choice {
+    if (std.mem.eql(u8, name, "claude")) return .{ .harness = .claude_code };
+    return app_agents.Choice.parse(name);
+}
+
+/// The real user id, for the shared-`/tmp` socket directory's name.
+fn currentUid() u32 {
+    if (comptime builtin.os.tag == .windows) return 0;
+    return @intCast(std.posix.system.getuid());
+}
+
+/// Where this run's control and instance sockets live: `<override>/conduit`
+/// for `--control-test`, else `control_api.runtimeDirectory`.
+fn controlRuntimeDir(buffer: []u8, env: EnvSource, override: ?[]const u8) ?[]const u8 {
+    if (override) |dir| return std.fmt.bufPrint(buffer, "{s}/conduit", .{dir}) catch null;
+    return control_api.runtimeDirectory(buffer, builtin.os.tag, .{
+        .xdg_runtime_dir = env.get("XDG_RUNTIME_DIR"),
+        .tmpdir = env.get("TMPDIR"),
+        .uid = currentUid(),
+    });
+}
+
+/// `<state directory>/instance.token`, beside `state.json`. `state_home`
+/// stands in for `$XDG_STATE_HOME` (`--control-test`).
+fn instanceTokenPath(buffer: []u8, env: EnvSource, state_home: ?[]const u8) ?[]const u8 {
+    var state_buffer: [path_capacity]u8 = undefined;
+    const state_path = state_mod.statePath(&state_buffer, builtin.os.tag, .{
+        .xdg_state_home = state_home orelse env.get("XDG_STATE_HOME"),
+        .home = env.get("HOME"),
+        .local_app_data = env.get("LOCALAPPDATA"),
+    }) orelse return null;
+    const dir = std.fs.path.dirname(state_path) orelse return null;
+    return std.fmt.bufPrint(buffer, "{s}{c}{s}", .{ dir, std.fs.path.sep, control_api.instance_token_file_name }) catch null;
+}
+
+/// Write the instance token, replacing any earlier one, as a new 0600 file in
+/// a 0700 directory: only this user's `conduit` commands can read it.
+fn writeInstanceToken(io: Io, path: []const u8, token: []const u8) !void {
+    const dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    _ = try Dir.cwd().createDirPathStatus(io, dir, privateArtifactPermissions(true));
+    Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    const file = try Dir.cwd().createFile(io, path, .{ .exclusive = true, .permissions = privateArtifactPermissions(false) });
+    defer file.close(io);
+    var line: [control_api.Token.text_len + 1]u8 = undefined;
+    @memcpy(line[0..token.len], token);
+    line[token.len] = '\n';
+    try file.writePositionalAll(io, line[0 .. token.len + 1], 0);
+}
 
 /// Free a list of owned strings and the list itself. An empty slice is the
 /// literal `&.{}`, which owns nothing, so it is not freed.
@@ -3290,7 +3555,64 @@ const WorkspacePresentation = struct {
     /// The workspace's backlog view (TASK-63), created the first time it
     /// opens. Owned; released (its write joined) before the workspace.
     backlog: ?*backlog_view.Panel = null,
+    /// The workspace's control token (TASK-60), issued the first time one of
+    /// its terminals is spawned while the endpoint runs, revoked when the
+    /// workspace closes.
+    control_token: ?control_api.Token = null,
 };
+
+/// One control request the owner has not answered yet (TASK-60).
+const ControlPending = struct {
+    /// The server that holds the ticket; null for the startup command.
+    server: ?*control_api.Server,
+    ticket: control_api.Ticket,
+    /// Borrowed from the server's queue slot (or the startup request) until
+    /// the ticket is completed.
+    request: *const control_api.Request,
+    /// When a waiting request gives up with `Unavailable` (awake clock).
+    deadline_ns: i96,
+    state: union(enum) {
+        /// Input, a modal or the workspace's spawn slot is busy; retried on
+        /// every loop iteration, in order.
+        waiting,
+        /// The tab, pane or agent exists and its child is being spawned; the
+        /// reply goes out when the worker reports back.
+        spawning: struct { key: workspace.WorkspaceKey, session_id: session.SessionId, opened: control_api.Opened },
+    },
+};
+
+/// How long a deferred control request waits for the app to be free before
+/// it is refused, kept under the server's own five-second reply deadline.
+const control_wait_ms: i96 = 4000;
+/// The most deferred control requests at once: one per queue slot.
+const control_pending_capacity: usize = 32;
+/// The most tabs with a `tab.status` mark at once.
+const control_status_capacity: usize = 64;
+/// How many queued control requests one loop iteration takes.
+const control_service_batch: usize = 8;
+
+/// One tab's `tab.status` mark (TASK-60): a short text shown before the tab's
+/// name and an attention mark like a bell's, until cleared or the tab is
+/// activated by the person.
+const ControlTabStatus = struct {
+    key: workspace.WorkspaceKey,
+    tab_id: workspace.TabId,
+    text: [control_api.protocol.max_status_bytes]u8 = undefined,
+    text_len: u8 = 0,
+    attention: bool = false,
+
+    fn textSlice(self: *const ControlTabStatus) []const u8 {
+        return self.text[0..self.text_len];
+    }
+};
+
+/// The sidebar label for a tab with a `tab.status` mark: the attention mark
+/// (or the tab's own `* `/`! `), the status text and the name.
+fn controlTabLabel(buffer: []u8, display_label: []const u8, name: []const u8, mark: *const ControlTabStatus) []const u8 {
+    const prefix = if (mark.attention) "! " else display_label[0 .. display_label.len - name.len];
+    if (mark.text_len == 0) return std.fmt.bufPrint(buffer, "{s}{s}", .{ prefix, name }) catch display_label;
+    return std.fmt.bufPrint(buffer, "{s}{s} {s}", .{ prefix, mark.textSlice(), name }) catch display_label;
+}
 
 /// Release a workspace's backlog view, joining a write in flight that borrows
 /// the workspace's context. Main thread.
@@ -4585,7 +4907,8 @@ const App = struct {
     /// Sidebar labels with an agent glyph, per row slot, and the state ids of
     /// the glyph elements. The ids alternate storage per frame, like terminal
     /// link ids, so the tree never sees an id's bytes change under it.
-    agent_tab_labels: [sidebar_element_capacity][tab_name_capacity + 8]u8 = undefined,
+    /// Also holds a `tab.status` label (TASK-60): mark, status text and name.
+    agent_tab_labels: [sidebar_element_capacity][tab_name_capacity + 8 + control_api.protocol.max_status_bytes]u8 = undefined,
     agent_workspace_labels: [sidebar_element_capacity][tab_name_capacity + 8]u8 = undefined,
     agent_state_ids: [2][sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
     agent_state_id_generation: usize = 0,
@@ -4688,6 +5011,29 @@ const App = struct {
     driver_pending: [driver_pending_capacity]?DriverPending = @splat(null),
     next_driver_barrier: u32 = 1,
     driver_quit_deadline_ns: ?i128 = null,
+
+    /// The run's control endpoint (TASK-60), when `control.enabled` is on.
+    /// Owned; stopped first in `deinit`. Its connection threads only wake the
+    /// loop; every request is performed on this thread by `pollControl`.
+    control_server: ?*control_api.Server = null,
+    /// The per-user single-instance endpoint (TASK-66): a second server with
+    /// one token, `control_api.instance_workspace`. Owned.
+    instance_server: ?*control_api.Server = null,
+    /// The instance token file this run wrote, removed when it leaves. Owned.
+    instance_token_path: ?[]u8 = null,
+    /// This executable, for the Claude Code hooks' `conduit control` helper.
+    /// Owned; null when it cannot be found.
+    self_exe: ?[:0]u8 = null,
+    /// Requests the owner deferred: waiting for input, a modal or a spawn
+    /// slot to clear, or for their spawn to finish. In arrival order.
+    control_pending: std.ArrayList(ControlPending) = .empty,
+    /// `tab.status` marks (TASK-60), by workspace and tab.
+    control_status: [control_status_capacity]?ControlTabStatus = @splat(null),
+    /// A `conduit <command>` this run executes once it has started (TASK-66),
+    /// queued like a request.
+    startup_request: ?control_api.Request = null,
+    /// Owned copies the startup request's strings borrow.
+    startup_arena: ?std.heap.ArenaAllocator = null,
 
     /// The `--ui-test` fixture while that check is running. Borrowed from the
     /// check's stack; null for every production frame.
@@ -5610,6 +5956,9 @@ const App = struct {
             app.driver = try platform.DriverTransport.start(allocator, endpoint, window);
             log.info("test driver listening on a local endpoint", .{});
         }
+        // The control endpoints start before the first spawn so the first
+        // tab's child already carries its control variables (TASK-60).
+        app.startControl(env, options);
         // Start the worker only after every fallible initialization step. On
         // an earlier error the local errdefers own cleanup; once this starts,
         // the returned App owns and joins it during deinit.
@@ -5617,6 +5966,739 @@ const App = struct {
         app.startChild();
         app.startConfigWatcher();
         return app;
+    }
+
+    // The control API and the single instance (TASK-60, TASK-66) -------------
+
+    /// The control servers' waker: post an event so a blocked loop iterates
+    /// and `pollControl` takes the request. Called from connection threads;
+    /// `window` is set once at startup and `postDriverWake` is thread-safe.
+    fn controlWake(context: ?*anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(context.?));
+        self.window.postDriverWake() catch |err| {
+            log.debug("could not wake the event loop for a control request: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Sixteen bytes for a token: the OS's entropy, else the process CSPRNG
+    /// it seeded.
+    fn controlEntropy(self: *App) [control_api.Token.byte_count]u8 {
+        var bytes: [control_api.Token.byte_count]u8 = undefined;
+        self.io.randomSecure(&bytes) catch self.io.random(&bytes);
+        return bytes;
+    }
+
+    /// Start the run's control endpoint and the single-instance endpoint when
+    /// `control.enabled` resolves on. Built-in checks other than
+    /// `--control-test` never start them, so a check run cannot answer the
+    /// person's `conduit` commands. Failures cost the API, never the run.
+    fn startControl(self: *App, env: EnvSource, options: Options) void {
+        self.control_pending.ensureTotalCapacity(self.allocator, control_pending_capacity) catch |err| {
+            log.warn("the control endpoint is off: {s}", .{@errorName(err)});
+            return;
+        };
+        if (usesDeterministicScratchpad(options) and !options.run.control_test) return;
+        if (!config.controlEnabled(options.run.control, self.config_current.settings.control_enabled)) {
+            log.debug("the control endpoint is off (control.enabled)", .{});
+            return;
+        }
+        var dir_buffer: [path_capacity]u8 = undefined;
+        const dir = controlRuntimeDir(&dir_buffer, env, options.run.runtime_dir) orelse {
+            log.info("no runtime directory for the control endpoint; it is off", .{});
+            return;
+        };
+        _ = Dir.cwd().createDirPathStatus(self.io, dir, privateArtifactPermissions(true)) catch |err| {
+            log.warn("the control endpoint's directory could not be created: {s}", .{@errorName(err)});
+            return;
+        };
+        // A short name: the whole path must fit `sockaddr_un` (about 104
+        // bytes), and an isolated test run's runtime directory is long.
+        var suffix: [4]u8 = undefined;
+        self.io.random(&suffix);
+        var endpoint_buffer: [path_capacity]u8 = undefined;
+        const endpoint = std.fmt.bufPrint(&endpoint_buffer, "{s}/r-{x}.sock", .{ dir, &suffix }) catch return;
+        const waker: control_api.Waker = .{ .context = self, .wakeFn = controlWake };
+        if (control_api.Server.start(self.allocator, self.io, .{ .endpoint = endpoint, .enabled = true, .waker = waker })) |server| {
+            self.control_server = server;
+            self.self_exe = std.process.executablePathAlloc(self.io, self.allocator) catch null;
+            self.agents.control_helper = self.self_exe;
+            log.info("control endpoint listening in the runtime directory", .{});
+        } else |err| log.warn("the control endpoint could not start: {s}", .{@errorName(err)});
+        self.startInstance(env, options, dir, waker);
+    }
+
+    /// Serve `conduit` commands at `<dir>/instance.sock` with a fresh token
+    /// written 0600 to the state directory. A live instance already there
+    /// keeps it: this run then simply does not answer commands.
+    fn startInstance(self: *App, env: EnvSource, options: Options, dir: []const u8, waker: control_api.Waker) void {
+        var endpoint_buffer: [path_capacity]u8 = undefined;
+        const endpoint = std.fmt.bufPrint(&endpoint_buffer, "{s}/{s}", .{ dir, control_api.instance_endpoint_file_name }) catch return;
+        var token_buffer: [path_capacity]u8 = undefined;
+        const token_path = instanceTokenPath(&token_buffer, env, options.run.state_dir) orelse {
+            log.info("no state directory for the instance token; `conduit` commands will start a new window", .{});
+            return;
+        };
+        const server = control_api.Server.start(self.allocator, self.io, .{ .endpoint = endpoint, .enabled = true, .waker = waker }) catch |err| {
+            switch (err) {
+                error.EndpointOccupied => log.info("another Conduit answers `conduit` commands", .{}),
+                else => log.warn("the instance endpoint could not start: {s}", .{@errorName(err)}),
+            }
+            return;
+        };
+        const token = server.issueToken(.{ .workspace = control_api.instance_workspace, .scratchpad_session = 0 }, self.controlEntropy()) catch |err| {
+            log.warn("the instance token could not be issued: {s}", .{@errorName(err)});
+            server.deinit();
+            return;
+        };
+        writeInstanceToken(self.io, token_path, token.text()) catch |err| {
+            log.warn("the instance token could not be written: {s}", .{@errorName(err)});
+            server.deinit();
+            return;
+        };
+        self.instance_token_path = self.allocator.dupe(u8, token_path) catch null;
+        self.instance_server = server;
+        log.info("answering `conduit` commands", .{});
+    }
+
+    /// Stop both endpoints: answer every deferred request, join every
+    /// connection thread, remove the sockets and this run's token file.
+    fn stopControl(self: *App) void {
+        for (self.control_pending.items) |item| {
+            if (item.server) |server| server.complete(item.ticket, .{ .fault = .unavailable });
+        }
+        self.control_pending.deinit(self.allocator);
+        self.control_pending = .empty;
+        if (self.instance_server) |server| server.deinit();
+        self.instance_server = null;
+        if (self.instance_token_path) |path| {
+            Dir.cwd().deleteFile(self.io, path) catch |err| log.debug("the instance token was not removed: {s}", .{@errorName(err)});
+            self.allocator.free(path);
+        }
+        self.instance_token_path = null;
+        if (self.control_server) |server| server.deinit();
+        self.control_server = null;
+        self.agents.control_helper = null;
+        if (self.startup_arena) |*arena| arena.deinit();
+        self.startup_arena = null;
+        self.startup_request = null;
+    }
+
+    /// `presentation`'s token, issued on first use.
+    fn controlTokenFor(self: *App, presentation: *WorkspacePresentation, model: *const workspace.Workspace) ?control_api.Token {
+        if (presentation.control_token) |token| return token;
+        const server = self.control_server orelse return null;
+        const token = server.issueToken(.{
+            .workspace = @intFromEnum(presentation.key),
+            .scratchpad_session = @intFromEnum(model.scratchpadId()),
+        }, self.controlEntropy()) catch |err| {
+            log.warn("no control token for a workspace: {s}", .{@errorName(err)});
+            return null;
+        };
+        presentation.control_token = token;
+        return token;
+    }
+
+    fn revokeControl(self: *App, presentation: *WorkspacePresentation) void {
+        if (self.control_server) |server| server.revokeWorkspace(@intFromEnum(presentation.key));
+        presentation.control_token = null;
+        for (&self.control_status) |*slot| {
+            if (slot.*) |mark| if (mark.key == presentation.key) {
+                slot.* = null;
+            };
+        }
+    }
+
+    /// The environment a child of `session_id` spawns with when it gets the
+    /// control variables: `base` plus the three, owned by the caller. Null
+    /// when the endpoint is off or the session may not have them.
+    fn controlEnvFor(
+        self: *App,
+        presentation: *WorkspacePresentation,
+        model: *const workspace.Workspace,
+        session_id: session.SessionId,
+        base: []const []const u8,
+    ) ?[][]const u8 {
+        const server = self.control_server orelse return null;
+        const kind = model.sessionKind(session_id) orelse return null;
+        if (!controlEnvAllowed(kind, model.contextKind())) return null;
+        const token = self.controlTokenFor(presentation, model) orelse return null;
+        return appendControlEnv(self.allocator, base, server.endpointPath(), token.text(), session_id) catch |err| {
+            log.warn("a child starts without its control variables: {s}", .{@errorName(err)});
+            return null;
+        };
+    }
+
+    fn controlHandler(self: *App) control_api.Handler {
+        return .{ .context = self, .vtable = &control_vtable };
+    }
+
+    const control_vtable: control_api.Handler.VTable = .{ .handle = handleControl };
+
+    /// The servers' hand-off, on this thread from `pollControl`. A request
+    /// that cannot run yet, or whose spawn is still running, is deferred.
+    fn handleControl(context: *anyopaque, ticket: control_api.Ticket, request: *const control_api.Request) control_api.Disposition {
+        const self: *App = @ptrCast(@alignCast(context));
+        // Instance tokens exist only on the instance server, workspace tokens
+        // only on the run's; the scope says which queue holds the ticket.
+        const server = if (request.workspace == control_api.instance_workspace) self.instance_server else self.control_server;
+        if (self.control_pending.items.len >= control_pending_capacity) return .{ .reply = .{ .fault = .busy } };
+        // Requests run in arrival order: behind a waiting one, wait too.
+        if (self.controlWaiting()) return self.deferControl(server, ticket, request, .waiting);
+        return switch (self.controlPerform(request)) {
+            .reply => |reply| .{ .reply = reply },
+            .wait => self.deferControl(server, ticket, request, .waiting),
+            .spawning => |spawn| self.deferControl(server, ticket, request, .{ .spawning = spawn }),
+        };
+    }
+
+    fn deferControl(
+        self: *App,
+        server: ?*control_api.Server,
+        ticket: control_api.Ticket,
+        request: *const control_api.Request,
+        state: @FieldType(ControlPending, "state"),
+    ) control_api.Disposition {
+        // Capacity was reserved in `startControl` and checked by the caller.
+        self.control_pending.appendAssumeCapacity(.{
+            .server = server,
+            .ticket = ticket,
+            .request = request,
+            .deadline_ns = Io.Clock.awake.now(self.io).nanoseconds + control_wait_ms * std.time.ns_per_ms,
+            .state = state,
+        });
+        return .deferred;
+    }
+
+    fn controlWaiting(self: *const App) bool {
+        for (self.control_pending.items) |item| if (item.state == .waiting) return true;
+        return false;
+    }
+
+    /// Take queued requests, retry deferred ones in order and expire those
+    /// that waited too long. Owner thread, once per loop iteration.
+    fn pollControl(self: *App) bool {
+        var changed = false;
+        if (self.control_server) |server| changed = server.service(self.controlHandler(), control_service_batch) != 0 or changed;
+        if (self.instance_server) |server| changed = server.service(self.controlHandler(), control_service_batch) != 0 or changed;
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        var index: usize = 0;
+        while (index < self.control_pending.items.len) {
+            const item = &self.control_pending.items[index];
+            switch (item.state) {
+                .spawning => |spawn| {
+                    // A workspace closed under its spawn never reports back.
+                    const presentation = self.presentationByKey(spawn.key);
+                    if (presentation == null or presentation.?.closing) {
+                        self.finishControl(index, .{ .fault = .unavailable });
+                        changed = true;
+                        continue;
+                    }
+                    index += 1;
+                },
+                .waiting => {
+                    switch (self.controlPerform(item.request)) {
+                        .reply => |reply| {
+                            self.finishControl(index, reply);
+                            changed = true;
+                        },
+                        .spawning => |spawn| {
+                            item.state = .{ .spawning = spawn };
+                            changed = true;
+                            index += 1;
+                        },
+                        .wait => {
+                            if (now < item.deadline_ns) break;
+                            self.finishControl(index, .{ .fault = .unavailable });
+                            changed = true;
+                        },
+                    }
+                },
+            }
+        }
+        return changed;
+    }
+
+    /// Answer and forget `control_pending[index]`.
+    fn finishControl(self: *App, index: usize, reply: control_api.Reply) void {
+        const item = self.control_pending.orderedRemove(index);
+        if (item.server) |server| {
+            server.complete(item.ticket, reply);
+            return;
+        }
+        // The startup command has no client left to tell.
+        switch (reply) {
+            .result => log.info("the startup command was carried out", .{}),
+            .fault => |fault| {
+                log.warn("the startup command was not carried out: {s}", .{fault.message()});
+                self.setWorkspaceStatus("conduit: the command could not be carried out");
+            },
+        }
+    }
+
+    /// A spawn job for `session_id` reported back: answer the request that
+    /// started it.
+    fn controlSpawnFinished(self: *App, key: workspace.WorkspaceKey, session_id: session.SessionId, started: bool) void {
+        var index: usize = 0;
+        while (index < self.control_pending.items.len) {
+            const item = self.control_pending.items[index];
+            const spawn = switch (item.state) {
+                .spawning => |value| value,
+                .waiting => {
+                    index += 1;
+                    continue;
+                },
+            };
+            if (spawn.key != key or spawn.session_id != session_id) {
+                index += 1;
+                continue;
+            }
+            self.finishControl(index, if (started) .{ .result = .{ .opened = spawn.opened } } else .{ .fault = .internal_error });
+        }
+    }
+
+    const ControlOutcome = union(enum) {
+        reply: control_api.Reply,
+        /// Not now: input, a modal or the spawn slot is busy.
+        wait,
+        spawning: ControlSpawn,
+    };
+
+    const ControlSpawn = @FieldType(@FieldType(ControlPending, "state"), "spawning");
+
+    fn controlFault(code: control_api.FaultCode) ControlOutcome {
+        return .{ .reply = .{ .fault = code } };
+    }
+
+    fn controlOk() ControlOutcome {
+        return .{ .reply = .{ .result = .ok } };
+    }
+
+    fn controlOpened(opened: control_api.Opened) ControlOutcome {
+        return .{ .reply = .{ .result = .{ .opened = opened } } };
+    }
+
+    /// Perform one request. Never fails: an unexpected error is logged and
+    /// answered `InternalError`.
+    fn controlPerform(self: *App, request: *const control_api.Request) ControlOutcome {
+        return self.controlPerformChecked(request) catch |err| {
+            log.warn("a control request failed: {s}", .{@errorName(err)});
+            return controlFault(.internal_error);
+        };
+    }
+
+    /// The caller a workspace token names: its workspace and, when it gave
+    /// one, its own session, checked to belong to that workspace.
+    const ControlCaller = struct {
+        key: workspace.WorkspaceKey,
+        presentation: *WorkspacePresentation,
+        model: *workspace.Workspace,
+        session_id: ?session.SessionId,
+    };
+
+    fn controlCaller(self: *App, request: *const control_api.Request) union(enum) { caller: ControlCaller, fault: control_api.FaultCode } {
+        const key: workspace.WorkspaceKey = @enumFromInt(request.workspace);
+        const presentation = self.presentationByKey(key) orelse return .{ .fault = .not_found };
+        if (presentation.closing) return .{ .fault = .not_found };
+        const model = self.workspace_registry.byKey(key) orelse return .{ .fault = .not_found };
+        var session_id: ?session.SessionId = null;
+        if (request.session) |raw| {
+            const id: session.SessionId = @enumFromInt(raw);
+            switch (model.sessionKind(id) orelse return .{ .fault = .not_found }) {
+                // The server refuses the scratchpad already; this is the
+                // owner's own check, never relaxed.
+                .scratchpad => return .{ .fault = .scratchpad_not_addressable },
+                .connection => return .{ .fault = .not_found },
+                .human_terminal, .agent_terminal => session_id = id,
+            }
+        }
+        return .{ .caller = .{ .key = key, .presentation = presentation, .model = model, .session_id = session_id } };
+    }
+
+    fn controlPerformChecked(self: *App, request: *const control_api.Request) !ControlOutcome {
+        const method = std.meta.activeTag(request.params);
+        if (method == .ping) return .{ .reply = .{ .result = .pong } };
+        const instance = request.workspace == control_api.instance_workspace;
+        // The instance token opens workspaces and launches agents; it names
+        // no workspace, so it cannot open tabs or report status in one.
+        if (instance and !method.isInstance()) return controlFault(.unauthorized);
+        if (self.requested_shutdown or self.workspace_registry.count() == 0) return controlFault(.unavailable);
+        const caller: ?ControlCaller = if (instance) null else switch (self.controlCaller(request)) {
+            .caller => |value| value,
+            .fault => |code| return controlFault(code),
+        };
+        return switch (request.params) {
+            .ping => unreachable, // answered above
+            .tab_open => |open| self.controlTabOpen(caller.?, open.spawn, open.title),
+            .pane_split => |split| self.controlPaneSplit(caller.?, split.direction, split.spawn),
+            .view_agent => |view| self.controlViewAgent(caller.?, view.agent_id),
+            .view_backlog => self.controlViewBacklog(caller.?),
+            .tab_status => |status| self.controlTabStatus(caller.?, status.text, status.attention),
+            .notify => |note| blk: {
+                const id = caller.?.session_id orelse caller.?.model.activeSessionId() orelse break :blk controlFault(.not_found);
+                self.agents.raiseTerminal(caller.?.key, id, note.title, note.body);
+                self.invalidateUi();
+                break :blk controlOk();
+            },
+            .agent_event => |event| blk: {
+                self.agents.ingestControlEvent(caller.?.key, &event.agent, event.payload_json) catch |err| break :blk controlFault(switch (err) {
+                    error.NotFound => .not_found,
+                    error.Unavailable => .unavailable,
+                    error.Rejected => .invalid_params,
+                });
+                break :blk controlOk();
+            },
+            .instance_open_directory => |open| self.controlOpenDirectory(open.path),
+            .instance_open_ssh => |open| self.controlOpenSsh(open.destination),
+            .instance_open_workspace => |open| self.controlOpenWorkspace(open.name, open.path),
+            .instance_agent => |launch| self.controlAgent(caller, launch.harness, launch.prompt),
+        };
+    }
+
+    /// Whether the person is mid-gesture or a modal owns input: a control
+    /// request then waits rather than move focus under them.
+    fn controlUiBusy(self: *const App) bool {
+        return self.paletteVisible() or self.closeModalActive() or self.workspaceTransitionBlocked();
+    }
+
+    /// Bring `key` forward and, when given, the tab and pane presenting
+    /// `session_id`. False when that has to wait.
+    fn controlFocus(self: *App, key: workspace.WorkspaceKey, session_id: ?session.SessionId) !bool {
+        if (self.controlUiBusy()) return false;
+        if (self.workspace_registry.activeKey() != key) {
+            if (!try self.prepareWorkspaceTransition()) return false;
+            try self.commitWorkspaceActivation(key, false);
+        }
+        const id = session_id orelse return true;
+        const model = self.activeWorkspace();
+        const location = model.paneForSession(id) orelse return true;
+        if (model.activeTabId() == location.tab_id and model.focusedPaneId(location.tab_id) == location.pane_id) return true;
+        if (!try self.prepareToLeaveActiveSession()) return false;
+        try model.focusPane(location.tab_id, location.pane_id);
+        try model.activateTab(location.tab_id);
+        try self.adoptActiveTab();
+        return true;
+    }
+
+    /// The working directory a new terminal inherits: the request's, else
+    /// the caller session's tracked cwd, else the active session's, else the
+    /// workspace's. Owned by the caller.
+    fn controlCwd(self: *App, caller: ControlCaller, requested: ?[]const u8) ![]u8 {
+        if (requested) |cwd| return self.allocator.dupe(u8, cwd);
+        if (caller.session_id) |id| if (caller.model.sessionById(id)) |live| if (live.workingDirectory()) |cwd| {
+            return self.allocator.dupe(u8, cwd);
+        };
+        const inherited = self.activeLive().workingDirectory() orelse self.activeWorkspace().workingDirectory();
+        return self.allocator.dupe(u8, inherited);
+    }
+
+    /// Whether the caller's workspace can start a terminal now: its spawn
+    /// slot is free and, for SSH, its connection is up.
+    fn controlSpawnReady(caller: ControlCaller) union(enum) { ready, wait, fault: control_api.FaultCode } {
+        if (caller.presentation.load != null) return .wait;
+        if (caller.presentation.remote) |record| if (!record.ready()) return .{ .fault = .unavailable };
+        return .ready;
+    }
+
+    fn controlTabOpen(self: *App, caller: ControlCaller, spawn: control_api.protocol.Spawn, title: ?[]const u8) !ControlOutcome {
+        switch (controlSpawnReady(caller)) {
+            .ready => {},
+            .wait => return .wait,
+            .fault => |code| return controlFault(code),
+        }
+        if (!try self.controlFocus(caller.key, caller.session_id)) return .wait;
+        if (!try self.prepareToLeaveActiveSession()) return .wait;
+        const cwd = try self.controlCwd(caller, spawn.cwd);
+        var cwd_owned = true;
+        defer if (cwd_owned) self.allocator.free(cwd);
+        const argv: ?[][]const u8 = if (spawn.command) |command| try dupeArgv(self.allocator, command) else null;
+        var argv_owned = true;
+        defer if (argv_owned) if (argv) |owned| freeEntries(self.allocator, owned);
+
+        try caller.presentation.pane_renderers.ensureUnusedCapacity(self.allocator, 1);
+        const expected_session = session.SessionId.fromOrdinal(@intCast(caller.model.registeredSessionCount()));
+        var pane_renderer = try self.newPaneRenderer(expected_session);
+        var renderer_owned = true;
+        errdefer if (renderer_owned) pane_renderer.deinit();
+        var name_buffer: [32]u8 = undefined;
+        const name = title orelse try std.fmt.bufPrint(&name_buffer, "Terminal {d}", .{caller.model.registeredSessionCount()});
+        const created = try caller.model.createTab(name, self.activeLive().terminal().gridSize());
+        pane_renderer.session_id = created.session_id;
+        caller.presentation.pane_renderers.appendAssumeCapacity(pane_renderer);
+        renderer_owned = false;
+        try self.adoptActiveTab();
+        cwd_owned = false;
+        argv_owned = false;
+        self.startTabChildWith(created.session_id, cwd, argv);
+        const opened: control_api.Opened = .{ .tab = @intFromEnum(created.tab_id), .session = @intFromEnum(created.session_id) };
+        // No child to wait for (a workspace without a shell).
+        if (caller.presentation.load == null) return controlOpened(opened);
+        return .{ .spawning = .{ .key = caller.key, .session_id = created.session_id, .opened = opened } };
+    }
+
+    fn controlPaneSplit(self: *App, caller: ControlCaller, direction: control_api.protocol.Direction, spawn: control_api.protocol.Spawn) !ControlOutcome {
+        switch (controlSpawnReady(caller)) {
+            .ready => {},
+            .wait => return .wait,
+            .fault => |code| return controlFault(code),
+        }
+        if (!try self.controlFocus(caller.key, caller.session_id)) return .wait;
+        if (!try self.prepareToLeaveActiveSession()) return .wait;
+        const model = caller.model;
+        const tab_id = model.activeTabId() orelse return controlFault(.not_found);
+        const tab = model.tab(tab_id) orelse return controlFault(.not_found);
+        if (tab.paneCount() >= pane_ui_capacity) return controlFault(.unavailable);
+        const focused_pane = model.focusedPaneId(tab_id) orelse return controlFault(.not_found);
+        const bounds = self.terminalCellBounds() orelse return controlFault(.unavailable);
+        const cwd = try self.controlCwd(caller, spawn.cwd);
+        var cwd_owned = true;
+        defer if (cwd_owned) self.allocator.free(cwd);
+        const argv: ?[][]const u8 = if (spawn.command) |command| try dupeArgv(self.allocator, command) else null;
+        var argv_owned = true;
+        defer if (argv_owned) if (argv) |owned| freeEntries(self.allocator, owned);
+
+        try caller.presentation.pane_renderers.ensureUnusedCapacity(self.allocator, 1);
+        const expected_session = session.SessionId.fromOrdinal(@intCast(model.registeredSessionCount()));
+        var pane_renderer = try self.newPaneRenderer(expected_session);
+        var renderer_owned = true;
+        errdefer if (renderer_owned) pane_renderer.deinit();
+        const split: workspace.PaneSplit = switch (direction) {
+            .right => .right,
+            .down => .down,
+        };
+        const created = model.createPaneSession(tab_id, focused_pane, .human_terminal, self.activeLive().terminal().gridSize(), split, bounds) catch |err| {
+            if (err == error.InvalidGeometry) {
+                pane_renderer.deinit();
+                renderer_owned = false;
+                return controlFault(.unavailable);
+            }
+            return err;
+        };
+        pane_renderer.session_id = created.session_id;
+        caller.presentation.pane_renderers.appendAssumeCapacity(pane_renderer);
+        renderer_owned = false;
+        try self.adoptFocusedPane();
+        cwd_owned = false;
+        argv_owned = false;
+        self.startTabChildWith(created.session_id, cwd, argv);
+        const opened: control_api.Opened = .{
+            .tab = @intFromEnum(tab_id),
+            .pane = @intFromEnum(created.pane_id),
+            .session = @intFromEnum(created.session_id),
+        };
+        if (caller.presentation.load == null) return controlOpened(opened);
+        return .{ .spawning = .{ .key = caller.key, .session_id = created.session_id, .opened = opened } };
+    }
+
+    fn controlViewAgent(self: *App, caller: ControlCaller, agent_id: ?[]const u8) !ControlOutcome {
+        const runner = if (agent_id) |text| found: {
+            const raw = std.fmt.parseInt(u64, text, 10) catch return controlFault(.not_found);
+            if (raw == 0) return controlFault(.not_found);
+            const record = self.agents.registry.get(@enumFromInt(raw)) orelse return controlFault(.not_found);
+            if (record.workspace != caller.key) return controlFault(.not_found);
+            break :found self.agents.runnerForSession(caller.key, record.session) orelse return controlFault(.not_found);
+        } else self.agents.runnerForSession(caller.key, caller.session_id orelse return controlFault(.not_found)) orelse
+            return controlFault(.not_found);
+        if (runner.agent_id == null) return controlFault(.unavailable);
+        if (!try self.controlFocus(caller.key, runner.session)) return .wait;
+        runner.view.active = true;
+        runner.view.follow = true;
+        runner.view.selection = null;
+        self.agent_view_pointer = null;
+        self.ui_tree.clearFocus();
+        self.composition.cancel();
+        try self.refreshActiveUi();
+        try self.syncTextInput();
+        return controlOpened(.{ .session = @intFromEnum(runner.session) });
+    }
+
+    fn controlViewBacklog(self: *App, caller: ControlCaller) !ControlOutcome {
+        if (!try self.controlFocus(caller.key, caller.session_id)) return .wait;
+        try self.openBacklog();
+        return if (self.backlogShown()) controlOk() else controlFault(.unavailable);
+    }
+
+    fn controlStatusFor(self: *const App, key: workspace.WorkspaceKey, tab_id: workspace.TabId) ?*const ControlTabStatus {
+        for (&self.control_status) |*slot| {
+            if (slot.*) |*mark| if (mark.key == key and mark.tab_id == tab_id) return mark;
+        }
+        return null;
+    }
+
+    fn clearControlAttention(self: *App, key: workspace.WorkspaceKey, tab_id: workspace.TabId) void {
+        for (&self.control_status) |*slot| {
+            const mark = if (slot.*) |*value| value else continue;
+            if (mark.key != key or mark.tab_id != tab_id or !mark.attention) continue;
+            mark.attention = false;
+            if (mark.text_len == 0) slot.* = null;
+            self.invalidateUi();
+        }
+    }
+
+    fn controlTabStatus(self: *App, caller: ControlCaller, text: ?[]const u8, attention: ?bool) !ControlOutcome {
+        const tab_id = if (caller.session_id) |id|
+            (caller.model.paneForSession(id) orelse return controlFault(.not_found)).tab_id
+        else
+            caller.model.activeTabId() orelse return controlFault(.not_found);
+        var slot: ?*?ControlTabStatus = null;
+        var free: ?*?ControlTabStatus = null;
+        for (&self.control_status) |*candidate| {
+            if (candidate.*) |mark| {
+                if (mark.key == caller.key and mark.tab_id == tab_id) slot = candidate;
+                // A mark whose tab or workspace is gone is free again.
+                const model = self.workspace_registry.byKey(mark.key);
+                if (free == null and (model == null or model.?.tab(mark.tab_id) == null)) free = candidate;
+            } else if (free == null) free = candidate;
+        }
+        const target = slot orelse free orelse return controlFault(.busy);
+        if (slot == null) target.* = .{ .key = caller.key, .tab_id = tab_id };
+        const mark = &target.*.?;
+        if (text) |value| {
+            // The protocol bounds the text to the buffer.
+            @memcpy(mark.text[0..value.len], value);
+            mark.text_len = @intCast(value.len);
+        }
+        if (attention) |value| mark.attention = value;
+        if (mark.text_len == 0 and !mark.attention) target.* = null;
+        self.invalidateUi();
+        try self.refreshActiveUi();
+        return controlOk();
+    }
+
+    /// The Local workspace already open in `directory`, counting the first
+    /// workspace, which opens in this process's directory without naming it.
+    fn localWorkspaceForDirectory(self: *App, directory: []const u8) ?workspace.WorkspaceKey {
+        if (self.workspaceForDirectory(directory)) |key| return key;
+        const cwd = std.process.currentPathAlloc(self.io, self.allocator) catch return null;
+        defer self.allocator.free(cwd);
+        if (!std.mem.eql(u8, normalizedWorkspaceDirectory(cwd), directory)) return null;
+        var index: usize = 0;
+        while (index < self.workspace_registry.count()) : (index += 1) {
+            const key = self.workspace_registry.keyAt(index) orelse continue;
+            const presentation = self.presentationByKey(key) orelse continue;
+            if (presentation.closing) continue;
+            const model = self.workspace_registry.byKey(key) orelse continue;
+            if (model.contextKind() == .local and model.workingDirectory().len == 0) return key;
+        }
+        return null;
+    }
+
+    fn controlWorkspaceOpened(key: workspace.WorkspaceKey) ControlOutcome {
+        return controlOpened(.{ .workspace = std.math.cast(u32, @intFromEnum(key)) });
+    }
+
+    /// Bring an existing workspace forward. False when that has to wait.
+    fn controlActivate(self: *App, key: workspace.WorkspaceKey) !bool {
+        if (self.controlUiBusy()) return false;
+        if (self.workspace_registry.activeKey() == key) return true;
+        if (!try self.prepareWorkspaceTransition()) return false;
+        try self.commitWorkspaceActivation(key, false);
+        return true;
+    }
+
+    /// Open a Local workspace named after `base` in `directory`, start its
+    /// first tab and scratchpad and switch to it, as `workspace.create` does.
+    fn controlCreateWorkspace(self: *App, directory: []const u8, base: []const u8) !workspace.WorkspaceKey {
+        const name = try self.uniqueWorkspaceName(base);
+        defer self.allocator.free(name);
+        const presentation = try self.createWorkspacePresentation(directory, name);
+        self.startPresentationChild(presentation, presentation.active_session_id, .{
+            .argv = self.scratchpad_spec.argv,
+            .env = self.scratchpad_spec.env,
+        });
+        self.startScratchpadFor(presentation, false);
+        try self.commitWorkspaceActivation(presentation.key, false);
+        return presentation.key;
+    }
+
+    fn controlOpenDirectory(self: *App, path: []const u8) !ControlOutcome {
+        if (!std.fs.path.isAbsolute(path)) return controlFault(.invalid_params);
+        const directory = normalizedWorkspaceDirectory(path);
+        if (self.localWorkspaceForDirectory(directory)) |key| {
+            if (!try self.controlActivate(key)) return .wait;
+            return controlWorkspaceOpened(key);
+        }
+        if (self.controlUiBusy() or !try self.prepareWorkspaceTransition()) return .wait;
+        const base = std.mem.trim(u8, workspaceBaseName(directory), std.ascii.whitespace[0..]);
+        if (base.len == 0) return controlFault(.invalid_params);
+        return controlWorkspaceOpened(try self.controlCreateWorkspace(directory, base));
+    }
+
+    fn controlOpenSsh(self: *App, text: []const u8) !ControlOutcome {
+        if (comptime !ssh.supported) return controlFault(.unavailable);
+        const destination = config.parseDestination(text) catch return controlFault(.invalid_params);
+        if (self.controlUiBusy() or !try self.prepareWorkspaceTransition()) return .wait;
+        if (!try self.openRemoteWorkspace(config.destinationHost(destination), destination.target, destination.port, text)) {
+            return controlFault(.unavailable);
+        }
+        const key = self.workspace_registry.activeKey() orelse return controlFault(.unavailable);
+        return controlWorkspaceOpened(key);
+    }
+
+    fn controlOpenWorkspace(self: *App, name: []const u8, path: ?[]const u8) !ControlOutcome {
+        if (self.workspace_registry.keyForName(name)) |key| {
+            const presentation = self.presentationByKey(key) orelse return controlFault(.not_found);
+            if (presentation.closing) return controlFault(.not_found);
+            if (!try self.controlActivate(key)) return .wait;
+            return controlWorkspaceOpened(key);
+        }
+        const directory = path orelse return controlFault(.not_found);
+        if (!std.fs.path.isAbsolute(directory)) return controlFault(.invalid_params);
+        if (self.controlUiBusy() or !try self.prepareWorkspaceTransition()) return .wait;
+        return controlWorkspaceOpened(try self.controlCreateWorkspace(normalizedWorkspaceDirectory(directory), name));
+    }
+
+    /// Launch `harness` in the caller's workspace (a workspace token) or the
+    /// active one (the instance token), as `agent.launch` does.
+    fn controlAgent(self: *App, caller: ?ControlCaller, harness: []const u8, prompt: ?[]const u8) !ControlOutcome {
+        const choice = controlHarnessChoice(harness) orelse return controlFault(.not_found);
+        if (choice == .fake and !self.agents.fake_enabled) return controlFault(.not_found);
+        const key = if (caller) |value| value.key else self.workspace_registry.activeKey() orelse return controlFault(.unavailable);
+        const presentation = self.presentationByKey(key) orelse return controlFault(.not_found);
+        if (presentation.load != null) return .wait;
+        if (presentation.remote) |record| if (!record.ready()) return controlFault(.unavailable);
+        if (!try self.controlFocus(key, if (caller) |value| value.session_id else null)) return .wait;
+        if (!try self.prepareToLeaveActiveSession()) return .wait;
+        const before = self.activePresentation().active_session_id;
+        try self.launchAgentWith(choice, prompt, .{});
+        const after = self.activePresentation().active_session_id;
+        if (after == before or self.agents.runnerForSession(key, after) == null) return controlFault(.unavailable);
+        const model = self.activeWorkspace();
+        const opened: control_api.Opened = .{
+            .workspace = std.math.cast(u32, @intFromEnum(key)),
+            .tab = if (model.activeTabId()) |tab_id| @intFromEnum(tab_id) else null,
+            .session = @intFromEnum(after),
+        };
+        if (presentation.load == null) return controlOpened(opened);
+        return .{ .spawning = .{ .key = key, .session_id = after, .opened = opened } };
+    }
+
+    /// Queue `command` (TASK-66) to run as soon as this run can: a `conduit`
+    /// command that found no running instance to forward it to. Its strings
+    /// are copied; `cwd` is the absolute directory it was typed in.
+    fn queueStartupCommand(self: *App, command: CliCommand, cwd: []const u8) !void {
+        if (command == .control) return;
+        self.startup_arena = .init(self.allocator);
+        const arena = self.startup_arena.?.allocator();
+        const params: control_api.Params = switch (command) {
+            .open_directory => |path| .{ .instance_open_directory = .{ .path = try arena.dupe(u8, path) } },
+            .open_ssh => |destination| .{ .instance_open_ssh = .{ .destination = try arena.dupe(u8, destination) } },
+            .open_workspace => |name| .{ .instance_open_workspace = .{ .name = try arena.dupe(u8, name), .path = try arena.dupe(u8, cwd) } },
+            .agent => |launch| .{ .instance_agent = .{
+                .harness = try arena.dupe(u8, launch.harness),
+                .prompt = if (launch.prompt.len == 0) null else try std.mem.join(arena, " ", launch.prompt),
+            } },
+            .control => unreachable, // returned above
+        };
+        self.startup_request = .{ .workspace = control_api.instance_workspace, .session = null, .params = params };
+        if (self.control_pending.capacity == 0) try self.control_pending.ensureTotalCapacity(self.allocator, control_pending_capacity);
+        self.control_pending.appendAssumeCapacity(.{
+            .server = null,
+            .ticket = .{ .slot = 0, .generation = 0 },
+            .request = &self.startup_request.?,
+            // Startup itself (fonts, the first shell) may take a while.
+            .deadline_ns = Io.Clock.awake.now(self.io).nanoseconds + 60 * std.time.ns_per_s,
+            .state = .waiting,
+        });
     }
 
     // SSH workspaces (TASK-43 part two, TASK-44, TASK-45) -------------------
@@ -6474,6 +7556,8 @@ const App = struct {
     /// Give back everything the app owns, in the reverse of the order it was
     /// built. The window belongs to `main`, which outlives the app.
     fn deinit(self: *App) void {
+        // No control request may reach a workspace that is going away.
+        self.stopControl();
         if (self.config_watcher) |watcher| watcher.stop();
         self.config_watcher = null;
         if (self.driver) |driver| {
@@ -6556,6 +7640,8 @@ const App = struct {
         self.allocator.free(self.output);
         self.allocator.free(self.readback);
         self.surface.deinit();
+        // The adapters borrowed it until the runtime above released them.
+        if (self.self_exe) |path| self.allocator.free(path);
         self.* = undefined;
     }
 
@@ -6588,13 +7674,17 @@ const App = struct {
     ) void {
         if (presentation.load != null) return;
         const model = self.workspace_registry.byKey(presentation.key) orelse unreachable;
-        const request = model.spawnRequest(session_id, process) catch |err| {
+        const control_env = self.controlEnvFor(presentation, model, session_id, process.env);
+        var request = model.spawnRequest(session_id, process) catch |err| {
             log.warn("could not prepare the child session: {s}", .{@errorName(err)});
+            if (control_env) |env| freeEntries(self.allocator, env);
             self.spawn_finished = true;
             return;
         };
+        if (control_env) |env| request.env = env;
         const job = self.allocator.create(Load) catch |err| {
             log.warn("no memory to start a child process: {s}", .{@errorName(err)});
+            if (control_env) |env| freeEntries(self.allocator, env);
             self.spawn_finished = true;
             return;
         };
@@ -6602,12 +7692,14 @@ const App = struct {
             .allocator = self.allocator,
             .io = self.io,
             .spawn = request,
+            .spawn_env = control_env,
             .spawn_session_id = session_id,
             .workspace_key = presentation.key,
             .execution_context = model.contextRef(),
         };
         job.start() catch |err| {
             log.warn("could not start the worker that spawns the child: {s}", .{@errorName(err)});
+            job.freeSpawnInputs();
             self.allocator.destroy(job);
             self.spawn_finished = true;
             return;
@@ -6827,10 +7919,13 @@ const App = struct {
             return;
         };
         request.cwd = cwd;
+        const control_env = self.controlEnvFor(presentation, model, session_id, process.env);
+        if (control_env) |env| request.env = env;
         const job = self.allocator.create(Load) catch |err| {
             log.warn("no memory to start the new tab child: {s}", .{@errorName(err)});
             self.allocator.free(cwd);
             if (argv) |owned| freeEntries(self.allocator, owned);
+            if (control_env) |env| freeEntries(self.allocator, env);
             return;
         };
         job.* = .{
@@ -6839,6 +7934,7 @@ const App = struct {
             .spawn = request,
             .spawn_cwd = cwd,
             .spawn_argv = argv,
+            .spawn_env = control_env,
             .spawn_session_id = session_id,
             .workspace_key = presentation.key,
             .execution_context = model.contextRef(),
@@ -7005,6 +8101,10 @@ const App = struct {
                 false;
             self.agents.spawnFinished(runner, started);
             self.invalidateUi();
+        }
+        if (job.spawn_session_id) |id| {
+            const started = if (model.sessionById(id)) |target| target.child() != null else false;
+            self.controlSpawnFinished(presentation.key, id, started);
         }
         job.freeSpawnInputs();
         self.allocator.destroy(job);
@@ -7774,9 +8874,14 @@ const App = struct {
             return;
         };
         request.cwd = cwd;
+        // The agent's hooks report through the endpoint (TASK-60); the
+        // adapter's `prepare` merges its own variables over these.
+        const control_env = self.controlEnvFor(presentation, model, session_id, process.env);
+        if (control_env) |env| request.env = env;
         const job = self.allocator.create(Load) catch |err| {
             log.warn("no memory to start the agent's child: {s}", .{@errorName(err)});
             self.allocator.free(cwd);
+            if (control_env) |env| freeEntries(self.allocator, env);
             self.agents.spawnFinished(runner, false);
             return;
         };
@@ -7785,6 +8890,7 @@ const App = struct {
             .io = self.io,
             .spawn = request,
             .spawn_cwd = cwd,
+            .spawn_env = control_env,
             .spawn_session_id = session_id,
             .workspace_key = presentation.key,
             .respawn = respawn,
@@ -11847,6 +12953,9 @@ const App = struct {
                                         .offset_px = group_offset_px,
                                     }, .{ .runs = &.{} });
                                 }
+                            } else if (self.controlStatusFor(key, tab.id())) |mark| {
+                                // A harness's `tab.status` (TASK-60).
+                                tab_label = controlTabLabel(&self.agent_tab_labels[storage_index], tab.displayLabel(), tab.name(), mark);
                             }
                             try self.ui_tree.addInteractiveText(.{
                                 .id = id,
@@ -14133,6 +15242,8 @@ const App = struct {
             // context; its agents and notifications go with it.
             self.dropGitTracks(presentation.key);
             self.agents.removeWorkspace(presentation.key);
+            // Its token expires with it; a request still queued is refused.
+            self.revokeControl(presentation);
             // Joins the host probe that borrows the context; the context's
             // own teardown then hangs the master up without waiting.
             self.releaseRemote(presentation);
@@ -14285,6 +15396,9 @@ const App = struct {
 
     fn activateTab(self: *App, id: workspace.TabId) !bool {
         _ = self.activeWorkspace().tab(id) orelse return false;
+        // The person looked at it: a harness's attention mark is answered,
+        // like a bell's (TASK-60).
+        self.clearControlAttention(self.activePresentation().key, id);
         if (self.activeWorkspace().focusedPaneSessionId(id) == self.activePresentation().active_session_id) {
             try self.activeWorkspace().activateTab(id);
             try self.refreshActiveUi();
@@ -15279,8 +16393,9 @@ const App = struct {
             .notifications_opencode,
             => if (self.config_current.settings.notifications.get(key) orelse true) "true" else "false",
             // Repeating and recorded keys have no row: the connection
-            // manager edits them (TASK-44).
-            .remote_profile, .remote_recent, .keybind => "",
+            // manager edits them (TASK-44). `control.enabled` applies at
+            // startup only, so it is a file setting without a row (TASK-60).
+            .remote_profile, .remote_recent, .control_enabled, .keybind => "",
         };
     }
 
@@ -16780,6 +17895,10 @@ const App = struct {
             changed = true;
         }
         if (self.pollBacklog()) {
+            self.invalidateUi();
+            changed = true;
+        }
+        if (self.pollControl()) {
             self.invalidateUi();
             changed = true;
         }
@@ -24624,6 +25743,346 @@ fn backlogTest(self: *App, io: Io, out: *Writer) !u8 {
     return if (failures == 0) 0 else 1;
 }
 
+// --control-test (TASK-60 part two, TASK-66) -------------------------------------
+
+/// The first tab of `--control-test`: a readiness marker, then an
+/// interactive shell with a known prompt. Its environment carries the check's
+/// private runtime and state directories (`ChildSpec.buildIn`) and this run's
+/// control variables (`appendControlEnv`).
+const control_test_script = "PS1='ctl$ '; export PS1; printf 'CONTROL-TEST-READY\\r\\n'; exec /bin/sh -i";
+const control_test_budget_ms: i64 = 15_000;
+/// The private SSH config `conduit ssh nowhere` resolves: a host that
+/// refuses at once, so the workspace shows a failed connection quickly.
+const control_test_ssh_config = "Host nowhere\n  HostName 127.0.0.1\n  Port 9\n  ConnectTimeout 2\n  BatchMode yes\n";
+
+const ControlWait = union(enum) {
+    terminal_text: []const u8,
+    element: []const u8,
+    element_absent: []const u8,
+    label: struct { id: []const u8, text: []const u8 },
+    role_label: struct { prefix: []const u8, text: []const u8 },
+    file: struct { path: []const u8, text: []const u8 },
+    entry_body: []const u8,
+    scratchpad_text: []const u8,
+};
+
+fn fileContains(io: Io, path: []const u8, text: []const u8) bool {
+    var buffer: [64 * 1024]u8 = undefined;
+    const contents = Dir.cwd().readFile(io, path, &buffer) catch return false;
+    return std.mem.indexOf(u8, contents, text) != null;
+}
+
+fn controlWaitMet(self: *App, io: Io, condition: ControlWait) !bool {
+    return switch (condition) {
+        .terminal_text => |text| text_found: {
+            try self.activeLive().terminal().refresh(self.allocator);
+            break :text_found self.activeLive().terminal().visibleTextContains(text);
+        },
+        .element => |id| self.ui_tree.byId(.{ .value = id }) != null,
+        .element_absent => |id| self.ui_tree.byId(.{ .value = id }) == null,
+        .label => |want| if (self.ui_tree.byId(.{ .value = want.id })) |element| std.mem.indexOf(u8, element.label, want.text) != null else false,
+        .role_label => |want| viewElement(self, want.prefix, want.text) != null,
+        .file => |want| fileContains(io, want.path, want.text),
+        .entry_body => |text| agentEntryIndex(self, text) != null,
+        .scratchpad_text => |text| scratchpad: {
+            const scratchpad = self.scratchpadLive() orelse break :scratchpad false;
+            try scratchpad.terminal().refresh(self.allocator);
+            break :scratchpad scratchpad.terminal().visibleTextContains(text);
+        },
+    };
+}
+
+fn waitForControl(self: *App, io: Io, out: *Writer, condition: ControlWait) !bool {
+    const deadline = Io.Clock.real.now(io).nanoseconds + control_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        if (try controlWaitMet(self, io, condition)) return true;
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return false;
+        }
+        if (self.outputReadable()) _ = try self.drainChildren(io);
+        if (self.poll()) self.scheduler.invalidate();
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) {
+            if (self.scheduler.shouldDraw()) try self.drawFrame();
+            return controlWaitMet(self, io, condition);
+        }
+    }
+}
+
+fn controlCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("control-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    out.flush() catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// Type one shell line into the focused terminal and press Enter.
+fn controlType(self: *App, io: Io, out: *Writer, comptime format: []const u8, args: anytype) !bool {
+    var buffer: [4096:0]u8 = undefined;
+    const line = try std.fmt.bufPrintZ(&buffer, format, args);
+    return agentTypeLine(self, io, out, line);
+}
+
+/// Wait for `<dir>/<name>` to hold `text`.
+fn waitForControlFile(self: *App, io: Io, out: *Writer, dir: []const u8, name: []const u8, text: []const u8) !bool {
+    var path_buffer: [path_capacity]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ dir, name });
+    return waitForControl(self, io, out, .{ .file = .{ .path = path, .text = text } });
+}
+
+/// The milliseconds a `<name>=<status> <ms>ms` line of the instance log
+/// reports, when its status is 0.
+fn controlCommandMs(io: Io, path: []const u8, name: []const u8) ?u64 {
+    var buffer: [8 * 1024]u8 = undefined;
+    const contents = Dir.cwd().readFile(io, path, &buffer) catch return null;
+    var prefix_buffer: [32]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buffer, "{s}=0 ", .{name}) catch return null;
+    const start = (std.mem.indexOf(u8, contents, prefix) orelse return null) + prefix.len;
+    const end = std.mem.indexOfPos(u8, contents, start, "ms") orelse return null;
+    return std.fmt.parseInt(u64, contents[start..end], 10) catch null;
+}
+
+fn controlTabNamed(self: *App, key: workspace.WorkspaceKey, name: []const u8) ?workspace.TabId {
+    const model = self.workspace_registry.byKey(key) orelse return null;
+    var index: usize = 0;
+    while (model.tabAt(index)) |tab| : (index += 1) {
+        if (std.mem.eql(u8, tab.name(), name)) return tab.id();
+    }
+    return null;
+}
+
+fn controlWorkspaceIn(self: *App, directory: []const u8) ?workspace.WorkspaceKey {
+    var index: usize = 0;
+    while (index < self.workspace_registry.count()) : (index += 1) {
+        const key = self.workspace_registry.keyAt(index) orelse continue;
+        const model = self.workspace_registry.byKey(key) orelse continue;
+        if (std.mem.eql(u8, model.workingDirectory(), directory)) return key;
+    }
+    return null;
+}
+
+/// Click the active tab's focused pane, so typing reaches its terminal
+/// rather than the sidebar row a previous click focused.
+fn controlFocusTerminal(self: *App, io: Io, out: *Writer) !bool {
+    const key = self.workspace_registry.activeKey() orelse return false;
+    const model = self.activeWorkspace();
+    const tab_id = model.activeTabId() orelse return false;
+    const pane_id = model.focusedPaneId(tab_id) orelse return false;
+    var buffer: [64]u8 = undefined;
+    try self.drawFrame();
+    return clickTabsElement(self, io, out, try paneSemanticId(&buffer, key, pane_id));
+}
+
+fn controlScreenshot(self: *App, io: Io, out: *Writer) !void {
+    try self.drawFrame();
+    const pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(pixels);
+    var path_buffer: [path_capacity]u8 = undefined;
+    var id_buffer: [path_capacity]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}{c}control-test-{s}.png", .{ fallback_log_dir, std.fs.path.sep, try generateRunId(io, &id_buffer) });
+    try writePngOffThread(self.allocator, io, path, pixels, self.size);
+    out.print("control-test: screenshot {s}\n", .{path}) catch {};
+}
+
+/// Exercise TASK-60 part two and TASK-66 through real PTYs, real child
+/// processes and SDL events: `conduit control` from a tab's shell opens a
+/// tab, splits a pane, raises a notification, marks the tab, shows the agent
+/// and backlog views and delivers an agent event; the scratchpad has no
+/// control variables and a stolen token naming it is refused; then `conduit
+/// <dir>`, `conduit ssh`, `conduit workspace open` and `conduit agent` run as
+/// separate processes against this run's private instance endpoint.
+fn controlTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    var os_trace: AgentOsTrace = .{};
+    self.agents.notifier = .{ .context = &os_trace, .notify_fn = AgentOsTrace.record };
+    defer self.agents.notifier = .{ .notify_fn = App.discardOsNotification };
+    self.focus_override = true;
+    defer self.focus_override = null;
+    defer self.backlog_program = "backlog";
+    const dir = self.agentTestDir() orelse return 1;
+
+    try self.drawFrame();
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "CONTROL-TEST-READY" }), "the first tab's shell started", .{});
+    controlCheck(out, &failures, self.control_server != null and self.instance_server != null, "the control and instance endpoints are listening", .{});
+    const exe = self.self_exe orelse {
+        controlCheck(out, &failures, false, "this executable's path is known", .{});
+        return 1;
+    };
+    const endpoint = (self.control_server orelse return 1).endpointPath();
+    const first_key = self.workspace_registry.activeKey() orelse return 1;
+    var id_buffer: [128]u8 = undefined;
+
+    // ping, from the first tab's shell.
+    _ = try controlType(self, io, out, "'{s}' control ping > '{s}/ping' 2>&1; echo \"rc=$?\" >> '{s}/ping'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "ping", "rc=0") and
+        try waitForControlFile(self, io, out, dir, "ping", "{\"pong\":true}"), "conduit control ping answered from a tab's shell", .{});
+
+    // tab.open: a titled tab in this workspace, reported once its shell runs.
+    _ = try controlType(self, io, out, "'{s}' control tab.open '{{\"title\":\"api\"}}' > '{s}/tab' 2>&1; echo \"rc=$?\" >> '{s}/tab'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "tab", "rc=0") and
+        try waitForControlFile(self, io, out, dir, "tab", "\"session\":"), "tab.open replied with the new tab and session", .{});
+    const api_tab = controlTabNamed(self, first_key, "api");
+    controlCheck(out, &failures, api_tab != null and self.activeWorkspace().activeTabId() == api_tab, "the api tab exists in the caller's workspace and is active", .{});
+    const api_id = try tabSemanticId(&id_buffer, first_key, api_tab orelse return 1);
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .label = .{ .id = api_id, .text = "api" } }), "the sidebar lists the api tab", .{});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "ctl$" }), "the api tab's shell started", .{});
+
+    // pane.split from the api tab's shell.
+    _ = try controlType(self, io, out, "'{s}' control pane.split '{{\"direction\":\"right\"}}' > '{s}/split' 2>&1; echo \"rc=$?\" >> '{s}/split'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "split", "rc=0") and
+        try waitForControlFile(self, io, out, dir, "split", "\"pane\":"), "pane.split replied with the new pane", .{});
+    const api_panes = if (self.activeWorkspace().tab(api_tab.?)) |tab| tab.paneCount() else 0;
+    controlCheck(out, &failures, api_panes == 2, "the api tab has two panes ({d})", .{api_panes});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "ctl$" }), "the new pane's shell started", .{});
+
+    // notify: an entry in the notification list.
+    _ = try controlType(self, io, out, "'{s}' control notify '{{\"title\":\"Build\",\"body\":\"control notified\"}}' > '{s}/notify' 2>&1; echo \"rc=$?\" >> '{s}/notify'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "notify", "rc=0") and
+        try waitForControl(self, io, out, .{ .entry_body = "control notified" }), "notify added a notification list entry", .{});
+
+    // tab.status: the caller's tab shows the text with an attention mark.
+    _ = try controlType(self, io, out, "'{s}' control tab.status '{{\"text\":\"busy\",\"attention\":true}}' > '{s}/status' 2>&1; echo \"rc=$?\" >> '{s}/status'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "status", "rc=0") and
+        try waitForControl(self, io, out, .{ .label = .{ .id = api_id, .text = "! busy api" } }), "tab.status marked the api tab", .{});
+
+    // A fixture backlog project and the fake CLI the view runs.
+    var project_buffer: [path_capacity]u8 = undefined;
+    const project_dir = try std.fmt.bufPrint(&project_buffer, "{s}/project", .{dir});
+    var root_buffer: [path_capacity]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, "{s}/backlog", .{project_dir});
+    _ = try Dir.cwd().createDirPathStatus(io, project_dir, .default_dir);
+    var copy = workspace.runLocalProcess(self.allocator, io, .{ .argv = &.{ "cp", "-R", "test/fixtures/backlog/valid", root }, .cwd = "" }) catch |err| {
+        out.print("control-test: FAIL could not copy the backlog fixture: {s}\n", .{@errorName(err)}) catch {};
+        return 1;
+    };
+    const copied = copy.succeeded();
+    copy.deinit(self.allocator);
+    controlCheck(out, &failures, copied, "the backlog fixture was copied (run from the repository root)", .{});
+    var program_buffer: [path_capacity]u8 = undefined;
+    const bin = try std.fmt.bufPrint(&program_buffer, "{s}/bin", .{dir});
+    _ = try Dir.cwd().createDirPathStatus(io, bin, .default_dir);
+    var fake_cli_buffer: [path_capacity]u8 = undefined;
+    const fake_cli = try std.fmt.bufPrint(&fake_cli_buffer, "{s}/backlog", .{bin});
+    try Dir.cwd().writeFile(io, .{ .sub_path = fake_cli, .data = backlog_fake_cli, .flags = .{ .permissions = .fromMode(0o700) } });
+    self.backlog_program = fake_cli;
+    var ssh_dir_buffer: [path_capacity]u8 = undefined;
+    const ssh_dir = try std.fmt.bufPrint(&ssh_dir_buffer, "{s}/home/.ssh", .{dir});
+    _ = try Dir.cwd().createDirPathStatus(io, ssh_dir, .fromMode(0o700));
+    var ssh_config_buffer: [path_capacity]u8 = undefined;
+    try Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&ssh_config_buffer, "{s}/config", .{ssh_dir}), .data = control_test_ssh_config, .flags = .{ .permissions = .fromMode(0o600) } });
+    // The SSH control sockets' private directory.
+    if (self.ssh_runtime_owned) |run_dir| _ = try Dir.cwd().createDirPathStatus(io, run_dir, .fromMode(0o700));
+
+    // The single instance: four `conduit` commands as separate processes,
+    // without this terminal's control variables, so each finds the private
+    // instance endpoint through XDG_RUNTIME_DIR and the token file through
+    // XDG_STATE_HOME. One line, so it keeps running in this shell while
+    // the commands switch workspaces.
+    var instance_path_buffer: [path_capacity]u8 = undefined;
+    const instance_log = try std.fmt.bufPrint(&instance_path_buffer, "{s}/instance", .{dir});
+    _ = try controlType(self, io, out, "(unset CONDUIT_CONTROL_ENDPOINT CONDUIT_CONTROL_TOKEN CONDUIT_CONTROL_SESSION; " ++
+        "t=$(date +%s%N); '{s}' '{s}'; echo \"dir=$? $(( ($(date +%s%N)-t)/1000000 ))ms\"; " ++
+        "t=$(date +%s%N); '{s}' ssh nowhere; echo \"ssh=$? $(( ($(date +%s%N)-t)/1000000 ))ms\"; " ++
+        "t=$(date +%s%N); '{s}' workspace open default; echo \"workspace=$? $(( ($(date +%s%N)-t)/1000000 ))ms\"; " ++
+        "t=$(date +%s%N); '{s}' agent fake; echo \"agent=$? $(( ($(date +%s%N)-t)/1000000 ))ms\"; echo done) > '{s}' 2>&1", .{ exe, project_dir, exe, exe, exe, instance_log });
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .file = .{ .path = instance_log, .text = "done" } }), "the four instance commands finished", .{});
+    for ([_][]const u8{ "dir", "ssh", "workspace", "agent" }) |name| {
+        const ms = controlCommandMs(io, instance_log, name);
+        controlCheck(out, &failures, ms != null and ms.? < 3000, "conduit {s} exited 0 quickly ({?d} ms)", .{ name, ms });
+    }
+    const project_key = controlWorkspaceIn(self, project_dir);
+    controlCheck(out, &failures, project_key != null, "conduit <dir> opened a workspace in that directory", .{});
+    const ssh_key = self.workspace_registry.keyForName("nowhere");
+    controlCheck(out, &failures, if (ssh_key) |key| (if (self.workspace_registry.byKey(key)) |model| model.contextKind() == .ssh else false) else false, "conduit ssh opened an SSH workspace", .{});
+    if (ssh_key) |key| {
+        var ssh_row_buffer: [64]u8 = undefined;
+        var ssh_prefix_buffer: [80]u8 = undefined;
+        const ssh_prefix = try std.fmt.bufPrint(&ssh_prefix_buffer, "{s}.ssh.", .{try workspaceSemanticId(&ssh_row_buffer, key)});
+        const state = if (self.presentationByKey(key)) |presentation| (if (presentation.remote) |record| remote.stateWords(record.state) else "none") else "none";
+        controlCheck(out, &failures, try waitForControl(self, io, out, .{ .role_label = .{ .prefix = ssh_prefix, .text = "" } }), "the SSH workspace shows its connection state ({s}) without hanging", .{state});
+    }
+    controlCheck(out, &failures, self.workspace_registry.activeKey() == first_key, "conduit workspace open focused the named workspace", .{});
+    const agent_runner = self.agents.runnerForSession(first_key, self.activePresentation().active_session_id);
+    controlCheck(out, &failures, agent_runner != null and agent_runner.?.choice == .fake, "conduit agent launched the harness in the current workspace", .{});
+    const runner = agent_runner orelse return 1;
+    const agent_number = @intFromEnum(runner.agent_id orelse return 1);
+
+    // view.agent, from the api tab's shell, by the agent's id.
+    _ = try clickTabsElement(self, io, out, api_id);
+    _ = try controlFocusTerminal(self, io, out);
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "ctl$" }), "the api tab is back in front", .{});
+    _ = try controlType(self, io, out, "'{s}' control view.agent '{{\"agent_id\":\"{d}\"}}' > '{s}/view' 2>&1; echo \"rc=$?\" >> '{s}/view'", .{ exe, agent_number, dir, dir });
+    var view_buffer: [64]u8 = undefined;
+    const view_id = try std.fmt.bufPrint(&view_buffer, "agent.view.{d}", .{agent_number});
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "view", "rc=0") and
+        try waitForControl(self, io, out, .{ .element = view_id }), "view.agent showed the agent's view", .{});
+
+    // agent.event: a raw line and a hook-wrapped one reach the fake's sink.
+    _ = try clickTabsElement(self, io, out, api_id);
+    _ = try controlFocusTerminal(self, io, out);
+    _ = try waitForControl(self, io, out, .{ .terminal_text = "ctl$" });
+    const token = runner.token.text();
+    _ = try controlType(self, io, out, "printf '%s' '{{\"conduit\":{{\"v\":1,\"event\":\"Stop\"}},\"payload\":{{\"probe\":\"control-event\"}}}}' | '{s}' control agent.event --agent={s} > '{s}/event' 2>&1; echo \"rc=$?\" >> '{s}/event'", .{ exe, token, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "event", "rc=0"), "agent.event was accepted", .{});
+    _ = try controlType(self, io, out, "printf '%s' '{{\"probe\":\"hook-event\"}}' | '{s}' control agent.event --agent={s} --event=Stop > '{s}/hook' 2>&1; echo \"rc=$?\" >> '{s}/hook'", .{ exe, token, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "hook", "rc=0"), "the hook form exited 0", .{});
+    var sink_buffer: [path_capacity]u8 = undefined;
+    const sink_events = try std.fmt.bufPrint(&sink_buffer, "{s}/{s}", .{ runner.sink_dir, agent.pi.events_file_name });
+    var hook_line_buffer: [256]u8 = undefined;
+    const hook_line = try std.fmt.bufPrint(&hook_line_buffer, "{{\"conduit\":{{\"v\":1,\"event\":\"Stop\",\"token\":\"{s}\"}},\"payload\":{{\"probe\":\"hook-event\"}}}}", .{token});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .file = .{ .path = sink_events, .text = "{\"conduit\":{\"v\":1,\"event\":\"Stop\"},\"payload\":{\"probe\":\"control-event\"}}" } }) and
+        try waitForControl(self, io, out, .{ .file = .{ .path = sink_events, .text = hook_line } }), "the fake runner's sink received both event lines", .{});
+
+    // view.backlog from the project workspace's shell.
+    const project = project_key orelse return 1;
+    var project_row_buffer: [64]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, try workspaceSemanticId(&project_row_buffer, project));
+    _ = try controlFocusTerminal(self, io, out);
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "$" }) and self.workspace_registry.activeKey() == project, "the project workspace's shell is in front", .{});
+    _ = try controlType(self, io, out, "'{s}' control view.backlog > '{s}/backlog' 2>&1; echo \"rc=$?\" >> '{s}/backlog'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .element = "backlog.view" }) and
+        try waitForControl(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1", .text = "TASK-1" } }) and
+        try waitForControlFile(self, io, out, dir, "backlog", "rc=0"), "view.backlog opened the workspace's backlog", .{});
+    _ = try backlogChordKey(self, io, out);
+    _ = try waitForControl(self, io, out, .{ .element_absent = "backlog.view" });
+
+    // The scratchpad: no control variables, and a stolen token naming it is
+    // refused before anything happens.
+    const project_presentation = self.presentationByKey(project) orelse return 1;
+    const project_model = self.workspace_registry.byKey(project) orelse return 1;
+    const project_token = (project_presentation.control_token orelse return 1).text();
+    const scratchpad_id = @intFromEnum(project_model.scratchpadId());
+    const tabs_before = project_model.tabCount();
+    _ = try scratchpadChord(self, io, out, false);
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .scratchpad_text = "$" }), "the scratchpad's shell is up", .{});
+    _ = try controlType(self, io, out, "echo \"TOKEN=[${{CONDUIT_CONTROL_TOKEN-unset}}][${{CONDUIT_CONTROL_ENDPOINT-unset}}][${{CONDUIT_CONTROL_SESSION-unset}}]\"", .{});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .scratchpad_text = "TOKEN=[unset][unset][unset]" }), "the scratchpad has no control variables", .{});
+    _ = try controlType(self, io, out, "CONDUIT_CONTROL_ENDPOINT='{s}' CONDUIT_CONTROL_TOKEN={s} CONDUIT_CONTROL_SESSION={d} '{s}' control tab.open > '{s}/stolen' 2>&1; echo \"rc=$?\" >> '{s}/stolen'", .{ endpoint, project_token, scratchpad_id, exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "stolen", "rc=1") and
+        try waitForControlFile(self, io, out, dir, "stolen", "ScratchpadNotAddressable") and project_model.tabCount() == tabs_before, "a stolen token naming the scratchpad was refused and opened nothing", .{});
+    _ = try controlType(self, io, out, "CONDUIT_CONTROL_ENDPOINT='{s}' CONDUIT_CONTROL_TOKEN=00000000000000000000000000000000 '{s}' control ping > '{s}/bad' 2>&1; echo \"rc=$?\" >> '{s}/bad'", .{ endpoint, exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "bad", "rc=1") and
+        try waitForControlFile(self, io, out, dir, "bad", "Unauthorized"), "conduit control with a bad token exits non-zero", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try waitForControl(self, io, out, .{ .element_absent = "scratchpad" });
+
+    // The final frame: the API-opened tab, its split and its status mark.
+    var first_row_buffer: [64]u8 = undefined;
+    _ = try clickTabsElement(self, io, out, try workspaceSemanticId(&first_row_buffer, first_key));
+    _ = try waitForControl(self, io, out, .{ .element = api_id });
+    _ = try clickTabsElement(self, io, out, api_id);
+    _ = try controlFocusTerminal(self, io, out);
+    _ = try waitForControl(self, io, out, .{ .terminal_text = "ctl$" });
+    _ = try controlType(self, io, out, "'{s}' control tab.status '{{\"text\":\"busy\",\"attention\":true}}'", .{exe});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .label = .{ .id = api_id, .text = "! busy api" } }), "the status mark is back for the screenshot", .{});
+    try controlScreenshot(self, io, out);
+
+    out.print("control-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
 // --agent-view-test (TASK-57) --------------------------------------------------
 
 fn viewCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
@@ -27045,12 +28504,25 @@ const usage =
     \\          [--ui-test] [--ime-test] [--sidebar-test] [--tabs-test]
     \\          [--panes-test] [--scratchpad-test] [--palette-test]
     \\          [--workspaces-test] [--links-test] [--search-test] [--git-test]
-    \\          [--ssh-test]
+    \\          [--ssh-test] [--control-test]
     \\          [--test-driver=<endpoint>]
     \\          [--test-artifact-dir=<dir>]
     \\          [--driver-test]
     \\          [--no-child] [--no-shell-integration]
+    \\          [--control | --no-control]
+    \\          [<command>]
     \\
+    \\  Commands reuse a running Conduit when one answers, else start one:
+    \\  conduit .  |  conduit <dir>          open or focus a workspace there
+    \\  conduit ssh <host>                   open an SSH workspace
+    \\  conduit workspace open <name>        focus that workspace, or open it here
+    \\  conduit agent <harness> [prompt...]  launch claude, codex, pi or opencode
+    \\                                       in the current workspace
+    \\  conduit control <method> [<json>]    send one control request from inside
+    \\                                       a Conduit terminal (docs/control-api.md)
+    \\
+    \\  --control / --no-control           run the control and instance endpoints,
+    \\                                    or not (default: control.enabled)
     \\  --log-level=<err|warn|info|debug>  minimum level written (default: debug
     \\                                    in a debug build, info in a release one)
     \\  --log-file=<path>                  log to exactly this path
@@ -27172,9 +28644,294 @@ const usage =
 /// Start the app. `main` returning is the clean exit: the window, the GL context
 /// and the surface are gone by then, and the process allocator has nothing of
 /// Conduit's left in it.
+// ---------------------------------------------------------------------------
+// The `conduit` command line client (TASK-60, TASK-66)
+// ---------------------------------------------------------------------------
+
+/// What a `conduit <command>` did before any window exists.
+const CommandOutcome = union(enum) {
+    /// Answered (or refused); leave with this status.
+    exit: u8,
+    /// No running instance answered: start one and run the command in it.
+    start,
+};
+
+/// Forward `command` to a running Conduit, or say that one has to start.
+///
+/// Inside a Conduit terminal (`CONDUIT_CONTROL_ENDPOINT` and its token set)
+/// the command goes to that terminal's own Conduit, scoped to its workspace.
+/// Otherwise it goes to the per-user instance endpoint with the token from
+/// the state directory. Nothing answering, at either, means start.
+fn runCommand(init: std.process.Init, command: CliCommand, cwd: []const u8) CommandOutcome {
+    const env = processEnv(init);
+    const arena = init.arena.allocator();
+    switch (command) {
+        .control => |request| return .{ .exit = runControlCommand(init, env, request) },
+        else => {},
+    }
+    const method = command.method().?;
+    const params = instanceParams(arena, command, cwd) catch return .{ .exit = commandFailure("out of memory") };
+
+    if (env.get(control_api.endpoint_env_name)) |endpoint| if (env.get(control_api.token_env_name)) |token| {
+        const frame = controlFrame(arena, method.wireName(), token, env.get(control_api.session_env_name), params) catch
+            return .{ .exit = commandFailure("out of memory") };
+        if (exchangeControl(arena, endpoint, frame)) |reply| return .{ .exit = reportReply(reply, false) };
+    };
+
+    var endpoint_buffer: [path_capacity]u8 = undefined;
+    var dir_buffer: [path_capacity]u8 = undefined;
+    const dir = controlRuntimeDir(&dir_buffer, env, null) orelse return .start;
+    const endpoint = std.fmt.bufPrint(&endpoint_buffer, "{s}/{s}", .{ dir, control_api.instance_endpoint_file_name }) catch return .start;
+    var token_path_buffer: [path_capacity]u8 = undefined;
+    const token_path = instanceTokenPath(&token_path_buffer, env, null) orelse return .start;
+    var token_buffer: [control_api.Token.text_len + 2]u8 = undefined;
+    const token_text = Dir.cwd().readFile(init.io, token_path, &token_buffer) catch return .start;
+    const token = std.mem.trim(u8, token_text, " \r\n");
+    _ = control_api.Token.parse(token) catch return .start;
+    const frame = controlFrame(arena, method.wireName(), token, null, params) catch return .{ .exit = commandFailure("out of memory") };
+    const reply = exchangeControl(arena, endpoint, frame) orelse return .start;
+    return .{ .exit = reportReply(reply, false) };
+}
+
+/// The `params` object of `command`'s instance method, as compact JSON.
+fn instanceParams(arena: Allocator, command: CliCommand, cwd: []const u8) ![]const u8 {
+    var out: Io.Writer.Allocating = .init(arena);
+    const writer = &out.writer;
+    switch (command) {
+        .open_directory => |path| {
+            try writer.writeAll("{\"path\":");
+            try std.json.Stringify.encodeJsonString(path, .{}, writer);
+        },
+        .open_ssh => |destination| {
+            try writer.writeAll("{\"destination\":");
+            try std.json.Stringify.encodeJsonString(destination, .{}, writer);
+        },
+        .open_workspace => |name| {
+            try writer.writeAll("{\"name\":");
+            try std.json.Stringify.encodeJsonString(name, .{}, writer);
+            try writer.writeAll(",\"path\":");
+            try std.json.Stringify.encodeJsonString(cwd, .{}, writer);
+        },
+        .agent => |launch| {
+            try writer.writeAll("{\"harness\":");
+            try std.json.Stringify.encodeJsonString(launch.harness, .{}, writer);
+            if (launch.prompt.len != 0) {
+                try writer.writeAll(",\"prompt\":");
+                try std.json.Stringify.encodeJsonString(try std.mem.join(arena, " ", launch.prompt), .{}, writer);
+            }
+        },
+        .control => unreachable, // sent raw by `runControlCommand`
+    }
+    try writer.writeByte('}');
+    return out.written();
+}
+
+/// One request frame (without its newline). `params` is compact JSON.
+fn controlFrame(arena: Allocator, method: []const u8, token: []const u8, session_text: ?[]const u8, params: []const u8) ![]const u8 {
+    var out: Io.Writer.Allocating = .init(arena);
+    const writer = &out.writer;
+    try writer.writeAll("{\"id\":1,\"method\":");
+    try std.json.Stringify.encodeJsonString(method, .{}, writer);
+    try writer.writeAll(",\"token\":");
+    try std.json.Stringify.encodeJsonString(token, .{}, writer);
+    if (session_text) |text| if (std.fmt.parseInt(u32, text, 10)) |id| {
+        if (id != 0) try writer.print(",\"session\":{d}", .{id});
+    } else |_| {};
+    try writer.writeAll(",\"params\":");
+    try writer.writeAll(params);
+    try writer.writeByte('}');
+    return out.written();
+}
+
+/// Send one frame and read its reply, or null when nothing answered.
+fn exchangeControl(arena: Allocator, endpoint: []const u8, frame: []const u8) ?[]u8 {
+    var client = platform.DriverClient.connect(endpoint) catch return null;
+    defer client.deinit();
+    return client.exchange(arena, frame) catch null;
+}
+
+/// Print a refused reply's message (and, with `print`, any reply) and return
+/// the exit status: 0 for a result, 1 for an error.
+fn reportReply(reply: []const u8, print: bool) u8 {
+    if (print) {
+        writeStdoutLine(reply);
+    }
+    const message = replyError(reply) orelse return 0;
+    if (!print) {
+        writeStderrText("conduit: ") catch {};
+        writeStderrText(message) catch {};
+        writeStderrText("\n") catch {};
+    }
+    return 1;
+}
+
+/// The error message of a reply, or null for a result. A reply that is not
+/// a JSON-RPC result counts as an error.
+fn replyError(reply: []const u8) ?[]const u8 {
+    var buffer: [4096]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, fixed.allocator(), reply, .{}) catch return "MalformedReply";
+    const object = switch (parsed) {
+        .object => |value| value,
+        else => return "MalformedReply",
+    };
+    if (object.get("result") != null) return null;
+    const failure = object.get("error") orelse return "MalformedReply";
+    if (failure == .object) if (failure.object.get("message")) |message| if (message == .string) {
+        return replyMessageName(message.string);
+    };
+    return "MalformedReply";
+}
+
+/// A fault message from the fixed set, or a generic one: the reply's text
+/// does not outlive `replyError`'s buffer otherwise.
+fn replyMessageName(text: []const u8) []const u8 {
+    inline for (std.meta.fields(control_api.FaultCode)) |field| {
+        const code: control_api.FaultCode = @enumFromInt(field.value);
+        if (std.mem.eql(u8, text, code.message())) return code.message();
+    }
+    return "Error";
+}
+
+fn writeStdoutLine(text: []const u8) void {
+    var buffer: [1024]u8 = undefined;
+    var out = File.stdout().writerStreaming(std.Io.Threaded.global_single_threaded.io(), &buffer);
+    out.interface.writeAll(text) catch return;
+    out.interface.writeByte('\n') catch return;
+    out.interface.flush() catch return;
+}
+
+fn commandFailure(message: []const u8) u8 {
+    writeStderrText("conduit: ") catch {};
+    writeStderrText(message) catch {};
+    writeStderrText("\n") catch {};
+    return 1;
+}
+
+/// The longest hook input `conduit control agent.event` reads from stdin,
+/// matching Claude Code's relay.
+const max_hook_stdin_bytes: usize = 1024 * 1024;
+
+/// `conduit control <method> [params]`: one raw request to this terminal's
+/// endpoint; the reply is printed and the status says whether it succeeded.
+///
+/// For `agent.event`, stdin is the payload (wrapped as a Claude Code hook
+/// line with `--event=<Hook>`), the agent is `--agent` or
+/// `$CONDUIT_AGENT_TOKEN`, and when the endpoint does not take it the line is
+/// appended to `$CONDUIT_AGENT_SINK/events.jsonl` instead. With `--event` the
+/// command is a hook: it prints nothing and always exits 0, so Claude Code's
+/// own behaviour never changes.
+fn runControlCommand(init: std.process.Init, env: EnvSource, request: @FieldType(CliCommand, "control")) u8 {
+    const arena = init.arena.allocator();
+    const hook = request.event != null;
+    const is_event = std.mem.eql(u8, request.method, "agent.event");
+    var line: ?[]const u8 = null;
+    const params: []const u8 = if (request.params) |text|
+        compactObject(arena, text) orelse return usageFailure("params must be a JSON object")
+    else if (is_event) event: {
+        const agent_token = request.agent orelse env.get(agent.correlation_env_name) orelse
+            return if (hook) 0 else usageFailure("no agent token (--agent or CONDUIT_AGENT_TOKEN)");
+        line = hookLine(init, arena, request.event, agent_token) orelse
+            return if (hook) 0 else usageFailure("stdin must be a JSON object");
+        var out: Io.Writer.Allocating = .init(arena);
+        out.writer.writeAll("{\"agent\":") catch return 1;
+        std.json.Stringify.encodeJsonString(agent_token, .{}, &out.writer) catch return 1;
+        out.writer.print(",\"payload\":{s}}}", .{line.?}) catch return 1;
+        break :event out.written();
+    } else "{}";
+
+    const reply: ?[]u8 = reply: {
+        const endpoint = env.get(control_api.endpoint_env_name) orelse break :reply null;
+        const token = env.get(control_api.token_env_name) orelse break :reply null;
+        const frame = controlFrame(arena, request.method, token, env.get(control_api.session_env_name), params) catch break :reply null;
+        break :reply exchangeControl(arena, endpoint, frame);
+    };
+    if (reply) |bytes| {
+        if (!hook) return reportReply(bytes, true);
+        if (replyError(bytes) == null) return 0;
+    }
+    if (hook) {
+        // Not delivered: the hook line still reaches its agent through the
+        // sink the relay script would have written.
+        if (line) |text| if (env.get(agent.pi.sink_env_name)) |sink_dir| appendSinkLine(sink_dir, text);
+        return 0;
+    }
+    return commandFailure("no Conduit control endpoint answered (not inside a Conduit terminal?)");
+}
+
+fn usageFailure(message: []const u8) u8 {
+    _ = commandFailure(message);
+    return 2;
+}
+
+/// `text` re-encoded compactly when it is a JSON object, else null. The
+/// encoding also removes any raw newline that would split the frame.
+fn compactObject(arena: Allocator, text: []const u8) ?[]const u8 {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return null;
+    if (value != .object) return null;
+    return std.json.Stringify.valueAlloc(arena, value, .{}) catch null;
+}
+
+/// The event line for stdin: the object itself, or with `event` Claude Code's
+/// relay format `{"conduit":{"v":1,"event":…,"token":…},"payload":<stdin>}`.
+fn hookLine(init: std.process.Init, arena: Allocator, event: ?[]const u8, agent_token: []const u8) ?[]const u8 {
+    var buffer: [4096]u8 = undefined;
+    var reader = File.stdin().readerStreaming(init.io, &buffer);
+    const input = reader.interface.allocRemaining(arena, .limited(max_hook_stdin_bytes)) catch return null;
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    const payload = compactObject(arena, if (trimmed.len == 0) "{}" else trimmed) orelse return null;
+    const name = event orelse return payload;
+    var out: Io.Writer.Allocating = .init(arena);
+    const writer = &out.writer;
+    writer.writeAll("{\"conduit\":{\"v\":1,\"event\":") catch return null;
+    std.json.Stringify.encodeJsonString(name, .{}, writer) catch return null;
+    writer.writeAll(",\"token\":") catch return null;
+    std.json.Stringify.encodeJsonString(agent_token, .{}, writer) catch return null;
+    writer.print("}},\"payload\":{s}}}", .{payload}) catch return null;
+    return out.written();
+}
+
+/// Append one line to `<sink>/events.jsonl` with a single O_APPEND write, as
+/// the relay script does. Best effort: a hook must never fail its harness.
+fn appendSinkLine(sink_dir: []const u8, line: []const u8) void {
+    if (comptime builtin.os.tag == .windows) return;
+    if (sink_dir.len == 0 or sink_dir[0] != '/') return;
+    var path_buffer: [path_capacity]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ sink_dir, agent.pi.events_file_name }) catch return;
+    var line_buffer: std.ArrayList(u8) = .empty;
+    defer line_buffer.deinit(std.heap.page_allocator);
+    line_buffer.ensureTotalCapacity(std.heap.page_allocator, line.len + 1) catch return;
+    line_buffer.appendSliceAssumeCapacity(line);
+    line_buffer.appendAssumeCapacity('\n');
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true, .CLOEXEC = true }, 0o600) catch return;
+    defer _ = std.posix.system.close(fd);
+    // A short or failed append loses this one event; there is no one to tell.
+    _ = std.posix.system.write(fd, line_buffer.items.ptr, line_buffer.items.len);
+}
+
+/// `command` with a directory resolved against `cwd` and checked to exist,
+/// or null after saying why on stderr.
+fn resolveCommand(io: Io, arena: Allocator, command: CliCommand, cwd: []const u8) ?CliCommand {
+    switch (command) {
+        .open_directory => |path| {
+            const absolute = std.fs.path.resolve(arena, &.{ cwd, path }) catch return null;
+            const stat = Dir.cwd().statFile(io, absolute, .{}) catch {
+                _ = commandFailure("no such directory");
+                return null;
+            };
+            if (stat.kind != .directory) {
+                _ = commandFailure("not a directory");
+                return null;
+            }
+            return .{ .open_directory = absolute };
+        },
+        else => return command,
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try collectArgs(init.arena.allocator(), init.minimal.args);
-    const options = parseArgs(args, processEnv(init)) catch |err| {
+    var options = parseArgs(args, processEnv(init)) catch |err| {
         try writeStderrText("conduit: ");
         try writeStderrText(@errorName(err));
         try writeStderrText("\n\n");
@@ -27191,6 +28948,23 @@ pub fn main(init: std.process.Init) !void {
     if (options.print_version) {
         try writeStdout(init.io, "conduit " ++ version ++ "\n");
         return;
+    }
+
+    // A subcommand talks to a running Conduit before any log file or window
+    // exists; only when none answers does this process become one.
+    if (options.command) |command| {
+        const cwd = try std.process.currentPathAlloc(init.io, init.arena.allocator());
+        const resolved = resolveCommand(init.io, init.arena.allocator(), command, cwd) orelse std.process.exit(1);
+        switch (runCommand(init, resolved, cwd)) {
+            .exit => |status| {
+                if (status != 0) std.process.exit(status);
+                return;
+            },
+            .start => {
+                options.command = resolved;
+                options.command_cwd = cwd;
+            },
+        }
     }
 
     sink.install(init.io, options) catch |err| {
@@ -27317,6 +29091,18 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         try writeConfigTestFile(init.io, options.run.config_path.?, agent_test_initial_config);
     }
     defer if (options.run.agent_test) removeAgentTestDir(init.io, options.run.agent_test_dir.?);
+    // `--control-test` keeps its sockets, instance token and SSH config in
+    // the same private directory, so neither the person's running Conduit
+    // nor their `~/.ssh/config` is ever reached.
+    var control_runtime_buffer: [path_capacity]u8 = undefined;
+    var control_state_buffer: [path_capacity]u8 = undefined;
+    if (options.run.control_test) {
+        const dir = options.run.agent_test_dir.?;
+        options.run.runtime_dir = try std.fmt.bufPrint(&control_runtime_buffer, "{s}/rt", .{dir});
+        options.run.state_dir = try std.fmt.bufPrint(&control_state_buffer, "{s}/state", .{dir});
+        options.run.ssh_test_dir = dir;
+        options.run.control = true;
+    }
     var ssh_test_dir_buffer: [path_capacity]u8 = undefined;
     if (options.run.ssh_test) {
         const dir = try sshTestDir(init.io, &ssh_test_dir_buffer);
@@ -27425,6 +29211,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
     const app = try App.init(init.io, env, init.gpa, &window, options);
     defer app.destroy();
     try app.syncTextInput();
+    // A `conduit <command>` that found no running instance runs here.
+    if (options.command) |command| try app.queueStartupCommand(command, options.command_cwd orelse "");
 
     // A check's status is the run's status: `--scroll-test` and `--mouse-test`
     // exit non-zero when a check failed, which is what a test script reads.
@@ -27471,6 +29259,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try settingsTest(app, init.io, out);
     } else if (options.run.git_test) {
         check_status = try gitTest(app, init.io, out);
+    } else if (options.run.control_test) {
+        check_status = try controlTest(app, init.io, out);
     } else if (options.run.agent_view_test) {
         check_status = try agentViewTest(app, init.io, out);
     } else if (options.run.agent_manager_test) {
@@ -29613,6 +31403,9 @@ const inheriting_env = test_env{ .vars = &.{
     .{ "CONDUIT_AGENT_GATE", "1" },
     .{ "CONDUIT_TEST_FAKE_AGENT", "1" },
     .{ "CONDUIT_TEST_BACKLOG_CLI", "./fake-backlog" },
+    .{ "CONDUIT_CONTROL_ENDPOINT", "/outer/run.sock" },
+    .{ "CONDUIT_CONTROL_TOKEN", "ffffffffffffffffffffffffffffffff" },
+    .{ "CONDUIT_CONTROL_SESSION", "3" },
     .{ "HOME", "" },
     .{ "SHELL", "/bin/sh" },
 } };
@@ -30064,4 +31857,153 @@ test "a multi-megabyte flood is consumed in frames bounded by time, not by reads
     const burst = try simulateFlood(100, chunk, 10, 30 * ms);
     try testing.expectEqual(@as(usize, 100), burst.consumed);
     try testing.expectEqual(@as(u64, 1), burst.frames);
+}
+
+test "conduit subcommands parse, and malformed ones are refused" {
+    const env = test_env{ .vars = &.{} };
+    const dot = try parseArgs(&.{ "conduit", "." }, env.source());
+    try std.testing.expectEqualStrings(".", dot.command.?.open_directory);
+    // Flags before the command still apply to a run the command starts.
+    const flagged = try parseArgs(&.{ "conduit", "--hidden", "/srv/app" }, env.source());
+    try std.testing.expect(flagged.run.hidden);
+    try std.testing.expectEqualStrings("/srv/app", flagged.command.?.open_directory);
+    try std.testing.expectEqualStrings("build-box", (try parseArgs(&.{ "conduit", "ssh", "build-box" }, env.source())).command.?.open_ssh);
+    try std.testing.expectEqualStrings("api", (try parseArgs(&.{ "conduit", "workspace", "open", "api" }, env.source())).command.?.open_workspace);
+    const launch = (try parseArgs(&.{ "conduit", "agent", "claude", "fix", "--the", "build" }, env.source())).command.?.agent;
+    try std.testing.expectEqualStrings("claude", launch.harness);
+    try std.testing.expectEqual(@as(usize, 3), launch.prompt.len);
+    try std.testing.expectEqualStrings("--the", launch.prompt[1]);
+    const bare_agent = (try parseArgs(&.{ "conduit", "agent", "pi" }, env.source())).command.?.agent;
+    try std.testing.expectEqual(@as(usize, 0), bare_agent.prompt.len);
+    const raw = (try parseArgs(&.{ "conduit", "control", "tab.open", "{\"title\":\"x\"}" }, env.source())).command.?.control;
+    try std.testing.expectEqualStrings("tab.open", raw.method);
+    try std.testing.expectEqualStrings("{\"title\":\"x\"}", raw.params.?);
+    const hook = (try parseArgs(&.{ "conduit", "control", "agent.event", "--event=Stop", "--agent=abc" }, env.source())).command.?.control;
+    try std.testing.expectEqualStrings("Stop", hook.event.?);
+    try std.testing.expectEqualStrings("abc", hook.agent.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), hook.params);
+    try std.testing.expectEqual(control_api.Method.instance_open_ssh, (CliCommand{ .open_ssh = "h" }).method().?);
+    try std.testing.expectEqual(@as(?control_api.Method, null), (CliCommand{ .control = .{ .method = "ping" } }).method());
+    try std.testing.expectEqual(@as(?CliCommand, null), (try parseArgs(&.{ "conduit", "--hidden" }, env.source())).command);
+
+    try std.testing.expectError(error.MissingArgument, parseArgs(&.{ "conduit", "ssh" }, env.source()));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "conduit", "ssh", "a", "b" }, env.source()));
+    try std.testing.expectError(error.MissingArgument, parseArgs(&.{ "conduit", "workspace" }, env.source()));
+    try std.testing.expectError(error.UnknownCommand, parseArgs(&.{ "conduit", "workspace", "close", "api" }, env.source()));
+    try std.testing.expectError(error.MissingArgument, parseArgs(&.{ "conduit", "workspace", "open" }, env.source()));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "conduit", "workspace", "open", "a", "b" }, env.source()));
+    try std.testing.expectError(error.MissingArgument, parseArgs(&.{ "conduit", "agent" }, env.source()));
+    try std.testing.expectError(error.MissingArgument, parseArgs(&.{ "conduit", "control" }, env.source()));
+    try std.testing.expectError(error.MissingArgument, parseArgs(&.{ "conduit", "control", "--event=Stop" }, env.source()));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "conduit", "control", "ping", "{}", "{}" }, env.source()));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "conduit", "control", "ping", "--verbose" }, env.source()));
+    try std.testing.expectError(error.MissingValue, parseArgs(&.{ "conduit", "control", "agent.event", "--event=" }, env.source()));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "conduit", ".", "extra" }, env.source()));
+}
+
+test "--control and --no-control are the session layer of control.enabled, and --control-test runs in the agent check's environment" {
+    const env = test_env{ .vars = &.{} };
+    try std.testing.expectEqual(@as(?bool, true), (try parseArgs(&.{ "conduit", "--control" }, env.source())).run.control);
+    try std.testing.expectEqual(@as(?bool, false), (try parseArgs(&.{ "conduit", "--no-control" }, env.source())).run.control);
+    try std.testing.expectEqual(@as(?bool, null), (try parseArgs(&.{"conduit"}, env.source())).run.control);
+    const check = try parseArgs(&.{ "conduit", "--control-test" }, env.source());
+    try std.testing.expect(check.run.control_test and check.run.agent_test);
+    const resolved = optionsForRun(check);
+    try std.testing.expectEqual(ui_test_width, resolved.run.width);
+    try std.testing.expect(resolved.run.hidden);
+}
+
+test "control variables reach human and agent terminals only, never the scratchpad, a connection or a remote child" {
+    try std.testing.expect(controlEnvAllowed(.human_terminal, .local));
+    try std.testing.expect(controlEnvAllowed(.agent_terminal, .local));
+    try std.testing.expect(!controlEnvAllowed(.scratchpad, .local));
+    try std.testing.expect(!controlEnvAllowed(.connection, .local));
+    try std.testing.expect(!controlEnvAllowed(.human_terminal, .ssh));
+    try std.testing.expect(!controlEnvAllowed(.human_terminal, .wsl));
+
+    // An enclosing Conduit's control variables never reach any child: not the
+    // ordinary spec, not the scratchpad's interactive one.
+    var options: Options = .{};
+    options.run.command = "true";
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, inheriting_env.source(), .local, options);
+    defer spec.deinit();
+    var scratchpad = try ChildSpec.buildInteractive(std.testing.allocator, std.testing.io, inheriting_env.source(), .local, true, "/bin/sh");
+    defer scratchpad.deinit();
+    for ([_][]const u8{ control_api.endpoint_env_name, control_api.token_env_name, control_api.session_env_name }) |name| {
+        try std.testing.expectEqual(@as(usize, 0), countKey(spec.env, name));
+        try std.testing.expectEqual(@as(usize, 0), countKey(scratchpad.env, name));
+    }
+
+    // This run's own are added per session, exactly once each, over a base
+    // that somehow still held stale ones.
+    const base = [_][]const u8{ "PATH=/bin", "CONDUIT_CONTROL_TOKEN=stale", "CONDUIT_CONTROL_SESSIONX=kept" };
+    const env = try appendControlEnv(std.testing.allocator, &base, "/run/user/7/conduit/run-1.sock", "0123456789abcdef0123456789abcdef", session.SessionId.fromOrdinal(3));
+    defer freeEntries(std.testing.allocator, env);
+    try std.testing.expect(hasEntry(env, "PATH=/bin"));
+    try std.testing.expect(hasEntry(env, "CONDUIT_CONTROL_SESSIONX=kept"));
+    try std.testing.expect(hasEntry(env, "CONDUIT_CONTROL_ENDPOINT=/run/user/7/conduit/run-1.sock"));
+    try std.testing.expect(hasEntry(env, "CONDUIT_CONTROL_TOKEN=0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(hasEntry(env, "CONDUIT_CONTROL_SESSION=4"));
+    try std.testing.expectEqual(@as(usize, 1), countKey(env, control_api.token_env_name));
+}
+
+test "a control-test run's tabs see its private runtime and state directories" {
+    var options: Options = .{};
+    options.run.control_test = true;
+    options.run.agent_test = true;
+    options.run.runtime_dir = "/tmp/conduit-agent-test-x/rt";
+    options.run.state_dir = "/tmp/conduit-agent-test-x/state";
+    var spec = try ChildSpec.build(std.testing.allocator, std.testing.io, inheriting_env.source(), .local, options);
+    defer spec.deinit();
+    try std.testing.expect(hasEntry(spec.env, "XDG_RUNTIME_DIR=/tmp/conduit-agent-test-x/rt"));
+    try std.testing.expect(hasEntry(spec.env, "XDG_STATE_HOME=/tmp/conduit-agent-test-x/state"));
+    try std.testing.expectEqualStrings(control_test_script, spec.argv[2]);
+}
+
+test "the instance token lives beside the state file, and the client's frames and replies are exact" {
+    const env = test_env{ .vars = &.{ .{ "HOME", "/home/me" }, .{ "XDG_STATE_HOME", "/home/me/.state" } } };
+    var buffer: [path_capacity]u8 = undefined;
+    if (builtin.os.tag == .linux) {
+        try std.testing.expectEqualStrings("/home/me/.state/conduit/instance.token", instanceTokenPath(&buffer, env.source(), null).?);
+        try std.testing.expectEqualStrings("/private/state/conduit/instance.token", instanceTokenPath(&buffer, env.source(), "/private/state").?);
+        try std.testing.expectEqualStrings("/private/rt/conduit", controlRuntimeDir(&buffer, env.source(), "/private/rt").?);
+    }
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("{\"path\":\"/srv/a \\\"b\\\"\"}", try instanceParams(arena, .{ .open_directory = "/srv/a \"b\"" }, "/x"));
+    try std.testing.expectEqualStrings("{\"name\":\"api\",\"path\":\"/home/me\"}", try instanceParams(arena, .{ .open_workspace = "api" }, "/home/me"));
+    try std.testing.expectEqualStrings("{\"harness\":\"claude\",\"prompt\":\"fix the build\"}", try instanceParams(arena, .{ .agent = .{ .harness = "claude", .prompt = &.{ "fix", "the", "build" } } }, "/"));
+    try std.testing.expectEqualStrings("{\"harness\":\"pi\"}", try instanceParams(arena, .{ .agent = .{ .harness = "pi", .prompt = &.{} } }, "/"));
+    try std.testing.expectEqualStrings(
+        "{\"id\":1,\"method\":\"instance.open_ssh\",\"token\":\"t\",\"session\":4,\"params\":{\"destination\":\"h\"}}",
+        try controlFrame(arena, "instance.open_ssh", "t", "4", "{\"destination\":\"h\"}"),
+    );
+    // A malformed or zero session is left out rather than sent.
+    try std.testing.expectEqualStrings("{\"id\":1,\"method\":\"ping\",\"token\":\"t\",\"params\":{}}", try controlFrame(arena, "ping", "t", "x", "{}"));
+    try std.testing.expectEqualStrings("{\"id\":1,\"method\":\"ping\",\"token\":\"t\",\"params\":{}}", try controlFrame(arena, "ping", "t", "0", "{}"));
+
+    try std.testing.expectEqual(@as(?[]const u8, null), replyError("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"));
+    try std.testing.expectEqualStrings("Unauthorized", replyError("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"Unauthorized\"}}").?);
+    try std.testing.expectEqualStrings("MalformedReply", replyError("nonsense").?);
+    try std.testing.expectEqualStrings("{\"a\":[1,2]}", compactObject(arena, " { \"a\" : [1, 2] }\n").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), compactObject(arena, "[1]"));
+    try std.testing.expectEqual(app_agents.Choice{ .harness = .claude_code }, controlHarnessChoice("claude").?);
+    try std.testing.expectEqual(app_agents.Choice{ .harness = .codex }, controlHarnessChoice("codex").?);
+    try std.testing.expectEqual(app_agents.Choice.fake, controlHarnessChoice("fake").?);
+    try std.testing.expectEqual(@as(?app_agents.Choice, null), controlHarnessChoice("emacs"));
+}
+
+test "a tab.status label leads with the attention mark and the status text" {
+    var mark: ControlTabStatus = .{ .key = .first, .tab_id = .first, .attention = true };
+    @memcpy(mark.text[0..4], "busy");
+    mark.text_len = 4;
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("! busy api", controlTabLabel(&buffer, "  api", "api", &mark));
+    mark.attention = false;
+    try std.testing.expectEqualStrings("* busy api", controlTabLabel(&buffer, "* api", "api", &mark));
+    mark.text_len = 0;
+    mark.attention = true;
+    try std.testing.expectEqualStrings("! api", controlTabLabel(&buffer, "  api", "api", &mark));
 }

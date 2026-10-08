@@ -3,24 +3,39 @@
 A program running inside a Conduit terminal (a coding-agent harness, its hooks or extensions, or
 a script) can ask Conduit to open a tab or split pane in its own workspace, show an agent or
 backlog view, set its tab's status, raise a notification, and deliver structured agent events.
-This page is the wire contract and the harness configuration guide. Code: `src/control.zig`
-(TASK-60).
+The `conduit` command uses the same protocol to reuse a running Conduit: `conduit .`,
+`conduit ssh <host>`, `conduit workspace open <name>` and `conduit agent <harness>`. This page is
+the wire contract and the harness configuration guide. Code: `src/control.zig` (TASK-60) and the
+app handler and command-line client in `src/main.zig` (TASK-60 part two, TASK-66).
 
-Status: part one (protocol, server, unit and socket integration tests) is implemented. The app
-wiring, the `control.enabled` setting, the `conduit` CLI subcommands and the MCP tools are part
-two; until then no Conduit build starts the endpoint, and the examples below use the raw socket
-protocol. Linux and macOS only: Windows has no control transport yet.
+Status: implemented and verified on Linux (`--control-test`, the `control-api` E2E scenario and
+the socket integration tests in `src/control.zig`). macOS uses the same POSIX code but has not
+been run. Windows has no control transport yet: neither endpoint starts there, and `conduit`
+commands always start a new window.
+
+## Enabling
+
+The endpoints run when the `control.enabled` setting resolves on: `--control` or `--no-control`
+for one run, else the settings file, else the build's default, which is **on in development
+(Debug) builds and off in release builds**. Built-in checks other than `--control-test` never
+start them. See [config.md](config.md#keys).
 
 ## Discovery
 
-Conduit sets three variables in the environment of every terminal child in a workspace, except
-the scratchpad's:
+Conduit sets three variables in the environment of every Local human and agent terminal in a
+workspace, and of no other child (not the scratchpad, not an SSH workspace's connection terminal,
+not a remote child, which could not reach a local socket anyway):
 
 | Variable | Value |
 |---|---|
-| `CONDUIT_CONTROL_ENDPOINT` | Absolute path of the control socket, inside the run's private directory (`…/control.sock`). |
+| `CONDUIT_CONTROL_ENDPOINT` | Absolute path of this run's control socket, `<runtime dir>/conduit/r-<8 hex>.sock`. |
 | `CONDUIT_CONTROL_TOKEN` | The workspace's control token: 32 lowercase hex digits (128 random bits). |
 | `CONDUIT_CONTROL_SESSION` | This terminal's session id, a positive integer. Pass it back as `session` so "my tab" and "my pane" mean this terminal. |
+
+The runtime directory is `$XDG_RUNTIME_DIR` (when absolute), else `/tmp/conduit-<uid>`; on macOS
+`$TMPDIR` comes before `/tmp`. Conduit creates `<runtime dir>/conduit` with mode 0700. An
+enclosing Conduit's three variables are never inherited, so a nested Conduit's children only see
+their own.
 
 Agent children also carry `CONDUIT_AGENT_TOKEN`, the agent's correlation token, which
 `agent.event` names. A program that does not see `CONDUIT_CONTROL_ENDPOINT` is not inside a
@@ -28,19 +43,22 @@ Conduit workspace terminal (or the endpoint is disabled) and should do nothing.
 
 ## Security model
 
-- **Local only.** The endpoint is a mode-0600 Unix socket inside a mode-0700 directory owned by
+- **Local only.** Each endpoint is a mode-0600 Unix socket inside a mode-0700 directory owned by
   the user; Conduit refuses to listen in a directory with any group or other permission. There
   is no TCP fallback.
-- **Off in release builds unless enabled.** The endpoint starts in development (Debug) builds,
-  and in release builds only when the `control.enabled` setting is on (part two adds it).
-- **Token-scoped.** Every request carries a workspace token, compared in constant time. A token
-  reaches only its own workspace. Tokens are random per run, expire when the workspace closes,
-  and can be rotated; a request with a missing, malformed, unknown or expired token gets
-  `Unauthorized` before its parameters are even looked at.
+- **Off in release builds unless enabled** (see [Enabling](#enabling)).
+- **Token-scoped.** Every request carries a token, compared in constant time. A workspace token
+  reaches only its own workspace. Tokens are random per run (from the OS entropy source), are
+  issued when the workspace's first terminal starts, expire when the workspace closes, and can be
+  rotated; a request with a missing, malformed, unknown or expired token gets `Unauthorized`
+  before its parameters are even looked at. The instance token (see
+  [Single instance](#single-instance)) names no workspace and is accepted only by `ping` and the
+  four `instance.*` methods.
 - **The scratchpad is never addressable.** Its child gets no control variables, and a request
-  whose `session` is the scratchpad's id is refused with `ScratchpadNotAddressable`. No method
-  can show, hide, restart, type into or otherwise take over the scratchpad.
-- **Enumerated methods only.** The eight methods below are the whole API; anything else is
+  whose `session` is the scratchpad's id is refused with `ScratchpadNotAddressable`, by the server
+  and again by Conduit itself. No method can show, hide, restart, type into or otherwise take over
+  the scratchpad.
+- **Enumerated methods only.** The twelve methods below are the whole API; anything else is
   `MethodNotFound`. Nothing in a request is executed by a shell: `command` is an argv. A `cwd` is
   handed to the workspace's ExecutionContext (local, SSH or WSL) and never resolved by the
   server. Request text is never logged above debug level, and replies never echo it.
@@ -67,7 +85,7 @@ Request:
 |---|---|---|
 | `id` | yes | An integer, or a string of at most 128 bytes. Echoed in the reply. |
 | `method` | yes | One of the method names below, exactly. |
-| `token` | yes | The workspace token. |
+| `token` | yes | The workspace token (or the instance token for `instance.*`). |
 | `session` | no | The caller's own session id (`CONDUIT_CONTROL_SESSION`). It must belong to the token's workspace and must not be the scratchpad. Without it, Conduit uses the workspace's active tab. |
 | `params` | no | An object; omitted means `{}`. Unknown members are refused. |
 | `jsonrpc` | no | If present, must be `"2.0"`. |
@@ -76,12 +94,21 @@ Success reply: `{"jsonrpc":"2.0","id":1,"result":{...}}`.
 Error reply: `{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"ScratchpadNotAddressable"}}`.
 When the request id could not be read, `id` is `null`.
 
+### Timing
+
+Requests are performed on Conduit's UI thread in arrival order. A request that would move focus
+while the person is holding a key or the mouse, while the palette or a close confirmation is open,
+or while the workspace is still starting another terminal waits for up to 4 seconds and is then
+answered `Unavailable`. `tab.open`, `pane.split` and `instance.agent` reply once the new
+terminal's process has started (or `InternalError` when it could not start). The server answers
+`TimedOut` after 5 seconds; the action may still happen.
+
 ## Methods
 
 String limits: UI text (`title`, status `text`, notification `title`) is UTF-8 without control
-characters; a notification `body` may also contain `\n` and `\t`. `cwd` is 1–4096 bytes without
-control characters. `command` is 1–256 strings of at most 4096 bytes each, without NUL, and the
-first may not be empty.
+characters; a notification `body` and an agent `prompt` may also contain `\n` and `\t`. `cwd` and
+`path` are 1–4096 bytes without control characters. `command` is 1–256 strings of at most 4096
+bytes each, without NUL, and the first may not be empty.
 
 ### `ping`
 
@@ -95,13 +122,14 @@ Checks the endpoint and the token. Params: none.
 ### `tab.open`
 
 Opens a new tab in the caller's workspace and makes it active, exactly like the "new tab"
-command: the child is spawned through the workspace's ExecutionContext. Params:
+command: the child is spawned through the workspace's ExecutionContext. When the caller's
+workspace is not the one shown, Conduit switches to it. Params:
 
 | Param | Meaning |
 |---|---|
-| `cwd` | Working directory in the workspace's context. Default: the caller session's tracked cwd, else the workspace cwd. |
+| `cwd` | Working directory in the workspace's context. Default: the caller session's tracked cwd, else the active session's, else the workspace cwd. |
 | `command` | argv to run instead of the workspace shell. |
-| `title` | Tab label, 1–256 bytes. Default: Conduit's usual label. |
+| `title` | Tab label, 1–256 bytes. Default: `Terminal <n>`. |
 
 ```json
 {"id":2,"method":"tab.open","token":"…","session":4,"params":{"cwd":"/home/me/src/app","command":["npm","test"],"title":"tests"}}
@@ -110,31 +138,34 @@ command: the child is spawned through the workspace's ExecutionContext. Params:
 
 ### `pane.split`
 
-Splits the caller's pane (its `session`, else the active tab's focused pane). Params:
-`direction` (`"right"` or `"down"`, required), `cwd`, `command` as for `tab.open`.
+Splits the caller's pane (its `session`, else the active tab's focused pane) and focuses the new
+pane. Params: `direction` (`"right"` or `"down"`, required), `cwd`, `command` as for `tab.open`.
 
 ```json
 {"id":3,"method":"pane.split","token":"…","session":4,"params":{"direction":"right","command":["tail","-f","build.log"]}}
-{"jsonrpc":"2.0","id":3,"result":{"pane":7,"session":10}}
+{"jsonrpc":"2.0","id":3,"result":{"tab":3,"pane":7,"session":10}}
 ```
 
 ### `view.agent`
 
-Shows the agent view (TASK-57) in the caller's workspace. Params: `agent_id` (optional,
-1–256 bytes of `A–Z a–z 0–9 . _ : -`), naming an agent of this workspace; without it, the agent
-attached to the caller's session. Result: `{}` or the ids of what was opened. `NotFound` when
-the agent is not in this workspace; `Unavailable` while the view does not exist yet.
+Shows the agent view (TASK-57) of an agent in the caller's workspace and brings its pane forward.
+Params: `agent_id` (optional): the agent's number as the agent manager and the
+`agent.view.<n>` semantic ids show it; without it, the agent running in the caller's own
+session. Result: `{"session":…}`. `NotFound` when the agent is not in this workspace.
 
 ### `view.backlog`
 
-Shows the backlog view (TASK-63) for the caller's workspace. Params: none. Result as for
-`view.agent`, including `Unavailable` while the view does not exist yet.
+Shows the backlog view (TASK-63) for the caller's workspace, on `<cwd>/backlog` of the caller's
+tab (its tracked cwd, else the workspace's directory). Params: none. Result: `{}`, or
+`Unavailable` when the view could not open.
 
 ### `tab.status`
 
-Sets the caller's tab status. Params: `text` (0–64 bytes; replaces the label prefix, `""`
-clears it) and `attention` (`true` raises the tab's attention mark like a BEL, `false` clears
-it). Both optional. Result: `{}`.
+Sets the caller's tab status. Params: `text` (0–64 bytes; shown before the tab's name, `""`
+clears it) and `attention` (`true` shows the tab's attention mark `!` like a bell, `false`
+clears it). Both optional. The sidebar shows `<mark> <text> <name>`, for example `! busy api`.
+The attention mark clears when the person activates the tab. An agent's tab keeps its state glyph
+instead. Result: `{}`.
 
 ```json
 {"id":4,"method":"tab.status","token":"…","session":4,"params":{"text":"testing","attention":false}}
@@ -142,21 +173,55 @@ it). Both optional. Result: `{}`.
 
 ### `notify`
 
-Raises a Conduit notification (TASK-56) attributed to the caller's tab. Params: `title` (1–256 bytes,
-required), `body` (0–4096 bytes). Result: `{}`.
+Raises a Conduit notification (TASK-56) attributed to the caller's tab: an entry in the
+notification list, and an OS notification while the window is unfocused, both subject to the
+`notifications.enabled`, `notifications.terminal` and `notifications.os` settings. Params:
+`title` (1–256 bytes, required), `body` (0–4096 bytes). Result: `{}`.
 
 ### `agent.event`
 
 Delivers one structured harness event (a hook call, an extension event) to Conduit's agent
 subsystem. Params: `agent` (required, the `CONDUIT_AGENT_TOKEN` value: 32 lowercase hex digits)
-and `payload` (required, a JSON object). The server checks only size and shape and forwards the
-payload, re-encoded as compact JSON, to the adapter that owns that agent token; it never
-interprets it. `NotFound` when no agent of this workspace has that token. Result: `{}`.
+and `payload` (required, a JSON object). The server checks only size and shape; Conduit appends
+the payload, re-encoded as one compact line, to the event channel the agent's adapter already
+reads, and never interprets it. `NotFound` when no agent of this workspace has that token;
+`Unavailable` for a harness whose adapter has no line channel (Codex and OpenCode use their own
+servers). Result: `{}`.
 
 The payload is the adapter's existing event-line object, unchanged: for Claude Code,
 `{"conduit":{"v":1,"event":"<Hook>","token":"<agent token>"},"payload":<hook input>}`; for Pi,
 `{"v":1,"token":"<agent token>","type":…}`. A payload larger than the 64 KiB frame cannot be
-sent; trim large fields (for example a `Write` tool's file contents) before sending.
+sent; `conduit control agent.event --event=…` then falls back to the agent's sink file.
+
+### `instance.open_directory`
+
+Opens or focuses a Local workspace for a directory (`conduit .`, `conduit <dir>`). Params: `path`
+(an absolute directory, required). An open workspace in that directory (including the first
+workspace when it opened in this directory) is focused; otherwise a workspace named after the
+directory's last component opens there with its first tab and scratchpad. Result:
+`{"workspace":…}`, the workspace key as in the `workspace.<n>` semantic ids.
+
+### `instance.open_ssh`
+
+Opens an SSH workspace (`conduit ssh <host>`), exactly as **Remote: connect** does: named after
+the host, connecting through the workspace's master connection, prompts in its connection view.
+Params: `destination` (`[user@]host[:port]` or an `~/.ssh/config` alias, required; validated as
+`remote.profile` destinations are). The reply comes as soon as the workspace exists, while it
+connects. Result: `{"workspace":…}`.
+
+### `instance.open_workspace`
+
+Focuses the workspace with this name (`conduit workspace open <name>`), or opens a Local workspace
+of that name in `path` when none exists. Params: `name` (1–256 bytes, required), `path` (absolute,
+optional). `NotFound` without `path` when no workspace has the name. Result: `{"workspace":…}`.
+
+### `instance.agent`
+
+Launches a coding agent (`conduit agent <harness> [prompt...]`), exactly as **Agent: launch**
+does, in a new tab of the caller's workspace (a workspace token, with the caller's cwd) or of the
+active workspace (the instance token). Params: `harness` (`claude`, `claude_code`, `codex`, `pi`
+or `opencode`, required) and `prompt` (0–4096 bytes, optional). `NotFound` for a harness Conduit
+cannot launch. Result: `{"workspace":…,"tab":…,"session":…}`.
 
 ## Errors
 
@@ -164,91 +229,111 @@ sent; trim large fields (for example a `Write` tool's file contents) before send
 |---|---|---|
 | -32700 | `ParseError` | The line is not valid UTF-8 JSON. |
 | -32600 | `InvalidRequest` | Not an object, missing `id` or `method`, unknown member, too deep, or over 64 KiB. |
-| -32601 | `MethodNotFound` | Not one of the eight methods. |
+| -32601 | `MethodNotFound` | Not one of the twelve methods. |
 | -32602 | `InvalidParams` | A parameter is missing, has the wrong type, or is out of bounds. |
-| -32603 | `InternalError` | Conduit failed unexpectedly. |
-| -32000 | `Unavailable` | Valid, but Conduit cannot do it now (feature not present, shutting down). |
-| -32001 | `Unauthorized` | Missing, malformed, unknown or expired token. |
+| -32603 | `InternalError` | Conduit failed unexpectedly, or the new terminal's process did not start. |
+| -32000 | `Unavailable` | Valid, but Conduit cannot do it now (busy for 4 s, view not available, shutting down). |
+| -32001 | `Unauthorized` | Missing, malformed, unknown or expired token, or a workspace method with the instance token. |
 | -32002 | `ScratchpadNotAddressable` | The request named the scratchpad session. |
 | -32003 | `Busy` | Too many requests or connections in flight; retry later. |
-| -32004 | `NotFound` | The session or agent is not in the token's workspace. |
+| -32004 | `NotFound` | The session, agent, harness or workspace is not there. |
 | -32008 | `TimedOut` | Conduit did not answer within its deadline (5 s). The action may still happen. |
+
+## The `conduit` command
+
+```
+conduit control <method> [<params-json>]   one request to this terminal's endpoint
+conduit .  |  conduit <dir>                 instance.open_directory
+conduit ssh <host>                          instance.open_ssh
+conduit workspace open <name>               instance.open_workspace (path: the current directory)
+conduit agent <harness> [prompt...]         instance.agent (the prompt words joined by spaces)
+```
+
+`conduit control` sends one request with `$CONDUIT_CONTROL_ENDPOINT`, `$CONDUIT_CONTROL_TOKEN`
+and `$CONDUIT_CONTROL_SESSION`, prints the reply line, and exits 0 for a result, 1 for an error
+reply or when nothing answers, and 2 for a malformed command line or params. `params` must be a
+JSON object; it is re-encoded compactly before it is sent. For `agent.event`, stdin is the
+payload object, the agent is `--agent=<token>` or `$CONDUIT_AGENT_TOKEN`, and `--event=<Hook>`
+wraps stdin as a Claude Code hook line. With `--event` the command is a hook: it prints nothing,
+always exits 0, and when the endpoint does not take the event (not running, too large, refused)
+appends the line to `$CONDUIT_AGENT_SINK/events.jsonl` instead.
+
+The other four commands print nothing and exit 0 when the running Conduit carried them out, or
+print `conduit: <Message>` and exit 1 when it refused. A directory is resolved against the current
+directory and must exist.
+
+## Single instance
+
+A running Conduit answers `conduit` commands on its instance endpoint,
+`<runtime dir>/conduit/instance.sock`, with a token it writes (mode 0600, directory 0700) to
+`<state dir>/instance.token` at startup and removes when it leaves: `$XDG_STATE_HOME/conduit`, else
+`~/.local/state/conduit` (`~/Library/Application Support/conduit` on macOS). A command then:
+
+1. inside a Conduit terminal (its control variables set), sends the method to that terminal's own
+   Conduit with the workspace token and session, so `conduit agent` launches in the caller's
+   workspace;
+2. otherwise reads the token file and sends the method to the instance endpoint, so
+   `conduit agent` launches in the active workspace;
+3. when nothing answers (no endpoint, no token file, a stale socket, a refused connection),
+   becomes Conduit itself: it starts a window and carries the command out once it can.
+
+Plain `conduit` always starts a new window. When a second Conduit starts while one already
+answers, the first keeps the instance endpoint. `conduit-test launch` and `--control-test` set a
+private `XDG_RUNTIME_DIR` and `XDG_STATE_HOME`, so a test run never answers, or reaches, the
+person's own Conduit.
 
 ## Harness configuration
 
-Until part two ships the `conduit` CLI (which will replace these helpers with commands such as
-`conduit tab open` and `conduit agent-event`), clients speak the socket directly. `socat` and
-OpenBSD `nc -U` both work; `jq` builds JSON safely. Every example exits quietly when it is not
-running inside Conduit.
+`conduit` must be on `PATH` (an installed package puts it there), or use its absolute path.
+Every example does nothing when it is not running inside Conduit, because `conduit control` then
+exits without sending anything.
 
 ### Shell
 
 ```sh
-# conduit-control METHOD PARAMS_JSON   e.g. conduit-control tab.open '{"command":["htop"]}'
-conduit_control() {
-  [ -n "$CONDUIT_CONTROL_ENDPOINT" ] || return 0
-  params=$2
-  [ -n "$params" ] || params='{}'
-  jq -cn --arg m "$1" --argjson p "$params" --arg t "$CONDUIT_CONTROL_TOKEN" \
-    --arg s "${CONDUIT_CONTROL_SESSION:-}" \
-    '{id:1, method:$m, token:$t, params:$p} + (if $s == "" then {} else {session:($s|tonumber)} end)' |
-    socat -t5 - "UNIX-CONNECT:$CONDUIT_CONTROL_ENDPOINT"
-  # or: nc -U -N "$CONDUIT_CONTROL_ENDPOINT"
-}
+conduit control tab.open '{"title":"logs","command":["tail","-f","/var/log/syslog"]}'
+conduit control pane.split '{"direction":"down"}'
+conduit control tab.status '{"text":"building","attention":false}'
+conduit control notify '{"title":"Build","body":"finished"}'
 ```
 
 ### Claude Code hooks
 
-Save as an executable `conduit-hook.sh` somewhere on your machine:
+An agent Conduit launches itself gets its hooks through `--settings` (TASK-53): while the control
+endpoint runs, every hook except `PermissionRequest` runs
+`'<conduit>' control agent.event --event=<Hook>`, which sends the hook input over the endpoint
+(falling back to the agent's sink); `PermissionRequest` keeps its file-based relay, whose answer
+comes back through `decisions/`. Nothing needs configuring.
 
-```sh
-#!/bin/sh
-# conduit-hook.sh <HookEvent>: forward one Claude Code hook input to Conduit.
-[ -n "$CONDUIT_CONTROL_ENDPOINT" ] && [ -n "$CONDUIT_AGENT_TOKEN" ] || exit 0
-jq -c --arg e "$1" --arg a "$CONDUIT_AGENT_TOKEN" --arg t "$CONDUIT_CONTROL_TOKEN" \
-  '{id:1, method:"agent.event", token:$t,
-    params:{agent:$a, payload:{conduit:{v:1, event:$e, token:$a}, payload:.}}}' |
-  socat -t5 - "UNIX-CONNECT:$CONDUIT_CONTROL_ENDPOINT" >/dev/null 2>&1
-exit 0
-```
-
-and register it in `~/.claude/settings.json` (or the project's `.claude/settings.json`):
+A Claude Code started by hand in a Conduit terminal has no agent token, but its hooks can still
+mark the tab and notify. In `~/.claude/settings.json` (or the project's `.claude/settings.json`):
 
 ```json
 {
   "hooks": {
-    "SessionStart":     [{"hooks": [{"type": "command", "command": "/path/to/conduit-hook.sh SessionStart"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/path/to/conduit-hook.sh UserPromptSubmit"}]}],
-    "PreToolUse":       [{"hooks": [{"type": "command", "command": "/path/to/conduit-hook.sh PreToolUse"}]}],
-    "PostToolUse":      [{"hooks": [{"type": "command", "command": "/path/to/conduit-hook.sh PostToolUse"}]}],
-    "Notification":     [{"hooks": [{"type": "command", "command": "/path/to/conduit-hook.sh Notification"}]}],
-    "Stop":             [{"hooks": [{"type": "command", "command": "/path/to/conduit-hook.sh Stop"}]}]
+    "Notification": [{"hooks": [{"type": "command", "command": "conduit control tab.status '{\"text\":\"waiting\",\"attention\":true}' >/dev/null 2>&1; true"}]}],
+    "Stop":         [{"hooks": [{"type": "command", "command": "conduit control tab.status '{\"text\":\"\",\"attention\":true}' >/dev/null 2>&1; true"}]}]
   }
 }
 ```
 
-The hook prints nothing, so Claude Code's own behaviour is unchanged. An agent Conduit launches
-itself already gets equivalent hooks through `--settings` (TASK-53); today they append to the
-per-agent `events.jsonl` sink, and part two moves that relay onto `agent.event` with the same
-event-line format. Permission replies keep their file channel until then.
+The output is discarded so Claude Code's own behaviour is unchanged.
 
 ### Pi extension
 
-Conduit's Pi extension (`src/agent/pi/conduit.js`) currently appends each event line to
-`$CONDUIT_AGENT_SINK/events.jsonl`. The migration replaces that append with one `agent.event`
-request carrying the same line object as `payload`, sent when `CONDUIT_CONTROL_ENDPOINT` is set
-and falling back to the sink otherwise:
+Conduit's Pi extension (`src/agent/pi/conduit.js`) appends each event line to
+`$CONDUIT_AGENT_SINK/events.jsonl`. An extension can send the same line object through the
+endpoint instead, falling back to the sink:
 
 ```js
-import { connect } from "node:net";
+import { execFileSync } from "node:child_process";
 function send(line) {
-  const endpoint = process.env.CONDUIT_CONTROL_ENDPOINT;
-  if (!endpoint) return appendToSink(line); // the existing CONDUIT_AGENT_SINK path
-  const frame = JSON.stringify({ id: 1, method: "agent.event", token: process.env.CONDUIT_CONTROL_TOKEN,
-    params: { agent: process.env.CONDUIT_AGENT_TOKEN, payload: line } }) + "\n";
-  const socket = connect(endpoint, () => socket.end(frame));
-  socket.on("data", () => socket.destroy());
-  socket.on("error", () => appendToSink(line));
+  if (!process.env.CONDUIT_CONTROL_ENDPOINT) return appendToSink(line); // the existing sink path
+  try {
+    execFileSync("conduit", ["control", "agent.event"], { input: JSON.stringify(line), stdio: ["pipe", "ignore", "ignore"] });
+  } catch {
+    appendToSink(line);
+  }
 }
 ```
 
@@ -263,13 +348,10 @@ notify = ["/path/to/conduit-codex-notify.sh"]
 
 ```sh
 #!/bin/sh
-# conduit-codex-notify.sh '<json>': turn a finished Codex turn into a tab mark and a notification.
+# conduit-codex-notify.sh '<json>': turn a finished Codex turn into a notification.
 [ -n "$CONDUIT_CONTROL_ENDPOINT" ] || exit 0
-printf '%s' "$1" | jq -c --arg t "$CONDUIT_CONTROL_TOKEN" --arg s "${CONDUIT_CONTROL_SESSION:-}" '
-  {id:1, method:"notify", token:$t,
-   params:{title:"Codex", body:((.["last-assistant-message"] // "Turn complete") | tostring | .[0:4096])}}
-  + (if $s == "" then {} else {session:($s|tonumber)} end)' |
-  socat -t5 - "UNIX-CONNECT:$CONDUIT_CONTROL_ENDPOINT" >/dev/null 2>&1
+params=$(printf '%s' "$1" | jq -c '{title:"Codex", body:((.["last-assistant-message"] // "Turn complete") | tostring | .[0:4096])}')
+conduit control notify "$params" >/dev/null 2>&1
 exit 0
 ```
 
@@ -281,23 +363,24 @@ An OpenCode plugin (for example `.opencode/plugin/conduit.js`) can mark the tab 
 goes idle:
 
 ```js
-import { connect } from "node:net";
+import { execFile } from "node:child_process";
 export const Conduit = async () => ({
   event: async ({ event }) => {
-    const endpoint = process.env.CONDUIT_CONTROL_ENDPOINT;
-    if (!endpoint || event.type !== "session.idle") return;
-    const session = Number(process.env.CONDUIT_CONTROL_SESSION) || undefined;
-    const frame = JSON.stringify({ id: 1, method: "tab.status", token: process.env.CONDUIT_CONTROL_TOKEN,
-      session, params: { text: "idle", attention: true } }) + "\n";
-    const socket = connect(endpoint, () => socket.end(frame));
-    socket.on("data", () => socket.destroy());
-    socket.on("error", () => {});
+    if (!process.env.CONDUIT_CONTROL_ENDPOINT || event.type !== "session.idle") return;
+    execFile("conduit", ["control", "tab.status", JSON.stringify({ text: "idle", attention: true })], () => {});
   },
 });
 ```
 
 An agent Conduit launches itself uses OpenCode's own server channel (TASK-78) instead.
 
-The Codex and OpenCode snippets follow those harnesses' documented `notify` and plugin
-interfaces and have not been run against a live harness; the protocol itself is covered by
-`src/control.zig`'s socket tests.
+The Codex, OpenCode and Pi snippets follow those harnesses' documented `notify`, plugin and
+extension interfaces and have not been run against a live harness; the protocol and the
+`conduit control` client are covered by `src/control.zig`'s socket tests and `--control-test`.
+
+## MCP and `conduit-test`
+
+`conduit-test` has no control forwarding: the workspace tokens exist only inside the app and its
+terminals, so an agent driving an isolated run types `conduit control …` into a terminal through
+the driver (`type`, `key`), as the `control-api` E2E scenario does. `conduit-test launch` puts
+the run's control and instance sockets in its private run directory.

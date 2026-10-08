@@ -54,6 +54,14 @@ pub const max_notify_title_bytes: usize = 256;
 pub const max_notify_body_bytes: usize = 4096;
 /// Longest agent id named by `view.agent`.
 pub const max_agent_id_bytes: usize = 256;
+/// Longest SSH destination `instance.open_ssh` accepts (TASK-66).
+pub const max_destination_bytes: usize = 256;
+/// Longest workspace name `instance.open_workspace` accepts.
+pub const max_workspace_name_bytes: usize = 256;
+/// Longest harness name `instance.agent` accepts.
+pub const max_harness_bytes: usize = 32;
+/// Longest initial prompt `instance.agent` accepts.
+pub const max_prompt_bytes: usize = 4096;
 
 /// A random 128-bit control token, kept as 32 lowercase hex digits. The owner
 /// supplies the random bytes, so this module needs no OS entropy.
@@ -107,6 +115,22 @@ pub const Method = enum {
     tab_status,
     notify,
     agent_event,
+    /// TASK-66's instance methods: what a `conduit <command>` forwards to a
+    /// running instance. Accepted with the instance token on the instance
+    /// endpoint, or with a workspace token on the run endpoint (a command
+    /// typed inside a Conduit terminal).
+    instance_open_directory,
+    instance_open_ssh,
+    instance_open_workspace,
+    instance_agent,
+
+    /// Whether this is one of the instance methods.
+    pub fn isInstance(self: Method) bool {
+        return switch (self) {
+            .instance_open_directory, .instance_open_ssh, .instance_open_workspace, .instance_agent => true,
+            else => false,
+        };
+    }
 
     /// The dotted wire name.
     pub fn wireName(self: Method) []const u8 {
@@ -119,6 +143,10 @@ pub const Method = enum {
             .tab_status => "tab.status",
             .notify => "notify",
             .agent_event => "agent.event",
+            .instance_open_directory => "instance.open_directory",
+            .instance_open_ssh => "instance.open_ssh",
+            .instance_open_workspace => "instance.open_workspace",
+            .instance_agent => "instance.agent",
         };
     }
 
@@ -174,6 +202,25 @@ pub const Params = union(Method) {
         agent: AgentToken,
         /// The payload object re-encoded as compact JSON, uninterpreted.
         payload_json: []const u8,
+    },
+    instance_open_directory: struct {
+        /// An absolute local directory. Opened as given; never resolved here.
+        path: []const u8,
+    },
+    instance_open_ssh: struct {
+        /// `[user@]host[:port]` or an ssh_config alias; validated by the owner.
+        destination: []const u8,
+    },
+    instance_open_workspace: struct {
+        name: []const u8,
+        /// Where a new workspace of that name opens when none exists yet.
+        path: ?[]const u8 = null,
+    },
+    instance_agent: struct {
+        /// A harness name (`claude`, `codex`, `pi`, `opencode`, ...),
+        /// matched by the owner against what it can launch.
+        harness: []const u8,
+        prompt: ?[]const u8 = null,
     },
 };
 
@@ -396,6 +443,37 @@ fn parseParams(arena: Allocator, method: Method, object: std.json.ObjectMap) All
             if (payload_json.len > max_frame_bytes) break :blk null;
             break :blk .{ .agent_event = .{ .agent = agent, .payload_json = payload_json } };
         },
+        .instance_open_directory => blk: {
+            if (!hasOnlyFields(object, &.{"path"})) break :blk null;
+            const path = boundedText(object.get("path") orelse break :blk null, 1, max_path_bytes, false) orelse break :blk null;
+            break :blk .{ .instance_open_directory = .{ .path = path } };
+        },
+        .instance_open_ssh => blk: {
+            if (!hasOnlyFields(object, &.{"destination"})) break :blk null;
+            const destination = boundedText(object.get("destination") orelse break :blk null, 1, max_destination_bytes, false) orelse
+                break :blk null;
+            break :blk .{ .instance_open_ssh = .{ .destination = destination } };
+        },
+        .instance_open_workspace => blk: {
+            if (!hasOnlyFields(object, &.{ "name", "path" })) break :blk null;
+            const name = boundedText(object.get("name") orelse break :blk null, 1, max_workspace_name_bytes, false) orelse
+                break :blk null;
+            const path = if (object.get("path")) |value|
+                (boundedText(value, 1, max_path_bytes, false) orelse break :blk null)
+            else
+                null;
+            break :blk .{ .instance_open_workspace = .{ .name = name, .path = path } };
+        },
+        .instance_agent => blk: {
+            if (!hasOnlyFields(object, &.{ "harness", "prompt" })) break :blk null;
+            const harness = agentId(object.get("harness") orelse break :blk null) orelse break :blk null;
+            if (harness.len > max_harness_bytes) break :blk null;
+            const prompt = if (object.get("prompt")) |value|
+                (boundedText(value, 0, max_prompt_bytes, true) orelse break :blk null)
+            else
+                null;
+            break :blk .{ .instance_agent = .{ .harness = harness, .prompt = prompt } };
+        },
     };
 }
 
@@ -519,6 +597,8 @@ pub const Result = union(enum) {
 
 /// Ids of what `tab.open`, `pane.split` or a view created.
 pub const Opened = struct {
+    /// A workspace an instance method opened or focused (its ordinal).
+    workspace: ?u32 = null,
     tab: ?u32 = null,
     pane: ?u32 = null,
     session: ?u32 = null,
@@ -592,7 +672,7 @@ fn writeReply(writer: *std.Io.Writer, id: ?RequestId, reply: Reply) std.Io.Write
                 .opened => |opened| {
                     try writer.writeByte('{');
                     var first = true;
-                    inline for (.{ "tab", "pane", "session" }) |name| {
+                    inline for (.{ "workspace", "tab", "pane", "session" }) |name| {
                         if (@field(opened, name)) |value| {
                             if (!first) try writer.writeByte(',');
                             first = false;
@@ -704,6 +784,29 @@ test "every method parses its valid parameters" {
     defer event.deinit();
     try testing.expectEqualStrings("{\"v\":1,\"type\":\"agent_start\"}", event.outcome.envelope.params.agent_event.payload_json);
     try testing.expectEqualStrings(test_token, &event.outcome.envelope.params.agent_event.agent);
+
+    var directory = try expectEnvelope("{\"id\":9,\"method\":\"instance.open_directory\",\"token\":\"" ++ test_token ++
+        "\",\"params\":{\"path\":\"/home/me/src\"}}", .instance_open_directory);
+    defer directory.deinit();
+    try testing.expectEqualStrings("/home/me/src", directory.outcome.envelope.params.instance_open_directory.path);
+
+    var ssh = try expectEnvelope("{\"id\":10,\"method\":\"instance.open_ssh\",\"token\":\"" ++ test_token ++
+        "\",\"params\":{\"destination\":\"ops@build:2200\"}}", .instance_open_ssh);
+    defer ssh.deinit();
+    try testing.expectEqualStrings("ops@build:2200", ssh.outcome.envelope.params.instance_open_ssh.destination);
+
+    var named = try expectEnvelope("{\"id\":11,\"method\":\"instance.open_workspace\",\"token\":\"" ++ test_token ++
+        "\",\"params\":{\"name\":\"api (2)\",\"path\":\"/srv\"}}", .instance_open_workspace);
+    defer named.deinit();
+    try testing.expectEqualStrings("api (2)", named.outcome.envelope.params.instance_open_workspace.name);
+    try testing.expectEqualStrings("/srv", named.outcome.envelope.params.instance_open_workspace.path.?);
+
+    var launch = try expectEnvelope("{\"id\":12,\"method\":\"instance.agent\",\"token\":\"" ++ test_token ++
+        "\",\"session\":2,\"params\":{\"harness\":\"claude\",\"prompt\":\"fix the build\\nplease\"}}", .instance_agent);
+    defer launch.deinit();
+    try testing.expectEqualStrings("claude", launch.outcome.envelope.params.instance_agent.harness);
+    try testing.expectEqualStrings("fix the build\nplease", launch.outcome.envelope.params.instance_agent.prompt.?);
+    try testing.expect(Method.instance_agent.isInstance() and !Method.tab_open.isInstance());
 }
 
 test "malformed envelopes map to stable faults" {
@@ -765,6 +868,15 @@ test "parameters are refused for missing fields, wrong types and oversize values
         "\"method\":\"agent.event\",\"params\":{\"agent\":\"short\",\"payload\":{}}}",
         "\"method\":\"agent.event\",\"params\":{\"agent\":\"" ++ test_token ++ "\",\"payload\":[1]}}",
         "\"method\":\"agent.event\",\"params\":{\"agent\":\"" ++ test_token ++ "\"}}",
+        "\"method\":\"instance.open_directory\",\"params\":{}}",
+        "\"method\":\"instance.open_directory\",\"params\":{\"path\":\"\"}}",
+        "\"method\":\"instance.open_directory\",\"params\":{\"path\":\"/a\\u001b\"}}",
+        "\"method\":\"instance.open_ssh\",\"params\":{\"destination\":7}}",
+        "\"method\":\"instance.open_ssh\",\"params\":{\"host\":\"x\"}}",
+        "\"method\":\"instance.open_workspace\",\"params\":{\"path\":\"/x\"}}",
+        "\"method\":\"instance.agent\",\"params\":{}}",
+        "\"method\":\"instance.agent\",\"params\":{\"harness\":\"two words\"}}",
+        "\"method\":\"instance.agent\",\"params\":{\"harness\":\"pi\",\"prompt\":\"bell\\u0007\"}}",
     };
     for (bad) |suffix| {
         const frame = try std.mem.concat(testing.allocator, u8, &.{ prefix, suffix });
@@ -798,6 +910,10 @@ test "replies encode ids, results and fixed fault names without request text" {
     try testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"id\":\"q\\\"\",\"result\":{\"tab\":2,\"session\":9}}",
         try encodeReply(&buffer, .{ .string = "q\"" }, .{ .result = .{ .opened = .{ .tab = 2, .session = 9 } } }),
+    );
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"workspace\":2,\"session\":4}}",
+        try encodeReply(&buffer, .{ .integer = 3 }, .{ .result = .{ .opened = .{ .workspace = 2, .session = 4 } } }),
     );
     try testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",

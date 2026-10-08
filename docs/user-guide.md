@@ -358,6 +358,34 @@ keybind = ctrl+alt+p=palette.open
 keybind = ctrl+alt+1=tab.goto:1
 ```
 
+## Command line
+
+From any terminal, the `conduit` command reuses a Conduit that is already running, or starts one
+when none answers:
+
+| Command | Effect |
+|---|---|
+| `conduit` | Start a new Conduit window |
+| `conduit .` or `conduit <dir>` | Open a workspace in that directory, or switch to the one already open there |
+| `conduit ssh <host>` | Open an SSH workspace for `[user@]host[:port]` or an `~/.ssh/config` alias, as **Remote: connect** does |
+| `conduit workspace open <name>` | Switch to the workspace with that name, or open one of that name in the current directory |
+| `conduit agent <harness> [prompt...]` | Launch `claude`, `codex`, `pi` or `opencode` in a new tab, with an optional first prompt |
+
+Typed inside a Conduit terminal, these act on that Conduit, and `conduit agent` launches in that
+terminal's workspace; from anywhere else they act on the running Conduit's active workspace. A
+command prints nothing and exits 0 when it was carried out, or prints why and exits 1. A directory
+is resolved against the current directory. Use `./ssh` for a directory that is called `ssh`.
+
+Inside a Conduit terminal, `conduit control <method> [<json>]` also lets a script or a
+coding-agent harness open a tab or pane in its own workspace, set its tab's status (shown in the
+sidebar as `! busy api`), raise a notification, or show the agent or backlog view. The
+scratchpad cannot be addressed this way. The methods, their parameters and harness hook examples
+are in [control-api.md](control-api.md).
+
+Both rely on local sockets that run when the `control.enabled` setting is on: by default in
+development builds, and off in release builds until you turn it on (or pass `--control`). See
+[config.md](config.md#keys).
+
 ## Command-line options
 
 `conduit --help` lists every flag. The ones for everyday use:
@@ -372,6 +400,7 @@ keybind = ctrl+alt+1=tab.goto:1
 | `--no-shell-integration` | Start shells exactly as they would start outside Conduit |
 | `--log-level=<err\|warn\|info\|debug>`, `--log-dir=<dir>`, `--log-file=<path>` | Logging; `--print-log-path` prints where the log goes |
 | `--version` | Print `conduit <version>` and exit |
+| `--control`, `--no-control` | Run, or do not run, the control and single-instance endpoints this run, overriding `control.enabled` |
 
 The `--*-test`, `--test-driver`, `--hidden` and `--screenshot` flags are for the test suite and
 the agent tooling described in [agents.md](agents.md).

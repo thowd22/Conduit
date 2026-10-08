@@ -807,10 +807,18 @@ pub const Runner = struct {
                 .bytes = agent.pi.extension_source,
             }),
             .fake => try extra_env.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ agent.pi.sink_env_name, self.sink_dir })),
+            // `conduit control agent.event` (the hooks' helper while the
+            // control endpoint is up) falls back to this sink when the
+            // endpoint does not answer.
+            .claude => if (self.sink_dir.len != 0) try extra_env.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ agent.pi.sink_env_name, self.sink_dir })),
             else => {},
         }
         for (files.items) |file| try self.writeLaunchFile(file);
-        const env = try mergeEnv(arena, base_env, spec.env, extra_env.items);
+        // Every string is copied: `base_env` belongs to the spawn job, which
+        // is freed once the child starts, and `prepared` outlives it.
+        const base_copy = try arena.alloc([]const u8, base_env.len);
+        for (base_copy, base_env) |*slot, entry| slot.* = try arena.dupe(u8, entry);
+        const env = try mergeEnv(arena, base_copy, spec.env, extra_env.items);
         self.prepared = .{ .argv = spec.argv, .env = env };
         return self.prepared.?;
     }
@@ -1113,6 +1121,10 @@ pub const Runtime = struct {
     choice_labels: [Harness.all.len + 1][96]u8 = undefined,
     choice_count: usize = 0,
     unavailable_logged: bool = false,
+    /// The `conduit` executable Claude Code hooks run as `conduit control
+    /// agent.event` while this run's control endpoint is up (TASK-60); null
+    /// keeps them on the sink relay. Borrowed for the runtime's life.
+    control_helper: ?[]const u8 = null,
 
     const drain_capacity = 8;
 
@@ -1312,6 +1324,7 @@ pub const Runtime = struct {
                         .sink_dir = runner.sink_dir,
                         .config_dir = config_dir,
                         .probe_env = request.probe_env,
+                        .control_helper = self.control_helper,
                     }) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.InvalidSinkPath => return error.NoSinkRoot,
@@ -1418,6 +1431,52 @@ pub const Runtime = struct {
             if (runner.workspace == key and runner.session == id and !runner.closing) return runner;
         }
         return null;
+    }
+
+    pub const IngestError = error{
+        /// No live agent of workspace `key` has that token.
+        NotFound,
+        /// The agent's harness has no line channel (Codex, OpenCode).
+        Unavailable,
+        /// The payload is not one line, or the sink could not be written.
+        Rejected,
+    };
+
+    /// Deliver one `agent.event` from the control endpoint (TASK-60): the
+    /// payload is the adapter's own event-line object, so it is appended,
+    /// newline-terminated, to the `events.jsonl` the adapter already tails
+    /// (Claude Code's hook relay, Pi's extension and the fake all use that
+    /// line format). The token is compared in constant time and must belong
+    /// to an agent of `key`. Owner thread; one bounded local append (at most
+    /// the control frame size), the same file write the relay makes.
+    pub fn ingestControlEvent(self: *Runtime, key: WorkspaceKey, token: *const [agent.CorrelationToken.text_len]u8, payload_json: []const u8) IngestError!void {
+        var found: ?*Runner = null;
+        for (self.runners.items) |runner| {
+            if (runner.workspace != key or runner.closing) continue;
+            if (std.crypto.timing_safe.eql([agent.CorrelationToken.text_len]u8, runner.token.text()[0..agent.CorrelationToken.text_len].*, token.*)) found = runner;
+        }
+        const runner = found orelse return error.NotFound;
+        if (runner.sink_dir.len == 0) return error.Unavailable;
+        // The control server re-encodes the payload compactly, so a raw
+        // newline cannot be in it; refuse one anyway rather than split lines.
+        if (payload_json.len == 0 or std.mem.indexOfAny(u8, payload_json, "\r\n") != null) return error.Rejected;
+        // The sink is this machine's private state, which only a Local
+        // agent has; the control endpoint does not exist on Windows yet.
+        if (comptime builtin.os.tag == .windows) return error.Unavailable;
+        var path_buffer: [Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ runner.sink_dir, agent.pi.events_file_name }) catch return error.Rejected;
+        const line = self.allocator.alloc(u8, payload_json.len + 1) catch return error.Rejected;
+        defer self.allocator.free(line);
+        @memcpy(line[0..payload_json.len], payload_json);
+        line[payload_json.len] = '\n';
+        // O_APPEND and one write: the relay script appends to the same file
+        // (`cat >> events.jsonl`), and an append of the whole line at once
+        // can never interleave with or overwrite one of its lines.
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true, .CLOEXEC = true }, 0o600) catch
+            return error.Rejected;
+        defer _ = std.posix.system.close(fd);
+        const written = std.posix.system.write(fd, line.ptr, line.len);
+        if (std.posix.errno(written) != .SUCCESS or @as(usize, @intCast(written)) != line.len) return error.Rejected;
     }
 
     fn removeRunner(self: *Runtime, runner: *Runner) void {
@@ -2115,4 +2174,36 @@ test "a message reaches the adapter through the worker's queue, and a restart re
     try testing.expectEqualStrings("TASK-7", replacement.taskId().?);
     try testing.expectEqual(@as(usize, 1), runtime.runners.items.len);
     try testing.expectError(error.NotRestartable, runtime.replaceRunner(new_id, runtime.relaunchRequest(new_id).?, binding));
+}
+
+test "a control agent.event reaches its own agent's sink as one line and nothing else" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPath(testing.io, &root_buffer);
+    var sink_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const sink_root = try std.fmt.bufPrint(&sink_buffer, "{s}/agents", .{root_buffer[0..tmp_path_len]});
+
+    var runtime = try Runtime.init(testing.allocator, testing.io, .{ .sink_root = sink_root, .fake_enabled = true });
+    defer runtime.deinit();
+    const key = WorkspaceKey.fromOrdinal(0);
+    const runner = try runtime.createRunner(.{ .choice = .fake, .workspace = key, .session = SessionId.fromOrdinal(1), .context_kind = .local, .cwd = "/" });
+    _ = try runner.prepare(&.{"PATH=/bin"});
+    const token = runner.token.text()[0..agent.CorrelationToken.text_len];
+
+    const line = "{\"conduit\":{\"v\":1,\"event\":\"Stop\"},\"payload\":{}}";
+    try runtime.ingestControlEvent(key, token, line);
+    try runtime.ingestControlEvent(key, token, line);
+    var other_token = token.*;
+    other_token[0] = if (other_token[0] == 'a') 'b' else 'a';
+    try testing.expectError(error.NotFound, runtime.ingestControlEvent(key, &other_token, line));
+    // The right token in another workspace's name reaches nothing.
+    try testing.expectError(error.NotFound, runtime.ingestControlEvent(WorkspaceKey.fromOrdinal(1), token, line));
+    try testing.expectError(error.Rejected, runtime.ingestControlEvent(key, token, "{}\n{}"));
+
+    var path_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ runner.sink_dir, agent.pi.events_file_name });
+    var read_buffer: [256]u8 = undefined;
+    try testing.expectEqualStrings(line ++ "\n" ++ line ++ "\n", try Dir.cwd().readFile(testing.io, path, &read_buffer));
 }

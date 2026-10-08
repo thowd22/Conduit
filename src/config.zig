@@ -220,6 +220,7 @@ pub const Key = enum {
     notifications_opencode,
     remote_profile,
     remote_recent,
+    control_enabled,
     keybind,
 
     /// The key's spelling in the file, which is also its `Name`.
@@ -250,6 +251,7 @@ pub const Key = enum {
             .notifications_opencode => "notifications.opencode",
             .remote_profile => "remote.profile",
             .remote_recent => "remote.recent",
+            .control_enabled => "control.enabled",
             .keybind => "keybind",
         };
     }
@@ -299,7 +301,22 @@ pub const Settings = struct {
     /// Destinations connected to most recently, newest first, at most
     /// `max_remote_recent`.
     remote_recent: []const []const u8 = &.{},
+    /// The file layer of `control.enabled` (TASK-60): whether the local
+    /// control endpoint and the single-instance endpoint run. Null when the
+    /// file is silent, which means on in Debug builds and off in release
+    /// builds (`controlEnabled`). Read at startup only.
+    control_enabled: ?bool = null,
 };
+
+/// The built-in value of `control.enabled`: on in development builds, off in
+/// release builds unless the file or a `--control` flag turns it on.
+pub const control_enabled_default: bool = builtin.mode == .Debug;
+
+/// Resolve `control.enabled` from the session layer (`--control` /
+/// `--no-control`), then the file, then the build's default.
+pub fn controlEnabled(session: ?bool, file: ?bool) bool {
+    return session orelse file orelse control_enabled_default;
+}
 
 /// The most saved connection profiles one file may hold.
 pub const max_remote_profiles: usize = 32;
@@ -601,6 +618,7 @@ pub const Config = struct {
                 for (list, from.remote_recent) |*slot, item| slot.* = try self.dupe(item);
                 to.remote_recent = list;
             },
+            .control_enabled => to.control_enabled = from.control_enabled,
             // Keybind lines are resolved against the previous binding table by `app`, which is
             // the only place that knows what a rejected chord used to do.
             .keybind => {},
@@ -818,6 +836,7 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
             for (list, parsed) |*slot, item| slot.* = try allocator.dupe(u8, item);
             settings.remote_recent = list;
         },
+        .control_enabled => settings.control_enabled = try parseBool(value),
         .keybind => {
             const split = try splitKeybind(value);
             try result.keybinds.append(allocator, .{
@@ -1043,6 +1062,12 @@ else
         "# keybind = ctrl+shift+p=palette.open\n" ++
         "# keybind = ctrl+,=config.open\n";
 
+/// The defaults document's `control.enabled` line: this build's own default.
+const control_default_line = if (control_enabled_default)
+    "# control.enabled = true\n"
+else
+    "# control.enabled = false\n";
+
 /// What `config.open` writes when there is no file yet: every key, commented out, at its built-in
 /// value. Uncommenting a setting line leaves the behaviour unchanged, so the file documents itself.
 pub const defaults_document =
@@ -1094,6 +1119,10 @@ pub const defaults_document =
     "# secret, and repeat one per line: remote.profile = <name> = <user@host[:port]>\n" ++
     "# The last ten destinations connected to, newest first:\n" ++
     "# remote.recent = \"\"\n" ++
+    "\n" ++
+    "# The local control endpoint (docs/control-api.md) and the single-instance endpoint the\n" ++
+    "# conduit command reuses. Read at startup. Off in release builds unless turned on.\n" ++
+    control_default_line ++
     "\n" ++
     "# Keybindings: keybind = <chord>=<action>[:<argument>], or <chord>=unbind.\n" ++
     "# Modifiers are ctrl, shift, alt and super (cmd). These lines repeat some defaults.\n" ++
@@ -1176,6 +1205,7 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
             },
             .font_ligatures,
             .font_nerd_symbols,
+            .control_enabled,
             .notifications_enabled,
             .notifications_os,
             .notifications_permission,
@@ -2520,4 +2550,30 @@ test "saving a profile replaces its own line, keeps the rest and never writes a 
     defer parsed.deinit();
     try testing.expect(!parsed.hasDiagnostics());
     try testing.expectEqual(@as(usize, 2), parsed.settings.remote_profiles.len);
+}
+
+test "control.enabled is a boolean the session layer overrides and the build defaults" {
+    var silent = try parse(testing.allocator, "", null);
+    defer silent.deinit();
+    try testing.expectEqual(@as(?bool, null), silent.settings.control_enabled);
+    try testing.expectEqual(builtin.mode == .Debug, controlEnabled(null, silent.settings.control_enabled));
+
+    var off = try parse(testing.allocator, "control.enabled = false\n", null);
+    defer off.deinit();
+    try testing.expect(!off.hasDiagnostics());
+    try testing.expectEqual(@as(?bool, false), off.settings.control_enabled);
+    try testing.expect(!controlEnabled(null, off.settings.control_enabled));
+    try testing.expect(controlEnabled(true, off.settings.control_enabled));
+
+    var on = try parse(testing.allocator, "control.enabled = true\n", null);
+    defer on.deinit();
+    try testing.expect(controlEnabled(null, on.settings.control_enabled));
+    try testing.expect(!controlEnabled(false, on.settings.control_enabled));
+
+    var bad = try parse(testing.allocator, "control.enabled = maybe\n", null);
+    defer bad.deinit();
+    try testing.expect(bad.hasDiagnostics());
+    try testing.expectEqual(@as(?bool, null), bad.settings.control_enabled);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.control_enabled, "true"));
+    try testing.expect(checkValue(.control_enabled, "yes") != null);
 }
