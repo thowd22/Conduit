@@ -36234,11 +36234,13 @@ test "a profile spec layers its variables, login flag and integration on the con
     try std.testing.expectEqualStrings("-NoLogo", pwsh_spec.argv[1]);
     try std.testing.expectEqualStrings("-NoExit", pwsh_spec.argv[2]);
     try std.testing.expectEqualStrings("-Command", pwsh_spec.argv[3]);
-    try std.testing.expect(std.mem.startsWith(u8, pwsh_spec.argv[4], ". ([scriptblock]::Create([System.IO.File]::ReadAllText('/"));
+    try std.testing.expect(std.mem.startsWith(u8, pwsh_spec.argv[4], ". ([scriptblock]::Create([System.IO.File]::ReadAllText('"));
     try std.testing.expect(std.mem.endsWith(u8, pwsh_spec.argv[4], "conduit.ps1')))"));
     try std.testing.expect(std.mem.indexOfScalar(u8, pwsh_spec.argv[4], '"') == null);
     var script_buffer: [16 * 1024]u8 = undefined;
     const script_path = pwsh_spec.argv[4][". ([scriptblock]::Create([System.IO.File]::ReadAllText('".len .. pwsh_spec.argv[4].len - "')))".len];
+    // The shell starts elsewhere, so the path it is given is absolute.
+    try std.testing.expect(std.fs.path.isAbsolute(script_path));
     const written = try Dir.cwd().readFile(std.testing.io, script_path, &script_buffer);
     try std.testing.expectEqualStrings(shell_scripts.powershell, written);
     const scripted: ResolvedProfile = .{ .name = "pwsh", .argv = &.{ "pwsh", "-File", "x.ps1" } };
@@ -36441,7 +36443,8 @@ test "PowerShell runs under ConPTY with its integration, colours and resize" {
                 while (row < terminal.gridSize().rows) : (row += 1) {
                     const first = terminal.cell(.{ .row = row, .col = 0 }) orelse continue;
                     if (first.codepoint != 'C') continue;
-                    const second = terminal.cell(.{ .row = row, .col = 7 }) orelse continue;
+                    // `CONDUIT-RED`: the R is the ninth cell.
+                    const second = terminal.cell(.{ .row = row, .col = 8 }) orelse continue;
                     if (second.codepoint != 'R') continue;
                     const fg = first.style.fg;
                     switch (fg) {
