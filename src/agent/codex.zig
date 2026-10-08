@@ -95,6 +95,7 @@ const adapter_mod = @import("adapter.zig");
 const event = @import("event.zig");
 const state_model = @import("state.zig");
 const Harness = @import("harness.zig").Harness;
+const readiness = @import("poll.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
@@ -302,20 +303,15 @@ pub const FdStream = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn waitFor(fd: std.posix.fd_t, events: i16, timeout_ms: u32) ByteStream.Error!?i16 {
-        if (comptime !posix_streams) return error.Disconnected;
-        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
-        const timeout: i32 = @intCast(@min(timeout_ms, std.math.maxInt(i32)));
-        const ready = std.posix.poll(&fds, timeout) catch return error.Disconnected;
-        if (ready == 0) return null;
-        return fds[0].revents;
+    fn waitFor(fd: std.posix.fd_t, interest: readiness.Interest, timeout_ms: u32) ByteStream.Error!?readiness.Ready {
+        return readiness.wait(fd, interest, timeout_ms) catch error.Disconnected;
     }
 
     fn readFn(ptr: *anyopaque, buffer: []u8, timeout_ms: u32) ByteStream.Error!ReadResult {
         if (comptime !posix_streams) return error.Disconnected;
         const self = cast(ptr);
         if (buffer.len == 0) return .{ .bytes = 0 };
-        if (try waitFor(self.read_fd, std.posix.POLL.IN, timeout_ms) == null) return .timeout;
+        if (try waitFor(self.read_fd, .read, timeout_ms) == null) return .timeout;
         const n = std.posix.read(self.read_fd, buffer) catch |err| switch (err) {
             error.WouldBlock => return .timeout,
             else => return error.Disconnected,
@@ -331,8 +327,8 @@ pub const FdStream = struct {
         if (!self.is_socket) {
             // A pipe whose reader is gone reports POLLERR; refuse before the
             // write would raise SIGPIPE.
-            if (try waitFor(self.write_fd, posix.POLL.OUT, 0)) |revents| {
-                if (revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return error.Disconnected;
+            if (try waitFor(self.write_fd, .write, 0)) |ready| {
+                if (ready.broken()) return error.Disconnected;
             }
         }
         const nosignal: u32 = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
@@ -346,9 +342,9 @@ pub const FdStream = struct {
                 .SUCCESS => rest = rest[@intCast(rc)..],
                 .INTR => continue,
                 .AGAIN => {
-                    const revents = try waitFor(self.write_fd, posix.POLL.OUT, self.write_timeout_ms) orelse
+                    const ready = try waitFor(self.write_fd, .write, self.write_timeout_ms) orelse
                         return error.Disconnected;
-                    if (revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return error.Disconnected;
+                    if (ready.broken()) return error.Disconnected;
                 },
                 else => return error.Disconnected,
             }
@@ -3438,11 +3434,22 @@ const FakeDaemon = struct {
         };
     }
 
+    /// How long the daemon waits for its client to connect or to send.
+    /// Bounded so a test that fails before it would talk to the daemon ends
+    /// the daemon instead of joining a thread blocked forever: shutting the
+    /// listening socket down does not wake `accept` on Darwin, and nothing
+    /// wakes a blocked `read` on the accepted socket while the client end
+    /// is still open.
+    const io_timeout_ms: u32 = 10_000;
+
     fn serve(self: *FakeDaemon) !void {
+        if (try readiness.wait(self.listen_fd, .read, io_timeout_ms) == null) return error.AcceptTimedOut;
         const accepted = std.posix.system.accept(self.listen_fd, null, null);
         if (std.posix.errno(accepted) != .SUCCESS) return error.AcceptFailed;
         const fd: std.posix.fd_t = @intCast(accepted);
         defer _ = std.posix.system.close(fd);
+        const timeout: std.posix.timeval = .{ .sec = io_timeout_ms / 1000, .usec = 0 };
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
 
         // The opening handshake.
         var request: [2048]u8 = undefined;

@@ -98,6 +98,7 @@ const state = @import("state.zig");
 const Harness = @import("harness.zig").Harness;
 const workspace = @import("workspace");
 const sink_io = @import("sink_io.zig");
+const readiness = @import("poll.zig");
 const SinkIo = sink_io.SinkIo;
 
 const Allocator = std.mem.Allocator;
@@ -2024,9 +2025,7 @@ const PipeTransport = struct {
     fn read(ptr: *anyopaque, out: []u8) Error!usize {
         const self: *PipeTransport = @ptrCast(@alignCast(ptr));
         const stdout = self.child.stdout orelse return error.Disconnected;
-        var fds = [_]std.posix.pollfd{.{ .fd = stdout.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&fds, 0) catch return error.Disconnected;
-        if (ready == 0) return 0;
+        if ((readiness.wait(stdout.handle, .read, 0) catch return error.Disconnected) == null) return 0;
         return stdout.readStreaming(testing.io, &.{out}) catch error.Disconnected;
     }
 

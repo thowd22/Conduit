@@ -21,7 +21,8 @@
 //! workspace), `agent/heuristics.zig` (the PTY baseline),
 //! `agent/harness.zig` (the closed harness set), `agent/fake.zig` (the
 //! scripted adapter tests use) and `agent/sink_io.zig` (the harness-neutral
-//! IO under the sink channels, Local or through a remote context, TASK-61).
+//! IO under the sink channels, Local or through a remote context, TASK-61)
+//! and `agent/poll.zig` (readiness waits on the transports' descriptors).
 //!
 //! It may depend on `config`, `input`, `session`, `theme`, `ui` and
 //! `workspace` (`build.zig`); today it imports only `session` and `workspace`,
@@ -114,6 +115,9 @@ pub fn instructionProfile(harness: Harness) InstructionProfile {
         .opencode => opencode.instruction_profile,
     };
 }
+/// Bounded readiness waits on the pipes and sockets the adapters speak over,
+/// the one place the agent layer asks the OS (TASK-5).
+pub const poll = @import("agent/poll.zig");
 
 test {
     _ = @import("agent/harness.zig");
@@ -128,4 +132,5 @@ test {
     _ = pi;
     _ = opencode;
     _ = sink_io;
+    _ = poll;
 }
