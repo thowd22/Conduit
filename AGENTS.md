@@ -937,6 +937,27 @@ take effect on the next session. Discovery uses `~` paths, not `$CODEX_HOME`, `P
 or `CLAUDE_CONFIG_DIR`. `--agent-prompts-test` and the twentieth scenario `agent-prompts` cover
 it; the frame was inspected.
 
+TASK-48 is complete on a GitHub macos-14 arm64 runner (`.github/workflows/macos.yml`; release
+dry run 37710508109 and, after the rebase, run 37717765398 green on every gating step). `zig
+build bundle` stages `Conduit.app` (generated Info.plist, `assets/macos/AppIcon.icns`, fonts, shell
+integration, licences). The bundle starts through Launch Services, passes `codesign --verify` (ad
+hoc), and a 640x360 window at scale 2 draws a crisp 1280x720 frame; the runner's display itself is
+1x, so a real Retina display is unverified. The macOS defaults are pinned to the user-guide table
+by a unit test. `platform` takes Command+W off SDL's Window ▸ Close menu item, which otherwise
+closed the window as well as the tab. `macos.option_as_alt = false|true|left|right` (default
+false) sets SDL's Option-as-Alt hint and marks composing Option keys, so `input` sends nothing and
+the composed character arrives as text; real keystrokes on the runner proved ≈ once by default
+and ESC x once with `true`. Font discovery reads every face of `.ttc`/`.otc` collections; DejaVu
+from `~/Library/Fonts` and Menlo from `/System/Library/Fonts` load. TASK-15's last criterion is
+met: Cmd+V from and Cmd+C to the system pasteboard pass on the runner; `--clipboard-test` cannot
+run on macOS (the offscreen driver has no OpenGL there). TASK-69's macOS half adds `macos` and
+`publish-macos` jobs to `release.yml`; the dmg is ad hoc signed, not notarized, until the
+`MACOS_*` secrets exist, and minimum macOS is 14. On macOS, 13 built-in checks pass; `--tabs-test`,
+`--panes-test`, `--palette-test`, `--workspaces-test`, `--search-test`, `--config-test` and
+`--settings-test` still fail (spawned-child cwd checks under `/private/tmp`, Ctrl-chord capture,
+search paging) and are reported, not gating; `window.fullscreen` and a settings row for the
+Option setting are still to do.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on

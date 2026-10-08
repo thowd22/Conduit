@@ -1,9 +1,11 @@
 ---
 id: TASK-47
 title: WSL ExecutionContext
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-10-03 21:39'
+updated_date: '2026-10-08 02:42'
 labels:
   - windows
   - wsl
@@ -27,3 +29,11 @@ Enumerate installed WSL distributions and offer them as workspace contexts on Wi
 - [ ] #2 A WSL workspace opens tabs, panes and scratchpad inside the distribution
 - [ ] #3 File reference clicks translate between WSL and Windows paths
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. WSL ExecutionContext (src/wsl.zig): enumerate distributions with wsl.exe --list --quiet, spawn through wsl.exe -d <distro> --cd <path> -- <argv> under ConPTY, file/dir/stat/run/watch/writeFile through wsl.exe exec channels, path translation (wslpath) for file references.
+2. Offered as workspace contexts in Remote: connect on Windows; tabs, panes and scratchpad inside the distribution; cwd tracking via OSC 7 from the WSL shell.
+3. Verified on the Windows runner if a distribution can be installed there (wsl --install is restricted on hosted runners: document the limit and fall back to unit tests with a scripted wsl.exe).
+<!-- SECTION:PLAN:END -->

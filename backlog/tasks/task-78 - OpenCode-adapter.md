@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-07 15:38'
-updated_date: '2026-10-07 20:39'
+updated_date: '2026-10-08 02:24'
 labels:
   - agents
   - opencode
@@ -37,6 +37,8 @@ The user runs OpenCode alongside Claude Code, Codex and omp (oh-my-pi) and wants
 <!-- SECTION:PLAN:BEGIN -->
 1. Implement agent.Adapter for OpenCode in src/agent/opencode.zig per decision-7 from the documented server API (unverified locally if the CLI is absent): detect, launch with a Conduit-chosen --port, poll via SSE /event (session.status, session.idle, permission.asked), respondPermission via POST /session/:id/permissions/:id, structured events only.
 2. Unit tests from fixture SSE streams; integration test against a fake OpenCode server; mark live verification as pending until opencode is installed.
+
+Live verification 2026-10-08: build a glibc-2.35 stage and run the agent-test binary's live OpenCode check plus an app-level fake-free flow inside an ubuntu container with Node and the opencode npm package (nothing installed on the host); implement observed-agent detection for hand-started harnesses through a pty foreground-command query consumed by the agent runtime on prompt marks, so AC3 (and the same gap for Claude/Pi/Codex) is closed.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes

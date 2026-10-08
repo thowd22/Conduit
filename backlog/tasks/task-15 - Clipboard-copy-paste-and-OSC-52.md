@@ -1,10 +1,10 @@
 ---
 id: TASK-15
 title: 'Clipboard: copy, paste and OSC 52'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-05 20:34'
+updated_date: '2026-10-08 02:42'
 labels:
   - input
   - clipboard
@@ -28,7 +28,7 @@ Native clipboard integration: Ctrl+Shift+C/V on Linux and Windows, Cmd+C/V on ma
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Copy and paste work with the system clipboard on Linux and macOS
+- [x] #1 Copy and paste work with the system clipboard on Linux and macOS
 - [x] #2 Ctrl+C with no selection always sends SIGINT
 - [x] #3 Bracketed paste is used when the application enables it
 - [x] #4 Middle-click pastes the primary selection on Linux
@@ -50,4 +50,12 @@ Coordinator verification: zig fmt --check . clean; zig build test 83/83 steps an
 Not verified: macOS (Cmd chords and the pasteboard), Windows, a real desktop clipboard manager or another process owning the X11/Wayland selection.
 
 2026-10-05 reconciliation: reopened because AC #1 remains unchecked. Linux behavior passes the offscreen/process-local SDL check, but neither a real desktop/interprocess clipboard nor macOS pasteboard behavior has been verified.
+
+2026-10-08: AC1 proven on the macOS runner by the TASK-48 workflow: Cmd+V pasted a pbcopy fixture into the child and Cmd+C put a double-clicked selection on the pasteboard (read back with pbpaste); Linux was proven earlier by --clipboard-test and the X11 PRIMARY check.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Native clipboard integration on Linux and macOS with the Ctrl+C/SIGINT rule, bracketed paste, primary selection and OSC 52 policy; the macOS criterion was closed by real keystrokes on a macOS runner.
+<!-- SECTION:FINAL_SUMMARY:END -->
