@@ -107,8 +107,8 @@ pub fn rowStateWord(state: State) []const u8 {
     return switch (state) {
         .idle => "idle",
         .working => "working",
-        .waiting_input => "waiting for input",
-        .waiting_permission => "needs permission",
+        .waiting_input => "input",
+        .waiting_permission => "permission",
         .done => "done",
         .errored => "errored",
     };
@@ -126,7 +126,7 @@ pub fn rowHarnessName(harness: Harness) []const u8 {
 /// The longest row `formatAgentRow` writes: a three-byte glyph, a name of
 /// at most `agent_row_name_bytes` and the longest state words.
 pub const agent_row_name_bytes = 16;
-pub const agent_row_bytes = 3 + 1 + agent_row_name_bytes + 1 + "waiting for input".len;
+pub const agent_row_bytes = 3 + 1 + agent_row_name_bytes + 1 + "permission".len;
 
 /// `<glyph> <name> <state>` into `buffer`; a name longer than
 /// `agent_row_name_bytes` is cut so the row always fits `agent_row_bytes`.
@@ -2539,9 +2539,9 @@ test "every state has one glyph, and urgency orders the waits first" {
 test "sidebar agent rows read glyph, harness and state words" {
     var buffer: [agent_row_bytes]u8 = undefined;
     try std.testing.expectEqualStrings("▸ claude working", formatAgentRow(&buffer, rowHarnessName(.claude_code), .working));
-    try std.testing.expectEqualStrings("! codex needs permission", formatAgentRow(&buffer, rowHarnessName(.codex), .waiting_permission));
+    try std.testing.expectEqualStrings("! codex permission", formatAgentRow(&buffer, rowHarnessName(.codex), .waiting_permission));
     try std.testing.expectEqualStrings("✓ pi done", formatAgentRow(&buffer, rowHarnessName(.pi), .done));
-    try std.testing.expectEqualStrings("? opencode waiting for input", formatAgentRow(&buffer, rowHarnessName(.opencode), .waiting_input));
+    try std.testing.expectEqualStrings("? opencode input", formatAgentRow(&buffer, rowHarnessName(.opencode), .waiting_input));
     try std.testing.expectEqualStrings("× fake errored", formatAgentRow(&buffer, "fake", .errored));
     try std.testing.expectEqualStrings("· aaaaaaaaaaaaaaaa idle", formatAgentRow(&buffer, "a" ** 40, .idle));
 }

@@ -30033,7 +30033,7 @@ fn agentRowChecks(self: *App, io: Io, out: *Writer, os_trace: *const AgentOsTrac
     _ = try clickTabsElement(self, io, out, try paneSemanticId(&pane_buffer, f.key, model.focusedPaneId(f.agent_tab) orelse return null));
     _ = try agentTypeLine(self, io, out, "six");
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element = "workspace.1.tab.2.agent.waiting_input" }) and
-        agentRowLabelIs(self, f.agent_row, "? fake waiting for input"), "waiting for input: the agent row reads `? fake waiting for input` with no other gesture", .{});
+        agentRowLabelIs(self, f.agent_row, "? fake input"), "waiting for input: the agent row reads `? fake input` with no other gesture", .{});
 
     // A click on the row from another tab shows the agent and its view.
     _ = try clickTabsElement(self, io, out, first_tab);
@@ -30129,7 +30129,7 @@ fn agentRowChecks(self: *App, io: Io, out: *Writer, os_trace: *const AgentOsTrac
     _ = try postNamedKey(self, io, out, .escape, .{});
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element_absent = "settings.dialog" }) and
         try waitForAgent(self, io, out, os_trace, .{ .element = f.agent_row }) and
-        agentRowLabelIs(self, f.agent_row, "? fake waiting for input"), "with the settings view closed the rows are back", .{});
+        agentRowLabelIs(self, f.agent_row, "? fake input"), "with the settings view closed the rows are back", .{});
     return pixels;
 }
 
@@ -30188,7 +30188,7 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.waiting_permission" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.agent.waiting_permission" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .entry_body = "Run: make test" }), "waiting for permission: glyphs changed and a permission notification was listed", .{});
-    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "! fake needs permission"), "waiting for permission: the agent row reads `! fake needs permission`", .{});
+    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "! fake permission"), "waiting for permission: the agent row reads `! fake needs permission`", .{});
     agentCheck(out, &failures, os_trace.calls == 0, "a focused window raised no OS notification", .{});
 
     self.focus_override = false;

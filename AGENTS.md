@@ -1121,6 +1121,29 @@ ZDOTDIR for good at the end (non-interactive shells restore it at once). A real-
 an rc fails on the old scripts; login, non-login, non-interactive and user-ZDOTDIR startups were
 traced by hand. Bash was already robust (it sources the user's rc first, then prepends its hook).
 
+TASK-80 is complete on Linux. Every agent record has a row of its own in the sidebar, nested one
+column under the tab it runs in, after the tab's branch row, drawn in the normal face so it is as
+tall as the tab row (the user's direction). It is an `InteractiveText`
+`workspace.<k>.tab.<n>.agent-row.<agent id>` (role `agent_row`, semantic-only action `agent.row`)
+reading `<glyph> <harness> <state>`: `· … idle`, `▸ … working`, `? … input`, `! … permission`,
+`✓ … done`, `× … errored`, with the harness as its tag up to the first `_` (`claude`, `codex`,
+`pi`, `opencode`; `fake` for the scripted fake). The row is rebuilt from the registry every frame,
+so it changes in the frame the tab glyph does. Observed (hand-started) agents get one as soon as
+they are recognised, and a finished agent keeps its row until its record is forgotten. A click, or
+Enter after reaching it with the sidebar keys (Up/Down now step between workspace, tab and agent
+rows when a tab or agent row is focused, instead of falling through to the terminal), shows the
+agent's workspace, tab and pane and opens its agent view; activating it again while that view
+shows closes it. A drop on an agent row targets its tab, and the rows count against the list limit
+like branch rows. `sidebar.agents = false` (hot-reloaded; a toggle in the settings view's Agents
+group) keeps only the glyphs, and the `<row>.agent.<state>` glyph elements are unchanged. The
+fake's script gained a sixth step ending in waiting for input. `--agent-test` covers launched and
+observed rows through every state, mouse and keyboard activation, drag, the list limit and the
+switch; the agent-notifications scenario clicks and keys both a launched and an observed agent's
+row, and its frames were inspected. On this box a real hand-started `claude` showed `· claude
+idle`, and earlier the same day real Claude Code was verified launched (working → done, transcript
+and reply in the view, a notification) and hand-started (observed within 3 s, a turn, done on
+`/exit`), with hand-started `codex` and `omp` observed too. macOS and Windows are unverified.
+
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
 attributes in any order, and `shell = <name>` for the default (32 profiles, 32 arguments and 32

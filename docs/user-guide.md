@@ -46,11 +46,12 @@ the tab rows (below the tab's branch row when it has one):
 │   Terminal 1       │
 │     ✓ claude done  │
 │   ! Fake agent     │
-│     ! codex needs permission
+│     ! codex permission
 ```
 
 A row reads `<glyph> <harness> <state>` and changes the moment the agent's state does: `·` idle,
-`▸ … working`, `? … waiting for input`, `! … needs permission`, `✓ … done`, `× … errored`. The row
+`▸ … working`, `? … input` (waiting for input), `! … permission` (waiting for permission), `✓ … done`,
+`× … errored`. The row
 appears as soon as the agent registers, whether you started it with **Agent: launch** or by
 typing `claude`, `codex`, `pi`/`omp` or `opencode` in a tab yourself (a hand-started agent shows
 its harness name before it reports anything). A finished agent keeps its row, showing `✓` or `×`,
