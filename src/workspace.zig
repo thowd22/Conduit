@@ -110,6 +110,11 @@ pub const PathStat = struct {
     mtime_ns: i128,
 };
 
+/// The most bytes `ExecutionContext.writeFile` writes in one call. Launch
+/// files (a hook relay, a settings file, an extension) and permission answers
+/// are a few KiB; the bound keeps a remote write a handful of exec channels.
+pub const max_write_bytes: usize = 1024 * 1024;
+
 /// One directory entry. `name` borrows the context's iteration buffer and is
 /// valid only during the visit callback.
 pub const DirEntry = struct {
@@ -234,12 +239,15 @@ pub const WatchHandle = struct {
 /// the same entries (TASK-43, TASK-47), and an entry a context does not
 /// implement defaults to `error.Unsupported`.
 ///
-/// Threads: `spawn`, `readFile`, `listDir`, `statPath` and `run` keep no
-/// mutable state in the context and may be called from any thread holding a
-/// `Ref`. They block on IO for as long as the operation takes (a remote
+/// Threads: `spawn`, `readFile`, `readFileAt`, `listDir`, `statPath`,
+/// `writeFile`, `makePrivateDir`, `stateDir` and `run` keep no mutable state
+/// in the context and may be called from any thread holding a `Ref`. They block on IO for as long as the operation takes (a remote
 /// context waits on its connection), so the render/UI thread must not call
 /// them for a remote context; `run` additionally waits for the child, up to
-/// its timeout, and so belongs on a worker thread everywhere. A `WatchHandle`
+/// its timeout, and so belongs on a worker thread everywhere. The writes
+/// (`writeFile`, `makePrivateDir`) are called only from workers: an agent's
+/// spawn worker stages its launch files and its IO worker publishes
+/// permission answers (TASK-61). A `WatchHandle`
 /// belongs to the thread that created it.
 pub const ExecutionContext = struct {
     ptr: *anyopaque,
@@ -261,6 +269,24 @@ pub const ExecutionContext = struct {
     pub const WatchFn = *const fn (*anyopaque, Allocator, std.Io, []const u8) WatchError!WatchHandle;
     /// Run one bounded command to completion; output is owned by the allocator.
     pub const RunFn = *const fn (*anyopaque, Allocator, std.Io, RunRequest) RunError!RunResult;
+    /// Read up to `buffer.len` bytes of the file at `path` starting at byte
+    /// `offset` and return how many were read: fewer only at the end of the
+    /// file, 0 at or past it. This is how a caller follows an append-only file
+    /// (an agent's event sink) without rereading it (TASK-61).
+    pub const ReadFileAtFn = *const fn (*anyopaque, std.Io, []const u8, u64, []u8) FsError!usize;
+    /// Replace the file at `path` with `bytes` (at most `max_write_bytes`,
+    /// else `error.TooLarge`) atomically: a reader sees the old file or the
+    /// whole new one, never a prefix. Missing parent directories are created
+    /// private (0700); the file gets exactly the permission bits `mode`.
+    pub const WriteFileFn = *const fn (*anyopaque, std.Io, []const u8, []const u8, u32) FsError!void;
+    /// Create the directory at `path`, and any missing parents, private
+    /// (0700), and set the directory itself to 0700 if it already existed.
+    pub const MakePrivateDirFn = *const fn (*anyopaque, std.Io, []const u8) FsError!void;
+    /// Write the context's per-user state directory (`$XDG_STATE_HOME`, else
+    /// `$HOME/.local/state`, as the context's own environment says) into
+    /// `buffer` and return it: an absolute path in the context's syntax.
+    /// Where an agent's sink lives on a remote host (TASK-61).
+    pub const StateDirFn = *const fn (*anyopaque, std.Io, []u8) FsError![]u8;
 
     pub const VTable = struct {
         spawn: SpawnFn,
@@ -271,6 +297,10 @@ pub const ExecutionContext = struct {
         stat_path: StatPathFn = unsupportedStatPath,
         watch: WatchFn = unsupportedWatch,
         run: RunFn = unsupportedRun,
+        read_file_at: ReadFileAtFn = unsupportedReadFileAt,
+        write_file: WriteFileFn = unsupportedWriteFile,
+        make_private_dir: MakePrivateDirFn = unsupportedMakePrivateDir,
+        state_dir: StateDirFn = unsupportedStateDir,
     };
 
     /// A non-owning execution capability. It may start work, read files and
@@ -314,6 +344,27 @@ pub const ExecutionContext = struct {
         pub fn run(self: Ref, allocator: Allocator, io: std.Io, request: RunRequest) RunError!RunResult {
             return self.vtable.run(self.ptr, allocator, io, request);
         }
+
+        /// See `ReadFileAtFn`.
+        pub fn readFileAt(self: Ref, io: std.Io, path: []const u8, offset: u64, buffer: []u8) FsError!usize {
+            return self.vtable.read_file_at(self.ptr, io, path, offset, buffer);
+        }
+
+        /// See `WriteFileFn`.
+        pub fn writeFile(self: Ref, io: std.Io, path: []const u8, bytes: []const u8, mode: u32) FsError!void {
+            if (bytes.len > max_write_bytes) return error.TooLarge;
+            return self.vtable.write_file(self.ptr, io, path, bytes, mode);
+        }
+
+        /// See `MakePrivateDirFn`.
+        pub fn makePrivateDir(self: Ref, io: std.Io, path: []const u8) FsError!void {
+            return self.vtable.make_private_dir(self.ptr, io, path);
+        }
+
+        /// See `StateDirFn`.
+        pub fn stateDir(self: Ref, io: std.Io, buffer: []u8) FsError![]u8 {
+            return self.vtable.state_dir(self.ptr, io, buffer);
+        }
     };
 
     /// Wrap an owned implementation. `vtable` must live at least as long as
@@ -325,6 +376,14 @@ pub const ExecutionContext = struct {
     /// Create the production local context.
     pub fn local(allocator: Allocator) Allocator.Error!ExecutionContext {
         return LocalExecutionContext.create(allocator);
+    }
+
+    /// Create a local context whose `stateDir` reports `state_dir` (copied),
+    /// which the owner resolves from Conduit's environment; the context
+    /// itself reads no environment. With null, `stateDir` is
+    /// `error.Unsupported`.
+    pub fn localWithStateDir(allocator: Allocator, state_dir: ?[]const u8) Allocator.Error!ExecutionContext {
+        return LocalExecutionContext.createWithStateDir(allocator, state_dir);
     }
 
     /// Borrow a capability handle without transferring destruction rights.
@@ -362,7 +421,37 @@ pub const ExecutionContext = struct {
     fn unsupportedRun(_: *anyopaque, _: Allocator, _: std.Io, _: RunRequest) RunError!RunResult {
         return error.Unsupported;
     }
+
+    fn unsupportedReadFileAt(_: *anyopaque, _: std.Io, _: []const u8, _: u64, _: []u8) FsError!usize {
+        return error.Unsupported;
+    }
+
+    fn unsupportedWriteFile(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8, _: u32) FsError!void {
+        return error.Unsupported;
+    }
+
+    fn unsupportedMakePrivateDir(_: *anyopaque, _: std.Io, _: []const u8) FsError!void {
+        return error.Unsupported;
+    }
+
+    fn unsupportedStateDir(_: *anyopaque, _: std.Io, _: []u8) FsError![]u8 {
+        return error.Unsupported;
+    }
 };
+
+/// This machine's file capabilities (`readFile`, `readFileAt`, `listDir`,
+/// `statPath`, `writeFile`, `makePrivateDir`) as a `Ref`, for code that must
+/// address Local files through the same seam as a remote context's without
+/// owning one: an agent's sink in a Local workspace (TASK-61). The Local file
+/// functions keep no state, so one static instance serves every thread. Use
+/// it for files only; it has no state directory, and spawning through it
+/// would allocate the PTY with the page allocator.
+pub fn localFiles() ExecutionContext.Ref {
+    return .{ .ptr = &local_files_state, .vtable = &LocalExecutionContext.vtable };
+}
+
+/// Never written: `localFiles` hands out a pointer the vtable only reads.
+var local_files_state: LocalExecutionContext = .{ .allocator = std.heap.page_allocator };
 
 /// The SSH execution context (TASK-43, decision-8): `ssh.SshContext.create`
 /// builds an owned `ExecutionContext` of kind `.ssh` whose processes ride one
@@ -378,6 +467,8 @@ pub const ssh = @import("ssh.zig");
 /// Local child (TASK-73).
 pub const LocalExecutionContext = struct {
     allocator: Allocator,
+    /// Owned; what `stateDir` reports, when the owner supplied it.
+    state_dir: ?[]u8 = null,
 
     const vtable: ExecutionContext.VTable = .{
         .spawn = spawn,
@@ -388,12 +479,23 @@ pub const LocalExecutionContext = struct {
         .stat_path = statPath,
         .watch = watch,
         .run = run,
+        .read_file_at = readFileAt,
+        .write_file = writeFile,
+        .make_private_dir = makePrivateDir,
+        .state_dir = stateDir,
     };
 
     /// Allocate an owned local context implementation.
     pub fn create(allocator: Allocator) Allocator.Error!ExecutionContext {
+        return createWithStateDir(allocator, null);
+    }
+
+    /// See `ExecutionContext.localWithStateDir`.
+    pub fn createWithStateDir(allocator: Allocator, state_dir: ?[]const u8) Allocator.Error!ExecutionContext {
         const self = try allocator.create(LocalExecutionContext);
-        self.* = .{ .allocator = allocator };
+        errdefer allocator.destroy(self);
+        const owned = if (state_dir) |dir| try allocator.dupe(u8, dir) else null;
+        self.* = .{ .allocator = allocator, .state_dir = owned };
         return ExecutionContext.initOwned(self, &vtable);
     }
 
@@ -409,6 +511,7 @@ pub const LocalExecutionContext = struct {
     fn destroy(ptr: *anyopaque) void {
         const self: *LocalExecutionContext = @ptrCast(@alignCast(ptr));
         const allocator = self.allocator;
+        if (self.state_dir) |dir| allocator.free(dir);
         allocator.destroy(self);
     }
 
@@ -483,6 +586,63 @@ pub const LocalExecutionContext = struct {
 
     fn run(_: *anyopaque, allocator: Allocator, io: std.Io, request: RunRequest) RunError!RunResult {
         return runLocalProcess(allocator, io, request);
+    }
+
+    fn readFileAt(_: *anyopaque, io: std.Io, path: []const u8, offset: u64, buffer: []u8) FsError!usize {
+        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| return fsError(err);
+        defer file.close(io);
+        var filled: usize = 0;
+        while (filled < buffer.len) {
+            const n = file.readPositional(io, &.{buffer[filled..]}, offset + filled) catch |err| return switch (err) {
+                error.IsDir => error.IsADirectory,
+                else => error.Unavailable,
+            };
+            if (n == 0) break;
+            filled += n;
+        }
+        return filled;
+    }
+
+    fn writeFile(_: *anyopaque, io: std.Io, path: []const u8, bytes: []const u8, mode: u32) FsError!void {
+        if (bytes.len > max_write_bytes) return error.TooLarge;
+        const cwd = std.Io.Dir.cwd();
+        if (std.fs.path.dirnamePosix(path)) |parent| {
+            _ = cwd.createDirPathStatus(io, parent, private_dir_permissions) catch |err| return fsError(err);
+        }
+        // An unnamed (or hidden temporary) file in the same directory, renamed
+        // over the destination: a reader polling for it never sees a prefix.
+        var atomic = cwd.createFileAtomic(io, path, .{ .permissions = permissionsFromMode(mode), .replace = true }) catch |err| return fsError(err);
+        defer atomic.deinit(io);
+        atomic.file.writeStreamingAll(io, bytes) catch return error.Unavailable;
+        // Creation is subject to the umask; the caller asked for exact bits.
+        if (comptime has_modes) {
+            atomic.file.setPermissions(io, permissionsFromMode(mode)) catch |err| return fsError(err);
+        }
+        atomic.replace(io) catch |err| return fsError(err);
+    }
+
+    fn makePrivateDir(_: *anyopaque, io: std.Io, path: []const u8) FsError!void {
+        const cwd = std.Io.Dir.cwd();
+        _ = cwd.createDirPathStatus(io, path, private_dir_permissions) catch |err| return fsError(err);
+        if (comptime has_modes) {
+            cwd.setFilePermissions(io, path, private_dir_permissions, .{}) catch |err| return fsError(err);
+        }
+    }
+
+    fn stateDir(ptr: *anyopaque, _: std.Io, buffer: []u8) FsError![]u8 {
+        const self: *LocalExecutionContext = @ptrCast(@alignCast(ptr));
+        const dir = self.state_dir orelse return error.Unsupported;
+        if (dir.len > buffer.len) return error.NameTooLong;
+        @memcpy(buffer[0..dir.len], dir);
+        return buffer[0..dir.len];
+    }
+
+    /// Whether this platform's file permissions are POSIX mode bits.
+    const has_modes = @hasDecl(std.Io.File.Permissions, "fromMode");
+    const private_dir_permissions: std.Io.File.Permissions = if (has_modes) .fromMode(0o700) else .default_dir;
+
+    fn permissionsFromMode(mode: u32) std.Io.File.Permissions {
+        return if (has_modes) .fromMode(@intCast(mode & 0o7777)) else .default_file;
     }
 };
 
@@ -5715,4 +5875,97 @@ test "an ssh workspace snapshot keeps its target but never its test-only config 
 test {
     // The SSH context's unit and sshd-container integration tests.
     _ = ssh;
+}
+
+test "the local context writes files atomically with exact modes and private parents" {
+    const testing = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var context = try ExecutionContext.localWithStateDir(testing.allocator, "/state/home");
+    defer context.deinit();
+    const local_ref = context.borrow();
+    var path_buffer: [256]u8 = undefined;
+
+    // Missing parents are created private, and the mode is exact despite the umask.
+    const script = try contextTmpPath(&tmp, &path_buffer, "sink/a/b/hook.sh");
+    try local_ref.writeFile(testing.io, script, "#!/bin/sh\n", 0o700);
+    var read_buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings("#!/bin/sh\n", try local_ref.readFile(testing.io, script, &read_buffer));
+    const stat = try tmp.dir.statFile(testing.io, "sink/a/b/hook.sh", .{});
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o7777)));
+    const parent = try tmp.dir.statFile(testing.io, "sink/a", .{});
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(parent.permissions.toMode() & 0o777)));
+
+    // Replacing keeps no temporary beside it and takes the new mode.
+    try local_ref.writeFile(testing.io, script, "replaced", 0o600);
+    try testing.expectEqualStrings("replaced", try local_ref.readFile(testing.io, script, &read_buffer));
+    const replaced = try tmp.dir.statFile(testing.io, "sink/a/b/hook.sh", .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(replaced.permissions.toMode() & 0o7777)));
+    var dir = try tmp.dir.openDir(testing.io, "sink/a/b", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    var entries: usize = 0;
+    while (try iterator.next(testing.io)) |_| entries += 1;
+    try testing.expectEqual(@as(usize, 1), entries);
+
+    // An empty file is a file, and the bound is enforced before any IO.
+    const empty = try contextTmpPath(&tmp, &path_buffer, "sink/events.jsonl");
+    try local_ref.writeFile(testing.io, empty, "", 0o600);
+    try testing.expectEqual(@as(u64, 0), (try local_ref.statPath(testing.io, empty)).size);
+    const too_large = try testing.allocator.alloc(u8, max_write_bytes + 1);
+    defer testing.allocator.free(too_large);
+    @memset(too_large, 'x');
+    try testing.expectError(error.TooLarge, local_ref.writeFile(testing.io, empty, too_large, 0o600));
+    try testing.expectEqual(@as(u64, 0), (try local_ref.statPath(testing.io, empty)).size);
+    // A directory cannot be replaced by a file.
+    try testing.expectError(error.IsADirectory, local_ref.writeFile(testing.io, try contextTmpPath(&tmp, &path_buffer, "sink/a"), "x", 0o600));
+
+    // makePrivateDir creates missing levels 0700 and tightens an existing one.
+    try tmp.dir.createDir(testing.io, "open", .fromMode(0o755));
+    try local_ref.makePrivateDir(testing.io, try contextTmpPath(&tmp, &path_buffer, "open"));
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast((try tmp.dir.statFile(testing.io, "open", .{})).permissions.toMode() & 0o777)));
+    try local_ref.makePrivateDir(testing.io, try contextTmpPath(&tmp, &path_buffer, "deep/er/sink"));
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast((try tmp.dir.statFile(testing.io, "deep/er", .{})).permissions.toMode() & 0o777)));
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast((try tmp.dir.statFile(testing.io, "deep/er/sink", .{})).permissions.toMode() & 0o777)));
+
+    var state_buffer: [32]u8 = undefined;
+    try testing.expectEqualStrings("/state/home", try local_ref.stateDir(testing.io, &state_buffer));
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.NameTooLong, local_ref.stateDir(testing.io, &tiny));
+    var plain = try ExecutionContext.local(testing.allocator);
+    defer plain.deinit();
+    try testing.expectError(error.Unsupported, plain.borrow().stateDir(testing.io, &state_buffer));
+}
+
+test "the local context reads a file from an offset" {
+    const testing = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "events.jsonl", .data = "one\ntwo\nthree\n" });
+    var context = try ExecutionContext.local(testing.allocator);
+    defer context.deinit();
+    const local_ref = context.borrow();
+    var path_buffer: [256]u8 = undefined;
+    const path = try contextTmpPath(&tmp, &path_buffer, "events.jsonl");
+
+    var buffer: [5]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), try local_ref.readFileAt(testing.io, path, 0, &buffer));
+    try testing.expectEqualStrings("one\nt", &buffer);
+    try testing.expectEqual(@as(usize, 5), try local_ref.readFileAt(testing.io, path, 5, &buffer));
+    try testing.expectEqualStrings("wo\nth", &buffer);
+    try testing.expectEqual(@as(usize, 4), try local_ref.readFileAt(testing.io, path, 10, &buffer));
+    try testing.expectEqualStrings("ree\n", buffer[0..4]);
+    try testing.expectEqual(@as(usize, 0), try local_ref.readFileAt(testing.io, path, 14, &buffer));
+    try testing.expectEqual(@as(usize, 0), try local_ref.readFileAt(testing.io, path, 1000, &buffer));
+    var absent_buffer: [256]u8 = undefined;
+    try testing.expectError(error.NotFound, local_ref.readFileAt(testing.io, try contextTmpPath(&tmp, &absent_buffer, "absent"), 0, &buffer));
+
+    // A context without the capability says so.
+    var audit: FakeAudit = .{};
+    var owner = try FakeContext.create(testing.allocator, &audit, .ssh);
+    defer owner.deinit();
+    try testing.expectError(error.Unsupported, owner.borrow().readFileAt(testing.io, path, 0, &buffer));
+    try testing.expectError(error.Unsupported, owner.borrow().writeFile(testing.io, path, "x", 0o600));
+    try testing.expectError(error.Unsupported, owner.borrow().makePrivateDir(testing.io, path));
+    try testing.expectError(error.Unsupported, owner.borrow().stateDir(testing.io, &buffer));
 }

@@ -12,9 +12,13 @@
 //!   master. A client with no live master silently falls back to a direct
 //!   connection, so a session is spawned only while the context is
 //!   `connected`.
-//! - **Exec channels.** `readFile`, `listDir`, `statPath`, `watch` and `run`
-//!   run `ssh -T -o BatchMode=yes -o ControlMaster=no` over pipes, so they can
-//!   never prompt where nobody can see it.
+//! - **Exec channels.** `readFile`, `readFileAt`, `listDir`, `statPath`,
+//!   `writeFile`, `makePrivateDir`, `stateDir`, `watch` and `run` run
+//!   `ssh -T -o BatchMode=yes -o ControlMaster=no` over pipes, so they can
+//!   never prompt where nobody can see it. A write's bytes travel on the
+//!   channel's stdin in `write_chunk_bytes` pieces into a hidden temporary
+//!   that the last piece renames into place; the only remote files Conduit
+//!   writes this way are an agent's private sink (TASK-61).
 //! - **State.** `disconnected` → `connecting` (master started) → `connected`
 //!   (the master's control socket accepts connections, which OpenSSH binds only
 //!   after authentication) → `lost` (the master exited, or a worker found it
@@ -381,6 +385,108 @@ pub fn statScript(allocator: Allocator, path: []const u8) QuoteError![]u8 {
         \\[ -e "$p" ] || exit {d}; if [ -d "$p" ]; then k=d; elif [ -f "$p" ]; then k=f; else k=o; fi; m=$(stat -L -c '%s %.9Y' -- "$p" 2>/dev/null) || m=$(stat -L -c '%s %Y' -- "$p" 2>/dev/null) || m=$(stat -L -f '%z %m' -- "$p" 2>/dev/null) || exit {d}; printf '%s %s\n' "$k" "$m"
     , .{ helper_not_found, helper_failed }) catch unreachable; // A fixed template and two integers fit 512 bytes.
     return pathScript(allocator, path, body);
+}
+
+/// Read at most `limit` bytes of a file starting at byte `offset`
+/// (`tail -c +N | head -c L`, both POSIX), so an append-only sink is followed
+/// without rereading it.
+pub fn readFileAtScript(allocator: Allocator, path: []const u8, offset: u64, limit: usize) QuoteError![]u8 {
+    var body_buffer: [512]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buffer,
+        \\[ -d "$p" ] && exit {d}; [ -e "$p" ] || exit {d}; [ -r "$p" ] || exit {d}; tail -c +{d} -- "$p" | head -c {d}
+    , .{ helper_is_dir, helper_not_found, helper_access_denied, offset + 1, limit }) catch unreachable; // A fixed template and five integers fit 512 bytes.
+    return pathScript(allocator, path, body);
+}
+
+/// The bytes one write exec channel carries on its stdin, so a remote write
+/// of up to `workspace.max_write_bytes` is at most 64 channels and stdin is
+/// always within what `runLocalProcess` writes up front.
+pub const write_chunk_bytes = workspace.RunRequest.max_stdin;
+
+/// One step of an atomic remote write (`writeFileScript`).
+pub const WriteStep = struct {
+    /// Truncate the temporary file before appending this chunk; otherwise
+    /// it must already exist from the previous step.
+    first: bool,
+    /// After this chunk, set `mode` on the temporary file and rename it over
+    /// the destination.
+    last: bool,
+    mode: u32,
+};
+
+/// The shell fragment every failed write step ends with.
+const write_failed = "{ rm -f -- \"$t\"; exit " ++ std.fmt.comptimePrint("{d}", .{helper_failed}) ++ "; }";
+
+/// One exec channel of a remote write: create the destination's missing
+/// parents private (under `umask 077`), append stdin to the hidden temporary
+/// file `tmp` beside it, and on the last step `chmod` and `mv` it into place,
+/// which is atomic within the directory. A failure removes the temporary.
+/// A destination that is a directory is refused rather than moved into.
+/// Caller owns.
+pub fn writeFileScript(allocator: Allocator, path: []const u8, tmp: []const u8, step: WriteStep) QuoteError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "p=");
+    try appendQuoted(&out, allocator, path);
+    try out.appendSlice(allocator, "; t=");
+    try appendQuoted(&out, allocator, tmp);
+    var buffer: [256]u8 = undefined;
+    try out.appendSlice(allocator, std.fmt.bufPrint(&buffer,
+        \\; umask 077; [ -d "$p" ] && exit {d}; d=${{p%/*}}; [ -n "$d" ] || d=/; mkdir -p -- "$d" 2>/dev/null; [ -d "$d" ] || {{ [ -e "$d" ] && exit {d}; exit {d}; }};
+    , .{ helper_is_dir, helper_not_dir, helper_access_denied }) catch unreachable); // A fixed template and three integers fit 256 bytes.
+    if (step.first) {
+        try out.appendSlice(allocator, " cat > \"$t\" || " ++ write_failed);
+    } else {
+        try out.appendSlice(allocator, " [ -f \"$t\" ] || exit " ++ std.fmt.comptimePrint("{d}", .{helper_failed}) ++
+            "; cat >> \"$t\" || " ++ write_failed);
+    }
+    if (step.last) {
+        try out.appendSlice(allocator, std.fmt.bufPrint(&buffer, "; chmod {o} -- \"$t\" && mv -f -- \"$t\" \"$p\" || ", .{step.mode & 0o7777}) catch unreachable); // A fixed template and one mode fit 256 bytes.
+        try out.appendSlice(allocator, write_failed);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Remove a write's temporary file after a failed step. Caller owns.
+pub fn discardScript(allocator: Allocator, tmp: []const u8) QuoteError![]u8 {
+    return pathScript(allocator, tmp, "rm -f -- \"$p\"");
+}
+
+/// Create a directory and its missing parents private and make the
+/// directory itself 0700. A symbolic link in its place is refused, so the
+/// directory Conduit names is one it made. Caller owns.
+pub fn makePrivateDirScript(allocator: Allocator, path: []const u8) QuoteError![]u8 {
+    var body_buffer: [512]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buffer,
+        \\umask 077; [ -L "$p" ] && exit {d}; mkdir -p -- "$p" 2>/dev/null; [ -d "$p" ] || {{ [ -e "$p" ] && exit {d}; exit {d}; }}; chmod 700 -- "$p" || exit {d}
+    , .{ helper_failed, helper_not_dir, helper_access_denied, helper_access_denied }) catch unreachable; // A fixed template and four integers fit 512 bytes.
+    return pathScript(allocator, path, body);
+}
+
+/// Print the remote user's state directory: an absolute `$XDG_STATE_HOME`,
+/// else `$HOME/.local/state`, with no trailing newline; exit
+/// `helper_not_found` when neither is absolute. The exec channel's
+/// environment is sshd's plus whatever the login shell's non-interactive
+/// startup files export.
+pub const state_dir_script = std.fmt.comptimePrint(
+    \\s=${{XDG_STATE_HOME:-}}; case "$s" in /*) ;; *) case "${{HOME:-}}" in /?*) s=$HOME/.local/state ;; *) exit {d} ;; esac ;; esac; printf '%s' "$s"
+, .{helper_not_found});
+
+/// Check `state_dir_script` output: one absolute path with no control bytes.
+pub fn parseStateDir(output: []const u8) ?[]const u8 {
+    if (output.len < 2 or output[0] != '/') return null;
+    for (output) |byte| {
+        if (byte < ' ' or byte == 0x7f) return null;
+    }
+    return output;
+}
+
+/// The hidden temporary a remote write of `path` stages into: beside the
+/// destination, so the final `mv` is a rename within one directory, and
+/// named per process and write so concurrent writers never share one.
+pub fn writeTempPath(buffer: []u8, path: []const u8, process_id: i32, serial: u32) error{NoSpaceLeft}![]const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return std.fmt.bufPrint(buffer, ".{s}.conduit-{d}-{d}", .{ path, process_id, serial });
+    return std.fmt.bufPrint(buffer, "{s}/.{s}.conduit-{d}-{d}", .{ path[0..slash], path[slash + 1 ..], process_id, serial });
 }
 
 /// How often the remote watch loop fingerprints its directory, and how often
@@ -771,6 +877,10 @@ pub const SshContext = struct {
         .stat_path = statPathFn,
         .watch = watchFn,
         .run = runFn,
+        .read_file_at = readFileAtFn,
+        .write_file = writeFileFn,
+        .make_private_dir = makePrivateDirFn,
+        .state_dir = stateDirFn,
     };
 
     /// Allocate an owned, not yet connected SSH context. Validates the target
@@ -1169,6 +1279,101 @@ pub const SshContext = struct {
             return error.CommandNotFound;
         }
         return result;
+    }
+
+    /// Run one file helper script and map a non-zero exit onto `FsError`.
+    /// The caller owns the result.
+    fn runHelper(self: *SshContext, io: std.Io, script: []const u8, stdin: ?[]const u8, max_output: usize) workspace.FsError!workspace.RunResult {
+        var result = self.runScript(self.allocator, io, script, stdin, max_output, 30_000) catch |err| return fsFromRun(err);
+        if (!result.succeeded()) {
+            const err = helperError(result.exit_code);
+            result.deinit(self.allocator);
+            return err;
+        }
+        return result;
+    }
+
+    fn readFileAtFn(ptr: *anyopaque, io: std.Io, path: []const u8, offset: u64, buffer: []u8) workspace.FsError!usize {
+        const self = fromPtr(ptr);
+        if (buffer.len == 0) return 0;
+        const script = readFileAtScript(self.allocator, path, offset, buffer.len) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.EmbeddedNul => error.NotFound,
+        };
+        defer self.allocator.free(script);
+        var result = try self.runHelper(io, script, null, buffer.len);
+        defer result.deinit(self.allocator);
+        // `head -c` never prints more than asked; anything else is not the helper.
+        if (result.stdout.len > buffer.len) return error.Unavailable;
+        @memcpy(buffer[0..result.stdout.len], result.stdout);
+        return result.stdout.len;
+    }
+
+    /// Distinguishes the temporaries of concurrent remote writes.
+    var next_write_serial = std.atomic.Value(u32).init(0);
+
+    /// Stage `bytes` through `write_chunk_bytes`-sized exec channels into a
+    /// hidden temporary beside `path`, then rename it into place on the last
+    /// one (`writeFileScript`). A failed step removes the temporary.
+    fn writeFileFn(ptr: *anyopaque, io: std.Io, path: []const u8, bytes: []const u8, mode: u32) workspace.FsError!void {
+        const self = fromPtr(ptr);
+        if (bytes.len > workspace.max_write_bytes) return error.TooLarge;
+        var tmp_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = writeTempPath(&tmp_buffer, path, sys.pid(), next_write_serial.fetchAdd(1, .monotonic)) catch return error.NameTooLong;
+        var offset: usize = 0;
+        while (true) {
+            const end = @min(bytes.len, offset + write_chunk_bytes);
+            const step: WriteStep = .{ .first = offset == 0, .last = end == bytes.len, .mode = mode };
+            self.writeStep(io, path, tmp, step, bytes[offset..end]) catch |err| {
+                if (offset != 0) self.discard(io, tmp);
+                return err;
+            };
+            if (step.last) return;
+            offset = end;
+        }
+    }
+
+    fn writeStep(self: *SshContext, io: std.Io, path: []const u8, tmp: []const u8, step: WriteStep, chunk: []const u8) workspace.FsError!void {
+        const script = writeFileScript(self.allocator, path, tmp, step) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.EmbeddedNul => error.NotFound,
+        };
+        defer self.allocator.free(script);
+        var result = try self.runHelper(io, script, chunk, 4096);
+        result.deinit(self.allocator);
+    }
+
+    /// Best effort: a temporary left by a lost connection is a hidden file in
+    /// a private directory, removed with the sink.
+    fn discard(self: *SshContext, io: std.Io, tmp: []const u8) void {
+        const script = discardScript(self.allocator, tmp) catch return;
+        defer self.allocator.free(script);
+        var result = self.runHelper(io, script, null, 4096) catch |err| {
+            log.debug("a remote write's temporary was not removed: {s}", .{@errorName(err)});
+            return;
+        };
+        result.deinit(self.allocator);
+    }
+
+    fn makePrivateDirFn(ptr: *anyopaque, io: std.Io, path: []const u8) workspace.FsError!void {
+        const self = fromPtr(ptr);
+        const script = makePrivateDirScript(self.allocator, path) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.EmbeddedNul => error.NotFound,
+        };
+        defer self.allocator.free(script);
+        var result = try self.runHelper(io, script, null, 4096);
+        result.deinit(self.allocator);
+    }
+
+    fn stateDirFn(ptr: *anyopaque, io: std.Io, buffer: []u8) workspace.FsError![]u8 {
+        const self = fromPtr(ptr);
+        var result = try self.runHelper(io, state_dir_script, null, std.fs.max_path_bytes);
+        defer result.deinit(self.allocator);
+        const dir = parseStateDir(result.stdout) orelse return error.Unavailable;
+        if (dir.len > buffer.len) return error.NameTooLong;
+        @memcpy(buffer[0..dir.len], dir);
+        return buffer[0..dir.len];
     }
 
     const master_view_vtable: pty.Pty.VTable = .{
@@ -1687,6 +1892,135 @@ test "the control directory is created 0700 and an insecure or symlinked one is 
     try testing.expectError(error.InsecureControlDir, prepareControlDir(testing.allocator, linked_root));
 }
 
+/// Run a helper script the way the remote side does: the `remoteCommand`
+/// wrapper parsed by a POSIX shell, with `prefix` (an `env` invocation) in
+/// front. Caller owns the result.
+fn runHelperLocally(prefix: []const []const u8, script: []const u8, stdin: ?[]const u8) !workspace.RunResult {
+    const command = try remoteCommand(testing.allocator, script);
+    defer testing.allocator.free(command);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(testing.allocator);
+    try argv.appendSlice(testing.allocator, prefix);
+    try argv.appendSlice(testing.allocator, &.{ "/bin/sh", "-c", command });
+    return workspace.runLocalProcess(testing.allocator, testing.io, .{ .argv = argv.items, .cwd = "", .stdin = stdin });
+}
+
+fn localMode(path: [:0]const u8) !u32 {
+    var buffer: std.os.linux.Statx = undefined;
+    const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, path.ptr, 0, .{ .MODE = true }, &buffer);
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.StatFailed;
+    return buffer.mode & 0o7777;
+}
+
+test "the write, offset-read, private-directory and state-directory helpers do what they say under /bin/sh" {
+    if (!supported) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(&tmp);
+    defer testing.allocator.free(root);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A three-step write into missing parents: nothing appears until the last
+    // step renames the temporary, then the bytes and mode are exact.
+    const dest = try std.fmt.allocPrintSentinel(arena, "{s}/sink/it's $(x)/hook.sh", .{root}, 0);
+    var tmp_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const temporary = try writeTempPath(&tmp_buffer, dest, 42, 7);
+    try testing.expect(std.mem.endsWith(u8, temporary, "/sink/it's $(x)/.hook.sh.conduit-42-7"));
+    const steps = [_]struct { step: WriteStep, chunk: []const u8 }{
+        .{ .step = .{ .first = true, .last = false, .mode = 0o700 }, .chunk = "#!/bin/sh\n" },
+        .{ .step = .{ .first = false, .last = false, .mode = 0o700 }, .chunk = "echo 'a\\b'\n" },
+        .{ .step = .{ .first = false, .last = true, .mode = 0o700 }, .chunk = "exit 0\n" },
+    };
+    for (steps) |entry| {
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, dest, .{}));
+        const script = try writeFileScript(arena, dest, temporary, entry.step);
+        var result = try runHelperLocally(&.{}, script, entry.chunk);
+        defer result.deinit(testing.allocator);
+        try testing.expect(result.succeeded());
+    }
+    var read_buffer: [128]u8 = undefined;
+    try testing.expectEqualStrings("#!/bin/sh\necho 'a\\b'\nexit 0\n", try std.Io.Dir.cwd().readFile(testing.io, dest, &read_buffer));
+    try testing.expectEqual(@as(u32, 0o700), try localMode(dest));
+    const parent = try std.fmt.allocPrintSentinel(arena, "{s}/sink", .{root}, 0);
+    try testing.expectEqual(@as(u32, 0o700), try localMode(parent));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, temporary, .{}));
+
+    // A single-step rewrite replaces the file; an append without its first
+    // step fails; a directory destination is refused, not moved into.
+    {
+        var result = try runHelperLocally(&.{}, try writeFileScript(arena, dest, temporary, .{ .first = true, .last = true, .mode = 0o600 }), "allow");
+        defer result.deinit(testing.allocator);
+        try testing.expect(result.succeeded());
+        try testing.expectEqualStrings("allow", try std.Io.Dir.cwd().readFile(testing.io, dest, &read_buffer));
+        try testing.expectEqual(@as(u32, 0o600), try localMode(dest));
+    }
+    {
+        var result = try runHelperLocally(&.{}, try writeFileScript(arena, dest, temporary, .{ .first = false, .last = true, .mode = 0o600 }), "x");
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(@as(?u8, helper_failed), result.exit_code);
+    }
+    {
+        var result = try runHelperLocally(&.{}, try writeFileScript(arena, parent, temporary, .{ .first = true, .last = true, .mode = 0o600 }), "x");
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(@as(?u8, helper_is_dir), result.exit_code);
+    }
+
+    // Offset reads follow an append-only file.
+    {
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "events.jsonl", .data = "one\ntwo\n" });
+        const events = try std.fmt.allocPrint(arena, "{s}/events.jsonl", .{root});
+        var result = try runHelperLocally(&.{}, try readFileAtScript(arena, events, 4, 3), null);
+        defer result.deinit(testing.allocator);
+        try testing.expect(result.succeeded());
+        try testing.expectEqualStrings("two", result.stdout);
+        var past = try runHelperLocally(&.{}, try readFileAtScript(arena, events, 100, 3), null);
+        defer past.deinit(testing.allocator);
+        try testing.expect(past.succeeded());
+        try testing.expectEqualStrings("", past.stdout);
+        var absent = try runHelperLocally(&.{}, try readFileAtScript(arena, try std.fmt.allocPrint(arena, "{s}/absent", .{root}), 0, 3), null);
+        defer absent.deinit(testing.allocator);
+        try testing.expectEqual(@as(?u8, helper_not_found), absent.exit_code);
+    }
+
+    // A private directory: created with its parents, an existing one
+    // tightened, a symlink refused.
+    {
+        const deep = try std.fmt.allocPrintSentinel(arena, "{s}/state/conduit/agents/r/a", .{root}, 0);
+        var result = try runHelperLocally(&.{}, try makePrivateDirScript(arena, deep), null);
+        defer result.deinit(testing.allocator);
+        try testing.expect(result.succeeded());
+        try testing.expectEqual(@as(u32, 0o700), try localMode(deep));
+        const middle = try std.fmt.allocPrintSentinel(arena, "{s}/state/conduit", .{root}, 0);
+        try testing.expectEqual(@as(u32, 0o700), try localMode(middle));
+        try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.chmod(deep.ptr, 0o755)));
+        var again = try runHelperLocally(&.{}, try makePrivateDirScript(arena, deep), null);
+        defer again.deinit(testing.allocator);
+        try testing.expect(again.succeeded());
+        try testing.expectEqual(@as(u32, 0o700), try localMode(deep));
+        try tmp.dir.symLink(testing.io, deep, "linked", .{ .is_directory = true });
+        var linked = try runHelperLocally(&.{}, try makePrivateDirScript(arena, try std.fmt.allocPrint(arena, "{s}/linked", .{root})), null);
+        defer linked.deinit(testing.allocator);
+        try testing.expectEqual(@as(?u8, helper_failed), linked.exit_code);
+    }
+
+    // The state directory comes from an absolute XDG_STATE_HOME, else HOME.
+    {
+        var xdg = try runHelperLocally(&.{ "env", "XDG_STATE_HOME=/x/state", "HOME=/h" }, state_dir_script, null);
+        defer xdg.deinit(testing.allocator);
+        try testing.expectEqualStrings("/x/state", parseStateDir(xdg.stdout).?);
+        var relative = try runHelperLocally(&.{ "env", "XDG_STATE_HOME=state", "HOME=/h" }, state_dir_script, null);
+        defer relative.deinit(testing.allocator);
+        try testing.expectEqualStrings("/h/.local/state", parseStateDir(relative.stdout).?);
+        var none = try runHelperLocally(&.{ "env", "-u", "XDG_STATE_HOME", "-u", "HOME" }, state_dir_script, null);
+        defer none.deinit(testing.allocator);
+        try testing.expectEqual(@as(?u8, helper_not_found), none.exit_code);
+    }
+    try testing.expect(parseStateDir("relative") == null);
+    try testing.expect(parseStateDir("/a\nb") == null);
+}
+
 // ------------------------------------------------- sshd container integration
 
 /// A terminal under test: everything its child printed, and bounded waits on
@@ -1789,6 +2123,179 @@ fn acceptedAuthentications(container: []const u8) !usize {
 
 const image = "conduit-ssh-test:latest";
 const remote_project = "/home/conduit/project";
+
+/// Test support for other modules' integration tests (the agent adapters,
+/// TASK-61): a disposable sshd container from `test/fixtures/ssh` and a
+/// connected `SshContext` to it. Only tests may use it: it relies on
+/// `std.testing` and Docker. The key is a throwaway unencrypted one and the
+/// private client config accepts the container's new host key, so the master
+/// connects without prompts; the prompts themselves are covered by this
+/// file's own integration test.
+pub const TestRemote = struct {
+    tmp: std.testing.TmpDir,
+    work: [:0]u8,
+    container: []u8,
+    runtime_dir: [:0]u8,
+    owner: ExecutionContext,
+    master: TestTerminal,
+
+    /// The remote user's home and the project fixture inside it.
+    pub const home = "/home/conduit";
+    pub const project = remote_project;
+
+    /// Start the container and connect; null when Docker or the image is
+    /// unavailable, so the caller skips. The result is heap-allocated
+    /// because the master terminal points into it.
+    pub fn start() !?*TestRemote {
+        if (!supported) return null;
+        var info = hostCommand(&.{ "docker", "info" }, 30_000) catch return null;
+        const docker_ok = info.succeeded();
+        info.deinit(testing.allocator);
+        if (!docker_ok) return null;
+        var build = hostCommand(&.{ "docker", "build", "-q", "-t", image, "test/fixtures/ssh" }, 900_000) catch return null;
+        const built = build.succeeded();
+        build.deinit(testing.allocator);
+        if (!built) return null;
+
+        const self = try testing.allocator.create(TestRemote);
+        errdefer testing.allocator.destroy(self);
+        self.tmp = testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        self.work = try tmpRoot(&self.tmp);
+        errdefer testing.allocator.free(self.work);
+
+        const serial = next_socket_serial.fetchAdd(1, .monotonic);
+        const key = try std.fmt.allocPrint(testing.allocator, "{s}/id_ed25519", .{self.work});
+        defer testing.allocator.free(key);
+        var keygen = try hostCommand(&.{ "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "conduit-ssh-test", "-f", key }, 30_000);
+        defer keygen.deinit(testing.allocator);
+        if (!keygen.succeeded()) return error.KeygenFailed;
+
+        self.container = try std.fmt.allocPrint(testing.allocator, "conduit-ssh-agent-{d}-{d}-{d}", .{ sys.pid(), serial, testNowMs() });
+        errdefer testing.allocator.free(self.container);
+        const mount = try std.fmt.allocPrint(testing.allocator, "{s}.pub:/conduit-key.pub:ro", .{key});
+        defer testing.allocator.free(mount);
+        var started = try hostCommand(&.{ "docker", "run", "-d", "--name", self.container, "-p", "127.0.0.1::22", "-v", mount, image }, 60_000);
+        defer started.deinit(testing.allocator);
+        if (!started.succeeded()) return error.ContainerFailed;
+        errdefer {
+            var removed = hostCommand(&.{ "docker", "rm", "-f", self.container }, 60_000) catch null;
+            if (removed) |*result| result.deinit(testing.allocator);
+        }
+
+        var port_result = try hostCommand(&.{ "docker", "port", self.container, "22/tcp" }, 30_000);
+        defer port_result.deinit(testing.allocator);
+        const first_line = std.mem.sliceTo(port_result.stdout, '\n');
+        const port_text = first_line[(std.mem.lastIndexOfScalar(u8, first_line, ':') orelse return error.NoPort) + 1 ..];
+        const port = try std.fmt.parseInt(u16, port_text, 10);
+        {
+            const deadline = testNowMs() + 30_000;
+            while (true) {
+                var logs = try hostCommand(&.{ "docker", "logs", self.container }, 30_000);
+                defer logs.deinit(testing.allocator);
+                if (std.mem.indexOf(u8, logs.stderr, "Server listening") != null or
+                    std.mem.indexOf(u8, logs.stdout, "Server listening") != null) break;
+                if (testNowMs() > deadline) return error.SshdNeverListened;
+            }
+        }
+
+        const config_text = try std.fmt.allocPrint(testing.allocator,
+            \\Host conduit-test-host
+            \\  HostName 127.0.0.1
+            \\  Port {d}
+            \\  User conduit
+            \\  IdentityFile {s}
+            \\  IdentitiesOnly yes
+            \\  IdentityAgent none
+            \\  UserKnownHostsFile {s}/known_hosts
+            \\  GlobalKnownHostsFile /dev/null
+            \\  StrictHostKeyChecking accept-new
+            \\  UpdateHostKeys no
+            \\
+        , .{ port, key, self.work });
+        defer testing.allocator.free(config_text);
+        try self.tmp.dir.writeFile(testing.io, .{ .sub_path = "ssh_config", .data = config_text });
+        const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/ssh_config", .{self.work});
+        defer testing.allocator.free(config_path);
+
+        self.runtime_dir = try std.fmt.allocPrintSentinel(testing.allocator, "/tmp/conduit-ssh-agent-{d}-{d}", .{ sys.pid(), serial }, 0);
+        errdefer testing.allocator.free(self.runtime_dir);
+        if (sys.mkdir(self.runtime_dir, 0o700) == .failed) return error.RuntimeDirFailed;
+        errdefer std.Io.Dir.cwd().deleteTree(testing.io, self.runtime_dir) catch {}; // Best-effort cleanup of a private test directory.
+
+        const path_entry = try std.fmt.allocPrint(testing.allocator, "PATH={s}", .{testing.environ.getPosix("PATH") orelse "/usr/bin:/bin"});
+        defer testing.allocator.free(path_entry);
+        self.owner = try SshContext.create(testing.allocator, testing.io, .{
+            .target = .{ .destination = "conduit-test-host", .config_file = config_path },
+            .local_env = &.{ path_entry, "TERM=xterm-256color", "LANG=C.UTF-8" },
+            .runtime_dir = self.runtime_dir,
+        });
+        errdefer self.owner.deinit();
+        const context = SshContext.fromContext(&self.owner).?;
+        self.master = .{ .handle = context.masterTerminal() };
+        errdefer self.master.deinit();
+        try context.connect(.{ .rows = 24, .cols = 100 });
+        try waitState(context, &self.master, .connected, 30_000);
+        return self;
+    }
+
+    /// The connected context, borrowed.
+    pub fn ref(self: *TestRemote) ExecutionContext.Ref {
+        return self.owner.borrow();
+    }
+
+    /// Run one remote command and return its result; the caller deinits it.
+    pub fn run(self: *TestRemote, argv: []const []const u8, stdin: ?[]const u8) !workspace.RunResult {
+        return self.ref().run(testing.allocator, testing.io, .{ .argv = argv, .cwd = "", .stdin = stdin, .timeout_ms = 60_000 });
+    }
+
+    pub fn stop(self: *TestRemote) void {
+        self.owner.deinit();
+        self.master.deinit();
+        var removed = hostCommand(&.{ "docker", "rm", "-f", self.container }, 60_000) catch null;
+        if (removed) |*result| result.deinit(testing.allocator);
+        std.Io.Dir.cwd().deleteTree(testing.io, self.runtime_dir) catch {}; // Best-effort cleanup of a private test directory.
+        testing.allocator.free(self.runtime_dir);
+        testing.allocator.free(self.container);
+        testing.allocator.free(self.work);
+        self.tmp.cleanup();
+        testing.allocator.destroy(self);
+    }
+};
+
+test "remote writes, offset reads, private directories and the state directory work over the master" {
+    const remote = (try TestRemote.start()) orelse return error.SkipZigTest;
+    defer remote.stop();
+    const ref = remote.ref();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state = try ref.stateDir(testing.io, &buffer);
+    try testing.expectEqualStrings(TestRemote.home ++ "/.local/state", state);
+
+    const sink = TestRemote.home ++ "/.local/state/conduit/agents/run/agent";
+    try ref.makePrivateDir(testing.io, sink);
+    var mode = try remote.run(&.{ "stat", "-c", "%a", TestRemote.home ++ "/.local/state/conduit", sink }, null);
+    defer mode.deinit(testing.allocator);
+    try testing.expectEqualStrings("700\n700\n", mode.stdout);
+
+    // A write larger than one chunk arrives whole, with its mode, and leaves
+    // no temporary behind.
+    const big = try testing.allocator.alloc(u8, write_chunk_bytes * 2 + 123);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    try ref.writeFile(testing.io, sink ++ "/blob", big, 0o600);
+    const back = try testing.allocator.alloc(u8, big.len);
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(u8, big, try ref.readFile(testing.io, sink ++ "/blob", back));
+    try testing.expectEqual(big.len - 1000, try ref.readFileAt(testing.io, sink ++ "/blob", 1000, back));
+    try testing.expectEqualSlices(u8, big[1000..], back[0 .. big.len - 1000]);
+    var listing = try remote.run(&.{ "sh", "-c", "ls -A \"$0\"; stat -c %a \"$0/blob\"", sink }, null);
+    defer listing.deinit(testing.allocator);
+    try testing.expectEqualStrings("blob\n600\n", listing.stdout);
+
+    try testing.expectError(error.IsADirectory, ref.writeFile(testing.io, sink, "x", 0o600));
+    try testing.expectError(error.NotFound, ref.readFileAt(testing.io, sink ++ "/absent", 0, back));
+    try testing.expectEqual(@as(usize, 0), try ref.readFileAt(testing.io, sink ++ "/blob", big.len, back));
+}
 
 test "an SSH context carries shells, files and commands over one authenticated master, detects loss and reconnects" {
     if (!supported) return error.SkipZigTest;
