@@ -1,186 +1,181 @@
-# Conduit
+<p align="center">
+  <img src="assets/linux/io.github.thowd22.Conduit-master.png" width="128" alt="Conduit">
+</p>
 
-Conduit is a terminal workspace written in Zig on top of Ghostty's terminal engine (libghostty).
-One window holds named workspaces; each workspace has tabs, split panes and an always-running
-scratchpad terminal, all driven equally by keyboard and mouse through a command palette. Its own
-interface is drawn in the terminal's grid and colours rather than as desktop chrome, and every
-element is exposed to a test driver so that an AI agent can launch, drive and screenshot it like a
-user. First-class support for coding-agent CLIs (Claude Code, Codex, Pi) and Backlog.md planning
-is the goal of the next milestones; today those tools run in Conduit as ordinary terminal programs.
+<h1 align="center">Conduit</h1>
 
-Conduit is pre-1.0. Linux x86_64 is the primary platform, with the fullest test coverage. macOS
-arm64 (a disk image, ad hoc signed and not notarized) and Windows x86_64 (a portable zip, unsigned)
-are released from v0.1.9 on and verified only on GitHub's hosted runners, so expect rough edges.
+<p align="center">
+  <strong>A terminal workspace built for the way you work with coding agents.</strong><br>
+  Tabs, split panes, named workspaces and a scratchpad that never dies, drawn in the terminal's own grid,
+  with Claude Code, Codex, Pi and OpenCode as first-class citizens.
+</p>
+
+<p align="center">
+  <a href="https://github.com/thowd22/Conduit/releases/latest"><img src="https://img.shields.io/github/v/release/thowd22/Conduit?display_name=tag&color=5b8def" alt="Latest release"></a>
+  <a href="https://github.com/thowd22/Conduit/actions/workflows/linux-e2e.yml"><img src="https://github.com/thowd22/Conduit/actions/workflows/linux-e2e.yml/badge.svg" alt="Linux E2E gate"></a>
+  <a href="https://github.com/thowd22/Conduit/actions/workflows/ci.yml"><img src="https://github.com/thowd22/Conduit/actions/workflows/ci.yml/badge.svg" alt="CI on Linux, macOS and Windows"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/licence-MIT-green" alt="MIT licence"></a>
+</p>
 
 ![Conduit with a workspace sidebar, two tabs and a split pane](docs/images/main-window.png)
 
-## Features
+Conduit is written in Zig on top of Ghostty's terminal engine. It is a real terminal first: a
+PTY, a GPU grid renderer, true colour, ligatures, emoji, IME, mouse reporting, shell integration.
+Everything Conduit adds on top is drawn as terminal text in the same grid and colours. No native
+chrome, no web view, no icons: if you can see it, you can click it, and if you can click it, there
+is a key chord and a palette command for it too.
 
-What works today (Linux):
+## Why Conduit
 
-- **Terminal.** A real PTY with your shell, rendered by Conduit's GPU grid renderer: true colour,
-  bold/italic faces, mouse reporting, selection (drag, double and triple click, Shift to override a
-  program's mouse capture), clipboard and middle-click primary selection, scrollback, IME input,
-  bash/zsh/fish shell integration for working-directory tracking and prompt marks.
-- **Tabs and panes.** A sidebar lists the workspace's tabs. Create, rename, reorder (drag or keys),
-  close (with a prompt when a program is still running). Each tab splits right or down to any depth;
-  focus, resize (drag a divider or use keys), zoom and close panes. New tabs and panes start in the
-  directory the shell reported.
-- **Command palette.** Fuzzy search over every command with its key chord, recent commands first,
-  arguments collected in nested steps, every row clickable.
-- **Scratchpad.** One persistent shell per workspace, shown as a bottom dock at 50% or 90% of the
-  window and kept running while hidden.
-- **Workspaces.** Several named workspaces in one window, each with its own tabs, panes and
-  scratchpad, saved on change and restored at the next launch.
-- **Remote workspaces.** SSH workspaces over the system OpenSSH client with one shared connection
-  per workspace, OpenSSH's own prompts shown verbatim, and reconnect; WSL workspaces on Windows
-  that run every tab, pane and the scratchpad inside a chosen distribution.
-- **Links and file references.** Ctrl+click (Cmd+click on macOS) opens URLs, OSC 8 hyperlinks and
-  `path:line:col` references; files open in `vi` in a new tab.
-- **Search.** Find in scrollback with literal or regular-expression matching and a case toggle.
-- **Context menu.** Right click for copy, paste, open link, open in editor, split and search.
-- **Coding agents.** Launch Claude Code, Codex, Pi or OpenCode into an agent tab, or start one by
-  hand in any tab: the sidebar shows its state, notifications collect waits, permission prompts
-  and finished runs, a structured view shows the transcript and answers permission prompts, an
-  agent manager lists every agent across workspaces, and agents can read and edit their own
-  instruction files. Agents reach Conduit through a local token-scoped control API (`conduit
-  control`), which also opens tabs, splits panes and drives the editor pane.
-- **Editor pane.** With VSCodium installed, "Editor: open file", the context menu or an agent's
-  `editor.open` request opens VSCodium in a split pane at a file and line; on X11 the window is
-  hosted inside the pane.
-- **Backlog.md.** A board or list of the workspace's Backlog.md tasks, with task details, status
-  changes and criteria toggles through the `backlog` CLI, and a "start agent" action per task.
-- **Shell profiles.** Named profiles (command, arguments, environment, login) with per-platform
-  built-in defaults, including PowerShell integration on Windows.
-- **Accessibility.** The UI is exposed over AT-SPI on Linux.
-- **Configuration.** A Ghostty-style settings file with hot reload, rebindable keys, and a
-  settings view that edits it in place.
-- **Themes.** Fourteen bundled colour schemes, Ghostty-format user themes, automatic light/dark
-  switching and a picker with live preview.
-- **Fonts.** Bundled JetBrains Mono and Nerd Font symbols, configurable family and style faces,
-  fallback chains, colour emoji, programming ligatures, pixel-exact box drawing and Powerline
-  glyphs, and size chords.
+- **Agents are not an afterthought.** Launch Claude Code, Codex, Pi or OpenCode into a tab, or
+  start one by hand anywhere. The sidebar shows what each agent is doing (`▸` working, `?` waiting
+  for input, `!` waiting for permission, `✓` done), notifications collect every wait, a structured
+  view shows the transcript and lets you answer permission prompts, and an agent manager lists every
+  agent across workspaces.
+- **Agents get a steering wheel.** A local, token-scoped control API lets the agent running in a
+  tab open tabs, split panes, show you a file at a line in an editor pane, and post status, with
+  the scratchpad always out of its reach. The same surface drives Conduit from tests and MCP.
+- **The scratchpad belongs to you.** Every workspace starts a shell that keeps running while
+  hidden, docks at 50% or 90% of the window, and can never be taken over by an agent.
+- **Workspaces, local or remote.** One window, many named workspaces, each with its own tabs,
+  panes and scratchpad, saved on change and restored on the next launch. SSH workspaces reuse one
+  connection and show OpenSSH's own prompts; WSL workspaces run inside a distribution of your choice.
+- **Backlog.md built in.** A board of the workspace's tasks, task details, status and criteria
+  edits through the `backlog` CLI, and a one-key "start an agent on this task".
+- **Testable to the pixel.** Every element registers once in a semantic tree that rendering, mouse
+  hit testing, keyboard focus, accessibility and the test driver all read. An agent can launch an
+  isolated Conduit, drive it through the real input path and screenshot it like a user.
 
-Still open (see [`CONDUIT.md`](CONDUIT.md) and the [`backlog/`](backlog/) milestones): signed
-and notarized macOS and Windows packages, macOS and Windows accessibility bridges, editor-pane
-hosting outside X11, and the Windows checks that are reported rather than gating.
+## Tour
 
-| Command palette | Theme picker previewing Catppuccin Latte | Settings view |
+| Command palette | Theme picker, previewing live | Settings view |
 |---|---|---|
 | ![Command palette filtered to pane commands](docs/images/palette.png) | ![Theme picker with a light theme previewed across the window](docs/images/theme-picker.png) | ![Settings view listing settings and key bindings](docs/images/settings.png) |
 
-## Install (Linux x86_64)
+**Terminal.** True colour, bold and italic faces, selection with drag, double and triple click,
+clipboard and primary selection, scrollback, IME, and bash, zsh, fish and PowerShell integration
+for working-directory tracking and prompt marks. Ctrl+click opens URLs, OSC 8 hyperlinks and
+`path:line:col` references. Search across scrollback with literals or regular expressions.
 
-Releases are published at <https://github.com/thowd22/Conduit/releases>. Each release has a
-Debian package, an AppImage, a tarball and a `SHA256SUMS` file. They need glibc 2.35 or newer
-(Ubuntu 22.04 or later), OpenGL 3.3 and an X11 or Wayland session. From v0.1.9 each release
-also has `conduit-<version>-macos-arm64.dmg` (macOS 14 or newer; ad hoc signed, so Gatekeeper
-needs a right-click Open the first time) and `conduit-<version>-windows-x86_64.zip` (unpack and
-run `Conduit\conduit.exe`; unsigned, so SmartScreen warns), each with a `.sha256` file.
+**Layout.** Tabs you can create, rename, reorder and close; panes that split right or down to any
+depth, resize by divider drag or keys, zoom and close; a right-click context menu for copy, paste,
+open link, open in editor, split and search. New tabs and panes start where the shell was.
 
-Download the assets for a version (here 0.1.8) and check them:
+**Editor pane.** With [VSCodium](https://vscodium.com) installed, "Editor: open file", the context
+menu over a file reference, or an agent's `editor.open` request opens the file at a line in a
+split pane. On X11 the VSCodium window is hosted inside the pane and follows it as it moves,
+resizes, zooms or hides; a second request reuses the pane.
+
+![VSCodium hosted in a Conduit pane after a control request from the terminal beside it](docs/images/editor-pane.png)
+
+**Looks.** Fourteen bundled colour schemes, Ghostty-format user themes, automatic light and dark
+switching, a theme picker and a font picker with live preview. JetBrains Mono and Nerd Font
+symbols are bundled; fallback chains, colour emoji, programming ligatures, pixel-exact box drawing
+and Powerline glyphs come for free.
+
+**Configuration.** One Ghostty-style settings file, hot-reloaded, every key rebindable, with a
+settings view that edits it in place and a keybinding editor that captures the chord you press.
+
+## Install
+
+Grab the latest release from the [releases page](https://github.com/thowd22/Conduit/releases).
+
+| Platform | Package | Notes |
+|---|---|---|
+| Linux x86_64 | `.deb`, AppImage, tarball | glibc 2.35+ (Ubuntu 22.04 or later), OpenGL 3.3, X11 or Wayland |
+| macOS arm64 | `.dmg` | macOS 14+. Ad hoc signed, so right-click, Open the first time |
+| Windows x86_64 | portable `.zip` | Unpack and run `Conduit\conduit.exe`. Unsigned, so SmartScreen warns |
+
+Every asset has a checksum (`SHA256SUMS`, or a `.sha256` file beside it):
 
 ```sh
-gh release download v0.1.8 --repo thowd22/Conduit   # or download them from the release page
+gh release download v0.1.9 --repo thowd22/Conduit
 sha256sum -c SHA256SUMS
+sudo apt install ./conduit_0.1.9_amd64.deb        # or run the AppImage, or unpack the tarball
+conduit --version
 ```
 
-Then install one of them:
+Linux is the primary platform with the fullest coverage. The macOS and Windows builds ship from
+v0.1.9 and are verified on GitHub's hosted runners, so expect rough edges there; see the
+[current state](AGENTS.md#current-state) for exactly what is proven where.
+
+## Let an agent drive it
+
+Inside any Conduit tab, an agent (or you) can talk to the window it lives in:
 
 ```sh
-# Debian or Ubuntu
-sudo apt install ./conduit_0.1.8_amd64.deb
-
-# AppImage (no installation; needs FUSE 2, or add --appimage-extract-and-run)
-chmod +x Conduit-0.1.8-x86_64.AppImage
-./Conduit-0.1.8-x86_64.AppImage
-
-# Tarball: bin/conduit plus share/ (desktop entry, icons, shell integration, licences)
-tar -xzf conduit-0.1.8-x86_64-linux.tar.gz
-./conduit-0.1.8-x86_64-linux/bin/conduit
+conduit control tab.open '{"cwd":"/home/me/src/app"}'
+conduit control pane.split '{"direction":"down"}'
+conduit control editor.open '{"path":"src/main.zig","line":142,"column":7}'
+conduit control tab.status '{"text":"running tests"}'
 ```
 
-`conduit --version` prints the installed version. The Debian package installs a desktop entry
-and icon, so Conduit also appears in the application menu.
+The endpoint and token arrive in the tab's environment, are scoped to that workspace, and can
+never reach the scratchpad. Claude Code hooks, Codex, Pi and OpenCode snippets are in
+[`docs/control-api.md`](docs/control-api.md).
 
-## Build from source
-
-Conduit needs exactly **Zig 0.16.0** (the `minimum_zig_version` in `build.zig.zon`; other
-versions are not supported). Everything else is fetched and compiled by the build: SDL3, FreeType,
-HarfBuzz, Oniguruma, zlib, libpng and the Ghostty terminal engine are pinned in `build.zig.zon`
-and statically linked. At runtime SDL loads the system OpenGL and X11 or Wayland libraries.
-
-```sh
-git clone https://github.com/thowd22/Conduit.git
-cd Conduit
-zig build                 # installs zig-out/bin/conduit and zig-out/bin/conduit-test
-zig build run             # build and start Conduit
-zig build test            # unit and integration tests
-```
-
-`zig build -Doptimize=ReleaseSafe` builds the optimised binary the releases ship;
-`zig build --prefix <dir>` stages the full install tree (binary, fonts, shell integration, desktop
-entry, icons, licences). [`docs/release.md`](docs/release.md) describes the release build and
-packaging.
-
-The end-to-end checks open a real window, so on a machine without a display run them under Xvfb.
-The CI gate (`.github/workflows/linux-e2e.yml`) installs these Ubuntu packages for them:
-`xvfb xauth xdotool dbus-x11 ibus ibus-hangul libglib2.0-bin sway jq xclip x11-utils
-desktop-file-utils fonts-noto-color-emoji fonts-noto-cjk fonts-dejavu-core`. Only `xvfb` (and
-`xauth`) is needed for the built-in checks below; the rest serve the platform checks in
-`.github/scripts/`.
-
-```sh
-xvfb-run -a zig build run -- --palette-test          # one deterministic built-in check
-xvfb-run -a zig build e2e -- --artifact-dir="$(mktemp -d)"   # the scripted scenarios
-```
-
-The built-in checks are `--grid-test`, `--self-test`, `--scroll-test`, `--mouse-test`,
-`--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`, `--panes-test`,
-`--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`, `--search-test`,
-`--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--agent-prompts-test`, `--profiles-test`, `--editor-test` and
-`--driver-test`; each exits non-zero on failure. `conduit --help` lists every flag.
-
-## Documentation
-
-- [`docs/user-guide.md`](docs/user-guide.md): using Conduit, and the full keybinding reference.
-- [`docs/config.md`](docs/config.md): the settings file, every key, themes, fonts and keybinding
-  syntax.
-- [`docs/agents.md`](docs/agents.md): running Claude Code, Codex, Pi and OpenCode in Conduit, and
-  letting them drive Conduit through `conduit-test`.
-- [`docs/architecture.md`](docs/architecture.md): how the code is organised.
-- [`docs/release.md`](docs/release.md): cutting and verifying a Linux release.
-- [`CONDUIT.md`](CONDUIT.md): the product specification and roadmap.
-- [`AGENTS.md`](AGENTS.md): the contributor and coding-agent guide, including the current state of
-  every feature and what is verified on which platform.
-- [`backlog/`](backlog/): the plan, as Backlog.md tasks, decisions and milestones.
-
-## For agents
-
-Conduit ships a development-only automation surface: `--test-driver` starts a local JSON-RPC
-server in the app, and the `conduit-test` executable (built by `zig build`, not packaged in
-releases) launches isolated runs and drives them through the real input path:
+For testing and exploration, `conduit-test` launches an isolated Conduit and drives it through the
+real input path, with a semantic tree instead of pixel coordinates:
 
 ```sh
 run="$(./zig-out/bin/conduit-test --root=/tmp/ct launch --width=960 --height=540 --scale=1)"
-./zig-out/bin/conduit-test --root=/tmp/ct --run="$run" inspect      # semantic tree as JSON
+./zig-out/bin/conduit-test --root=/tmp/ct --run="$run" inspect        # the semantic tree
 ./zig-out/bin/conduit-test --root=/tmp/ct --run="$run" key CTRL+SHIFT+p
-./zig-out/bin/conduit-test --root=/tmp/ct --run="$run" screenshot   # prints the PNG path
+./zig-out/bin/conduit-test --root=/tmp/ct --run="$run" screenshot     # a PNG you can look at
 ./zig-out/bin/conduit-test --root=/tmp/ct --run="$run" quit
 ```
 
-`conduit-test mcp` exposes the same commands as an MCP server; the checked-in
-[`.mcp.json`](.mcp.json) registers it for Claude Code. [`docs/agents.md`](docs/agents.md) covers
-Codex and Pi, and `AGENTS.md` describes the full development loop.
+`conduit-test mcp` exposes the same commands as an MCP server, and the checked-in
+[`.mcp.json`](.mcp.json) registers it for Claude Code.
+
+## Build from source
+
+Conduit needs exactly **Zig 0.16.0**. Everything else (SDL3, FreeType, HarfBuzz, Oniguruma, zlib,
+libpng and the Ghostty engine) is pinned in `build.zig.zon`, fetched by the build and statically
+linked.
+
+```sh
+git clone https://github.com/thowd22/Conduit.git && cd Conduit
+zig build            # zig-out/bin/conduit and zig-out/bin/conduit-test
+zig build run        # start it
+zig build test       # unit and integration tests
+```
+
+The end-to-end checks open a real window; on a headless machine run them under Xvfb:
+
+```sh
+xvfb-run -a zig build run -- --palette-test                   # one of 33 deterministic checks
+xvfb-run -a zig build e2e -- --artifact-dir="$(mktemp -d)"    # 22 scripted scenarios
+```
+
+`conduit --help` lists every check; [`AGENTS.md`](AGENTS.md) describes the development loop,
+and [`docs/release.md`](docs/release.md) the release build.
+
+## Documentation
+
+- [`docs/user-guide.md`](docs/user-guide.md): using Conduit, with the full keybinding reference.
+- [`docs/config.md`](docs/config.md): every setting, themes, fonts and keybinding syntax.
+- [`docs/agents.md`](docs/agents.md): running coding agents in Conduit and letting them drive it.
+- [`docs/control-api.md`](docs/control-api.md): the control API and the `conduit` CLI.
+- [`docs/architecture.md`](docs/architecture.md): how the code is organised.
+- [`CONDUIT.md`](CONDUIT.md): the product specification.
+- [`AGENTS.md`](AGENTS.md): the contributor and coding-agent guide, including what is verified
+  on which platform.
+- [`backlog/`](backlog/): the plan as Backlog.md tasks, decisions and milestones.
+
+## Status
+
+Conduit is pre-1.0. All planned milestones are implemented; what remains open is signed and
+notarized macOS and Windows packages, accessibility bridges on macOS and Windows (Linux has
+AT-SPI), editor-pane hosting outside X11, and a couple of Windows checks that report rather than
+gate. Issues and pull requests are welcome.
 
 ## Licence
 
-Conduit is released under the [MIT licence](LICENSE). It compiles in or bundles the components
-below. `zig build` and the release packages install their licence texts under
-`share/licenses/conduit/` (all but the colour-scheme notices, which live in
-[`assets/themes/README.md`](assets/themes/README.md)); the sources are in
-[`assets/THIRD-PARTY-LICENSES/`](assets/THIRD-PARTY-LICENSES/), [`assets/fonts/`](assets/fonts/)
-and the pinned dependencies.
+Conduit is MIT. It compiles in or bundles the components below; `zig build` and the release
+packages install their licence texts under `share/licenses/conduit/`, and the sources are in
+[`assets/THIRD-PARTY-LICENSES/`](assets/THIRD-PARTY-LICENSES/), [`assets/fonts/`](assets/fonts/),
+[`assets/themes/README.md`](assets/themes/README.md) and the pinned dependencies.
 
 | Component | Licence |
 |---|---|
