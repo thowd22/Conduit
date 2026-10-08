@@ -4330,15 +4330,16 @@ test "a completed snapshot carries the app's values and is always representable"
 
 test "only a plain run or the restore check persists, and checks never read a state file" {
     const testing = std.testing;
-    // The state path follows the platform's convention (`state.statePath`
-    // has its own per-OS tests); here only the Linux and macOS spellings are
-    // pinned, and Windows, whose path needs LOCALAPPDATA, skips.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const env = test_env{ .vars = &.{ .{ "XDG_STATE_HOME", "/state" }, .{ "HOME", "/home/u" } } };
+    const env = test_env{ .vars = &.{ .{ "XDG_STATE_HOME", "/state" }, .{ "HOME", "/home/u" }, .{ "LOCALAPPDATA", "C:\\state" } } };
     var plain = Persistence.forRun(testing.allocator, testing.io, env.source(), .{}, true);
     defer plain.deinit();
-    const expected_path = if (builtin.os.tag == .macos) "/home/u/Library/Application Support/conduit/state.json" else "/state/conduit/state.json";
-    try testing.expectEqualStrings(expected_path, plain.path.?);
+    // Each platform's own state location (`state.statePath`).
+    const expected_path = switch (builtin.os.tag) {
+        .windows => "C:\\state\\conduit\\state.json",
+        .macos => "/home/u/Library/Application Support/conduit/state.json",
+        else => "/state/conduit/state.json",
+    };
+    try testing.expectEqualStrings(expected_path, plain.path orelse return error.TestUnexpectedResult);
 
     var off = Persistence.forRun(testing.allocator, testing.io, env.source(), .{}, false);
     defer off.deinit();

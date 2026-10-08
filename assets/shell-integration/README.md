@@ -21,7 +21,7 @@ is used here.
 | bash | `bash/conduit.bash` | yes — real bash 5.3 over a real PTY |
 | zsh | `zsh/.zshenv` + `zsh/conduit.zsh` | yes — real zsh 5.9 over a real PTY |
 | fish | `fish/vendor_conf.d/conduit.fish` | **no, by decision** — the project proves bash and zsh only |
-| PowerShell | `powershell/conduit.ps1` | yes — PowerShell over Windows ConPTY on the hosted Windows runner (TASK-46) |
+| PowerShell | `powershell/conduit.ps1` | yes — PowerShell 7 over Windows ConPTY on the hosted Windows runner (TASK-46, CI run 37720295115), and pwsh over a Linux PTY |
 
 The PowerShell script emits OSC 7 as `file://localhost/<path>` with forward slashes and a leading
 slash before the drive (`file://localhost/C:/Users/me`), each segment percent-encoded; Conduit
