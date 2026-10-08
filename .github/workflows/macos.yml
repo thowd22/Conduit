@@ -253,7 +253,9 @@ jobs:
         shell: bash
         run: |
           for name in platform pty config font input term render ui session workspace testdriver app; do
-            bin="$(ls -t $(find .zig-cache/o -type f -name "$name-test") 2>/dev/null | head -n 1)"
+            found="$(find .zig-cache/o -type f -name "$name-test")"
+            bin=""
+            [ -z "$found" ] || bin="$(ls -t $found | head -n 1)"
             [ -n "$bin" ] || { echo "== $name-test: no binary"; continue; }
             echo "== $name-test ($bin)"
             perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 240 "$bin" > diag.txt 2>&1 || echo "== $name-test exited $?"
