@@ -34,6 +34,7 @@
 //! heuristics are owner-thread state. Every allocation takes an explicit
 //! allocator and every buffer is bounded.
 
+const std = @import("std");
 const state = @import("agent/state.zig");
 const event = @import("agent/event.zig");
 const adapter = @import("agent/adapter.zig");
@@ -90,6 +91,9 @@ pub const Heuristics = heuristics.Heuristics;
 pub const Observation = heuristics.Observation;
 
 pub const FakeAdapter = @import("agent/fake.zig").FakeAdapter;
+/// The scripted fake's own program name, which only checks recognize.
+pub const fake_command_name = @import("agent/fake.zig").command_name;
+pub const recognizeFakeCommand = @import("agent/fake.zig").recognizeCommand;
 
 /// The harness adapters. Each lives in its own file so the adapter tasks
 /// (TASK-53, 54, 55, 78) can land independently; a file that is still a stub
@@ -115,9 +119,64 @@ pub fn instructionProfile(harness: Harness) InstructionProfile {
         .opencode => opencode.instruction_profile,
     };
 }
+/// Interpreters whose second command-line word, not their own name, says
+/// which program runs: npm installs harness launchers as `#!/usr/bin/env
+/// node` scripts, so a terminal's foreground leader reads `node
+/// /usr/lib/node_modules/.../bin/codex`.
+const interpreters = [_][]const u8{ "node", "nodejs", "bun", "deno", "python", "python3", "sh", "bash", "dash", "zsh" };
+
+/// The program a foreground process runs, as the basename that names it:
+/// `argv0`'s, or for an interpreter the script's (`argv1`, when it is not an
+/// option). Borrows its arguments; harness-neutral.
+pub fn commandName(argv0: []const u8, argv1: []const u8) []const u8 {
+    const base = std.fs.path.basenamePosix(argv0);
+    // A login shell's argv0 starts with '-': still a shell, never a harness.
+    for (interpreters) |interpreter| {
+        if (!std.mem.eql(u8, base, interpreter)) continue;
+        if (argv1.len == 0 or argv1[0] == '-') return base;
+        return std.fs.path.basenamePosix(argv1);
+    }
+    return base;
+}
+
+/// Which harness a foreground program name (`commandName`) is, by each
+/// adapter's own spelling, or null. Lets the app classify a process the human
+/// started in their own terminal (observed agents, TASK-56) without knowing
+/// any harness's name itself.
+pub fn recognize(name: []const u8) ?Harness {
+    if (claude_code.recognizeCommand(name)) return .claude_code;
+    if (codex.recognizeCommand(name)) return .codex;
+    if (pi.recognizeCommand(name) != null) return .pi;
+    if (opencode.recognizeCommand(name)) return .opencode;
+    return null;
+}
+
 /// Bounded readiness waits on the pipes and sockets the adapters speak over,
 /// the one place the agent layer asks the OS (TASK-5).
 pub const poll = @import("agent/poll.zig");
+
+test "foreground programs are named through interpreters and recognized by each adapter's spelling" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("claude", commandName("/home/u/.local/bin/claude", "--resume"));
+    try testing.expectEqualStrings("codex", commandName("node", "/usr/lib/node_modules/@openai/codex/bin/codex"));
+    try testing.expectEqualStrings("opencode", commandName("/usr/bin/node", "/usr/local/lib/node_modules/opencode-ai/bin/opencode"));
+    try testing.expectEqualStrings("conduit-fake-agent", commandName("/bin/sh", "/tmp/x/conduit-fake-agent"));
+    try testing.expectEqualStrings("node", commandName("node", "-e"));
+    try testing.expectEqualStrings("bash", commandName("bash", ""));
+    try testing.expectEqualStrings("-bash", commandName("-bash", ""));
+
+    try testing.expectEqual(Harness.claude_code, recognize("claude").?);
+    try testing.expectEqual(Harness.codex, recognize("codex").?);
+    try testing.expectEqual(Harness.pi, recognize("pi").?);
+    try testing.expectEqual(Harness.pi, recognize("omp").?);
+    try testing.expectEqual(Harness.opencode, recognize("opencode").?);
+    for ([_][]const u8{ "bash", "vim", "claude-code", "pip", "", "conduit-fake-agent", "Claude" }) |other| {
+        try testing.expect(recognize(other) == null);
+    }
+    // The fake is recognized only by its own spelling, never as a harness.
+    try testing.expect(recognizeFakeCommand(fake_command_name));
+    try testing.expect(!recognizeFakeCommand("claude"));
+}
 
 test {
     _ = @import("agent/harness.zig");

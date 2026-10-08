@@ -767,6 +767,14 @@ pub const SessionMatch = union(enum) {
 
 // Instructions (TASK-59) ---------------------------------------------------------
 
+/// Whether a foreground program name (`agent.commandName`, a basename) is
+/// Claude Code, so the agent core can classify a process the human started
+/// in their own terminal (TASK-56 observed agents). The native installer and
+/// npm both install `claude`, and Claude Code retitles its process `claude`.
+pub fn recognizeCommand(name: []const u8) bool {
+    return std.mem.eql(u8, name, "claude");
+}
+
 /// Where Claude Code reads its instructions, from its memory documentation
 /// (doc-3): `CLAUDE.md` in the cwd and every directory above it (also as
 /// `.claude/CLAUDE.md` and the personal `CLAUDE.local.md`), the user's
@@ -817,6 +825,12 @@ pub const Options = struct {
     /// machine where this path and the local endpoint do not exist.
     /// Borrowed for the adapter's life.
     control_helper: ?[]const u8 = null,
+    /// An observed agent's foreground process (TASK-56): `attach` without a
+    /// harness session id then finds the session by this pid, else by this
+    /// cwd (`attachRunning`). Copied.
+    observe: ?Observe = null,
+
+    pub const Observe = struct { pid: u32, cwd: []const u8 };
 };
 
 const Mode = enum { unbound, owned, observed };
@@ -852,6 +866,9 @@ pub const ClaudeCodeAdapter = struct {
     pending: [max_pending]PendingPermission = undefined,
     pending_len: usize = 0,
     arena: std.heap.ArenaAllocator,
+    /// `Options.observe`, with an owned cwd.
+    observe_pid: ?u32 = null,
+    observe_cwd: []u8 = &.{},
 
     pub fn init(allocator: Allocator, io: Io, options: Options) (Allocator.Error || error{InvalidSinkPath})!ClaudeCodeAdapter {
         if (options.sink_dir) |sink| if (!isValidSinkPath(sink)) return error.InvalidSinkPath;
@@ -859,8 +876,12 @@ pub const ClaudeCodeAdapter = struct {
         errdefer if (sink_dir) |sink| allocator.free(sink);
         const config_dir = if (options.config_dir) |config| try allocator.dupe(u8, std.mem.trimEnd(u8, config, "/")) else null;
         errdefer if (config_dir) |config| allocator.free(config);
+        const observe_cwd: []u8 = if (options.observe) |o| try allocator.dupe(u8, o.cwd) else &.{};
+        errdefer allocator.free(observe_cwd);
         const program = try allocator.dupe(u8, options.program);
         return .{
+            .observe_pid = if (options.observe) |o| o.pid else null,
+            .observe_cwd = observe_cwd,
             .allocator = allocator,
             .io = io,
             .sink_dir = sink_dir,
@@ -881,6 +902,7 @@ pub const ClaudeCodeAdapter = struct {
         if (self.transcript) |*reader| reader.deinit(self.allocator);
         if (self.sink_dir) |sink| self.allocator.free(sink);
         if (self.config_dir) |config| self.allocator.free(config);
+        self.allocator.free(self.observe_cwd);
         self.allocator.free(self.program);
         self.arena.deinit();
         self.* = undefined;
@@ -1055,7 +1077,14 @@ pub const ClaudeCodeAdapter = struct {
 
     fn attachFn(ptr: *anyopaque, request: api.AttachRequest) api.Error!void {
         const self = cast(ptr);
-        const reported = request.harness_session_id orelse return error.UnknownTarget;
+        const reported = request.harness_session_id orelse {
+            // An observed agent's owner knows only the foreground process.
+            if (self.observe_pid) |pid| {
+                if (self.mode != .unbound) return error.UnknownTarget;
+                return self.attachRunning(pid, self.observe_cwd, request);
+            }
+            return error.UnknownTarget;
+        };
         const id = SessionId.parse(reported) orelse return error.UnknownTarget;
         switch (self.mode) {
             .unbound => self.mode = .observed,
@@ -1080,6 +1109,22 @@ pub const ClaudeCodeAdapter = struct {
             try self.locateTranscript();
         }
         log.debug("attached ({t})", .{self.mode});
+    }
+
+    /// Attach to a Claude Code the human started in their own terminal
+    /// (observed agents, TASK-56): the registry record of the terminal's
+    /// foreground process `pid`, else the newest session whose cwd is `cwd`.
+    /// `error.UnknownTarget` while neither is registered yet (Claude writes
+    /// its record shortly after it starts), so the caller retries.
+    pub fn attachRunning(self: *ClaudeCodeAdapter, pid: u32, cwd: []const u8, request: api.AttachRequest) api.Error!void {
+        var found: RegisteredSession = undefined;
+        if (!try self.findRunningSession(.{ .pid = pid }, &found)) {
+            if (cwd.len == 0 or !try self.findRunningSession(.{ .cwd = cwd }, &found)) return error.UnknownTarget;
+        }
+        var by_id = request;
+        by_id.harness_session_id = found.session_id.text();
+        try attachFn(self, by_id);
+        self.registry_pid = found.pid;
     }
 
     /// Look for a running interactive session in Claude Code's registry.
@@ -2024,6 +2069,45 @@ test "a hand-started session is detected, attached and followed until it exits" 
     try dir.deleteFile(testing.io, "config/sessions/4242.json");
     try testing.expectEqual(@as(usize, 0), try iface.poll(&queue));
     try testing.expectError(error.Disconnected, iface.poll(&queue));
+}
+
+test "an observed claude attaches by its foreground pid, else by its cwd, and waits until registered" {
+    var scratch: Scratch = undefined;
+    try scratch.init();
+    defer scratch.deinit();
+    const dir = scratch.tmp.dir;
+    try dir.createDirPath(testing.io, "config/sessions");
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const config = scratch.join(&buffer, "config");
+
+    var early = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .config_dir = config });
+    defer early.deinit();
+    // Not registered yet: retried, and the adapter stays unbound.
+    try testing.expectError(error.UnknownTarget, early.attachRunning(4242, "/work/conduit", .{ .session = .first, .token = fixtureToken() }));
+
+    try dir.writeFile(testing.io, .{ .sub_path = "config/sessions/4242.json", .data = fixture_registry });
+    try early.attachRunning(4242, "", .{ .session = .first, .token = fixtureToken() });
+    try testing.expectEqualStrings("a99524b3-acf5-4f2d-9d81-63305a561d2a", early.session_id.?.text());
+    try testing.expectEqual(@as(?u32, 4242), early.registry_pid);
+
+    // A node launcher's leader is not Claude's own pid: the cwd finds it.
+    var by_cwd = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .config_dir = config });
+    defer by_cwd.deinit();
+    try by_cwd.attachRunning(7, "/work/conduit", .{ .session = .first, .token = fixtureToken() });
+    try testing.expectEqual(@as(?u32, 4242), by_cwd.registry_pid);
+
+    var elsewhere = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .config_dir = config });
+    defer elsewhere.deinit();
+    try testing.expectError(error.UnknownTarget, elsewhere.attachRunning(7, "/elsewhere", .{ .session = .first, .token = fixtureToken() }));
+
+    // The owner attaches through the common interface; the option names
+    // the process.
+    var observed = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .config_dir = config, .observe = .{ .pid = 4242, .cwd = "/elsewhere" } });
+    const iface = observed.adapter();
+    defer iface.destroy();
+    try iface.attach(.{ .session = .first, .token = fixtureToken() });
+    try testing.expectEqual(@as(?u32, 4242), observed.registry_pid);
+    try testing.expectError(error.UnknownTarget, iface.attach(.{ .session = .first, .token = fixtureToken() }));
 }
 
 test "launch writes the sink and describes the claude process" {

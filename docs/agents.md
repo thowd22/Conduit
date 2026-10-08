@@ -12,7 +12,8 @@ There are two separate topics here:
    development and test loop for Conduit itself.
 
 Everything below is verified on Linux only, with Claude Code 2.1.292, Codex 0.160.1, Pi 0.73.1 and
-omp 18.6.1 installed. OpenCode has not been installed or tried.
+omp 18.6.1 installed. OpenCode 1.18.35 is not installed on the host; it was verified in a throwaway
+ubuntu:24.04 container with a fixed local model (`scripts/opencode-container-check.sh`).
 
 ## Running agents inside Conduit (works today)
 
@@ -22,7 +23,7 @@ Start the harness in any tab, pane or the scratchpad exactly as in another termi
 claude          # Claude Code
 codex           # Codex
 pi              # Pi (omp, the oh-my-pi fork, likewise)
-opencode        # OpenCode (untested)
+opencode        # OpenCode
 ```
 
 What Conduit provides for them now:
@@ -53,9 +54,9 @@ Current limits:
 - **No clipboard writes from the program (OSC 52).** Conduit's OSC 52 policy is "ask" and the
   prompt does not exist yet, so a harness's own copy command (for example one that copies the last
   answer) is refused and logged. Select the text and use Ctrl+Shift+C (Cmd+C) instead.
-- **Hand-started agents are followed only partly.** A harness you start yourself in a terminal
-  is a terminal program to Conduit until it is noticed (Claude Code through its session
-  registry); agents launched with **Agent: launch** get the full integration below.
+- **Hand-started agents are observed, with less than a launch gives** (see
+  [Observed agents](#observed-agents)); agents launched with **Agent: launch** get the full
+  integration below.
 - **WSL is not built.** Agents run locally or, in an SSH workspace, on the remote host
   ([user guide](user-guide.md#agents-in-ssh-workspaces)); there Codex and OpenCode keep the
   terminal-level status only.
@@ -82,11 +83,42 @@ in `backlog/docs/doc-3`. In short:
   may be edited, opens editable files in `vi`, and for Claude Code restarts the agent to apply an
   edit (TASK-59).
 
+### Observed agents
+
+A harness you start yourself in an ordinary tab or pane is noticed and followed on that tab
+(TASK-56, TASK-78). When a terminal produces output, a prompt mark or input, Conduit looks at the
+PTY's foreground process group (at most once every 2 seconds per terminal, never per frame): on
+Linux the group leader's first two command-line words and working directory from `/proc`. The
+program is named by the leader's basename, or for an interpreter (`node`, `bun`, `python3`, `sh`
+and similar) by its script's, so npm's `node …/bin/codex` launcher counts as `codex`. Each
+adapter owns its spelling (`claude`, `codex`, `pi`/`omp`, `opencode`). A recognized program
+becomes an **observed** agent bound to that human terminal: its glyph leads the tab row,
+notifications and the agent manager list it, and **Agent: stop** only stops observing it (the
+process is the human's and is never signalled). What it gets beyond the PTY baseline depends on
+the harness:
+
+| Harness | How an observed agent attaches |
+|---|---|
+| Claude Code | Its own session registry: the record of the foreground pid, else the newest session in the process's cwd; then its transcript and registry status |
+| Codex | The shared app-server daemon's newest thread in the process's cwd |
+| Pi / omp | PTY baseline only (no extension is loaded in a hand-started Pi; its session JSONL is not followed live) |
+| OpenCode | PTY baseline only: without `--port` the TUI starts no server Conduit can reach |
+
+When the program leaves the foreground (it exits and the shell is back, or another program
+replaces it) the observed agent ends as `done`; Conduit did not start it and cannot read its exit
+status. Starting it again makes a new observed agent in place of the ended one. The scratchpad,
+an agent's own terminal and an SSH connection terminal are never observed, and neither is a
+terminal in an SSH workspace (there the local foreground is the SSH client). Foreground lookup
+is implemented for the Linux PTY backend only; macOS and Windows report nothing yet.
+
 The work is tracked as TASK-52 (adapter interface), TASK-53 to TASK-55 (Claude Code, Codex and Pi
 adapters), TASK-56 (notifications), TASK-57 (agent view), TASK-58 (agent manager), TASK-59 (prompt viewer and editor), TASK-60
 (control API), TASK-61 (agents over SSH), TASK-62 to TASK-64 (Backlog.md) and TASK-78 (OpenCode).
 Live authenticated harness runs (a real Claude Code permission answered from the view, a real
 remote Claude Code) have not been checked; the deterministic checks use a scripted fake agent.
+OpenCode is the exception: `scripts/opencode-container-check.sh` runs a real OpenCode 1.18.35 in a
+container, launches it with **Agent: launch**, answers its bash permission from the agent view and
+sees the turn finish, and observes an `opencode` started by hand in a plain tab.
 
 ## Letting an agent drive Conduit
 

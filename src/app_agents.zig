@@ -44,6 +44,7 @@ const workspace = @import("workspace");
 const session = @import("session");
 const config = @import("config");
 const platform = @import("platform");
+const pty = @import("pty");
 const inputmod = @import("input");
 const agent_view = @import("agent_view.zig");
 
@@ -664,6 +665,16 @@ pub const Runner = struct {
     needs_attach: bool = false,
     thread: ?std.Thread = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    /// Observed agents only (TASK-56): the foreground process the human
+    /// started, whose harness records the worker attaches to. Null for an
+    /// agent Conduit launched.
+    observed_pid: ?u32 = null,
+    /// The adapter's capabilities as the worker last saw them (a
+    /// `Capabilities` bit pattern; zero before its first poll), published
+    /// after every poll so the owner never calls the adapter while the
+    /// worker does: a structured channel may come up only after
+    /// registration (OpenCode's event stream).
+    published_caps: std.atomic.Value(u16) = .init(0),
     /// Worker-owned.
     attached: bool = false,
     attach_attempts: u32 = 0,
@@ -895,7 +906,7 @@ pub const Runner = struct {
             // One attempt per `attach_every` polls, so a daemon that is still
             // starting is not hammered.
             if ((self.attach_attempts - 1) % attach_every != 0) return;
-            self.adapter().attach(.{ .session = self.session, .token = self.token }) catch |err| switch (err) {
+            self.attach() catch |err| switch (err) {
                 error.Unsupported, error.Protocol => {
                     self.polling = false;
                     log.debug("the agent's side channel is unavailable ({s}); heuristics only", .{@errorName(err)});
@@ -910,6 +921,7 @@ pub const Runner = struct {
             const fake = &self.backend.fake;
             fake.poll_batch = released -| fake.cursor;
         }
+        defer self.published_caps.store(@bitCast(self.adapter().capabilities()), .release);
         const pushed = self.adapter().poll(&self.queue) catch |err| switch (err) {
             error.Unsupported => {
                 self.polling = false;
@@ -921,6 +933,14 @@ pub const Runner = struct {
             },
         };
         if (pushed != 0) self.wake.send();
+    }
+
+    /// Attach the side channel. An observed agent's adapter was told its
+    /// foreground process when it was made, so its `attach` finds the
+    /// harness's own session (Claude Code: its registry by pid, else cwd;
+    /// Codex: the daemon's newest thread in the cwd). Worker thread.
+    fn attach(self: *Runner) agent.AdapterError!void {
+        return self.adapter().attach(.{ .session = self.session, .token = self.token });
     }
 
     /// Lines the human typed into the fake agent, counted by the bytes its
@@ -1286,6 +1306,59 @@ pub const LaunchRequest = struct {
     /// The backlog task the agent is started on (TASK-64). The caller passes
     /// a validated id; one longer than `Runner.max_task_id_bytes` is dropped.
     task_id: ?[]const u8 = null,
+    /// Set for an observed agent (TASK-56): the human started the harness as
+    /// this process in their own terminal. Nothing is spawned and no sink is
+    /// kept; the worker attaches to the harness's own records instead.
+    observed_pid: ?u32 = null,
+};
+
+// Observed agents (TASK-56, TASK-78) ------------------------------------------------
+
+/// What the app knows about one session when the runtime asks: its binding,
+/// its context and the terminal's foreground process.
+pub const SessionFacts = struct {
+    binding: agent.Binding,
+    context_kind: workspace.ExecutionContextKind,
+    /// The leader of the terminal's foreground process group, its text in
+    /// the buffer the runtime lent; null when the PTY backend cannot say.
+    process: ?pty.ForegroundProcess,
+    /// `$HOME`, `$CLAUDE_CONFIG_DIR` and `$CODEX_HOME` as this machine sees
+    /// them, for the Local side channels an observed agent attaches to.
+    /// Borrowed for the call.
+    home: ?[]const u8 = null,
+    claude_config_dir: ?[]const u8 = null,
+    codex_home: ?[]const u8 = null,
+};
+
+/// The app's answer to "what runs in this session?", installed by the
+/// composition root. Without it no human terminal is ever observed.
+pub const SessionProbe = struct {
+    context: ?*anyopaque = null,
+    /// Owner thread; bounded (`pty.Pty.foregroundProcess` reads `/proc`).
+    /// Null when the session is gone.
+    probe_fn: ?*const fn (context: ?*anyopaque, key: WorkspaceKey, id: SessionId, buffer: []u8) ?SessionFacts = null,
+};
+
+/// At most one foreground look per session per this interval, and only after
+/// the session did something (output, a prompt mark, input): never per frame.
+pub const observe_interval_ns: i96 = 2 * std.time.ns_per_s;
+
+/// Sessions the runtime remembers looking at; the oldest is forgotten first.
+const watch_capacity = 64;
+
+/// One session the runtime looks into for a harness the human started.
+const Watch = struct {
+    key: WorkspaceKey,
+    id: SessionId,
+    /// The session did something since the last look.
+    due: bool = true,
+    last_check_ns: ?i96 = null,
+    /// Not a human terminal (the scratchpad, an agent's own terminal, an SSH
+    /// connection terminal): never looked at again.
+    excluded: bool = false,
+    /// The process the human told Conduit to stop observing; not attached
+    /// again while it stays in front.
+    ignored_pid: ?u32 = null,
 };
 
 pub const LaunchError = Allocator.Error || error{
@@ -1338,6 +1411,11 @@ pub const Runtime = struct {
     /// agent.event` while this run's control endpoint is up (TASK-60); null
     /// keeps them on the sink relay. Borrowed for the runtime's life.
     control_helper: ?[]const u8 = null,
+    /// How the runtime asks the app what runs in a session (observed agents).
+    probe: SessionProbe = .{},
+    watches: std.ArrayList(Watch) = .empty,
+    /// Foreground looks taken, for checks and diagnostics.
+    foreground_checks: usize = 0,
 
     const drain_capacity = 8;
 
@@ -1386,6 +1464,7 @@ pub const Runtime = struct {
         }
         self.os_jobs.deinit(self.allocator);
         self.tracks.deinit(self.allocator);
+        self.watches.deinit(self.allocator);
         self.registry.deinit();
         self.allocator.free(self.drained);
         if (self.sink_root) |root| {
@@ -1556,7 +1635,9 @@ pub const Runtime = struct {
         // run's private state directory.
         const remote = request.context_kind.isRemote();
         const remote_context: ?workspace.ExecutionContext.Ref = if (remote) request.context orelse return error.NoSinkRoot else null;
-        const sink_dir: []u8 = if (request.choice.needsSink()) blk: {
+        // An observed agent was started by the human: no launch files and no
+        // hook relay, so it keeps no sink.
+        const sink_dir: []u8 = if (request.choice.needsSink() and request.observed_pid == null) blk: {
             const root = if (remote) self.remoteSinkRootFor(request.workspace) orelse return error.NoSinkRoot else self.sink_root orelse return error.NoSinkRoot;
             break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, token.text()[0..16] });
         } else try self.allocator.dupe(u8, "");
@@ -1590,6 +1671,7 @@ pub const Runtime = struct {
             .arena = .init(self.allocator),
             .wake = self.wake,
             .view = view,
+            .observed_pid = request.observed_pid,
         };
         errdefer runner.arena.deinit();
         if (request.task_id) |task| if (task.len <= runner.task_id_bytes.len) {
@@ -1614,7 +1696,14 @@ pub const Runtime = struct {
                     .launch_argv = &fake_argv,
                     .resolve_on_answer = true,
                 } };
-                if (runner.sink.isRemote()) {
+                if (request.observed_pid != null) {
+                    // A fake the check started by hand: no script and no
+                    // side channel, only the PTY baseline, like an observed
+                    // harness whose records cannot be found.
+                    runner.backend.fake.script = &.{};
+                    runner.backend.fake.caps = .{ .attach = true, .poll = true };
+                    runner.polling = false;
+                } else if (runner.sink.isRemote()) {
                     // The remote fake runs a script staged in its remote
                     // sink, so its launch files cross the connection too.
                     const arena = runner.arena.allocator();
@@ -1652,15 +1741,20 @@ pub const Runtime = struct {
                         else
                             null;
                     runner.backend = .{ .claude = agent.claude_code.ClaudeCodeAdapter.init(self.allocator, self.io, .{
-                        .sink_dir = runner.sink_dir,
+                        .sink_dir = if (runner.sink_dir.len == 0) null else runner.sink_dir,
                         .config_dir = config_dir,
                         .probe_env = request.probe_env,
                         .sink_io = runner.sink,
                         .control_helper = self.control_helper,
+                        .observe = if (request.observed_pid) |pid| .{ .pid = pid, .cwd = runner.cwd } else null,
                     }) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.InvalidSinkPath => return error.NoSinkRoot,
                     } };
+                    // An observed Claude Code is found in its own session
+                    // registry (by the foreground pid, else the cwd) and
+                    // followed through its transcript.
+                    if (request.observed_pid != null) runner.needs_attach = true;
                 },
                 .pi => {
                     runner.backend = .{ .pi = .{ .adapter = undefined, .sink = .init(self.io, runner.sink_dir, runner.sink) } };
@@ -1669,6 +1763,10 @@ pub const Runtime = struct {
                         .sink_dir = runner.sink_dir,
                         .transport = pi.sink.transport(),
                     });
+                    // A hand-started Pi has no extension writing a sink:
+                    // only the PTY baseline (its session JSONL is not
+                    // followed live yet).
+                    if (request.observed_pid != null) runner.polling = false;
                 },
                 .codex => {
                     var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
@@ -1698,7 +1796,10 @@ pub const Runtime = struct {
                     runner.polling = socket_path.len != 0;
                 },
                 .opencode => {
-                    const port: u16 = if (request.context_kind == .local) freeLoopbackPort(self.io) orelse 0 else 0;
+                    // A hand-started OpenCode serves no port Conduit knows
+                    // (the TUI talks to its worker in-process without
+                    // `--port`), so an observed one keeps the PTY baseline.
+                    const port: u16 = if (request.context_kind == .local and request.observed_pid == null) freeLoopbackPort(self.io) orelse 0 else 0;
                     runner.backend = .{ .opencode = try agent.opencode.OpenCodeAdapter.init(self.allocator, self.io, .{ .port = port }) };
                     runner.needs_attach = port != 0;
                     runner.polling = port != 0;
@@ -1707,12 +1808,14 @@ pub const Runtime = struct {
         }
     }
 
-    /// Register a runner's agent, owned, bound to its session.
+    /// Register a runner's agent bound to its session: owned, or observed
+    /// for a runner made from `LaunchRequest.observed_pid`.
     pub fn register(self: *Runtime, runner: *Runner, binding: agent.Binding) !AgentId {
         const id = try self.registry.create(.{
             .binding = binding,
             .harness = runner.choice.registryHarness(),
-            .ownership = .owned,
+            // An observed agent lives in the human's own terminal.
+            .ownership = if (runner.observed_pid == null) .owned else .observed,
             .token = runner.token,
             .capabilities = runner.adapter().capabilities(),
         });
@@ -1843,6 +1946,14 @@ pub const Runtime = struct {
     /// The session of an agent is gone (its tab or pane closed): stop its
     /// worker and forget it.
     pub fn sessionClosed(self: *Runtime, key: WorkspaceKey, id: SessionId) void {
+        // `agent.stop` on an observed agent lands here while the human's
+        // process still runs: remember not to attach to it again. A session
+        // that is really gone drops its watch at the next look.
+        if (self.registry.findBySession(key, id)) |agent_id| {
+            if (self.runnerForAgent(agent_id)) |runner| if (runner.observed_pid) |pid| {
+                if (self.watchFor(key, id)) |watch| watch.ignored_pid = pid;
+            };
+        }
         if (self.runnerForSession(key, id)) |runner| {
             // A spawn worker may still be in `prepare`; the runner goes when
             // it reports back.
@@ -1908,6 +2019,12 @@ pub const Runtime = struct {
         }
         for (removed.items) |id| self.forgetAgent(id);
         self.notifications.removeWorkspace(key);
+        index = 0;
+        while (index < self.watches.items.len) {
+            if (self.watches.items[index].key == key) {
+                _ = self.watches.orderedRemove(index);
+            } else index += 1;
+        }
         self.changed = true;
     }
 
@@ -1916,6 +2033,12 @@ pub const Runtime = struct {
     /// Feed one terminal fact about a session to its agent's heuristics.
     /// Sessions without an agent are ignored.
     pub fn observe(self: *Runtime, key: WorkspaceKey, id: SessionId, observation: Observation, now_ns: i96) void {
+        switch (observation) {
+            // Something happened in the terminal: what runs in front may
+            // have changed (a harness started, or left).
+            .output, .title, .command_started, .shell_prompt, .user_input => self.noteActivity(key, id),
+            else => {},
+        }
         const agent_id = self.registry.findBySession(key, id) orelse return;
         const track_record = self.trackFor(agent_id) orelse return;
         switch (observation) {
@@ -1927,6 +2050,145 @@ pub const Runtime = struct {
         }
         const batch = track_record.heuristics.observe(observation);
         for (batch.events()) |ev| self.applyAndAnnounce(agent_id, ev, null);
+    }
+
+    fn watchFor(self: *Runtime, key: WorkspaceKey, id: SessionId) ?*Watch {
+        for (self.watches.items) |*candidate| {
+            if (candidate.key == key and candidate.id == id) return candidate;
+        }
+        return null;
+    }
+
+    /// Mark a session for a foreground look at the next due `poll`. Only
+    /// sessions that may hold an observed agent are watched: none while no
+    /// probe is installed, and never one Conduit launched an agent into.
+    fn noteActivity(self: *Runtime, key: WorkspaceKey, id: SessionId) void {
+        if (self.probe.probe_fn == null) return;
+        if (self.watchFor(key, id)) |watch| {
+            watch.due = true;
+            return;
+        }
+        if (self.registry.findBySession(key, id)) |agent_id| {
+            const record = self.registry.get(agent_id) orelse return;
+            if (record.ownership == .owned) return;
+        }
+        if (self.watches.items.len >= watch_capacity) _ = self.watches.orderedRemove(0);
+        self.watches.append(self.allocator, .{ .key = key, .id = id }) catch |err| {
+            log.debug("a session was not watched for agents: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Look at every due session's foreground process, at most once per
+    /// `observe_interval_ns` each: attach an observed agent to a harness the
+    /// human started in their own terminal, and end one whose harness left
+    /// the foreground. Owner thread; each look is a few bounded `/proc`
+    /// reads through the app's probe.
+    fn checkForegrounds(self: *Runtime, now_ns: i96) void {
+        const probe_fn = self.probe.probe_fn orelse return;
+        var index: usize = 0;
+        while (index < self.watches.items.len) {
+            const watch = self.watches.items[index];
+            const recent = if (watch.last_check_ns) |last| now_ns - last < observe_interval_ns else false;
+            if (!watch.due or watch.excluded or recent) {
+                index += 1;
+                continue;
+            }
+            self.watches.items[index].due = false;
+            self.watches.items[index].last_check_ns = now_ns;
+            self.foreground_checks += 1;
+            var buffer: [1024]u8 = undefined;
+            const facts = probe_fn(self.probe.context, watch.key, watch.id, &buffer) orelse {
+                // The session is gone.
+                _ = self.watches.orderedRemove(index);
+                continue;
+            };
+            self.checkForeground(&self.watches.items[index], facts);
+            index += 1;
+        }
+    }
+
+    /// What a foreground process is as an agent choice: a harness by its
+    /// adapter's spelling, or the scripted fake when checks enable it.
+    fn recognizeProcess(self: *const Runtime, process: pty.ForegroundProcess) ?Choice {
+        const name = agent.commandName(process.argv0, process.argv1);
+        if (self.fake_enabled and agent.recognizeFakeCommand(name)) return .fake;
+        const harness = agent.recognize(name) orelse return null;
+        return .{ .harness = harness };
+    }
+
+    fn checkForeground(self: *Runtime, watch: *Watch, facts: SessionFacts) void {
+        // The scratchpad belongs to the human (invariant 7), an agent's own
+        // terminal is already its agent's, and a connection terminal is
+        // OpenSSH's: only a human terminal is ever observed.
+        if (facts.binding.session_kind != .human_terminal) {
+            watch.excluded = true;
+            return;
+        }
+        const process = facts.process;
+        const choice: ?Choice = if (process) |p| self.recognizeProcess(p) else null;
+        if (self.registry.findBySession(watch.key, watch.id)) |agent_id| {
+            const record = self.registry.get(agent_id) orelse return;
+            if (record.ownership != .observed) return;
+            const runner = self.runnerForAgent(agent_id);
+            const same = if (runner) |r|
+                choice != null and std.meta.eql(choice.?, r.choice) and r.observed_pid == process.?.pid
+            else
+                false;
+            if (same) return;
+            // The harness left the foreground, or another took its place.
+            // Conduit did not start it and cannot read its status, so the
+            // end is recorded as a normal one.
+            self.applyAndAnnounce(agent_id, .{ .exited = .{ .code = 0 } }, null);
+            if (runner) |r| r.join();
+            log.debug("an observed agent left the foreground", .{});
+        }
+        const found = choice orelse {
+            watch.ignored_pid = null;
+            return;
+        };
+        const leader = process.?;
+        if (watch.ignored_pid == leader.pid) return;
+        // Observed side channels read this machine's files and sockets; a
+        // remote workspace's terminal is an SSH client here (TASK-61).
+        if (facts.context_kind.isRemote()) return;
+        self.startObserved(watch.key, watch.id, found, leader, facts) catch |err| {
+            log.debug("a hand-started agent was not observed: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Register an observed agent for `process` in a human terminal and start
+    /// its worker. A previous observed agent of the session, already ended,
+    /// makes way, so the session has one record.
+    fn startObserved(self: *Runtime, key: WorkspaceKey, id: SessionId, choice: Choice, process: pty.ForegroundProcess, facts: SessionFacts) !void {
+        var index: usize = 0;
+        while (index < self.registry.all().len) {
+            const record = self.registry.all()[index];
+            if (record.workspace == key and record.session == id and record.ownership == .observed and record.hasExited()) {
+                if (self.runnerForAgent(record.id)) |old| self.removeRunner(old);
+                self.forgetAgent(record.id);
+                continue;
+            }
+            index += 1;
+        }
+        const runner = try self.createRunner(.{
+            .choice = choice,
+            .workspace = key,
+            .session = id,
+            .context_kind = facts.context_kind,
+            .cwd = if (process.cwd.len != 0) process.cwd else "/",
+            .home = facts.home,
+            .claude_config_dir = facts.claude_config_dir,
+            .codex_home = facts.codex_home,
+            .observed_pid = process.pid,
+        });
+        _ = self.register(runner, facts.binding) catch |err| {
+            self.removeRunner(runner);
+            return err;
+        };
+        runner.start() catch |err| {
+            log.warn("the observed agent's side channel worker did not start: {s}", .{@errorName(err)});
+        };
+        log.debug("observing a {s} the human started", .{choice.value()});
     }
 
     fn trackFor(self: *Runtime, id: AgentId) ?*Track {
@@ -2132,6 +2394,9 @@ pub const Runtime = struct {
     pub fn poll(self: *Runtime, now_ns: i96) bool {
         for (self.runners.items) |runner| {
             const id = runner.agent_id orelse continue;
+            // Zero until the worker's first poll: keep what registration saw.
+            const caps = runner.published_caps.load(.acquire);
+            if (caps != 0 and self.registry.setCapabilities(id, @bitCast(caps))) self.changed = true;
             var batch_entry: ?*Entry = null;
             while (true) {
                 const n = runner.queue.drain(self.drained);
@@ -2140,6 +2405,7 @@ pub const Runtime = struct {
                 for (self.drained[0..n]) |*stored| self.applyAndAnnounce(id, stored.event, &batch_entry);
             }
         }
+        self.checkForegrounds(now_ns);
         for (self.tracks.items) |*candidate| {
             if (now_ns - candidate.last_tick_ns < tick_interval_ns) continue;
             candidate.last_tick_ns = now_ns;
@@ -2295,6 +2561,188 @@ const TestNotifier = struct {
         self.last_title_len = copyDisplay(&self.last_title, title).len;
     }
 };
+
+/// A scripted answer to the runtime's foreground looks: one process per
+/// session, changed by the test as a human would by starting and quitting
+/// programs.
+const ScriptedProbe = struct {
+    kind: session.Session.Kind = .human_terminal,
+    context_kind: workspace.ExecutionContextKind = .local,
+    argv0: []const u8 = "bash",
+    argv1: []const u8 = "",
+    pid: u32 = 100,
+    gone: bool = false,
+    looks: usize = 0,
+
+    fn probe(context: ?*anyopaque, key: WorkspaceKey, id: SessionId, buffer: []u8) ?SessionFacts {
+        const self: *ScriptedProbe = @ptrCast(@alignCast(context.?));
+        self.looks += 1;
+        if (self.gone) return null;
+        // The real probe copies into the lent buffer; so does this one.
+        @memcpy(buffer[0..self.argv0.len], self.argv0);
+        @memcpy(buffer[self.argv0.len..][0..self.argv1.len], self.argv1);
+        return .{
+            .binding = .{ .workspace = key, .session = id, .session_kind = self.kind, .scratchpad = SessionId.fromOrdinal(9) },
+            .context_kind = self.context_kind,
+            .process = .{
+                .pid = self.pid,
+                .argv0 = buffer[0..self.argv0.len],
+                .argv1 = buffer[self.argv0.len..][0..self.argv1.len],
+                .cwd = "/work",
+            },
+        };
+    }
+};
+
+test "a harness started by hand in a human terminal is observed, rate-limited, and ends when it leaves" {
+    var runtime = try Runtime.init(testing.allocator, testing.io, .{ .fake_enabled = true });
+    defer runtime.deinit();
+    var notifier: TestNotifier = .{};
+    runtime.notifier = .{ .context = &notifier, .notify_fn = TestNotifier.record };
+    const key = WorkspaceKey.fromOrdinal(0);
+    const human = SessionId.fromOrdinal(1);
+    const s: i96 = std.time.ns_per_s;
+
+    // Without a probe nothing is watched.
+    runtime.observe(key, human, .{ .output = .{ .now_ns = 0 } }, 0);
+    _ = runtime.poll(s);
+    try testing.expectEqual(@as(usize, 0), runtime.watches.items.len);
+
+    var scripted: ScriptedProbe = .{};
+    runtime.probe = .{ .context = &scripted, .probe_fn = ScriptedProbe.probe };
+
+    // A plain shell in front: looked at once, nothing observed.
+    runtime.observe(key, human, .shell_prompt, 0);
+    _ = runtime.poll(10 * s);
+    try testing.expectEqual(@as(usize, 1), scripted.looks);
+    try testing.expect(!runtime.hasAgent(key, human));
+    // More activity within the interval waits for it to pass.
+    runtime.observe(key, human, .{ .output = .{ .now_ns = 0 } }, 10 * s);
+    _ = runtime.poll(11 * s);
+    try testing.expectEqual(@as(usize, 1), scripted.looks);
+    _ = runtime.poll(12 * s);
+    try testing.expectEqual(@as(usize, 2), scripted.looks);
+    // No activity: no look, however long it has been.
+    _ = runtime.poll(20 * s);
+    try testing.expectEqual(@as(usize, 2), scripted.looks);
+
+    // The human starts the fake by hand (a `#!/bin/sh` script in front).
+    scripted.argv0 = "/bin/sh";
+    scripted.argv1 = "/tmp/bin/conduit-fake-agent";
+    scripted.pid = 4242;
+    runtime.observe(key, human, .{ .output = .{ .now_ns = 0 } }, 21 * s);
+    _ = runtime.poll(22 * s);
+    try testing.expectEqual(@as(usize, 3), scripted.looks);
+    const record = runtime.agentForSession(key, human) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(agent.Ownership.observed, record.ownership);
+    try testing.expectEqualStrings("Fake agent", runtime.displayName(record));
+    const first_id = record.id;
+    try testing.expect(!runtime.restartable(first_id));
+    try testing.expectEqual(@as(?u32, 4242), runtime.runnerForAgent(first_id).?.observed_pid);
+    // Its PTY baseline runs like any agent's: output means working.
+    runtime.observe(key, human, .{ .output = .{ .now_ns = @intCast(23 * s) } }, 23 * s);
+    try testing.expectEqual(State.working, runtime.agentForSession(key, human).?.state);
+    // Still in front: the next look keeps it.
+    _ = runtime.poll(25 * s);
+    try testing.expectEqual(@as(usize, 4), scripted.looks);
+    try testing.expectEqual(first_id, runtime.agentForSession(key, human).?.id);
+
+    // It exits and the shell is back in front: the agent ends.
+    scripted.argv0 = "bash";
+    scripted.argv1 = "";
+    scripted.pid = 100;
+    runtime.observe(key, human, .shell_prompt, 26 * s);
+    _ = runtime.poll(28 * s);
+    try testing.expect(!runtime.hasAgent(key, human));
+    try testing.expect(runtime.registry.get(first_id).?.hasExited());
+    try testing.expectEqual(State.done, runtime.registry.get(first_id).?.state);
+
+    // Started again: a new observed agent replaces the ended record.
+    scripted.argv0 = "/bin/sh";
+    scripted.argv1 = "/tmp/bin/conduit-fake-agent";
+    scripted.pid = 4343;
+    runtime.observe(key, human, .{ .output = .{ .now_ns = 0 } }, 30 * s);
+    _ = runtime.poll(30 * s);
+    const second = runtime.agentForSession(key, human) orelse return error.TestUnexpectedResult;
+    try testing.expect(second.id != first_id);
+    try testing.expect(runtime.registry.get(first_id) == null);
+    try testing.expectEqual(@as(usize, 1), runtime.registry.all().len);
+
+    // The human stops observing it: forgotten, and not attached again while
+    // the same process stays in front.
+    runtime.sessionClosed(key, human);
+    try testing.expect(!runtime.hasAgent(key, human));
+    runtime.observe(key, human, .{ .output = .{ .now_ns = 0 } }, 33 * s);
+    _ = runtime.poll(33 * s);
+    try testing.expect(!runtime.hasAgent(key, human));
+
+    // A real harness's spelling is recognized through its adapter; with no
+    // Claude Code config directory its side channel is unavailable and the
+    // agent keeps the PTY baseline.
+    scripted.argv0 = "/home/u/.local/bin/claude";
+    scripted.argv1 = "";
+    scripted.pid = 5000;
+    runtime.observe(key, human, .{ .output = .{ .now_ns = 0 } }, 36 * s);
+    _ = runtime.poll(36 * s);
+    const claude = runtime.agentForSession(key, human) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Harness.claude_code, claude.harness);
+    try testing.expectEqualStrings("Claude Code", runtime.displayName(claude));
+    try testing.expectEqualStrings("/work", runtime.runnerForAgent(claude.id).?.cwd);
+
+    // The scratchpad, an agent terminal and a remote context are never
+    // observed, whatever runs there.
+    const scratch = SessionId.fromOrdinal(2);
+    scripted.kind = .scratchpad;
+    runtime.observe(key, scratch, .{ .output = .{ .now_ns = 0 } }, 40 * s);
+    _ = runtime.poll(40 * s);
+    try testing.expect(!runtime.hasAgent(key, scratch));
+    const looks = scripted.looks;
+    runtime.observe(key, scratch, .{ .output = .{ .now_ns = 0 } }, 50 * s);
+    _ = runtime.poll(50 * s);
+    try testing.expectEqual(looks, scripted.looks);
+    scripted.kind = .human_terminal;
+    scripted.context_kind = .ssh;
+    const remote = SessionId.fromOrdinal(3);
+    runtime.observe(key, remote, .{ .output = .{ .now_ns = 0 } }, 50 * s);
+    _ = runtime.poll(50 * s);
+    try testing.expect(!runtime.hasAgent(key, remote));
+
+    // A session that is gone stops being watched.
+    scripted.gone = true;
+    const before = runtime.watches.items.len;
+    runtime.observe(key, remote, .{ .output = .{ .now_ns = 0 } }, 60 * s);
+    _ = runtime.poll(60 * s);
+    try testing.expectEqual(before - 1, runtime.watches.items.len);
+    runtime.removeWorkspace(key);
+    try testing.expectEqual(@as(usize, 0), runtime.watches.items.len);
+}
+
+test "an agent's capabilities follow its adapter after registration" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPath(testing.io, &root_buffer);
+    var sink_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const sink_root = try std.fmt.bufPrint(&sink_buffer, "{s}/agents", .{root_buffer[0..tmp_path_len]});
+    var runtime = try Runtime.init(testing.allocator, testing.io, .{ .sink_root = sink_root, .fake_enabled = true });
+    defer runtime.deinit();
+    const key = WorkspaceKey.fromOrdinal(0);
+    const id = SessionId.fromOrdinal(1);
+    const runner = try runtime.createRunner(.{ .choice = .fake, .workspace = key, .session = id, .context_kind = .local, .cwd = "/" });
+    // Registered while the side channel is not up yet (as OpenCode's is
+    // until its event stream answers).
+    runner.backend.fake.caps = .{ .launch = true, .poll = true };
+    _ = try runtime.register(runner, .{ .workspace = key, .session = id, .session_kind = .agent_terminal, .scratchpad = .first });
+    try testing.expect(!runtime.agentForSession(key, id).?.capabilities.respond_permission);
+    _ = runtime.poll(0);
+    try testing.expect(!runtime.agentForSession(key, id).?.capabilities.respond_permission);
+    // The channel comes up: the worker publishes, the owner records it, and
+    // the view may offer answers.
+    runner.backend.fake.caps = agent.FakeAdapter.all_capabilities;
+    runner.pollOnce();
+    _ = runtime.poll(1);
+    try testing.expect(runtime.agentForSession(key, id).?.capabilities.respond_permission);
+}
 
 test "a fake agent's launch writes its files and its events become glyph states and notifications" {
     var tmp = testing.tmpDir(.{});

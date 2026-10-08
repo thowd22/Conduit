@@ -184,6 +184,11 @@ pub const Pty = struct {
     /// `Pty` value is dead afterwards and must not be used again.
     pub const DestroyFn = *const fn (ptr: *anyopaque) void;
 
+    /// The terminal's foreground process right now, its text copied into `buffer`, or null when
+    /// the backend cannot say (see `ForegroundProcess`). Never blocks: a few bounded reads of
+    /// the OS's own process table.
+    pub const ForegroundFn = *const fn (ptr: *anyopaque, buffer: []u8) ?ForegroundProcess;
+
     pub const VTable = struct {
         write: WriteFn,
         resize: ResizeFn,
@@ -192,6 +197,9 @@ pub const Pty = struct {
         state: StateFn,
         waitReadable: WaitReadableFn,
         destroy: DestroyFn,
+        /// Optional: a backend that cannot see its terminal's processes (ConPTY, an SSH master
+        /// view) leaves it null and `foregroundProcess` answers null.
+        foregroundProcess: ?ForegroundFn = null,
     };
 
     pub fn write(self: Pty, bytes: []const u8) Error!usize {
@@ -221,6 +229,31 @@ pub const Pty = struct {
     pub fn destroy(self: Pty) void {
         self.vtable.destroy(self.ptr);
     }
+
+    /// What runs in the terminal's foreground: the leader of its foreground process group, as
+    /// observed-agent detection asks (TASK-56, TASK-78). `buffer` holds the copied text; 1 KiB
+    /// is plenty for two command-line words and a working directory, and longer text is cut.
+    pub fn foregroundProcess(self: Pty, buffer: []u8) ?ForegroundProcess {
+        const f = self.vtable.foregroundProcess orelse return null;
+        return f(self.ptr, buffer);
+    }
+};
+
+/// The leader of a terminal's foreground process group, as the OS reports it. Every slice
+/// borrows the caller's buffer. Conduit's own types only: `pid` is informational (a harness's
+/// own session registry may be keyed by it) and is never signalled.
+///
+/// Linux reads `/proc/<pgid>/cmdline` and `/proc/<pgid>/cwd`. The macOS and Windows backends do
+/// not implement it yet and answer null, so observed agents are Linux-only for now.
+pub const ForegroundProcess = struct {
+    pid: u32,
+    /// The first command-line word, as the process was started (or retitled itself).
+    argv0: []const u8,
+    /// The second word, empty when there is none: the script an interpreter (`node`, `sh`,
+    /// `python3`, `bun`) runs, which names the program when `argv0` is only the interpreter.
+    argv1: []const u8,
+    /// The process's working directory; empty when the OS would not say.
+    cwd: []const u8,
 };
 
 /// Start a terminal on whichever backend this build has: ConPTY on Windows, the POSIX backend on
@@ -491,6 +524,7 @@ const PosixPty = struct {
         .state = childState,
         .waitReadable = waitReadable,
         .destroy = destroy,
+        .foregroundProcess = foregroundProcess,
     };
 
     /// The body of the read thread, and the only place a terminal blocks on IO.
@@ -656,6 +690,14 @@ fn childState(ptr: *anyopaque) ChildState {
 fn waitReadable(ptr: *anyopaque, timeout_ms: u32) bool {
     const self: *PosixPty = @ptrCast(@alignCast(ptr));
     return self.waitUntilPending(timeout_ms);
+}
+
+fn foregroundProcess(ptr: *anyopaque, buffer: []u8) ?ForegroundProcess {
+    const self: *PosixPty = @ptrCast(@alignCast(ptr));
+    // A collected child's terminal has no foreground worth naming, and its group id may be reused.
+    if (self.finished()) return null;
+    const group = sys.foregroundGroup(self.master) orelse return null;
+    return sys.describeProcess(group, buffer);
 }
 
 fn destroy(ptr: *anyopaque) void {
@@ -1204,6 +1246,59 @@ const sys = struct {
         } else {
             return unsupported();
         }
+    }
+
+    /// The terminal's foreground process group (`tcgetpgrp` on the master: TIOCGPGRP). Null on
+    /// any failure, and on platforms where this is not implemented.
+    fn foregroundGroup(master: fd_t) ?u32 {
+        if (comptime builtin.os.tag != .linux) return null;
+        const linux = @import("std").os.linux;
+        var group: i32 = 0;
+        // TIOCGPGRP, as linux's own uapi header numbers it: 0x540F.
+        const rc = linux.ioctl(master, 0x540F, @intFromPtr(&group));
+        if (linux.errno(rc) != .SUCCESS or group <= 0) return null;
+        return @intCast(group);
+    }
+
+    /// The first two command-line words and the working directory of process `pid`, from
+    /// `/proc`. Bounded: reads of at most half the buffer for the command line and one readlink
+    /// for the directory, into the other half. Null when the process is gone or `/proc` refuses.
+    fn describeProcess(pid: u32, buffer: []u8) ?ForegroundProcess {
+        if (comptime builtin.os.tag != .linux) return null;
+        const linux = @import("std").os.linux;
+        if (buffer.len < 16) return null;
+        var path_buffer: [64]u8 = undefined;
+        const half = buffer.len / 2;
+
+        const cmdline_path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/cmdline", .{pid}) catch return null;
+        const open_rc = linux.open(cmdline_path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(open_rc) != .SUCCESS) return null;
+        const fd: fd_t = @intCast(open_rc);
+        defer close(fd);
+        const words = buffer[0..half];
+        var filled: usize = 0;
+        while (filled < words.len) {
+            const rc = linux.read(fd, words[filled..].ptr, words.len - filled);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return null,
+            }
+            if (rc == 0) break;
+            filled += rc;
+        }
+        // A kernel thread or a zombie has an empty command line: nothing to name.
+        if (filled == 0) return null;
+        var parts = std.mem.splitScalar(u8, words[0..filled], 0);
+        const argv0 = parts.first();
+        if (argv0.len == 0) return null;
+        const argv1 = parts.next() orelse "";
+
+        const cwd_path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/cwd", .{pid}) catch return null;
+        const rest = buffer[half..];
+        const link_rc = linux.readlink(cwd_path.ptr, rest.ptr, rest.len);
+        const cwd: []const u8 = if (linux.errno(link_rc) == .SUCCESS and link_rc < rest.len) rest[0..link_rc] else "";
+        return .{ .pid = pid, .argv0 = argv0, .argv1 = argv1, .cwd = cwd };
     }
 
     /// Read from a descriptor. `error.Closed` means the far end hung up: on Linux a pty master
@@ -3217,6 +3312,7 @@ const interface_types = [_]type{
     WindowSize,
     Signal,
     ChildState,
+    ?ForegroundProcess,
 };
 
 fn isInterfaceType(comptime candidate: type) bool {
@@ -3256,7 +3352,11 @@ test "the interface surface names no POSIX-only type" {
     // Every method, checked leaf by leaf rather than by reading the file and hoping.
     var methods: usize = 0;
     inline for (@typeInfo(Pty.VTable).@"struct".fields) |field| {
-        try testing.expect(comptime signatureIsClean(@typeInfo(field.type).pointer.child));
+        const Pointer = switch (@typeInfo(field.type)) {
+            .optional => |optional| optional.child,
+            else => field.type,
+        };
+        try testing.expect(comptime signatureIsClean(@typeInfo(Pointer).pointer.child));
         methods += 1;
     }
     try testing.expectEqual(@typeInfo(Pty.VTable).@"struct".fields.len, methods);
@@ -3266,6 +3366,7 @@ test "the interface surface names no POSIX-only type" {
     try testing.expect(@typeInfo(Signal) == .@"enum");
     try testing.expect(@typeInfo(ChildState) == .@"union");
     try testing.expect(@typeInfo(ExitStatus) == .@"union");
+    try testing.expect(@typeInfo(ForegroundProcess) == .@"struct");
 }
 
 /// A terminal backend that is not POSIX at all: it records what the interface was asked to do and
@@ -3734,6 +3835,65 @@ test "a reader waiting for room is woken even when the owner empties the ring an
     }
     try testing.expectEqual(ChildState{ .exited = .{ .code = 0 } }, pty.state());
     try testing.expectEqual(@as(usize, total), consumed);
+}
+
+/// Wait until the terminal's foreground leader is `name`, within the test deadline. The wait is
+/// a bounded `waitReadable` step, never a sleep, and it ends as soon as the condition holds.
+fn waitForForeground(pty: Pty, buffer: []u8, name: []const u8) ?ForegroundProcess {
+    const deadline = testDeadline();
+    while (true) {
+        if (pty.foregroundProcess(buffer)) |found| {
+            if (std.mem.eql(u8, std.fs.path.basenamePosix(found.argv0), name)) return found;
+        }
+        const left = timeLeft(deadline) orelse return null;
+        _ = pty.waitReadable(@min(left, test_step_ms));
+        var scratch: [256]u8 = undefined;
+        _ = pty.takeBytes(&scratch);
+    }
+}
+
+test "the foreground process names the job a shell put in front, with its words and directory" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // An interactive shell with job control gives `sleep` a process group of its own and makes
+    // that group the terminal's foreground, exactly as a human's shell does with `claude`.
+    const pty = try spawnPosix(gpa, shellRequest(&.{ "/bin/sh", "-c", "set -m; cd /tmp && sleep 30; printf 'after\\n'; sleep 30" }));
+    defer pty.destroy();
+    var buffer: [1024]u8 = undefined;
+    const found = waitForForeground(pty, &buffer, "sleep") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("sleep", found.argv0);
+    try testing.expectEqualStrings("30", found.argv1);
+    try testing.expectEqualStrings("/tmp", found.cwd);
+    try testing.expect(found.pid != 0);
+
+    // Ending the job brings the shell back in front: the leader is no longer `sleep`.
+    _ = std.os.linux.kill(@intCast(found.pid), std.os.linux.SIG.TERM);
+    const output = try readUntil(gpa, pty, "after");
+    defer gpa.free(output);
+    var second: [1024]u8 = undefined;
+    const next = waitForForeground(pty, &second, "sleep") orelse return error.TestUnexpectedResult;
+    try testing.expect(next.pid != found.pid);
+}
+
+test "a finished terminal and a tiny buffer have no foreground process" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try spawnPosix(gpa, shellRequest(&.{ "/bin/sh", "-c", "exec sleep 30" }));
+    defer pty.destroy();
+    var buffer: [1024]u8 = undefined;
+    const found = waitForForeground(pty, &buffer, "sleep") orelse return error.TestUnexpectedResult;
+    // The session leader itself is the foreground when nothing used job control.
+    try testing.expectEqualStrings("30", found.argv1);
+    try testing.expectEqualStrings("/", found.cwd);
+    var tiny: [8]u8 = undefined;
+    try testing.expect(pty.foregroundProcess(&tiny) == null);
+    try pty.kill(.kill);
+    _ = try waitForExit(pty);
+    try testing.expect(pty.foregroundProcess(&buffer) == null);
+
+    // A backend without the slot answers null rather than failing.
+    var backend = FakeTerminal{ .gpa = gpa };
+    try testing.expect(backend.asPty().foregroundProcess(&buffer) == null);
 }
 
 test "starting and destroying a terminal leaks no descriptor and leaves no child" {

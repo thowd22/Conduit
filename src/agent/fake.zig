@@ -17,6 +17,16 @@ const Harness = @import("harness.zig").Harness;
 
 const Allocator = std.mem.Allocator;
 
+/// The program name the fake answers to when a check starts it by hand in a
+/// plain terminal: the observed-agent path (TASK-56) recognizes it like a
+/// real harness's name, without a real harness ever running in a check.
+pub const command_name = "conduit-fake-agent";
+
+/// Whether a foreground program name (`agent.commandName`) is the fake.
+pub fn recognizeCommand(name: []const u8) bool {
+    return std.mem.eql(u8, name, command_name);
+}
+
 pub const FakeAdapter = struct {
     harness_value: Harness = .claude_code,
     caps: adapter.Capabilities = all_capabilities,

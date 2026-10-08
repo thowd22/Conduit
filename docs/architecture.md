@@ -380,7 +380,23 @@ nothing else is a legal dependency.
   file's keybinds) is a modal `Surface` like the context menu with `notification.<n>` rows
   (newest first: age, workspace › tab, title: text); Enter or a click focuses that workspace,
   tab and pane and selects the agent; Escape or an outside click closes it;
-  `notifications.clear` empties it. `agent.stop` hangs up an owned agent's PTY (an observed one
+  `notifications.clear` empties it. **Observed agents (TASK-56, TASK-78):** the composition root
+  installs `Runtime.probe` (`SessionFacts`: binding, context kind, `$HOME`/config dirs and the
+  session PTY's `foregroundProcess`). `observe` marks a session `due` on output, title, OSC 133
+  command/prompt marks or human input (sessions with an owned agent are skipped), and `poll`
+  looks at each due session at most once per `observe_interval_ns` (2 s), never per frame. A
+  non-`human_terminal` session (scratchpad, agent terminal, connection terminal) is excluded for
+  good, a remote context is not observed, and a gone session drops its watch (at most 64,
+  oldest first). `agent.commandName` (basename, or an interpreter's script) and
+  `agent.recognize` (each adapter's `recognizeCommand`; the fake's `conduit-fake-agent` only
+  while checks enable it) pick the choice; `startObserved` makes a runner from
+  `LaunchRequest.observed_pid` with no sink and registers it `.observed`: Claude Code's adapter
+  gets `Options.observe` so its `attach` finds the registry record by pid, else cwd; Codex
+  attaches to the daemon's thread in the process's cwd; Pi, OpenCode and the fake keep the PTY
+  baseline (`polling = false`). When the foreground no longer is that process the agent gets
+  `exited` (code 0: Conduit cannot read a status it did not reap) and its worker is joined; a
+  new one replaces the ended record. `agent.stop` on an observed agent records its pid in the
+  watch so it is not re-attached while it stays in front. `agent.stop` hangs up an owned agent's PTY (an observed one
   is only forgotten) and `agent.focus` shows its session; both list live agents only, so never the
   scratchpad. API for TASK-57/58/60/64: `Runtime.registry` (states, summaries, pending
   permissions), `runnerForSession(...).adapter()` (respond, send input — from that runner's
@@ -653,6 +669,15 @@ nothing else is a legal dependency.
   just seen a full ring, stalling the session forever; a deterministic test parks the reader at
   that point and proves it is woken. A live POSIX terminal therefore holds five descriptors. The
   Windows backend already used separate `space`, `owner_wake` and `stop` events.
+- **Foreground process (TASK-56, TASK-78).** `Pty.foregroundProcess(buffer)` answers what runs
+  in front: `ForegroundProcess{pid, argv0, argv1, cwd}`, every slice in the caller's buffer. The
+  vtable slot is optional (null answers null), so the SSH master view and ConPTY need no stub.
+  The Linux backend asks `TIOCGPGRP` on the master for the foreground process group, then reads
+  the group leader's `/proc/<pgid>/cmdline` (first two words, into half the buffer) and
+  `readlink`s `/proc/<pgid>/cwd` (into the other half); a collected child, a failure or a buffer
+  under 16 bytes answers null. Bounded and non-blocking, so the owner thread may call it. macOS
+  (`proc_pidinfo`) and Windows are not implemented and answer null. It knows nothing of
+  harnesses; `app_agents` and `agent.recognize` classify what it reports.
 - **ConPTY (TASK-16).** The Windows backend gives `CreatePseudoConsole` the read end of an
   anonymous input pipe (Conduit keeps the write end and writes it synchronously, like a pty
   master) and the client end of a one-instance, remote-rejecting named output pipe opened
@@ -1421,16 +1446,28 @@ nothing else is a legal dependency.
     `/session/:sid/permissions/:id` `{"response":…}`; `sendInput` uses `prompt_async`
     (creating a session on a headless server), `stop` uses `abort`, and `attach` with a harness
     session id replays `GET /session/:id/message`. Every request carries `?directory=` for the
-    agent's cwd. Structured capabilities are reported only while the event stream is live; an
-    unreachable server leaves the PTY baseline and is retried with backoff. Gaps: `detect`
-    is unsupported until the ExecutionContext can run a probe; the channel is Local-only (SSH and
+    agent's cwd. Structured capabilities are reported only while the event stream is live (the
+    runner publishes them after every poll and `Runtime.poll` copies them into the registry
+    record with `Registry.setCapabilities`, so the agent view offers answers once the stream is
+    up, not only if it was up at registration); an unreachable server leaves the PTY baseline and
+    is retried with backoff, and an event-stream head that does not arrive within
+    `request_timeout_ns` is given up and redialled (1.18.35 accepted a connection made while it
+    was still starting and never answered it). `detect` runs `opencode --version` through the
+    ExecutionContext. Gaps: the channel is Local-only (SSH and
     WSL get the plain TUI and the PTY baseline: TASK-61 carries file sinks over the context, but
     no TCP port forwarding); an `opencode` started by hand without `--port` has no
-    external server; prompts are files, so read/update prompt are unsupported; events over
-    1 MiB are dropped. The protocol was read from opencode.ai/docs/server and the
-    anomalyco/opencode `dev` source (a697115, v1.18.35) on 2026-10-07 and is unverified against
-    a live opencode; the fixtures in `test/fixtures/agent/opencode/` are hand-written, and the
-    live test skips when `opencode` is not installed.
+    external server, so an observed OpenCode keeps the PTY baseline; prompts are files, so
+    read/update prompt are unsupported; events over 1 MiB are dropped. The protocol was read
+    from opencode.ai/docs/server and the anomalyco/opencode `dev` source (a697115, v1.18.35) on
+    2026-10-07, then verified live against npm `opencode-ai@1.18.35` in a throwaway ubuntu:24.04
+    container with a fixed local model (`scripts/opencode-container-check.sh`, not CI; nothing
+    is installed on the host): a turn with a bash permission request answered by Conduit maps to
+    working → tool_use → permission_request → permission_resolved(allowed) → message → done,
+    both through the adapter's live test and through `Agent: launch` driven by `conduit-test`.
+    `recorded-turn.sse` and `recorded-messages.json` are scrubbed recordings of that server; the
+    other fixtures are hand-written and still cover shapes not seen live (`question.asked`,
+    subagents, `session.error`, aborts, v1 events). The live test skips when `opencode` is not
+    installed and runs a whole turn only with `CONDUIT_OPENCODE_LIVE_TURN` and a configured model.
   - `pi.zig` (TASK-55): `PiAdapter` for Pi 0.73.1 and, as `Variant.omp`, the omp fork. Pi has no
     hooks and no permission prompts, so the adapter speaks one of two channels (`Mode`). `tui`:
     Conduit's dependency-free extension `pi/conduit.js` (embedded as `extension_source`; the owner

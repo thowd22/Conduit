@@ -884,6 +884,13 @@ pub const Mode = enum {
     stdio,
 };
 
+/// Whether a foreground program name (`agent.commandName`, a basename) is
+/// Codex, for observed agents (TASK-56). npm's `codex` launcher is a Node
+/// script that runs the native `codex` binary, so both spell the same name.
+pub fn recognizeCommand(name: []const u8) bool {
+    return std.mem.eql(u8, name, "codex");
+}
+
 /// Where Codex reads its instructions (TASK-59), from its AGENTS.md
 /// documentation (doc-3): `AGENTS.override.md` and `AGENTS.md` along the
 /// project hierarchy, the global `~/.codex/AGENTS.md`, and the
