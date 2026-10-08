@@ -46,6 +46,9 @@ const modules = [_]ModuleSpec{
     .{ .name = "ui", .source_file = "src/ui.zig", .deps = &.{ "font", "render", "term", "theme" } },
     .{ .name = "input", .source_file = "src/input.zig", .deps = &.{ "platform", "term", "ui" } },
     .{ .name = "palette", .source_file = "src/palette.zig", .deps = &.{"input"} },
+    // TASK-68: snapshots of the semantic tree served to platform
+    // accessibility APIs (AT-SPI2 over D-Bus on Linux).
+    .{ .name = "accessibility", .source_file = "src/accessibility.zig", .deps = &.{"ui"} },
 
     // A session owns a PTY and terminal state; a workspace owns sessions.
     .{ .name = "session", .source_file = "src/session.zig", .deps = &.{ "config", "pty", "term", "theme" } },
@@ -69,9 +72,9 @@ const modules = [_]ModuleSpec{
 
     // The composition root. Its root file is the executable entry point.
     .{ .name = "app", .source_file = "src/main.zig", .deps = &.{
-        "agent",   "backlog",  "config",  "control",    "font",      "input", "link",
-        "palette", "platform", "pty",     "render",     "session",   "state", "term",
-        "theme",   "ui",       "version", "testdriver", "workspace",
+        "accessibility", "agent",   "backlog",  "config",  "control",    "font",      "input",
+        "link",          "palette", "platform", "pty",     "render",     "session",   "state",
+        "term",          "theme",   "ui",       "version", "testdriver", "workspace",
     } },
 };
 
