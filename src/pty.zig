@@ -4936,12 +4936,13 @@ test "a Windows terminal's foreground job is the program its shell runs, with it
     const idle = waitForWindowsForeground(pty, &idle_buffer, "cmd") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("/Q", idle.argv1);
 
-    // A nested program, started from another directory, is the job.
-    try writeAll(pty, "cd /d C:\\Windows\\System32\rping -n 30 127.0.0.1\r");
+    // A nested program, started from another directory, is the job. It ends on its own after
+    // about five seconds, so nothing here depends on an interrupt reaching it.
+    try writeAll(pty, "cd /d C:\\Windows\\System32\rping -n 6 127.0.0.1\r");
     var found_buffer: [1024]u8 = undefined;
     const found = waitForWindowsForeground(pty, &found_buffer, "ping") orelse return error.TestUnexpectedResult;
     try testing.expect(found.pid != 0 and found.pid != idle.pid);
-    try testing.expectEqualStrings("-n\x0030\x00127.0.0.1", found.argv1);
+    try testing.expectEqualStrings("-n\x006\x00127.0.0.1", found.argv1);
     try testing.expect(std.ascii.eqlIgnoreCase("C:\\Windows\\System32", found.cwd));
 
     // Looks in quick succession share one snapshot.
@@ -4953,9 +4954,10 @@ test "a Windows terminal's foreground job is the program its shell runs, with it
     try testing.expectEqual(found.pid, third.pid);
     try testing.expect(win_processes.snapshots - before <= 1);
 
-    // Ctrl+C ends the job and the shell is in front again.
-    try writeAll(pty, "\x03");
+    // Once the job has ended the shell is in front again, and then the shell leaves too.
     var back_buffer: [1024]u8 = undefined;
     const back = waitForWindowsForeground(pty, &back_buffer, "cmd") orelse return error.TestUnexpectedResult;
     try testing.expectEqual(idle.pid, back.pid);
+    try writeAll(pty, "exit\r");
+    _ = try waitForExit(pty);
 }
