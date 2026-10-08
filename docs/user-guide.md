@@ -221,7 +221,8 @@ Hold Ctrl (Cmd on macOS) over terminal text to underline what Conduit recognises
 - **File references**: `path`, `path:line` and `path:line:col` (for example compiler errors such
   as `src/main.zig:142:7`) open in a new tab named after the file, running `vi +<line> -- <path>`.
   A relative path is resolved against the directory the shell reported. `vi` must be on `PATH`;
-  the column is recognised but not passed to `vi`. A configurable editor is planned.
+  the column is recognised but not passed to `vi`. With VSCodium installed, the context menu's
+  **open in editor** opens the reference in the editor pane instead (see Editor pane).
 
 The context menu's **open link** does the same for the link under the pointer.
 
