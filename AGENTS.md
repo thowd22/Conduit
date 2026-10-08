@@ -812,6 +812,22 @@ restart; cards, list rows and the detail show that agent's glyph, harness and st
 (semantic `backlog.task.<id>.agent.<state>`), and the agent manager's task column names the
 task. Changes an agent makes through the backlog CLI appear through the same watch.
 
+TASK-16 is complete on the hosted Windows runner. The ConPTY backend hands `CreatePseudoConsole`
+the read end of an anonymous input pipe (Conduit keeps the write end) and the write-only client
+end of a one-instance, remote-rejecting named output pipe; Conduit reads its server end with
+overlapped IO so the `stop` event can wake the read thread. Conduit closes its copies of the
+console's ends at once, and children get `STARTF_USESTDHANDLES` with null handles so a Conduit
+with redirected stdio cannot hand them its own handles. An exit-watcher thread closes the
+pseudoconsole when the child's process handle signals, under an SRW lock shared with resize; the
+read thread drains to `BROKEN_PIPE` before publishing the exit code, so a program's last output is
+never lost; `destroy` joins both threads and closes Conduit's output end before
+`ClosePseudoConsole`, which avoids the pre-24H2 deadlock. CI run 37706523144 on windows-latest
+(build 26100) passes every ConPTY test: cmd.exe round trip, PowerShell-observed resize 80x24 to
+100x40, exit code, final output, kill, and a `GetProcessHandleCount` release check. The Windows
+leg still fails outside `pty` (agent modules use `std.posix.pollfd`; backlog CRLF checkout and
+live watch), and the macOS leg times out in the agent codex websocket test and fails the tmux
+keys, `/private/tmp` and backlog watch tests; closing those is what remains of TASK-5.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on

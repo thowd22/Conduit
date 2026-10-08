@@ -1,11 +1,11 @@
 ---
 id: TASK-16
 title: Windows ConPTY backend
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-07 22:33'
+updated_date: '2026-10-08 00:28'
 labels:
   - pty
   - windows
@@ -26,9 +26,9 @@ Implement the Pty interface on Windows using ConPTY (CreatePseudoConsole), inclu
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Integration test spawns cmd.exe or pwsh and round-trips a command on Windows CI
-- [ ] #2 Resize is propagated to the pseudoconsole
-- [ ] #3 Child exit is detected and handles are released
+- [x] #1 Integration test spawns cmd.exe or pwsh and round-trips a command on Windows CI
+- [x] #2 Resize is propagated to the pseudoconsole
+- [x] #3 Child exit is detected and handles are released
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -50,4 +50,12 @@ Coordinator verification on this box: zig fmt --check src/pty.zig clean; zig tes
 What is still needed, and by whom: a Windows runner to execute it. The CI workflow already has windows-latest in its matrix, so pushing the repository is what unblocks ACs 1-3. Until then no criterion may be ticked on Linux evidence.
 
 2026-10-05 reconciliation: reopened because all three ACs require Windows runtime evidence and remain unchecked. The ConPTY path cross-compiles and Windows-only tests exist, but no Windows runner has executed them.
+
+Agent: fixed swapped CreatePseudoConsole pipe arguments, reversed input pipe ends (ACCESS_DENIED), non-overlapped anonymous output pipe (resize hang) -> named overlapped pipe, closed Conduit's copies of console ends, STARTF_USESTDHANDLES with null handles, exit-watcher thread closing the pseudoconsole under an SRW lock, drain to BROKEN_PIPE before publishing exit. Evidence: CI run 37706523144 Windows pty-test 20 pass / 13 skip (cmd.exe round trip, PowerShell-observed resize, exit code 42, kill 137, handle-count release). Coordinator 2026-10-08: merged as a0ec9c3 (branch task-16-conpty); Linux 898/911 unit tests green; Windows cross-compile still fails in agent modules (std.posix.pollfd) and backlog tests on CRLF/watch: TASK-5 close-out.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Windows ConPTY backend made to work: correct pipe plumbing, overlapped named output pipe, no inherited std handles, exit-watcher closing the pseudoconsole, final output drained before exit; proven on the hosted Windows runner by the ConPTY integration tests for round trip, resize, exit and handle release.
+<!-- SECTION:FINAL_SUMMARY:END -->
