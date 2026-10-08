@@ -43,6 +43,9 @@ pub const default_byte_budget = 4 * 1024 * 1024;
 pub const max_rows = 20_000;
 /// The narrowest width rows are wrapped at; a narrower pane clips instead.
 pub const min_wrap_cells = 8;
+/// The clickable row at the top of every view that opens the agent's
+/// prompts and instruction files (TASK-59, `agent.prompts`).
+pub const prompts_row_label = "▤ prompts and instructions";
 
 // The event log --------------------------------------------------------------
 

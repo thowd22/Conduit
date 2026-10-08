@@ -674,6 +674,50 @@ const control_api_steps = [_]Step{
     .screenshot,
 };
 
+// TASK-59: a fixture project written into the run's private TMPDIR, whose
+// directory the shell claims with OSC 7, so the fake agent (which reads
+// instructions as Claude Code does) is launched there. Its prompts view is
+// opened from the palette; CLAUDE.md in the agent's cwd is always the first
+// row, and a click on it opens vi on the file in a new tab.
+const agent_prompts_command =
+    "d=\"${TMPDIR:-/tmp}/conduit-e2e-prompts\"; " ++
+    "mkdir -p \"$d/.claude/agents\" && cd \"$d\" || exit 1; " ++
+    "printf '%s\\n' '# Project rules' 'Answer in PROMPTS_FIXTURE style.' > CLAUDE.md; " ++
+    "printf '%s\\n' 'Review every diff.' > .claude/agents/reviewer.md; " ++
+    "printf '\\033]7;file://localhost%s\\007' \"$PWD\"; " ++
+    "PS1='CONDUIT_E2E> '; ENV=/dev/null; export PS1 ENV; exec /bin/sh -i";
+
+const agent_prompts_dialog_id = "agent.prompts.1";
+const agent_prompts_claude_row = agent_prompts_dialog_id ++ ".item.0";
+// Tab 1 is the shell, tab 2 the agent, tab 3 the editor.
+const agent_prompts_editor_tab = "workspace.1.tab.3";
+
+const agent_prompts_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "Agent: launch" },
+    .{ .key = "ENTER" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "palette.argument", .state = "exists", .equals = true } },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.idle", .state = "exists", .equals = true } },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-AGENT-READY" } },
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "Agent: prompts" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_prompts_dialog_id, .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = agent_prompts_claude_row, .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .click = agent_prompts_claude_row },
+    .{ .wait_element = .{ .id = agent_prompts_dialog_id, .state = "exists", .equals = false } },
+    .{ .wait_element = .{ .id = agent_prompts_editor_tab, .state = "exists", .equals = true } },
+    // vi shows the file's own text, never typed by the scenario.
+    .{ .wait_terminal_text = .{ .contains = "PROMPTS_FIXTURE style." } },
+    .screenshot,
+};
+
 pub const all = [_]Scenario{
     .{
         .name = "launch-prompt",
@@ -775,12 +819,45 @@ pub const all = [_]Scenario{
         .command = control_api_command,
         .steps = &control_api_steps,
     },
+    .{
+        .name = "agent-prompts",
+        .launch_env = &agent_notifications_env,
+        .command = agent_prompts_command,
+        .steps = &agent_prompts_steps,
+    },
 };
+
+test "the agent prompts scenario opens the view from the palette and edits CLAUDE.md by a click" {
+    const scenario = all[19];
+    try std.testing.expectEqualStrings("agent-prompts", scenario.name);
+    try std.testing.expectEqual(@as(usize, 20), all.len);
+    try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
+    var opened = false;
+    var clicked = false;
+    var editor = false;
+    for (scenario.steps) |step| switch (step) {
+        .type_text => |text| if (std.mem.eql(u8, text, "Agent: prompts")) {
+            opened = true;
+        },
+        .click => |id| if (std.mem.eql(u8, id, agent_prompts_claude_row)) {
+            clicked = true;
+        },
+        .wait_element => |wait| if (std.mem.eql(u8, wait.id, agent_prompts_editor_tab) and wait.equals) {
+            editor = true;
+        },
+        // The asserted file text is never typed by a step.
+        .wait_terminal_text => |wait| if (std.mem.indexOf(u8, wait.contains, "PROMPTS_FIXTURE") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, agent_prompts_command, wait.contains) != null);
+        },
+        else => {},
+    };
+    try std.testing.expect(opened and clicked and editor);
+}
 
 test "the control API scenario opens a tab and a pane from the terminal, then switches by mouse" {
     const scenario = all[18];
     try std.testing.expectEqualStrings("control-api", scenario.name);
-    try std.testing.expectEqual(@as(usize, 19), all.len);
+    try std.testing.expectEqual(@as(usize, 20), all.len);
     var opened = false;
     var split = false;
     var clicked = false;
@@ -800,7 +877,7 @@ test "the control API scenario opens a tab and a pane from the terminal, then sw
 test "the backlog scenario opens the view by chord, a card by click, and moves the task" {
     const scenario = all[17];
     try std.testing.expectEqualStrings("backlog-board", scenario.name);
-    try std.testing.expectEqual(@as(usize, 19), all.len);
+    try std.testing.expectEqual(@as(usize, 20), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_BACKLOG_CLI", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -825,7 +902,7 @@ test "the backlog scenario opens the view by chord, a card by click, and moves t
 test "the agent manager scenario opens the manager by chord and focuses by a click" {
     const scenario = all[16];
     try std.testing.expectEqualStrings("agent-manager", scenario.name);
-    try std.testing.expectEqual(@as(usize, 19), all.len);
+    try std.testing.expectEqual(@as(usize, 20), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -848,7 +925,7 @@ test "the agent manager scenario opens the manager by chord and focuses by a cli
 test "the agent view scenario opens the view by chord and answers by a click" {
     const scenario = all[15];
     try std.testing.expectEqualStrings("agent-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 19), all.len);
+    try std.testing.expectEqual(@as(usize, 20), all.len);
     var chords: usize = 0;
     var clicked = false;
     var outcome = false;
@@ -1116,7 +1193,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 19), all.len);
+    try std.testing.expectEqual(@as(usize, 20), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;

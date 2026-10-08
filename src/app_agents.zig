@@ -524,6 +524,20 @@ pub fn fakeViewScript(allocator: Allocator, sample_path: []const u8) Allocator.E
 /// end of the turn.
 pub const fake_view_step_ends = [_]usize{ 12, 14 };
 
+/// The message `--agent-prompts-test`'s fake reports the human sent.
+pub const fake_prompts_message = "Keep the project rules short and current.";
+
+/// `--agent-prompts-test`'s script (TASK-59): one turn carrying a human's
+/// message, released by one step.
+pub const fake_prompts_script = [_]agent.Event{
+    .{ .status_change = .{ .state = .working, .source = .structured } },
+    .{ .message = .{ .role = .user, .text = fake_prompts_message } },
+    .{ .message = .{ .role = .assistant, .text = "I will read CLAUDE.md first." } },
+    .{ .status_change = .{ .state = .done, .source = .structured } },
+};
+
+pub const fake_prompts_step_ends = [_]usize{fake_prompts_script.len};
+
 // Owner-side transports ------------------------------------------------------------
 
 /// The Codex daemon's control socket, connected lazily: the TUI Conduit
@@ -1245,6 +1259,9 @@ pub const InitOptions = struct {
     fake_enabled: bool = false,
     /// Give the fake `--agent-view-test`'s script instead of TASK-56's.
     fake_view: bool = false,
+    /// Give the fake `--agent-prompts-test`'s script: a human's message and
+    /// the end of a turn (TASK-59).
+    fake_prompts: bool = false,
     wake: Wake = .{},
 };
 
@@ -1302,6 +1319,7 @@ pub const Runtime = struct {
     run_name_len: usize = 0,
     fake_enabled: bool,
     fake_view: bool = false,
+    fake_prompts: bool = false,
     wake: Wake,
     /// The agent the last notification activation or `agent.focus` chose,
     /// for TASK-58's manager to select.
@@ -1334,6 +1352,7 @@ pub const Runtime = struct {
             .sink_root = sink_root,
             .fake_enabled = options.fake_enabled,
             .fake_view = options.fake_view,
+            .fake_prompts = options.fake_prompts,
             .wake = options.wake,
             .drained = drained,
         };
@@ -1607,6 +1626,9 @@ pub const Runtime = struct {
                     argv[1] = script_path;
                     runner.backend.fake.launch_files = files;
                     runner.backend.fake.launch_argv = argv;
+                } else if (self.fake_prompts) {
+                    runner.backend.fake.script = &fake_prompts_script;
+                    runner.fake_step_ends = &fake_prompts_step_ends;
                 } else if (self.fake_view) {
                     const root = self.sink_root orelse return error.NoSinkRoot;
                     const parent = std.fs.path.dirnamePosix(root) orelse root;

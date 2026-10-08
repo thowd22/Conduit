@@ -1033,6 +1033,22 @@ fn boolean(value: ?json.Value) bool {
 
 const parse_options: json.ParseOptions = .{ .duplicate_field_behavior = .use_last, .max_value_len = max_response_bytes };
 
+// Instructions (TASK-59) -------------------------------------------------------
+
+/// Where OpenCode reads its instructions (TASK-59), from its rules and agents
+/// documentation (decision-9, unverified live): `AGENTS.md` along the project
+/// hierarchy, the global `~/.config/opencode/AGENTS.md`, custom agents under
+/// `.opencode/agent/`, and the `opencode.json` it owns. An edit takes effect
+/// on the next session.
+pub const instruction_profile: agent_adapter.InstructionProfile = .{
+    .sources = &.{
+        .{ .base = .project_tree, .path = "AGENTS.md", .list_missing = true },
+        .{ .base = .home, .path = ".config/opencode/AGENTS.md" },
+        .{ .base = .project, .path = ".opencode/agent/*.md", .kind = .subagent },
+        .{ .base = .project, .path = "opencode.json", .kind = .settings },
+    },
+};
+
 // The adapter -----------------------------------------------------------------
 
 pub const Options = struct {

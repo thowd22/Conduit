@@ -73,6 +73,9 @@ pub const DetectRequest = adapter.DetectRequest;
 pub const LaunchRequest = adapter.LaunchRequest;
 pub const LaunchSpec = adapter.LaunchSpec;
 pub const AttachRequest = adapter.AttachRequest;
+pub const InstructionSource = adapter.InstructionSource;
+pub const InstructionApply = adapter.InstructionApply;
+pub const InstructionProfile = adapter.InstructionProfile;
 
 pub const AgentId = registry.AgentId;
 pub const Agent = registry.Agent;
@@ -99,6 +102,18 @@ pub const opencode = @import("agent/opencode.zig");
 /// files, or a remote workspace's through its ExecutionContext (TASK-61).
 pub const sink_io = @import("agent/sink_io.zig");
 pub const SinkIo = sink_io.SinkIo;
+
+/// Where `harness` reads its instructions and how a change reaches an agent
+/// (TASK-59), as its adapter documents it: the one place outside an adapter
+/// that maps a harness to its harness knowledge.
+pub fn instructionProfile(harness: Harness) InstructionProfile {
+    return switch (harness) {
+        .claude_code => claude_code.instruction_profile,
+        .codex => codex.instruction_profile,
+        .pi => pi.instruction_profile,
+        .opencode => opencode.instruction_profile,
+    };
+}
 
 test {
     _ = @import("agent/harness.zig");

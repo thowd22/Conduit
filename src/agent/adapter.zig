@@ -172,6 +172,71 @@ pub const LaunchSpec = struct {
     };
 };
 
+/// One place a harness reads instructions from (TASK-59): its project
+/// memory, a user-level file, subagent definitions, its settings. Each
+/// adapter publishes what its harness documents as an `InstructionProfile`,
+/// so the prompts view lists files without knowing any harness itself
+/// (invariant 9). Paths are relative and `/`-separated; they are resolved in
+/// the agent's own ExecutionContext, never on this machine by assumption.
+pub const InstructionSource = struct {
+    pub const Base = enum {
+        /// The agent's cwd and every directory above it, nearest first.
+        project_tree,
+        /// The agent's cwd only.
+        project,
+        /// The home directory of the agent's context.
+        home,
+    };
+
+    pub const Kind = enum {
+        /// Instructions the harness loads into the session (CLAUDE.md,
+        /// AGENTS.md): text a person writes, so editable.
+        instructions,
+        /// A subagent or custom agent definition.
+        subagent,
+        /// The harness's own settings: shown, never edited from Conduit,
+        /// because the harness owns their format and meaning.
+        settings,
+    };
+
+    base: Base,
+    /// The file, or `<dir>/*.md` for every Markdown file of a directory.
+    path: []const u8,
+    kind: Kind = .instructions,
+    /// Listed even when it does not exist yet, so a person can create it:
+    /// only a harness's primary file in the agent's own cwd.
+    list_missing: bool = false,
+
+    /// Whether the prompts view may open this source for editing.
+    pub fn editable(self: InstructionSource) bool {
+        return self.kind != .settings;
+    }
+
+    /// Whether `path` names every Markdown file of a directory.
+    pub fn isListing(self: InstructionSource) bool {
+        return std.mem.endsWith(u8, self.path, "/*.md");
+    }
+};
+
+/// How a change to an instruction file reaches an agent.
+pub const InstructionApply = enum {
+    /// The harness reads its instruction files when a session starts, so a
+    /// restart of the agent applies an edit (the prompts view offers it).
+    restart,
+    /// An edit takes effect the next time the human starts a session; the
+    /// prompts view says so and offers nothing.
+    next_session,
+};
+
+/// What one harness reads its instructions from and how a change applies.
+pub const InstructionProfile = struct {
+    sources: []const InstructionSource,
+    apply: InstructionApply = .next_session,
+    /// Whether the harness lets Conduit read its system prompt (none does
+    /// today: shown as "not exposed by this harness").
+    system_prompt_exposed: bool = false,
+};
+
 /// An existing session to adopt: one Conduit launched (and knows the token
 /// of) or one the human started by hand in a terminal.
 pub const AttachRequest = struct {

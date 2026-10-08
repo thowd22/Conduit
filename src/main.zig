@@ -98,6 +98,7 @@ const agent = @import("agent");
 const remote = @import("remote.zig");
 /// The agent view's log, rows, selection and search model (TASK-57).
 const agent_view = @import("agent_view.zig");
+const agent_prompts = @import("agent_prompts.zig");
 /// The backlog view's board, list, detail and write-queue model (TASK-63).
 const backlog_view = @import("backlog_view.zig");
 const backlog = @import("backlog");
@@ -115,6 +116,7 @@ test {
     _ = app_agents;
     _ = remote;
     _ = agent_view;
+    _ = agent_prompts;
     _ = backlog_view;
 }
 /// The input module, imported under a name that does not collide with the app's
@@ -404,6 +406,12 @@ pub const Run = struct {
     /// palette, keyboard and mouse. Runs in `--agent-test`'s environment
     /// (the flag sets `agent_test` too) with TASK-56's fake script.
     agent_manager_test: bool = false,
+    /// Exercise TASK-59: one agent's prompts view over a fixture project, by
+    /// palette, the agent view's row, keyboard and mouse, an instruction
+    /// file edited in vi and re-read, a harness-owned file viewed read-only
+    /// and the restart that applies an edit. Runs in `--agent-test`'s
+    /// environment (the flag sets `agent_test` too).
+    agent_prompts_test: bool = false,
     /// Exercise TASK-63 and TASK-64: the backlog view over a fixture project
     /// with a fake `backlog` CLI, its board, list and detail by keyboard and
     /// mouse, writes, live reloads and an agent started on a task. Runs in
@@ -744,6 +752,9 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
         } else if (std.mem.eql(u8, arg, "--agent-manager-test")) {
             run.agent_test = true;
             run.agent_manager_test = true;
+        } else if (std.mem.eql(u8, arg, "--agent-prompts-test")) {
+            run.agent_test = true;
+            run.agent_prompts_test = true;
         } else if (std.mem.eql(u8, arg, "--backlog-test")) {
             run.agent_test = true;
             run.backlog_test = true;
@@ -1816,6 +1827,8 @@ const ChildSpec = struct {
             git_test_script
         else if (options.run.control_test)
             control_test_script
+        else if (options.run.agent_prompts_test)
+            agent_prompts_test_script
         else if (options.run.agent_test)
             agent_test_script
         else
@@ -2366,6 +2379,20 @@ const manager_label_capacity: usize = 384;
 /// hint elements.
 const manager_element_capacity: usize = manager_visible_capacity * 4 + 12;
 const manager_hint = "Enter focus  s stop  r restart  m message  n new  Esc close";
+/// TASK-59: the prompts view over one agent's prompts and instruction files,
+/// and the semantic action its rows and controls dispatch.
+const agent_prompts_action = "agent.prompts";
+const agent_prompts_activate_action = "agent.prompts.activate";
+/// The most item rows the prompts view shows at once; the list scrolls.
+const prompts_visible_capacity: usize = 16;
+/// Element slots the view uses besides its rows: the dialog, heading,
+/// refresh, empty line, three preview rows, apply, status and hint.
+const prompts_fixed_slots: usize = 10;
+const prompts_id_capacity: usize = 64;
+const prompts_label_capacity: usize = 512;
+const prompts_apply_label = "restart with updated instructions";
+const prompts_hint = "Enter open  r refresh  Esc close";
+const prompts_hint_restart = "Enter open  a apply (restart)  r refresh  Esc close";
 /// What the manager is doing: listing agents, typing a message to the
 /// highlighted one, or one step of the new-agent flow.
 const ManagerMode = enum { browse, message, new_harness, new_workspace, new_prompt };
@@ -2481,7 +2508,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 80;
+const action_capacity_base: usize = 82;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 const settings_open_action = "settings.open";
@@ -4999,6 +5026,25 @@ fn buildFileReferenceArgv(
 
 /// The tab label for a file reference: its final path component, bounded on a
 /// codepoint boundary. Borrows `path`.
+/// `vi -- <path>`, or `vi -R -- <path>` to view a file the harness owns
+/// (TASK-59). Shell-free like a file reference's argv (decision-5); the
+/// path comes from discovery, never from instruction text. Caller owns.
+fn buildInstructionEditorArgv(allocator: Allocator, path: []const u8, read_only: bool) Allocator.Error![][]const u8 {
+    const argv = try allocator.alloc([]const u8, if (read_only) 4 else 3);
+    var filled: usize = 0;
+    errdefer {
+        for (argv[0..filled]) |entry| allocator.free(entry);
+        allocator.free(argv);
+    }
+    const parts = [_][]const u8{ "vi", "-R", "--", path };
+    for (parts) |part| {
+        if (!read_only and std.mem.eql(u8, part, "-R")) continue;
+        argv[filled] = try allocator.dupe(u8, part);
+        filled += 1;
+    }
+    return argv;
+}
+
 fn fileReferenceLabel(path: []const u8) []const u8 {
     var name = path;
     if (std.mem.lastIndexOfAny(u8, path, "/\\")) |index| name = path[index + 1 ..];
@@ -5387,6 +5433,31 @@ const App = struct {
     manager_choice_selected: usize = 0,
     manager_new_choice: ?app_agents.Choice = null,
     manager_new_workspace: ?workspace.WorkspaceKey = null,
+    /// The prompts view (TASK-59). Main thread. The list stays after the
+    /// view closes, so an editor it opened can refresh it when it exits.
+    prompts_visible: bool = false,
+    prompts_agent: ?agent.AgentId = null,
+    prompts_list: ?agent_prompts.List = null,
+    /// The discovery running on a worker, and whether another was asked
+    /// for while it ran.
+    prompts_job: ?*agent_prompts.Job = null,
+    prompts_refresh_pending: bool = false,
+    prompts_selected: usize = 0,
+    prompts_scroll: usize = 0,
+    prompts_pointer_owned: bool = false,
+    prompts_generation: u8 = 0,
+    prompts_ids: [2][prompts_fixed_slots + prompts_visible_capacity][prompts_id_capacity]u8 = undefined,
+    prompts_labels: [prompts_visible_capacity][prompts_label_capacity]u8 = undefined,
+    /// The heading and preview texts the tree borrows until the next frame.
+    prompts_heading: [prompts_label_capacity]u8 = undefined,
+    prompts_preview: [3][prompts_label_capacity]u8 = undefined,
+    prompts_status_storage: [palette_label_capacity]u8 = undefined,
+    prompts_status_len: usize = 0,
+    /// The editor tab an item opened; its exit re-reads the list.
+    prompts_editor: ?struct { key: workspace.WorkspaceKey, session: session.SessionId } = null,
+    /// An agent stopped by "restart with updated instructions", restarted
+    /// once its exit arrives.
+    prompts_restart: ?agent.AgentId = null,
     /// The backlog view (TASK-63). Main thread. Each workspace's state is
     /// its presentation's `backlog` panel; this is what composing it needs.
     /// Element ids and labels of the last two frames live in alternating
@@ -6292,6 +6363,18 @@ const App = struct {
             .handler = backlogActivateAction,
             .palette = null,
         });
+        // TASK-59: one agent's prompts and instruction files.
+        try actions.register(.{
+            .name = agent_prompts_action,
+            .label = "Agent: prompts and instructions",
+            .handler = agentPromptsAction,
+        });
+        try actions.register(.{
+            .name = agent_prompts_activate_action,
+            .label = "Activate prompts view element",
+            .handler = agentPromptsActivateAction,
+            .palette = null,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -6378,6 +6461,7 @@ const App = struct {
             .fake_enabled = options.run.agent_test or options.run.ssh_test or (options.run.test_driver_endpoint != null and
                 std.mem.eql(u8, env.get(fake_agent_env) orelse "", "1")),
             .fake_view = options.run.agent_view_test,
+            .fake_prompts = options.run.agent_prompts_test,
         });
         errdefer agents.deinit();
         agents.settings = loaded_config.settings.notifications;
@@ -8697,6 +8781,11 @@ const App = struct {
             if (presentation.load) |job| self.destroyLoad(job);
             if (presentation.scratchpad_load) |job| self.destroyLoad(job);
         }
+        // The prompts view's discovery borrows a workspace's context.
+        if (self.prompts_job) |job| job.destroy();
+        self.prompts_job = null;
+        if (self.prompts_list) |*list| list.deinit();
+        self.prompts_list = null;
         // Every spawn worker that could still be preparing an agent has been
         // joined above; the runtime's own workers stop here, before the
         // workspaces whose contexts its detections borrow.
@@ -9545,7 +9634,7 @@ const App = struct {
     /// opens over another modal surface or while a gesture is in flight.
     fn openContextMenu(self: *App, col: u32, row: u32, link_id: ?[]const u8) !void {
         if (self.contextMenuVisible() or self.notificationsVisible() or self.paletteVisible() or self.settingsVisible() or self.closeModalActive() or
-            self.managerVisible() or self.rename_tab_id != null or self.search_visible or self.scratchpadVisible() or
+            self.managerVisible() or self.promptsVisible() or self.rename_tab_id != null or self.search_visible or self.scratchpadVisible() or
             self.backlogShown() or self.ui_pointer_owned or self.sidebar_dragging or self.dragged_divider_id != null or
             self.dragged_tab_id != null) return;
         var menu: ContextMenu = .{
@@ -10220,6 +10309,17 @@ const App = struct {
         return .{ .x = layout.rect.col, .y = layout.rect.row, .width = layout.rect.cols, .height = layout.rect.rows };
     }
 
+    /// Where a view's event rows go: below its prompts row (TASK-59) when
+    /// the pane has room for both, else the whole pane.
+    fn agentViewRowsRect(layout: workspace.PaneLayout) ui.Rect {
+        var rect = agentViewRect(layout);
+        if (rect.height >= 2) {
+            rect.y += 1;
+            rect.height -= 1;
+        }
+        return rect;
+    }
+
     /// The view and pane under a device-pixel point, when the point is over a
     /// pane that shows an agent view.
     fn agentViewAt(self: *App, point: ui.Point) ?struct { runner: *app_agents.Runner, layout: workspace.PaneLayout } {
@@ -10337,7 +10437,8 @@ const App = struct {
         const agent_id = runner.agent_id orelse return;
         const record = self.agents.registry.get(agent_id) orelse return;
         const number = @intFromEnum(agent_id);
-        const rect = agentViewRect(layout);
+        const pane_rect = agentViewRect(layout);
+        const rect = agentViewRowsRect(layout);
         if (rect.width == 0 or rect.height == 0) return;
         const view = &runner.view;
         if (view.rows.stale(&view.log, rect.width)) {
@@ -10359,8 +10460,29 @@ const App = struct {
             .parent = pane_id,
             .role = "agent_view",
             .label = "Agent view",
-            .bounds = rect,
-        }, .{ .rect = rect, .fill = .background });
+            .bounds = pane_rect,
+        }, .{ .rect = pane_rect, .fill = .background });
+        // TASK-59: the way to the agent's prompts and instruction files.
+        if (pane_rect.height >= 2) {
+            const prompts_text = self.nextAgentViewId("agent.view.{d}.prompts", .{number}, null) orelse return;
+            const prompts_id: ui.Id = .{ .value = prompts_text };
+            const label = agent_view.prompts_row_label;
+            try self.ui_tree.addInteractiveText(.{
+                .id = prompts_id,
+                .parent = surface_id,
+                .role = "button",
+                .label = label,
+                .action = agent_prompts_action,
+                .bounds = .{ .x = pane_rect.x, .y = pane_rect.y, .width = @min(agent_view.displayCells(label), pane_rect.width), .height = 1 },
+            }, .{
+                .id = prompts_id,
+                .label = label,
+                .action = agent_prompts_action,
+                .normal = .{ .foreground = .muted },
+                .hovered = .{ .foreground = .strong, .underline = .accent },
+                .focused = .{ .foreground = .on_accent, .background = .accent },
+            });
+        }
 
         if (view.rowCount() == 0) {
             // A harness with no structured channel yet (or a quiet one) has
@@ -10522,7 +10644,7 @@ const App = struct {
     /// The view's height in rows, for scrolling by keys.
     fn agentViewHeight(self: *App, runner: *const app_agents.Runner) u32 {
         const layout = self.agentViewLayout(runner) orelse return 1;
-        return @max(layout.rect.rows, 1);
+        return @max(agentViewRowsRect(layout).height, 1);
     }
 
     /// The interactive view elements of this frame in order: references and
@@ -10694,7 +10816,7 @@ const App = struct {
                     };
                     const layout = self.agentViewLayout(runner) orelse return true;
                     if (runner.view.selection) |*selection| {
-                        const caret = self.agentViewPosition(&runner.view, agentViewRect(layout), point);
+                        const caret = self.agentViewPosition(&runner.view, agentViewRowsRect(layout), point);
                         if (!std.meta.eql(caret, selection.caret)) {
                             selection.caret = caret;
                             try self.refreshActiveUi();
@@ -10738,7 +10860,7 @@ const App = struct {
                     }
                 }
                 tree.clearFocus();
-                const position = self.agentViewPosition(&hit.runner.view, agentViewRect(hit.layout), point);
+                const position = self.agentViewPosition(&hit.runner.view, agentViewRowsRect(hit.layout), point);
                 hit.runner.view.selection = .{ .anchor = position, .caret = position };
                 self.agent_view_pointer = hit.runner.agent_id;
                 try self.refreshActiveUi();
@@ -10750,7 +10872,7 @@ const App = struct {
                 if (wheel.dy == 0) return true;
                 var up = wheel.dy > 0;
                 if (wheel.flipped) up = !up;
-                hit.runner.view.scrollBy(if (up) -3 else 3, @max(hit.layout.rect.rows, 1));
+                hit.runner.view.scrollBy(if (up) -3 else 3, @max(agentViewRowsRect(hit.layout).height, 1));
                 try self.refreshActiveUi();
                 return true;
             },
@@ -10983,7 +11105,7 @@ const App = struct {
 
     fn openNotifications(self: *App) !void {
         if (self.notificationsVisible() or self.contextMenuVisible() or self.paletteVisible() or self.settingsVisible() or
-            self.managerVisible() or self.closeModalActive() or self.rename_tab_id != null or self.ui_pointer_owned or self.sidebar_dragging or
+            self.managerVisible() or self.promptsVisible() or self.closeModalActive() or self.rename_tab_id != null or self.ui_pointer_owned or self.sidebar_dragging or
             self.dragged_divider_id != null or self.dragged_tab_id != null) return;
         if (self.search_visible) try self.closeSearch();
         self.composition.cancel();
@@ -11463,7 +11585,7 @@ const App = struct {
     }
 
     fn openManager(self: *App) !void {
-        if (self.managerVisible() or self.notificationsVisible() or self.contextMenuVisible() or self.paletteVisible() or
+        if (self.managerVisible() or self.promptsVisible() or self.notificationsVisible() or self.contextMenuVisible() or self.paletteVisible() or
             self.settingsVisible() or self.closeModalActive() or self.rename_tab_id != null or self.ui_pointer_owned or
             self.sidebar_dragging or self.dragged_divider_id != null or self.dragged_tab_id != null) return;
         const canvas = self.ui_canvas.bounds();
@@ -11604,25 +11726,38 @@ const App = struct {
     fn managerRestart(self: *App, id: agent.AgentId) !void {
         self.manager_selected = id;
         const record = self.agents.registry.get(id) orelse return;
+        // Static: it outlives the record a restart replaces.
         const name = self.agents.displayName(record);
-        if (!self.agents.restartable(id)) {
-            self.setManagerStatus("{s}: only an exited agent Conduit started can restart", .{name});
-            return self.refreshActiveUi();
+        switch (try self.relaunchAgent(id)) {
+            .restarted => |runner| {
+                self.manager_selected = runner.agent_id;
+                self.setManagerStatus("restarted {s}", .{name});
+            },
+            .refused => |reason| self.setManagerStatus("{s}: {s}", .{ name, reason }),
         }
+        try self.refreshActiveUi();
+    }
+
+    const RelaunchOutcome = union(enum) {
+        restarted: *app_agents.Runner,
+        /// Why not, as a short phrase.
+        refused: []const u8,
+    };
+
+    /// The restart TASK-58's manager and TASK-59's prompts view share:
+    /// replace an exited (or failed) owned agent's runner and spawn the same
+    /// launch again into its own session.
+    fn relaunchAgent(self: *App, id: agent.AgentId) !RelaunchOutcome {
+        if (!self.agents.restartable(id)) return .{ .refused = "only an exited agent Conduit started can restart" };
+        const record = self.agents.registry.get(id) orelse return .{ .refused = "it is gone" };
         const key = record.workspace;
         const session_id = record.session;
-        const model = self.workspace_registry.byKey(key) orelse return;
-        const presentation = self.presentationByKey(key) orelse return;
-        const live = model.sessionById(session_id) orelse return;
-        if (live.child()) |child| if (child.state() == .running) {
-            self.setManagerStatus("{s} is still running: stop it first", .{name});
-            return self.refreshActiveUi();
-        };
-        if (presentation.load != null or presentation.closing) {
-            self.setManagerStatus("restart deferred: a start is in progress", .{});
-            return self.refreshActiveUi();
-        }
-        var request = self.agents.relaunchRequest(id) orelse return;
+        const model = self.workspace_registry.byKey(key) orelse return .{ .refused = "its workspace is gone" };
+        const presentation = self.presentationByKey(key) orelse return .{ .refused = "its workspace is gone" };
+        const live = model.sessionById(session_id) orelse return .{ .refused = "its tab is gone" };
+        if (live.child()) |child| if (child.state() == .running) return .{ .refused = "still running: stop it first" };
+        if (presentation.load != null or presentation.closing) return .{ .refused = "restart deferred: a start is in progress" };
+        var request = self.agents.relaunchRequest(id) orelse return .{ .refused = "it has no launch to repeat" };
         request.probe_env = self.agent_spec.env;
         request.home = self.home_dir;
         request.claude_config_dir = self.claude_config_dir;
@@ -11632,20 +11767,14 @@ const App = struct {
             .session = session_id,
             .session_kind = .agent_terminal,
             .scratchpad = model.scratchpadId(),
-        }) catch |err| {
-            self.setManagerStatus("{s} did not restart: {s}", .{ name, @errorName(err) });
-            return self.refreshActiveUi();
-        };
+        }) catch |err| return .{ .refused = @errorName(err) };
         const cwd = self.allocator.dupe(u8, runner.cwd) catch {
             self.agents.spawnFinished(runner, false);
-            self.setManagerStatus("out of memory", .{});
-            return self.refreshActiveUi();
+            return .{ .refused = "out of memory" };
         };
-        self.manager_selected = runner.agent_id;
         self.startAgentChildIn(presentation, model, session_id, cwd, runner, live.child() != null);
         self.rebuildAgentChoices();
-        self.setManagerStatus("restarted {s}", .{name});
-        try self.refreshActiveUi();
+        return .{ .restarted = runner };
     }
 
     fn managerMessage(self: *App, id: agent.AgentId) !void {
@@ -11977,6 +12106,650 @@ const App = struct {
         if (origin.value.len > id_storage.len) return;
         @memcpy(id_storage[0..origin.value.len], origin.value);
         try self.activateManagerElement(id_storage[0..origin.value.len]);
+    }
+
+    // The prompts view (TASK-59) ----------------------------------------------
+
+    fn promptsVisible(self: *const App) bool {
+        return self.prompts_visible;
+    }
+
+    /// The agent the prompts view is about when no element names one: the
+    /// presented pane's agent, the one the view showed last, the one a
+    /// notification or `agent.focus` chose, then the first agent.
+    fn defaultPromptsAgent(self: *App) ?agent.AgentId {
+        if (self.presentedAgentRunner()) |runner| if (runner.agent_id) |id| return id;
+        if (self.prompts_agent) |id| if (self.agents.registry.get(id) != null) return id;
+        if (self.agents.selected_agent) |id| if (self.agents.registry.get(id) != null) return id;
+        const all = self.agents.registry.all();
+        return if (all.len != 0) all[0].id else null;
+    }
+
+    fn promptsStatus(self: *const App) []const u8 {
+        return self.prompts_status_storage[0..self.prompts_status_len];
+    }
+
+    fn setPromptsStatus(self: *App, comptime format: []const u8, args: anytype) void {
+        var writer: std.Io.Writer = .fixed(&self.prompts_status_storage);
+        writer.print(format, args) catch {
+            // A status cut by the fixed buffer is still its start.
+        };
+        var len = writer.end;
+        while (len != 0 and !std.unicode.utf8ValidateSlice(self.prompts_status_storage[0..len])) len -= 1;
+        self.prompts_status_len = len;
+    }
+
+    fn promptsItems(self: *const App) []const agent_prompts.Item {
+        const list = &(self.prompts_list orelse return &.{});
+        return list.items.items;
+    }
+
+    /// Where the agent's instructions are looked for: its session's tracked
+    /// cwd, else the cwd it was launched in, else the workspace's.
+    fn promptsCwd(self: *App, record: *const agent.Agent) ?[]const u8 {
+        const model = self.workspace_registry.byKey(record.workspace) orelse return null;
+        if (model.sessionById(record.session)) |live| if (live.workingDirectory()) |cwd| return cwd;
+        if (self.agents.runnerForAgent(record.id)) |runner| return runner.cwd;
+        return model.workingDirectory();
+    }
+
+    /// Start (or queue) a discovery of the agent's instruction files on a
+    /// worker, through its workspace's ExecutionContext. A discovery still
+    /// running is never joined here: the next one is queued behind it.
+    fn refreshPrompts(self: *App) void {
+        if (self.prompts_job != null) {
+            self.prompts_refresh_pending = true;
+            return;
+        }
+        const id = self.prompts_agent orelse return;
+        const record = self.agents.registry.get(id) orelse return;
+        const model = self.workspace_registry.byKey(record.workspace) orelse return;
+        if (self.presentationByKey(record.workspace)) |presentation| {
+            if (presentation.remote) |connection| if (!connection.ready()) {
+                self.setPromptsStatus("the workspace is not connected", .{});
+                return;
+            };
+        }
+        const cwd = self.promptsCwd(record) orelse return;
+        const remote_context = model.contextKind().isRemote();
+        self.prompts_job = agent_prompts.Job.start(self.allocator, self.io, .{
+            .context = model.contextRef(),
+            .profile = agent.instructionProfile(record.harness),
+            .cwd = cwd,
+            .home = if (remote_context) null else self.home_dir,
+            .resolve_home = remote_context,
+        }) catch |err| {
+            log.warn("the instruction files could not be listed: {s}", .{@errorName(err)});
+            self.setPromptsStatus("the instruction files could not be listed", .{});
+            return;
+        };
+    }
+
+    /// Take a finished discovery: its files, then the agent's prompts from
+    /// its runner (the launch prompt and the human's messages in its log).
+    fn takePromptsDiscovery(self: *App) void {
+        const job = self.prompts_job orelse return;
+        if (!job.finished()) return;
+        var list = job.take();
+        job.destroy();
+        self.prompts_job = null;
+        if (self.prompts_agent) |id| {
+            if (self.agents.registry.get(id)) |record| {
+                const runner = self.agents.runnerForAgent(id);
+                var sent: [agent_prompts.max_items][]const u8 = undefined;
+                var sent_count: usize = 0;
+                if (runner) |owner| {
+                    const event_log = &owner.view.log;
+                    for (0..event_log.count()) |index| {
+                        const entry = event_log.at(index);
+                        if (entry.event != .message or entry.event.message.role != .user) continue;
+                        if (sent_count == sent.len) break;
+                        sent[sent_count] = entry.event.message.text;
+                        sent_count += 1;
+                    }
+                }
+                agent_prompts.addPrompts(&list, agent.instructionProfile(record.harness), if (runner) |owner| owner.prompt else null, sent[0..sent_count]) catch |err| {
+                    log.warn("the agent's prompts were not listed: {s}", .{@errorName(err)});
+                };
+            }
+        }
+        if (self.prompts_list) |*old| old.deinit();
+        self.prompts_list = list;
+        const count = self.promptsItems().len;
+        if (self.prompts_selected >= count) self.prompts_selected = count -| 1;
+        if (self.prompts_refresh_pending) {
+            self.prompts_refresh_pending = false;
+            self.refreshPrompts();
+        }
+    }
+
+    /// Owner-thread service: a finished discovery, an editor that exited
+    /// (its file is read again), and a restart waiting for the agent to
+    /// stop. Returns whether the view changed.
+    fn pollPrompts(self: *App) bool {
+        var changed = false;
+        if (self.prompts_job) |job| if (job.finished()) {
+            self.takePromptsDiscovery();
+            changed = true;
+        };
+        if (self.prompts_editor) |editor| {
+            const ended = ended: {
+                const model = self.workspace_registry.byKey(editor.key) orelse break :ended true;
+                const live = model.sessionById(editor.session) orelse break :ended true;
+                const child = live.child() orelse break :ended false;
+                break :ended child.state() != .running;
+            };
+            if (ended) {
+                self.prompts_editor = null;
+                self.setPromptsStatus("the editor closed: the list was read again", .{});
+                self.refreshPrompts();
+                changed = true;
+            }
+        }
+        if (self.prompts_restart) |id| {
+            if (self.agents.registry.get(id) == null) {
+                self.prompts_restart = null;
+            } else if (self.agents.restartable(id)) {
+                self.prompts_restart = null;
+                self.restartFromPrompts(id) catch |err| log.warn("the agent was not restarted: {s}", .{@errorName(err)});
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    fn promptsListRows(self: *const App) usize {
+        return @max(self.promptsItems().len, 1);
+    }
+
+    fn promptsBounds(self: *const App) ?ui.Rect {
+        if (!self.prompts_visible) return null;
+        const canvas = self.ui_canvas.bounds();
+        if (canvas.width < 40 or canvas.height < 12) return null;
+        const width = @min(canvas.width - 2, @as(u32, 100));
+        const list: u32 = @intCast(@min(self.promptsListRows(), prompts_visible_capacity));
+        // Two borders, the heading, three preview rows, the apply row, the
+        // status line and the hint.
+        const height = @min(list + 9, canvas.height - 2);
+        return .{
+            .x = (canvas.width - width) / 2,
+            .y = (canvas.height - height) / 2,
+            .width = width,
+            .height = height,
+        };
+    }
+
+    /// The id of one prompts element, in this frame's storage (two
+    /// generations, like the manager's, so an id's bytes never change under
+    /// the tree).
+    fn promptsId(self: *App, slot: usize, comptime format: []const u8, args: anytype) ![]const u8 {
+        const generation = self.prompts_generation % 2;
+        return std.fmt.bufPrint(&self.prompts_ids[generation][slot], format, args);
+    }
+
+    fn addPromptsControl(self: *App, parent: ui.Id, id_text: []const u8, label: []const u8, x: u32, y: u32) !void {
+        const id: ui.Id = .{ .value = id_text };
+        try self.ui_tree.addInteractiveText(.{
+            .id = id,
+            .parent = parent,
+            .role = "button",
+            .label = label,
+            .action = agent_prompts_activate_action,
+            .bounds = .{ .x = x, .y = y, .width = agent_view.displayCells(label), .height = 1 },
+        }, .{
+            .id = id,
+            .label = label,
+            .action = agent_prompts_activate_action,
+            .normal = .{ .foreground = .accent },
+            .hovered = .{ .foreground = .strong, .underline = .accent },
+            .focused = .{ .foreground = .on_accent, .background = .accent },
+        });
+    }
+
+    /// The view is a `Surface` panel: a heading naming the agent, one
+    /// `InteractiveText` row per item (its name, size and whether it is
+    /// editable or why not), a preview of the highlighted item, the apply
+    /// row, a status line and a key hint.
+    fn composePrompts(self: *App) !void {
+        const bounds = self.promptsBounds() orelse return;
+        const id = self.prompts_agent orelse return;
+        const number = @intFromEnum(id);
+        self.prompts_generation +%= 1;
+        const record = self.agents.registry.get(id);
+        const dialog_id: ui.Id = .{ .value = try self.promptsId(0, "agent.prompts.{d}", .{number}) };
+        try self.ui_tree.addSurface(.{
+            .id = dialog_id,
+            .role = "dialog",
+            .label = "Prompts and instructions",
+            .bounds = bounds,
+        }, .{
+            .rect = bounds,
+            .erase_underlay = true,
+            .fill = .background,
+            .border = .double,
+            .border_style = .{ .foreground = .border, .background = .background },
+            .title = " Prompts and instructions ",
+            .title_style = .{ .foreground = .strong, .background = .background, .face_style = .bold },
+        });
+        const inner_x = bounds.x + 2;
+        const inner_width = bounds.width - 4;
+        const muted: ui.TextStyle = .{ .foreground = .muted };
+
+        const heading = if (record) |found| blk: {
+            const cwd = self.promptsCwd(found) orelse "?";
+            var writer: std.Io.Writer = .fixed(&self.prompts_heading);
+            writer.print("{s} {s} #{d}  {s}", .{ app_agents.stateGlyph(found.state), self.agents.displayName(found), number, cwd }) catch {};
+            var len = writer.end;
+            while (len != 0 and !std.unicode.utf8ValidateSlice(self.prompts_heading[0..len])) len -= 1;
+            break :blk self.prompts_heading[0..len];
+        } else "the agent is gone";
+        const refresh_label = "refresh";
+        try self.addManagerText(dialog_id, try self.promptsId(1, "agent.prompts.{d}.heading", .{number}), "heading", heading, muted, .{ .x = inner_x, .y = bounds.y + 1, .width = inner_width -| @as(u32, refresh_label.len + 1), .height = 1 });
+        try self.addPromptsControl(dialog_id, try self.promptsId(2, "agent.prompts.{d}.refresh", .{number}), refresh_label, inner_x + inner_width - @as(u32, refresh_label.len), bounds.y + 1);
+
+        const list_top = bounds.y + 2;
+        const footer_rows: u32 = 7;
+        const available: usize = if (bounds.height > footer_rows + 2) bounds.height - footer_rows - 2 else 0;
+        const items = self.promptsItems();
+        if (items.len == 0) {
+            const empty = if (self.prompts_job != null)
+                "looking for instruction files…"
+            else if (self.prompts_list) |list| list.problem orelse "nothing to show" else "nothing to show";
+            try self.addManagerText(dialog_id, try self.promptsId(3, "agent.prompts.{d}.empty", .{number}), "status", empty, muted, .{ .x = inner_x, .y = list_top, .width = inner_width, .height = 1 });
+        }
+        if (self.prompts_selected < self.prompts_scroll) self.prompts_scroll = self.prompts_selected;
+        if (available != 0 and self.prompts_selected >= self.prompts_scroll + available) self.prompts_scroll = self.prompts_selected + 1 - available;
+        const end = @min(items.len, self.prompts_scroll + available);
+        for (self.prompts_scroll..end, 0..) |index, slot| {
+            const item = &items[index];
+            const label = agent_prompts.formatRow(&self.prompts_labels[slot], item, inner_width);
+            const row_id: ui.Id = .{ .value = try self.promptsId(prompts_fixed_slots + slot, "agent.prompts.{d}.item.{d}", .{ number, index }) };
+            const selected = index == self.prompts_selected;
+            try self.ui_tree.addInteractiveText(.{
+                .id = row_id,
+                .parent = dialog_id,
+                .role = if (item.kind.isFile()) "file" else "prompt",
+                .label = label,
+                .selected = selected,
+                .action = agent_prompts_activate_action,
+                .bounds = .{ .x = inner_x, .y = list_top + @as(u32, @intCast(slot)), .width = inner_width, .height = 1 },
+            }, .{
+                .id = row_id,
+                .label = label,
+                .action = agent_prompts_activate_action,
+                .normal = if (selected)
+                    .{ .foreground = .strong, .background = .selection }
+                else if (item.editable())
+                    .{ .foreground = .foreground }
+                else
+                    .{ .foreground = .muted },
+                .hovered = if (selected)
+                    .{ .foreground = .strong, .background = .selection, .underline = .accent }
+                else
+                    .{ .foreground = .strong, .underline = .accent },
+                .focused = .{ .foreground = .on_accent, .background = .accent },
+            });
+        }
+
+        // The preview: a file's full path and what Enter does, or a
+        // prompt's text wrapped over the three rows.
+        const preview_top = bounds.y + bounds.height - footer_rows;
+        var preview_lines: [3][]const u8 = .{ "", "", "" };
+        if (self.prompts_selected < items.len) {
+            const item = &items[self.prompts_selected];
+            if (item.kind.isFile()) {
+                preview_lines[0] = item.value;
+                preview_lines[1] = if (item.reason == .read_only_host)
+                    "the context cannot read it"
+                else if (item.editable())
+                    (if (item.exists) "Enter opens it in vi in a new tab" else "Enter creates it in vi in a new tab")
+                else
+                    "Enter views it read-only in vi; the harness owns this file";
+            } else if (item.kind == .system_prompt) {
+                preview_lines[0] = "the harness keeps its system prompt to itself";
+            } else {
+                var rest: []const u8 = item.value;
+                for (&preview_lines) |*line| {
+                    if (rest.len == 0) break;
+                    const cut = agent_view.byteAtCell(rest, inner_width);
+                    if (cut == 0) break;
+                    const piece = rest[0..cut];
+                    const newline = std.mem.indexOfScalar(u8, piece, '\n');
+                    line.* = if (newline) |at| piece[0..at] else piece;
+                    rest = rest[if (newline) |at| at + 1 else cut..];
+                }
+            }
+        }
+        // Copied: the list they point into may be replaced before the tree
+        // lets go of this frame.
+        for (&preview_lines, &self.prompts_preview) |*line, *storage| {
+            const kept = agent.truncateUtf8(line.*, storage.len);
+            @memcpy(storage[0..kept.len], kept);
+            line.* = storage[0..kept.len];
+        }
+        for (preview_lines, 0..) |line, row| {
+            if (line.len == 0) continue;
+            try self.addManagerText(dialog_id, try self.promptsId(4 + row, "agent.prompts.{d}.preview.{d}", .{ number, row }), "status", line, muted, .{ .x = inner_x, .y = preview_top + @as(u32, @intCast(row)), .width = inner_width, .height = 1 });
+        }
+
+        // How an edit reaches the agent: a restart where the harness reads
+        // its instructions at session start, otherwise the next session.
+        const apply_y = preview_top + 3;
+        const apply_id = try self.promptsId(7, "agent.prompts.{d}.apply", .{number});
+        const restart_applies = if (record) |found| agent.instructionProfile(found.harness).apply == .restart and found.ownership == .owned else false;
+        if (restart_applies) {
+            try self.addPromptsControl(dialog_id, apply_id, prompts_apply_label, inner_x, apply_y);
+        } else {
+            try self.addManagerText(dialog_id, apply_id, "status", "edits take effect on the next session", muted, .{ .x = inner_x, .y = apply_y, .width = inner_width, .height = 1 });
+        }
+        if (self.prompts_status_len != 0) {
+            try self.addManagerText(dialog_id, try self.promptsId(8, "agent.prompts.{d}.status", .{number}), "status", self.promptsStatus(), .{ .foreground = .attention }, .{ .x = inner_x, .y = apply_y + 1, .width = inner_width, .height = 1 });
+        }
+        try self.addManagerText(dialog_id, try self.promptsId(9, "agent.prompts.{d}.hint", .{number}), "status", if (restart_applies) prompts_hint_restart else prompts_hint, muted, .{ .x = inner_x, .y = apply_y + 2, .width = inner_width, .height = 1 });
+    }
+
+    fn openPrompts(self: *App, id: agent.AgentId) !void {
+        // No `ui_pointer_owned` guard: the agent view's prompts row opens
+        // the view from that very click's release.
+        if (self.promptsVisible() or self.managerVisible() or self.notificationsVisible() or self.contextMenuVisible() or self.paletteVisible() or
+            self.settingsVisible() or self.closeModalActive() or self.rename_tab_id != null or
+            self.sidebar_dragging or self.dragged_divider_id != null or self.dragged_tab_id != null) return;
+        if (self.agents.registry.get(id) == null) return;
+        const canvas = self.ui_canvas.bounds();
+        if (canvas.width < 40 or canvas.height < 12) return;
+        if (self.search_visible) try self.closeSearch();
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        try self.window.stopTextInput();
+        if (self.prompts_agent != id) {
+            if (self.prompts_list) |*old| old.deinit();
+            self.prompts_list = null;
+            self.prompts_selected = 0;
+        }
+        self.prompts_agent = id;
+        self.prompts_visible = true;
+        self.prompts_scroll = 0;
+        self.prompts_status_len = 0;
+        self.refreshPrompts();
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    fn closePrompts(self: *App) !void {
+        if (!self.promptsVisible()) return;
+        self.composition.cancel();
+        _ = takeCommittedText(&self.pending_committed_text);
+        self.prompts_visible = false;
+        self.ui_tree.clearFocus();
+        try self.composeUi();
+        try self.syncTextInput();
+        self.invalidateUi();
+    }
+
+    const PromptsMove = enum { previous, next, first, last };
+
+    fn movePromptsSelection(self: *App, move: PromptsMove) !void {
+        const count = self.promptsItems().len;
+        if (count == 0) return self.refreshActiveUi();
+        self.prompts_status_len = 0;
+        const current = @min(self.prompts_selected, count - 1);
+        self.prompts_selected = switch (move) {
+            .first => 0,
+            .last => count - 1,
+            .next => (current + 1) % count,
+            .previous => (current + count - 1) % count,
+        };
+        try self.refreshActiveUi();
+    }
+
+    /// Enter or a click on an item: a file opens in `vi` in a new tab of the
+    /// agent's workspace, through its ExecutionContext (so an SSH
+    /// workspace's file is edited on its host), read-only (`vi -R`) when the
+    /// harness owns it. A prompt or the system prompt only says why it
+    /// cannot be edited. Nothing in an item's text runs.
+    fn activatePromptsItem(self: *App, index: usize) !void {
+        const items = self.promptsItems();
+        if (index >= items.len) return;
+        self.prompts_selected = index;
+        const item = items[index];
+        if (!item.kind.isFile()) {
+            const reason: agent_prompts.Reason = item.reason orelse .sent;
+            self.setPromptsStatus("read-only: {s}", .{reason.text()});
+            return self.refreshActiveUi();
+        }
+        if (item.reason == .read_only_host) {
+            self.setPromptsStatus("read-only on this host: it cannot be read here", .{});
+            return self.refreshActiveUi();
+        }
+        const id = self.prompts_agent orelse return;
+        const record = self.agents.registry.get(id) orelse return;
+        const key = record.workspace;
+        var path_storage: [file_reference_path_max_bytes]u8 = undefined;
+        if (item.value.len > path_storage.len) return;
+        @memcpy(path_storage[0..item.value.len], item.value);
+        const path = path_storage[0..item.value.len];
+        const read_only = !item.editable();
+        const cwd_text = self.promptsCwd(record) orelse return;
+        var cwd_storage: [file_reference_path_max_bytes]u8 = undefined;
+        if (cwd_text.len > cwd_storage.len) return;
+        @memcpy(cwd_storage[0..cwd_text.len], cwd_text);
+        try self.closePrompts();
+        if (self.workspace_registry.activeKey() != key) {
+            if (!try self.activateWorkspaceKey(key, false)) {
+                self.setWorkspaceStatus("the agent's workspace could not be shown");
+                return;
+            }
+        }
+        if (self.activePresentation().load != null) {
+            self.setWorkspaceStatus("editor deferred: a start is in progress");
+            return;
+        }
+        if (self.remoteNotReady()) return;
+        const argv = try buildInstructionEditorArgv(self.allocator, path, read_only);
+        const cwd = self.allocator.dupe(u8, cwd_storage[0..cwd_text.len]) catch |err| {
+            freeEntries(self.allocator, argv);
+            return err;
+        };
+        if (!try self.openEditorTab(std.fs.path.basenamePosix(path), cwd, argv)) return;
+        const model = self.activeWorkspace();
+        const tab_id = model.activeTabId() orelse return;
+        if (model.focusedPaneSessionId(tab_id)) |session_id| self.prompts_editor = .{ .key = key, .session = session_id };
+        self.setPromptsStatus("{s} {s} in a new tab", .{ if (read_only) "viewing" else "editing", std.fs.path.basenamePosix(path) });
+    }
+
+    /// Apply: restart the agent so its harness reads the edited files at its
+    /// new session start, through the manager's restart (same harness, cwd,
+    /// prompt and task, a new agent id). A running agent is stopped first and
+    /// restarted once its exit arrives.
+    fn applyPrompts(self: *App) !void {
+        const id = self.prompts_agent orelse return;
+        const record = self.agents.registry.get(id) orelse return;
+        const name = self.agents.displayName(record);
+        if (agent.instructionProfile(record.harness).apply != .restart) {
+            self.setPromptsStatus("{s} reads its instructions at session start: edits take effect on the next session", .{name});
+            return self.refreshActiveUi();
+        }
+        if (record.ownership != .owned) {
+            self.setPromptsStatus("{s} runs in your terminal: restart it there", .{name});
+            return self.refreshActiveUi();
+        }
+        if (self.agents.restartable(id)) return self.restartFromPrompts(id);
+        if (record.hasExited()) {
+            self.setPromptsStatus("{s} cannot restart yet", .{name});
+            return self.refreshActiveUi();
+        }
+        self.prompts_restart = id;
+        self.hangUpAgent(record);
+        self.setPromptsStatus("stopping {s} to restart it with the updated instructions", .{name});
+        try self.refreshActiveUi();
+    }
+
+    fn restartFromPrompts(self: *App, id: agent.AgentId) !void {
+        const record = self.agents.registry.get(id) orelse return;
+        // A static name: it outlives the record the restart replaces.
+        const name = self.agents.displayName(record);
+        switch (try self.relaunchAgent(id)) {
+            .restarted => |runner| {
+                if (self.prompts_agent == id) self.prompts_agent = runner.agent_id;
+                self.setPromptsStatus("restarted {s} with the updated instructions", .{name});
+                self.refreshPrompts();
+            },
+            .refused => |reason| self.setPromptsStatus("{s} did not restart: {s}", .{ name, reason }),
+        }
+        if (self.promptsVisible()) try self.refreshActiveUi() else self.invalidateUi();
+    }
+
+    /// Every key while the prompts view is open: the view's own, nothing
+    /// else's (modal like the manager).
+    fn onPromptsKey(self: *App, key: platform.KeyEvent) !void {
+        var scratch: inputmod.TextScratch = .{};
+        const translated = translateAppKey(&self.composition, &scratch, key);
+        if (key.action != .press) {
+            _ = inputmod.resolve(&self.binding_state, key, translated, self.bindings);
+            return;
+        }
+        const identity = uiKeyIdentity(key) orelse return;
+        _ = self.ui_key_state.claim(identity, .none);
+        const plain = !key.mods.ctrl and !key.mods.alt and !key.mods.super;
+        if (!plain) return;
+        switch (key.key) {
+            .escape => try self.closePrompts(),
+            .up => try self.movePromptsSelection(.previous),
+            .down => try self.movePromptsSelection(.next),
+            .tab => try self.movePromptsSelection(if (key.mods.shift) .previous else .next),
+            .home => try self.movePromptsSelection(.first),
+            .end => try self.movePromptsSelection(.last),
+            .enter => try self.activatePromptsItem(self.prompts_selected),
+            else => {
+                if (key.mods.shift) return;
+                const codepoint = if (key.unshifted_codepoint != 0) key.unshifted_codepoint else key.codepoint;
+                switch (codepoint) {
+                    'a' => try self.applyPrompts(),
+                    'r' => {
+                        self.prompts_status_len = 0;
+                        self.refreshPrompts();
+                        try self.refreshActiveUi();
+                    },
+                    else => {},
+                }
+            },
+        }
+    }
+
+    const PromptsTarget = union(enum) { item: usize, apply, refresh };
+
+    fn promptsTarget(self: *const App, id: []const u8) ?PromptsTarget {
+        const agent_id = self.prompts_agent orelse return null;
+        var prefix_buffer: [prompts_id_capacity]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buffer, "agent.prompts.{d}.", .{@intFromEnum(agent_id)}) catch return null;
+        if (!std.mem.startsWith(u8, id, prefix)) return null;
+        const rest = id[prefix.len..];
+        if (std.mem.eql(u8, rest, "apply")) return .apply;
+        if (std.mem.eql(u8, rest, "refresh")) return .refresh;
+        if (paletteSemanticIndex(rest, "item.")) |index| return .{ .item = index };
+        return null;
+    }
+
+    fn activatePromptsElement(self: *App, id: []const u8) !void {
+        if (!self.promptsVisible()) return;
+        const target = self.promptsTarget(id) orelse return;
+        switch (target) {
+            .item => |index| try self.activatePromptsItem(index),
+            .apply => try self.applyPrompts(),
+            .refresh => {
+                self.prompts_status_len = 0;
+                self.refreshPrompts();
+                try self.refreshActiveUi();
+            },
+        }
+    }
+
+    /// Modal like the manager: pointer gestures inside it highlight and
+    /// activate its rows and controls, a press outside closes it, and every
+    /// gesture is owned through release.
+    fn handlePromptsUiEvent(self: *App, event: platform.Event) !bool {
+        const tree = self.activeUiTree();
+        switch (event) {
+            .mouse_motion => |motion| {
+                const point = devicePointerPoint(motion.x, motion.y, self.window.state.scale);
+                const before = uiInteractionState(tree);
+                tree.pointerMoved(point);
+                if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                return true;
+            },
+            .mouse_button => |button| {
+                const point = devicePointerPoint(button.x, button.y, self.window.state.scale);
+                switch (button.action) {
+                    .press => {
+                        self.prompts_pointer_owned = true;
+                        const bounds = self.promptsBounds();
+                        if (bounds == null or !self.pointInCellRect(point, bounds.?)) {
+                            try self.closePrompts();
+                            return true;
+                        }
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        tree.pointerPressed(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        return true;
+                    },
+                    .repeat => return true,
+                    .release => {
+                        if (!self.prompts_pointer_owned) return true;
+                        self.prompts_pointer_owned = false;
+                        if (button.button != .left) return true;
+                        const before = uiInteractionState(tree);
+                        const activation = tree.pointerReleased(point);
+                        if (!std.meta.eql(before, uiInteractionState(tree))) try self.refreshActiveUi();
+                        const requested = activation orelse return true;
+                        var id_storage: [prompts_id_capacity]u8 = undefined;
+                        if (requested.id.value.len > id_storage.len) return true;
+                        @memcpy(id_storage[0..requested.id.value.len], requested.id.value);
+                        try self.activatePromptsElement(id_storage[0..requested.id.value.len]);
+                        return true;
+                    },
+                }
+            },
+            .wheel => return true,
+            .key => return false,
+            // No field: text and composition reach nobody.
+            .text_input, .text_editing, .candidates => return true,
+            else => return false,
+        }
+    }
+
+    /// `agent.prompts`: from the agent view's prompts row (whose id names
+    /// the agent), the palette or a binding (the presented agent, else the
+    /// last one shown).
+    fn agentPromptsAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        var chosen: ?agent.AgentId = null;
+        if (invocation.origin) |origin| {
+            const prefix = "agent.view.";
+            if (std.mem.startsWith(u8, origin.value, prefix)) {
+                const rest = origin.value[prefix.len..];
+                const dot = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+                const raw = std.fmt.parseUnsigned(u64, rest[0..dot], 10) catch 0;
+                if (raw != 0) chosen = @enumFromInt(raw);
+            }
+        }
+        const id = chosen orelse self.defaultPromptsAgent() orelse {
+            self.setWorkspaceStatus("no agent to show prompts for");
+            try self.refreshActiveUi();
+            return;
+        };
+        try self.openPrompts(id);
+    }
+
+    fn agentPromptsActivateAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const origin = invocation.origin orelse return;
+        var id_storage: [prompts_id_capacity]u8 = undefined;
+        if (origin.value.len > id_storage.len) return;
+        @memcpy(id_storage[0..origin.value.len], origin.value);
+        try self.activatePromptsElement(id_storage[0..origin.value.len]);
     }
 
     // The backlog view (TASK-63, TASK-64) -------------------------------------
@@ -14438,7 +15211,7 @@ const App = struct {
         try self.composeSearchBar();
 
         const text = self.composition.preedit();
-        if (!self.paletteVisible() and !self.settingsVisible() and !self.managerVisible() and !self.search_visible and self.presentedAgentView() == null and
+        if (!self.paletteVisible() and !self.settingsVisible() and !self.managerVisible() and !self.promptsVisible() and !self.search_visible and self.presentedAgentView() == null and
             !self.backlogShown() and text.len != 0 and std.unicode.utf8ValidateSlice(text))
         {
             if (self.presentedLive().terminal().cursor().position) |cursor| {
@@ -14519,6 +15292,7 @@ const App = struct {
         if (self.contextMenuVisible()) try self.composeContextMenu();
         if (self.notificationsVisible()) try self.composeNotifications();
         if (self.managerVisible()) try self.composeManager();
+        if (self.promptsVisible()) try self.composePrompts();
         if (self.closeModalActive()) {
             const modal_width = @min(canvas_bounds.width, @as(u32, 42));
             const modal_height = @min(canvas_bounds.height, @as(u32, 7));
@@ -15123,6 +15897,11 @@ const App = struct {
         if (self.managerVisible()) {
             const terminal_owned = if (uiKeyIdentity(key)) |identity| self.terminal_key_state.indexOf(identity) != null else false;
             if (key.action == .press or !terminal_owned) return self.onManagerKey(key);
+        }
+        // And the prompts view (TASK-59).
+        if (self.promptsVisible()) {
+            const terminal_owned = if (uiKeyIdentity(key)) |identity| self.terminal_key_state.indexOf(identity) != null else false;
+            if (key.action == .press or !terminal_owned) return self.onPromptsKey(key);
         }
         if (try self.routeSearchKey(key)) return;
         if (try self.routeBacklogKey(key)) return;
@@ -16388,9 +17167,14 @@ const App = struct {
                 index += 1;
                 continue;
             }
-            // Branch lookups and harness detection borrow this workspace's
-            // context; its agents and notifications go with it.
+            // Branch lookups, harness detection and a prompts discovery
+            // borrow this workspace's context; its agents and notifications
+            // go with it.
             self.dropGitTracks(presentation.key);
+            if (self.prompts_job) |job| {
+                job.destroy();
+                self.prompts_job = null;
+            }
             self.agents.removeWorkspace(presentation.key);
             // Its token expires with it; a request still queued is refused.
             self.revokeControl(presentation);
@@ -17811,7 +18595,7 @@ const App = struct {
     }
 
     fn openSettings(self: *App) !void {
-        if (self.settingsVisible() or self.paletteVisible() or self.contextMenuVisible() or self.managerVisible() or
+        if (self.settingsVisible() or self.paletteVisible() or self.contextMenuVisible() or self.managerVisible() or self.promptsVisible() or
             self.closeModalActive() or self.rename_tab_id != null or self.sidebar_dragging or
             self.dragged_divider_id != null or self.dragged_tab_id != null) return;
         const canvas = self.ui_canvas.bounds();
@@ -18249,7 +19033,7 @@ const App = struct {
     }
 
     fn openPalette(self: *App) !void {
-        if (self.paletteVisible() or self.settingsVisible() or self.notificationsVisible() or self.managerVisible() or self.closeModalActive() or self.rename_tab_id != null or
+        if (self.paletteVisible() or self.settingsVisible() or self.notificationsVisible() or self.managerVisible() or self.promptsVisible() or self.closeModalActive() or self.rename_tab_id != null or
             self.ui_key_state.len != 0 or self.terminal_key_state.len != 0 or
             self.ui_pointer_owned or self.scratchpad_ui_pointer_owned or
             self.scratchpad_terminal_pointer_owned or self.terminal_pointer_presses != 0 or
@@ -19050,6 +19834,10 @@ const App = struct {
             self.invalidateUi();
             changed = true;
         }
+        if (self.pollPrompts()) {
+            self.invalidateUi();
+            changed = true;
+        }
         if (self.pollBacklog()) {
             self.invalidateUi();
             changed = true;
@@ -19783,7 +20571,7 @@ const App = struct {
             try self.refreshActiveUi();
             return;
         }
-        if (self.paletteVisible() or self.settingsVisible() or self.managerVisible() or self.search_visible) return;
+        if (self.paletteVisible() or self.settingsVisible() or self.managerVisible() or self.promptsVisible() or self.search_visible) return;
         // A view is not a terminal: text typed over it reaches nobody.
         if (self.presentedAgentView() != null or self.backlogShown()) return;
         self.presentedLive().terminal().userInput();
@@ -20129,6 +20917,14 @@ const App = struct {
             },
             else => {},
         };
+        if (!self.promptsVisible() and self.prompts_pointer_owned) switch (event) {
+            .mouse_motion => return true,
+            .mouse_button => |button| {
+                if (button.action == .release) self.prompts_pointer_owned = false;
+                return true;
+            },
+            else => {},
+        };
         if (!self.backlogShown() and self.backlog_pointer_owned) switch (event) {
             .mouse_motion => return true,
             .mouse_button => |button| {
@@ -20140,6 +20936,7 @@ const App = struct {
         if (self.contextMenuVisible()) return self.handleContextMenuUiEvent(event);
         if (self.notificationsVisible()) return self.handleNotificationsUiEvent(event);
         if (self.managerVisible()) return self.handleManagerUiEvent(event);
+        if (self.promptsVisible()) return self.handlePromptsUiEvent(event);
         if (self.paletteVisible()) return self.handlePaletteUiEvent(event);
         if (self.settingsVisible()) return self.handleSettingsUiEvent(event);
         if (self.search_visible) return self.handleSearchUiEvent(event);
@@ -22240,7 +23037,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 81 and
+    failures += reportCheck(out, registered_actions.len == 83 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -22321,7 +23118,9 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[77].name, agents_activate_action) and
         std.mem.eql(u8, registered_actions[78].name, backlog_open_action) and
         std.mem.eql(u8, registered_actions[79].name, backlog_activate_action) and
-        std.mem.eql(u8, registered_actions[80].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager, backlog and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[80].name, agent_prompts_action) and
+        std.mem.eql(u8, registered_actions[81].name, agent_prompts_activate_action) and
+        std.mem.eql(u8, registered_actions[82].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager, backlog, prompts and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
@@ -26826,6 +27625,14 @@ const AgentWait = union(enum) {
     fake_input: struct { agent: agent.AgentId, text: []const u8 },
     /// The session's child is a running process (a restart's new child).
     child_running: struct { key: workspace.WorkspaceKey, session: session.SessionId },
+    /// The session's tracked cwd is `cwd` (TASK-59).
+    session_cwd: struct { key: workspace.WorkspaceKey, session: session.SessionId, cwd: []const u8 },
+    /// The prompts view lists the file at `path` with `size` bytes.
+    prompts_item_size: struct { path: []const u8, size: u64 },
+    /// The editor the prompts view opened has exited.
+    prompts_editor_closed,
+    /// The prompts view follows a new agent in place of `old` (a restart).
+    prompts_agent_replaced: agent.AgentId,
 };
 
 const AgentOsTrace = struct {
@@ -26863,6 +27670,15 @@ fn agentWaitMet(self: *App, trace: *const AgentOsTrace, condition: AgentWait) bo
             const child = live.child() orelse break :running false;
             break :running child.state() == .running;
         },
+        .session_cwd => |want| cwd: {
+            const model = self.workspace_registry.byKey(want.key) orelse break :cwd false;
+            const live = model.sessionById(want.session) orelse break :cwd false;
+            const actual = live.workingDirectory() orelse break :cwd false;
+            break :cwd std.mem.eql(u8, actual, want.cwd);
+        },
+        .prompts_item_size => |want| promptsItemSize(self, want.path) == want.size and self.prompts_job == null,
+        .prompts_editor_closed => self.prompts_editor == null,
+        .prompts_agent_replaced => |old| if (self.prompts_agent) |current| current != old else false,
     };
 }
 
@@ -27314,6 +28130,245 @@ fn agentManagerTest(self: *App, io: Io, out: *Writer) !u8 {
     out.print("agent-manager-test: {d} failure(s)\n", .{failures}) catch {};
     out.flush() catch {};
     return if (failures == 0) 0 else 1;
+}
+
+// --agent-prompts-test (TASK-59) -------------------------------------------------
+
+fn promptsCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("agent-prompts-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    out.flush() catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// The first tab of `--agent-prompts-test` claims the fixture project as
+/// its cwd with OSC 7 (beside the agent-test trigger), then runs
+/// `--agent-test`'s loop, so an agent launched from it starts there.
+const agent_prompts_test_script =
+    "d=$(dirname \"$" ++ agent_test_trigger_env ++ "\")/project; " ++
+    "printf '\\033]7;file://localhost%s\\007' \"$d\"; " ++ agent_test_script;
+
+const prompts_test_prompt = "TASK-9: tidy the project rules";
+
+/// The row of the open prompts view whose label contains `text`.
+fn promptsRow(self: *const App, text: []const u8) ?*const ui.Element {
+    const id = self.prompts_agent orelse return null;
+    var prefix_buffer: [prompts_id_capacity]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buffer, "agent.prompts.{d}.item.", .{@intFromEnum(id)}) catch return null;
+    return viewElement(self, prefix, text);
+}
+
+/// The listed size of the file item at `path`.
+fn promptsItemSize(self: *const App, path: []const u8) ?u64 {
+    const list = &(self.prompts_list orelse return null);
+    const item = list.fileAt(path) orelse return null;
+    return item.size;
+}
+
+/// Exercise TASK-59 through real PTYs and SDL events: the fake agent
+/// (impersonating Claude Code) launched with a prompt in a fixture project,
+/// its prompts view opened from the palette and from the agent view's row,
+/// every row's editability and reason, an editable file opened in vi in a
+/// new tab and saved, the row refreshed when the editor exits, a harness-owned
+/// file opened read-only, "restart with updated instructions" restarting the
+/// agent with its task, and modal isolation.
+fn agentPromptsTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    var os_trace: AgentOsTrace = .{};
+    self.agents.notifier = .{ .context = &os_trace, .notify_fn = AgentOsTrace.record };
+    defer self.agents.notifier = .{ .notify_fn = App.discardOsNotification };
+    var editor_trace: EditorSpawnTrace = .{};
+    self.editor_spawn_observer = .{ .context = &editor_trace, .observe_fn = recordEditorSpawn };
+    defer self.editor_spawn_observer = .{};
+    const test_dir = self.agentTestDir() orelse return 1;
+
+    // The fixture: a project with Claude Code's files and an AGENTS.md
+    // Claude Code does not read, and a private home with a user file.
+    var paths: [8][path_capacity]u8 = undefined;
+    const project = try std.fmt.bufPrint(&paths[0], "{s}/project", .{test_dir});
+    const home = try std.fmt.bufPrint(&paths[1], "{s}/home", .{test_dir});
+    const claude_md = try std.fmt.bufPrint(&paths[2], "{s}/CLAUDE.md", .{project});
+    const reviewer = try std.fmt.bufPrint(&paths[3], "{s}/.claude/agents/reviewer.md", .{project});
+    const settings = try std.fmt.bufPrint(&paths[4], "{s}/.claude/settings.json", .{project});
+    const agents_md = try std.fmt.bufPrint(&paths[5], "{s}/AGENTS.md", .{project});
+    const user_md = try std.fmt.bufPrint(&paths[6], "{s}/.claude/CLAUDE.md", .{home});
+    try Dir.cwd().createDirPath(io, std.fs.path.dirnamePosix(reviewer).?);
+    try Dir.cwd().createDirPath(io, std.fs.path.dirnamePosix(user_md).?);
+    const claude_text = "# Project rules\n\nBe brief.\n";
+    try Dir.cwd().writeFile(io, .{ .sub_path = claude_md, .data = claude_text });
+    try Dir.cwd().writeFile(io, .{ .sub_path = reviewer, .data = "---\nname: reviewer\n---\nReview every diff.\n" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = settings, .data = "{}\n" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = agents_md, .data = "# Codex rules\n" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = user_md, .data = "# Mine\n" });
+    // The user-level files are looked for in the check's own home, never the
+    // person's.
+    const saved_home = self.home_dir;
+    self.home_dir = home;
+    defer self.home_dir = saved_home;
+
+    try self.drawFrame();
+    const model = self.activeWorkspace();
+    const key = self.workspace_registry.activeKey() orelse return 1;
+    const first_tab = model.activeTabId() orelse return 1;
+    const first_session = model.focusedPaneSessionId(first_tab) orelse return 1;
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "AGENT-TEST-READY" }), "the first tab's real PTY peer became ready", .{});
+    const cwd_ok = try waitForAgent(self, io, out, &os_trace, .{ .session_cwd = .{ .key = key, .session = first_session, .cwd = project } });
+    promptsCheck(out, &failures, cwd_ok, "the first tab's OSC 7 made the fixture project its cwd", .{});
+
+    // The fake agent, launched by keyboard through the palette with a prompt.
+    _ = try paletteChord(self, io, out);
+    _ = try postPaletteText(self, io, out, "Agent: launch");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try postPaletteText(self, io, out, prompts_test_prompt);
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.idle" }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-AGENT-READY" }), "the fake agent launched with a prompt in its own tab", .{});
+    const agent_tab = model.activeTabId() orelse return 1;
+    const agent_session = model.focusedPaneSessionId(agent_tab) orelse return 1;
+    const first_runner = self.agents.runnerForSession(key, agent_session) orelse return 1;
+    const first_agent = first_runner.agent_id orelse return 1;
+    promptsCheck(out, &failures, std.mem.eql(u8, first_runner.cwd, project) and
+        std.mem.eql(u8, first_runner.prompt orelse "", prompts_test_prompt), "it started in the fixture project with the typed prompt", .{});
+    _ = try agentTypeLine(self, io, out, "go");
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.done" }), "one step released the human's message and the end of the turn", .{});
+
+    // AC1 by palette: every row says what it is and whether it can change.
+    _ = try paletteChord(self, io, out);
+    _ = try postPaletteText(self, io, out, "Agent: prompts");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    var dialog_buffer: [prompts_id_capacity]u8 = undefined;
+    const dialog_id = try std.fmt.bufPrint(&dialog_buffer, "agent.prompts.{d}", .{@intFromEnum(first_agent)});
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = dialog_id }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .role_label = .{ .prefix = "agent.prompts.", .text = "CLAUDE.md" } }), "Agent: prompts and instructions opened {s} from the palette", .{dialog_id});
+    const expected_rows = [_]struct { name: []const u8, tail: []const u8 }{
+        .{ .name = "▤ CLAUDE.md", .tail = "  editable" },
+        .{ .name = "▤ ~/.claude/CLAUDE.md", .tail = "  editable" },
+        .{ .name = "◆ .claude/agents/reviewer.md", .tail = "  editable" },
+        .{ .name = "⚙ .claude/settings.json", .tail = "read-only · harness-owned" },
+        .{ .name = "· system prompt", .tail = "read-only · not exposed by this harness" },
+        .{ .name = "launch › " ++ prompts_test_prompt, .tail = "read-only · sent" },
+        .{ .name = "you › " ++ app_agents.fake_prompts_message, .tail = "read-only · sent" },
+    };
+    for (expected_rows) |row| {
+        const element = promptsRow(self, row.name);
+        promptsCheck(out, &failures, element != null and std.mem.endsWith(u8, element.?.label, row.tail), "a row '{s}' ending '{s}'", .{ row.name, row.tail });
+    }
+    promptsCheck(out, &failures, promptsRow(self, "AGENTS.md") == null, "AGENTS.md, which Claude Code does not read, is not listed", .{});
+    var apply_buffer: [prompts_id_capacity]u8 = undefined;
+    const apply_id = try std.fmt.bufPrint(&apply_buffer, "agent.prompts.{d}.apply", .{@intFromEnum(first_agent)});
+    promptsCheck(out, &failures, if (self.ui_tree.byId(.{ .value = apply_id })) |element|
+        std.mem.eql(u8, element.label, prompts_apply_label) and element.primitive.isInteractive()
+    else
+        false, "Claude Code offers '{s}' as its apply action", .{prompts_apply_label});
+    try self.drawFrame();
+    const screenshot_pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(screenshot_pixels);
+
+    // Modal isolation: an unused key and the new-tab chord do nothing beneath.
+    const presented = model.sessionById(self.presentedSessionId()) orelse return 1;
+    const sent_before = presented.pendingResponseBytes();
+    const routes_before = self.terminal_key_route_count;
+    const tabs_before = model.tabCount();
+    _ = try postKey(self, io, out, 'x', .{});
+    _ = try postKey(self, io, out, 't', switch (self.binding_profile) {
+        .macos => .{ .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    });
+    promptsCheck(out, &failures, self.promptsVisible() and presented.pendingResponseBytes() == sent_before and
+        self.terminal_key_route_count == routes_before and model.tabCount() == tabs_before, "an unused key and the new-tab chord stayed inside the view", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element_absent = dialog_id }), "Escape closed the view", .{});
+
+    // AC1 from the agent view: its prompts row, clicked.
+    _ = try viewChordKey(self, io, out, 'a');
+    var row_buffer: [agent_view_id_capacity]u8 = undefined;
+    const prompts_row = try std.fmt.bufPrint(&row_buffer, "agent.view.{d}.prompts", .{@intFromEnum(first_agent)});
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = prompts_row, .text = agent_view.prompts_row_label } }), "the agent view leads with its prompts row", .{});
+    _ = try clickTabsElement(self, io, out, prompts_row);
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = dialog_id }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .role_label = .{ .prefix = "agent.prompts.", .text = "CLAUDE.md" } }), "a click on the row opened the same view", .{});
+
+    // AC2: Enter on CLAUDE.md opens vi on it in a new tab; an edit saved
+    // there is the row's new size once the editor exits.
+    _ = try postNamedKey(self, io, out, .home, .{});
+    const tabs_before_edit = model.tabCount();
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    var argv_buffer: [path_capacity + 16]u8 = undefined;
+    const expected_argv = try std.fmt.bufPrint(&argv_buffer, "vi -- {s}", .{claude_md});
+    promptsCheck(out, &failures, !self.promptsVisible() and editor_trace.calls == 1 and std.mem.eql(u8, editor_trace.argv(), expected_argv) and
+        model.tabCount() == tabs_before_edit + 1, "Enter opened '{s}' in a new tab through the workspace context", .{editor_trace.argv()});
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "Be brief." }), "vi shows the file", .{});
+    _ = try agentTypeKeys(self, io, out, "Go");
+    _ = try agentTypeKeys(self, io, out, "Edited in Conduit.");
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try agentTypeKeys(self, io, out, ":wq");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    const edited_size = claude_text.len + "Edited in Conduit.\n".len;
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .prompts_item_size = .{ .path = claude_md, .size = edited_size } }), "the editor's exit re-read the list: CLAUDE.md is now {d} bytes", .{edited_size});
+    var read_buffer: [256]u8 = undefined;
+    const saved = Dir.cwd().readFile(io, claude_md, &read_buffer) catch "";
+    promptsCheck(out, &failures, std.mem.endsWith(u8, saved, "Be brief.\nEdited in Conduit.\n"), "the file holds the edit", .{});
+
+    // Reopen by palette: the row shows the new size.
+    _ = try clickTabsElement(self, io, out, "workspace.1.tab.2");
+    _ = try waitForAgent(self, io, out, &os_trace, .{ .active_tab = agent_tab });
+    _ = try paletteChord(self, io, out);
+    _ = try postPaletteText(self, io, out, "Agent: prompts");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    var size_buffer: [24]u8 = undefined;
+    var size_text_buffer: [48]u8 = undefined;
+    const size_text = try std.fmt.bufPrint(&size_text_buffer, "{s}  editable", .{agent_prompts.formatSize(&size_buffer, edited_size)});
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = dialog_id }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .role_label = .{ .prefix = "agent.prompts.", .text = size_text } }), "the reopened view lists CLAUDE.md at '{s}'", .{size_text});
+
+    // AC3: the harness-owned settings file opens read-only (`vi -R`).
+    const settings_row = promptsRow(self, "⚙ .claude/settings.json");
+    var settings_id: [prompts_id_capacity]u8 = undefined;
+    const settings_id_text = if (settings_row) |element| try std.fmt.bufPrint(&settings_id, "{s}", .{element.id.value}) else "";
+    _ = try clickTabsElement(self, io, out, settings_id_text);
+    var view_argv_buffer: [path_capacity + 16]u8 = undefined;
+    const view_argv = try std.fmt.bufPrint(&view_argv_buffer, "vi -R -- {s}", .{settings});
+    promptsCheck(out, &failures, editor_trace.calls == 2 and std.mem.eql(u8, editor_trace.argv(), view_argv), "a click on the settings row viewed it read-only: '{s}'", .{editor_trace.argv()});
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "{}" }), "vi shows the settings file", .{});
+    _ = try agentTypeKeys(self, io, out, ":q");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try waitForAgent(self, io, out, &os_trace, .{ .prompts_editor_closed = {} });
+
+    // Apply, by mouse: the running agent is stopped and restarted under a
+    // new id in its own tab, with the same task prompt.
+    _ = try clickTabsElement(self, io, out, "workspace.1.tab.2");
+    _ = try waitForAgent(self, io, out, &os_trace, .{ .active_tab = agent_tab });
+    _ = try paletteChord(self, io, out);
+    _ = try postPaletteText(self, io, out, "Agent: prompts");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try waitForAgent(self, io, out, &os_trace, .{ .element = apply_id });
+    _ = try clickTabsElement(self, io, out, apply_id);
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .prompts_agent_replaced = first_agent }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .child_running = .{ .key = key, .session = agent_session } }), "'{s}' restarted the agent under a new id in its own tab", .{prompts_apply_label});
+    const restarted = self.agents.runnerForSession(key, agent_session);
+    promptsCheck(out, &failures, if (restarted) |runner|
+        runner.agent_id != first_agent and std.mem.eql(u8, runner.prompt orelse "", prompts_test_prompt) and std.mem.eql(u8, runner.cwd, project)
+    else
+        false, "the restarted agent keeps its task prompt and project", .{});
+    promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-AGENT-READY" }), "the restarted agent's process is running", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    promptsCheck(out, &failures, !self.promptsVisible(), "Escape closed the view again", .{});
+
+    var screenshot_path_buffer: [path_capacity]u8 = undefined;
+    var id_buffer: [path_capacity]u8 = undefined;
+    const screenshot_path = try std.fmt.bufPrint(&screenshot_path_buffer, "{s}{c}agent-prompts-test-{s}.png", .{ fallback_log_dir, std.fs.path.sep, try generateRunId(io, &id_buffer) });
+    try writePngOffThread(self.allocator, io, screenshot_path, screenshot_pixels, self.size);
+    out.print("agent-prompts-test: screenshot {s}\n", .{screenshot_path}) catch {};
+    out.print("agent-prompts-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
+/// Type `text` into whatever has keyboard focus, through SDL, without a
+/// trailing Enter.
+fn agentTypeKeys(self: *App, io: Io, out: *Writer, text: [:0]const u8) !bool {
+    try self.window.postTextInput(text);
+    return pumpUntil(self, io, out, .text_input, self_test_event_budget_ms);
 }
 
 // --backlog-test (TASK-63, TASK-64) ----------------------------------------------
@@ -30587,6 +31642,9 @@ const usage =
     \\  --agent-manager-test               drive the agent manager over two workspaces:
     \\                                    live rows, focus, message, stop, restart and
     \\                                    a new agent by keyboard and mouse, then exit
+    \\  --agent-prompts-test               drive an agent's prompts view over a fixture
+    \\                                    project: rows, edit in vi, read-only view and
+    \\                                    restart, by keyboard and mouse, then exit
     \\  --backlog-test                     drive the backlog view over a fixture project
     \\                                    and a fake backlog CLI: board, list, detail,
     \\                                    writes, live reloads and a task's agent
@@ -31277,6 +32335,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try agentViewTest(app, init.io, out);
     } else if (options.run.agent_manager_test) {
         check_status = try agentManagerTest(app, init.io, out);
+    } else if (options.run.agent_prompts_test) {
+        check_status = try agentPromptsTest(app, init.io, out);
     } else if (options.run.backlog_test) {
         check_status = try backlogTest(app, init.io, out);
     } else if (options.run.agent_test) {
@@ -31784,6 +32844,29 @@ test "--backlog-test runs in --agent-test's environment" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "--backlog-test") != null);
     const options = optionsForRun(parsed);
     try std.testing.expect(options.run.hidden and wantsChild(options) and usesDeterministicScratchpad(options));
+}
+
+test "--agent-prompts-test runs in --agent-test's environment" {
+    const env = test_env{ .vars = &.{.{ "HOME", "/home/u" }} };
+    const parsed = try parseArgs(&.{ "conduit", "--agent-prompts-test" }, env.source());
+    try std.testing.expect(parsed.run.agent_test and parsed.run.agent_prompts_test and !parsed.run.agent_manager_test);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--agent-prompts-test") != null);
+    const options = optionsForRun(parsed);
+    try std.testing.expect(options.run.hidden and wantsChild(options) and usesDeterministicScratchpad(options));
+}
+
+test "an instruction file opens shell-free in vi, read-only for a harness-owned one" {
+    const editable = try buildInstructionEditorArgv(std.testing.allocator, "/p/CLAUDE.md", false);
+    defer freeEntries(std.testing.allocator, editable);
+    try std.testing.expectEqual(@as(usize, 3), editable.len);
+    try std.testing.expectEqualStrings("vi", editable[0]);
+    try std.testing.expectEqualStrings("--", editable[1]);
+    try std.testing.expectEqualStrings("/p/CLAUDE.md", editable[2]);
+    const viewed = try buildInstructionEditorArgv(std.testing.allocator, "-rf", true);
+    defer freeEntries(std.testing.allocator, viewed);
+    try std.testing.expectEqualStrings("-R", viewed[1]);
+    try std.testing.expectEqualStrings("--", viewed[2]);
+    try std.testing.expectEqualStrings("-rf", viewed[3]);
 }
 
 test "--agent-manager-test runs in --agent-test's environment" {

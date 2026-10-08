@@ -765,6 +765,30 @@ pub const SessionMatch = union(enum) {
     session_id: SessionId,
 };
 
+// Instructions (TASK-59) ---------------------------------------------------------
+
+/// Where Claude Code reads its instructions, from its memory documentation
+/// (doc-3): `CLAUDE.md` in the cwd and every directory above it (also as
+/// `.claude/CLAUDE.md` and the personal `CLAUDE.local.md`), the user's
+/// `~/.claude/CLAUDE.md`, project and user subagents under `agents/`, and
+/// the settings files Claude Code owns. Memory is read when a session
+/// starts, so restarting the agent applies an edit; the system prompt
+/// itself is not exposed (`--append-system-prompt` adds to it, unread).
+pub const instruction_profile: api.InstructionProfile = .{
+    .sources = &.{
+        .{ .base = .project_tree, .path = "CLAUDE.md", .list_missing = true },
+        .{ .base = .project_tree, .path = ".claude/CLAUDE.md" },
+        .{ .base = .project_tree, .path = "CLAUDE.local.md" },
+        .{ .base = .home, .path = ".claude/CLAUDE.md" },
+        .{ .base = .project, .path = ".claude/agents/*.md", .kind = .subagent },
+        .{ .base = .home, .path = ".claude/agents/*.md", .kind = .subagent },
+        .{ .base = .project, .path = ".claude/settings.json", .kind = .settings },
+        .{ .base = .project, .path = ".claude/settings.local.json", .kind = .settings },
+        .{ .base = .home, .path = ".claude/settings.json", .kind = .settings },
+    },
+    .apply = .restart,
+};
+
 // The adapter ------------------------------------------------------------------
 
 pub const Options = struct {

@@ -252,6 +252,21 @@ pub const SinkTransport = struct {
     }
 };
 
+/// Where Pi reads its instructions (TASK-59), from its `--help` (doc-3):
+/// context files `AGENTS.md` and `CLAUDE.md` along the project hierarchy
+/// (`--no-context-files` turns them off) and the global
+/// `~/.pi/agent/AGENTS.md` (`PI_CODING_AGENT_DIR` moves it and is not
+/// followed here). Pi reads them when a session starts; an edit takes effect
+/// on the next session. Pi has no subagents and no settings file Conduit
+/// shows.
+pub const instruction_profile: iface.InstructionProfile = .{
+    .sources = &.{
+        .{ .base = .project_tree, .path = "AGENTS.md", .list_missing = true },
+        .{ .base = .project_tree, .path = "CLAUDE.md" },
+        .{ .base = .home, .path = ".pi/agent/AGENTS.md" },
+    },
+};
+
 pub const Options = struct {
     variant: Variant = .pi,
     /// The channel for an attached session; `launch` sets it from

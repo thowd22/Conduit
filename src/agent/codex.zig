@@ -880,6 +880,21 @@ pub const Mode = enum {
     stdio,
 };
 
+/// Where Codex reads its instructions (TASK-59), from its AGENTS.md
+/// documentation (doc-3): `AGENTS.override.md` and `AGENTS.md` along the
+/// project hierarchy, the global `~/.codex/AGENTS.md`, and the
+/// `~/.codex/config.toml` Codex owns. Codex reads them when a thread starts;
+/// an edit takes effect on the next session. `$CODEX_HOME` overrides `~/.codex`
+/// and is not followed here.
+pub const instruction_profile: adapter_mod.InstructionProfile = .{
+    .sources = &.{
+        .{ .base = .project_tree, .path = "AGENTS.md", .list_missing = true },
+        .{ .base = .project_tree, .path = "AGENTS.override.md" },
+        .{ .base = .home, .path = ".codex/AGENTS.md" },
+        .{ .base = .home, .path = ".codex/config.toml", .kind = .settings },
+    },
+};
+
 pub const Options = struct {
     /// The channel to the app-server, borrowed; the adapter connects it in
     /// `attach` and closes it in `deinit`.
