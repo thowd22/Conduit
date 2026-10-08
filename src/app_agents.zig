@@ -1447,9 +1447,16 @@ pub const Runtime = struct {
     choice_count: usize = 0,
     unavailable_logged: bool = false,
     /// The `conduit` executable Claude Code hooks run as `conduit control
-    /// agent.event` while this run's control endpoint is up (TASK-60); null
+    /// agent.event` while this run's control endpoint is up (TASK-60), and
+    /// on Windows always, where there is no relay shell (TASK-82); null
     /// keeps them on the sink relay. Borrowed for the runtime's life.
     control_helper: ?[]const u8 = null,
+    /// Owner thread: agent event lines the control endpoint delivered
+    /// (`ingestControlEvent`), for checks and diagnostics.
+    control_events_ingested: u64 = 0,
+    /// Checks only: the program a Claude Code agent runs instead of
+    /// `claude` (`--control-test`'s stand-in harness). Borrowed.
+    claude_program: ?[]const u8 = null,
     /// How the runtime asks the app what runs in a session (observed agents).
     probe: SessionProbe = .{},
     watches: std.ArrayList(Watch) = .empty,
@@ -1785,6 +1792,7 @@ pub const Runtime = struct {
                         .probe_env = request.probe_env,
                         .sink_io = runner.sink,
                         .control_helper = self.control_helper,
+                        .program = self.claude_program orelse "claude",
                         .observe = if (request.observed_pid) |pid| .{ .pid = pid, .cwd = runner.cwd } else null,
                     }) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -1937,23 +1945,18 @@ pub const Runtime = struct {
         // The control server re-encodes the payload compactly, so a raw
         // newline cannot be in it; refuse one anyway rather than split lines.
         if (payload_json.len == 0 or std.mem.indexOfAny(u8, payload_json, "\r\n") != null) return error.Rejected;
-        // The sink is this machine's private state, which only a Local
-        // agent has; the control endpoint does not exist on Windows yet.
-        if (comptime builtin.os.tag == .windows) return error.Unavailable;
         var path_buffer: [Dir.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ runner.sink_dir, agent.pi.events_file_name }) catch return error.Rejected;
         const line = self.allocator.alloc(u8, payload_json.len + 1) catch return error.Rejected;
         defer self.allocator.free(line);
         @memcpy(line[0..payload_json.len], payload_json);
         line[payload_json.len] = '\n';
-        // O_APPEND and one write: the relay script appends to the same file
-        // (`cat >> events.jsonl`), and an append of the whole line at once
-        // can never interleave with or overwrite one of its lines.
-        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true, .CLOEXEC = true }, 0o600) catch
-            return error.Rejected;
-        defer _ = std.posix.system.close(fd);
-        const written = std.posix.system.write(fd, line.ptr, line.len);
-        if (std.posix.errno(written) != .SUCCESS or @as(usize, @intCast(written)) != line.len) return error.Rejected;
+        // One append-mode write (O_APPEND, or FILE_APPEND_DATA on Windows):
+        // the relay script appends to the same file (`cat >> events.jsonl`),
+        // and an append of the whole line at once can never interleave with
+        // or overwrite one of its lines.
+        platform.appendToFile(path, line) catch return error.Rejected;
+        self.control_events_ingested += 1;
     }
 
     fn removeRunner(self: *Runtime, runner: *Runner) void {

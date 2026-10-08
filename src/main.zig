@@ -282,6 +282,11 @@ pub const CliCommand = union(enum) {
         event: ?[]const u8 = null,
         /// `--agent=<token>`: the agent token instead of `$CONDUIT_AGENT_TOKEN`.
         agent: ?[]const u8 = null,
+        /// `agent.permission --wait`: block until the human answers
+        /// (TASK-82, the Windows `PermissionRequest` hook).
+        wait: bool = false,
+        /// `--wait-ms=<n>`: how long `--wait` waits; the hook's bound when 0.
+        wait_ms: u32 = 0,
     },
 
     /// The instance method this command forwards, or null for `control`.
@@ -865,6 +870,11 @@ pub fn parseCommand(words: []const []const u8) ConfigError!CliCommand {
             } else if (std.mem.startsWith(u8, word, "--agent=")) {
                 parsed.agent = word["--agent=".len..];
                 if (parsed.agent.?.len == 0) return error.MissingValue;
+            } else if (std.mem.eql(u8, word, "--wait")) {
+                parsed.wait = true;
+            } else if (std.mem.startsWith(u8, word, "--wait-ms=")) {
+                parsed.wait_ms = std.fmt.parseInt(u32, word["--wait-ms=".len..], 10) catch return error.MissingValue;
+                if (parsed.wait_ms == 0) return error.MissingValue;
             } else if (parsed.params == null and (word.len == 0 or word[0] != '-')) {
                 parsed.params = word;
             } else return error.UnexpectedArgument;
@@ -1889,7 +1899,13 @@ const ChildSpec = struct {
             try variables.put(agent_test_trigger_env, try std.fmt.bufPrint(&trigger_buffer, "{s}/trigger", .{dir}));
         }
         var default_buffer: [path_capacity]u8 = undefined;
-        const shell: ?[]const u8 = if (command) |line| blk: {
+        const shell: ?[]const u8 = if (builtin.os.tag == .windows and options.run.control_test) blk: {
+            // `--control-test` on Windows (TASK-82): its tabs, panes and
+            // scratchpad are the shell a Windows person has, PowerShell 7,
+            // with the check's prompt and no profile.
+            for (control_test_windows_argv) |arg| try put(allocator, &argv, arg);
+            break :blk null;
+        } else if (command) |line| blk: {
             // `/bin/sh` rather than `$SHELL`: a line to run is a script, and a
             // script should not depend on which login shell the person running
             // it happens to have. A script is not an interactive shell, so it
@@ -2119,6 +2135,16 @@ fn currentUid() u32 {
 /// Where this run's control and instance sockets live: `<override>/conduit`
 /// for `--control-test`, else `control_api.runtimeDirectory`.
 fn controlRuntimeDir(buffer: []u8, env: EnvSource, override: ?[]const u8) ?[]const u8 {
+    var user_buffer: [192]u8 = undefined;
+    if (comptime builtin.os.tag == .windows) {
+        // Pipe names, not a directory: the override (a check's private
+        // directory, which its tabs see as XDG_RUNTIME_DIR) isolates them
+        // exactly as XDG_RUNTIME_DIR does for every client.
+        return control_api.runtimeDirectory(buffer, .windows, .{
+            .xdg_runtime_dir = override orelse env.get("XDG_RUNTIME_DIR"),
+            .windows_user = platform.currentUserId(&user_buffer),
+        });
+    }
     if (override) |dir| return std.fmt.bufPrint(buffer, "{s}/conduit", .{dir}) catch null;
     return control_api.runtimeDirectory(buffer, builtin.os.tag, .{
         .xdg_runtime_dir = env.get("XDG_RUNTIME_DIR"),
@@ -2128,8 +2154,16 @@ fn controlRuntimeDir(buffer: []u8, env: EnvSource, override: ?[]const u8) ?[]con
 }
 
 /// `<state directory>/instance.token`, beside `state.json`. `state_home`
-/// stands in for `$XDG_STATE_HOME` (`--control-test`).
+/// stands in for `$XDG_STATE_HOME` (`--control-test`). On Windows an
+/// `XDG_STATE_HOME` (which `conduit-test launch` and `--control-test` set)
+/// comes before `%LOCALAPPDATA%`, so an isolated run's token file is its own,
+/// like its pipe names.
 fn instanceTokenPath(buffer: []u8, env: EnvSource, state_home: ?[]const u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        if (state_home orelse env.get("XDG_STATE_HOME")) |dir| if (dir.len != 0) {
+            return std.fmt.bufPrint(buffer, "{s}\\conduit\\{s}", .{ std.mem.trimEnd(u8, dir, "\\/"), control_api.instance_token_file_name }) catch null;
+        };
+    }
     var state_buffer: [path_capacity]u8 = undefined;
     const state_path = state_mod.statePath(&state_buffer, builtin.os.tag, .{
         .xdg_state_home = state_home orelse env.get("XDG_STATE_HOME"),
@@ -5398,6 +5432,12 @@ fn agentSinkRoot(io: Io, env: EnvSource, options: Options, buffer: []u8) ?[]cons
     if (env.get("XDG_STATE_HOME")) |state| {
         if (state.len != 0 and state[0] == '/') return std.fmt.bufPrint(buffer, "{s}/conduit/agents/{s}", .{ state, id }) catch null;
     }
+    // Windows: the per-user local application data, which only the user can
+    // read; its agents' hooks find the sink through CONDUIT_AGENT_SINK, never
+    // a path in a command (TASK-82).
+    if (comptime builtin.os.tag == .windows) if (env.get("LOCALAPPDATA")) |base| {
+        if (agent.claude_code.isValidWindowsPath(base)) return std.fmt.bufPrint(buffer, "{s}\\conduit\\agents\\{s}", .{ std.mem.trimEnd(u8, base, "\\/"), id }) catch null;
+    };
     const home = env.get("HOME") orelse return null;
     if (home.len == 0 or home[0] != '/') return null;
     return std.fmt.bufPrint(buffer, "{s}/.local/state/conduit/agents/{s}", .{ home, id }) catch null;
@@ -8004,6 +8044,14 @@ const App = struct {
     /// `--control-test` never start them, so a check run cannot answer the
     /// person's `conduit` commands. Failures cost the API, never the run.
     fn startControl(self: *App, env: EnvSource, options: Options) void {
+        if (comptime builtin.os.tag == .windows) {
+            // Windows has no `/bin/sh` for the hook relay, so Claude Code's
+            // hooks always run this executable, which delivers over the
+            // endpoint when it runs and appends to the agent's sink when it
+            // does not (TASK-82).
+            self.ensureSelfExe();
+            self.agents.control_helper = self.self_exe;
+        }
         self.control_pending.ensureTotalCapacity(self.allocator, control_pending_capacity) catch |err| {
             log.warn("the control endpoint is off: {s}", .{@errorName(err)});
             return;
@@ -8018,32 +8066,41 @@ const App = struct {
             log.info("no runtime directory for the control endpoint; it is off", .{});
             return;
         };
-        _ = Dir.cwd().createDirPathStatus(self.io, dir, privateArtifactPermissions(true)) catch |err| {
-            log.warn("the control endpoint's directory could not be created: {s}", .{@errorName(err)});
-            return;
-        };
+        // A Windows runtime "directory" is a pipe-name prefix (TASK-82).
+        if (comptime builtin.os.tag != .windows) {
+            _ = Dir.cwd().createDirPathStatus(self.io, dir, privateArtifactPermissions(true)) catch |err| {
+                log.warn("the control endpoint's directory could not be created: {s}", .{@errorName(err)});
+                return;
+            };
+        }
         // A short name: the whole path must fit `sockaddr_un` (about 104
         // bytes), and an isolated test run's runtime directory is long.
         var suffix: [4]u8 = undefined;
         self.io.random(&suffix);
         var endpoint_buffer: [path_capacity]u8 = undefined;
-        const endpoint = std.fmt.bufPrint(&endpoint_buffer, "{s}/r-{x}.sock", .{ dir, &suffix }) catch return;
+        const endpoint = control_api.runEndpoint(&endpoint_buffer, builtin.os.tag, dir, suffix) orelse return;
         const waker: control_api.Waker = .{ .context = self, .wakeFn = controlWake };
         if (control_api.Server.start(self.allocator, self.io, .{ .endpoint = endpoint, .enabled = true, .waker = waker })) |server| {
             self.control_server = server;
-            self.self_exe = std.process.executablePathAlloc(self.io, self.allocator) catch null;
+            self.ensureSelfExe();
             self.agents.control_helper = self.self_exe;
             log.info("control endpoint listening in the runtime directory", .{});
         } else |err| log.warn("the control endpoint could not start: {s}", .{@errorName(err)});
         self.startInstance(env, options, dir, waker);
     }
 
-    /// Serve `conduit` commands at `<dir>/instance.sock` with a fresh token
-    /// written 0600 to the state directory. A live instance already there
-    /// keeps it: this run then simply does not answer commands.
+    /// This executable's path, once: `conduit control` for hooks and checks.
+    fn ensureSelfExe(self: *App) void {
+        if (self.self_exe == null) self.self_exe = std.process.executablePathAlloc(self.io, self.allocator) catch null;
+    }
+
+    /// Serve `conduit` commands at the runtime directory's instance endpoint
+    /// with a fresh token written 0600 to the state directory. A live
+    /// instance already there keeps it: this run then simply does not answer
+    /// commands.
     fn startInstance(self: *App, env: EnvSource, options: Options, dir: []const u8, waker: control_api.Waker) void {
         var endpoint_buffer: [path_capacity]u8 = undefined;
-        const endpoint = std.fmt.bufPrint(&endpoint_buffer, "{s}/{s}", .{ dir, control_api.instance_endpoint_file_name }) catch return;
+        const endpoint = control_api.instanceEndpointIn(&endpoint_buffer, builtin.os.tag, dir) orelse return;
         var token_buffer: [path_capacity]u8 = undefined;
         const token_path = instanceTokenPath(&token_buffer, env, options.run.state_dir) orelse {
             log.info("no state directory for the instance token; `conduit` commands will start a new window", .{});
@@ -31488,7 +31545,80 @@ fn editorTest(self: *App, io: Io, out: *Writer) !u8 {
 /// private runtime and state directories (`ChildSpec.buildIn`) and this run's
 /// control variables (`appendControlEnv`).
 const control_test_script = "PS1='ctl$ '; export PS1; printf 'CONTROL-TEST-READY\\r\\n'; exec /bin/sh -i";
+/// `--control-test`'s tabs, panes and scratchpad on Windows (TASK-82):
+/// PowerShell 7 without a profile, with the check's prompt. The readiness
+/// line is assembled so the command itself never contains it.
+const control_test_windows_argv = [_][]const u8{
+    "pwsh",                                                                  "-NoLogo", "-NoProfile", "-NoExit", "-Command",
+    "function prompt { 'ctl$ ' }; Write-Output ('CONTROL-TEST-' + 'READY')",
+};
 const control_test_budget_ms: i64 = 15_000;
+
+/// `--control-test`'s stand-in for Claude Code on Linux and macOS (TASK-82):
+/// it runs each hook command from its `--settings` file the way Claude Code
+/// does (`sh -c`, the hook input on stdin) and records what the
+/// `PermissionRequest` hook printed. The first request goes through the
+/// generated settings (the POSIX relay); the second runs the Windows hook
+/// command, `conduit control agent.permission --wait`, directly, so that
+/// path is proved here too. `@DIR@` and `@EXE@` are filled in.
+const control_standin_sh =
+    \\#!/bin/sh
+    \\[ "$1" = --version ] && { echo '2.1.292 (Claude Code)'; exit 0; }
+    \\settings=$2
+    \\hook() {
+    \\  cmd=$(sed -n "s/.*\"$1\":\[{\"hooks\":\[{\"type\":\"command\",\"command\":\"\([^\"]*\)\".*/\1/p" "$settings")
+    \\  printf '%s' "$2" | /bin/sh -c "$cmd"
+    \\}
+    \\echo STANDIN-READY
+    \\hook SessionStart '{"hook_event_name":"SessionStart","source":"startup"}'
+    \\hook UserPromptSubmit '{"hook_event_name":"UserPromptSubmit","prompt":"run the tests"}'
+    \\hook PreToolUse '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"zig build test"},"tool_use_id":"toolu_1"}'
+    \\echo STANDIN-ASKING
+    \\hook PermissionRequest '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"zig build test"},"tool_use_id":"toolu_1"}' > '@DIR@/hook-reply-1'
+    \\hook PostToolUse '{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"toolu_1"}'
+    \\printf '%s' '{"hook_event_name":"PermissionRequest","tool_name":"Edit","tool_input":{"file_path":"build.zig"},"tool_use_id":"toolu_2"}' | '@EXE@' control agent.permission --wait > '@DIR@/hook-reply-2'
+    \\hook PostToolUse '{"hook_event_name":"PostToolUse","tool_name":"Edit","tool_use_id":"toolu_2"}'
+    \\hook Stop '{"hook_event_name":"Stop"}'
+    \\echo STANDIN-DONE
+    \\while IFS= read -r line; do :; done
+    \\
+;
+
+/// The same stand-in on Windows: PowerShell runs each hook command through
+/// `cmd.exe /d /s /c`, which is how a command string reaches a Windows
+/// shell. `claude.cmd` starts it, because Conduit spawns `claude` by name.
+const control_standin_ps1 =
+    \\if ($args[0] -eq '--version') { '2.1.292 (Claude Code)'; exit 0 }
+    \\$settings = Get-Content -Raw -LiteralPath $args[1] | ConvertFrom-Json
+    \\function Invoke-Hook([string]$Name, [string]$Payload) {
+    \\  $command = $settings.hooks.PSObject.Properties[$Name].Value[0].hooks[0].command
+    \\  $info = [System.Diagnostics.ProcessStartInfo]::new($env:ComSpec, '/d /s /c "' + $command + '"')
+    \\  $info.UseShellExecute = $false
+    \\  $info.RedirectStandardInput = $true
+    \\  $info.RedirectStandardOutput = $true
+    \\  $process = [System.Diagnostics.Process]::Start($info)
+    \\  $process.StandardInput.Write($Payload)
+    \\  $process.StandardInput.Close()
+    \\  $output = $process.StandardOutput.ReadToEnd()
+    \\  $process.WaitForExit()
+    \\  return $output
+    \\}
+    \\'STANDIN-READY'
+    \\$null = Invoke-Hook 'SessionStart' '{"hook_event_name":"SessionStart","source":"startup"}'
+    \\$null = Invoke-Hook 'UserPromptSubmit' '{"hook_event_name":"UserPromptSubmit","prompt":"run the tests"}'
+    \\$null = Invoke-Hook 'PreToolUse' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"zig build test"},"tool_use_id":"toolu_1"}'
+    \\'STANDIN-ASKING'
+    \\$reply = Invoke-Hook 'PermissionRequest' '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"zig build test"},"tool_use_id":"toolu_1"}'
+    \\[System.IO.File]::WriteAllText('@DIR@/hook-reply-1', $reply)
+    \\'STANDIN-REPLY ' + $reply.Trim()
+    \\$null = Invoke-Hook 'PostToolUse' '{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"toolu_1"}'
+    \\$null = Invoke-Hook 'Stop' '{"hook_event_name":"Stop"}'
+    \\'STANDIN-DONE'
+    \\while ($true) { $null = [Console]::ReadLine() }
+    \\
+;
+
+const control_standin_cmd = "@echo off\r\npwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"%~dp0claude-standin.ps1\" %*\r\n";
 /// The private SSH config `conduit ssh nowhere` resolves: a host that
 /// refuses at once, so the workspace shows a failed connection quickly.
 const control_test_ssh_config = "Host nowhere\n  HostName 127.0.0.1\n  Port 9\n  ConnectTimeout 2\n  BatchMode yes\n";
@@ -31623,6 +31753,316 @@ fn controlScreenshot(self: *App, io: Io, out: *Writer) !void {
     out.print("control-test: screenshot {s}\n", .{path}) catch {};
 }
 
+/// TASK-82's hook check: a stand-in Claude Code launched with `conduit agent
+/// claude` from the focused tab's shell runs the hook commands Conduit
+/// generated for it (`conduit control agent.event` for every hook while the
+/// endpoint is up; on Windows the `PermissionRequest` hook is `conduit
+/// control agent.permission --wait`). Its events must reach the agent view
+/// through the endpoint, and each permission request answered by a click on
+/// the view's `Allow once` must come back to the waiting hook process as
+/// Claude Code's allow reply.
+fn controlHookCheck(self: *App, io: Io, out: *Writer, failures: *usize, dir: []const u8, exe: []const u8) !void {
+    const windows = builtin.os.tag == .windows;
+    var bin_buffer: [path_capacity]u8 = undefined;
+    const bin = try std.fmt.bufPrint(&bin_buffer, "{s}/bin", .{dir});
+    _ = try Dir.cwd().createDirPathStatus(io, bin, .default_dir);
+    var program_buffer: [path_capacity]u8 = undefined;
+    var program_owned: ?[]u8 = null;
+    defer if (program_owned) |path| self.allocator.free(path);
+    const program: []const u8 = if (windows) program: {
+        const script = try std.mem.replaceOwned(u8, self.allocator, control_standin_ps1, "@DIR@", dir);
+        defer self.allocator.free(script);
+        try Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&program_buffer, "{s}/claude-standin.ps1", .{bin}), .data = script });
+        try Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&program_buffer, "{s}/claude.cmd", .{bin}), .data = control_standin_cmd });
+        // A batch file runs through cmd.exe, which would read a `/tmp/…`
+        // program as a switch: name it by its drive-absolute path.
+        program_owned = try Dir.cwd().realPathFileAlloc(io, try std.fmt.bufPrint(&program_buffer, "{s}/claude.cmd", .{bin}), self.allocator);
+        break :program program_owned.?;
+    } else program: {
+        const with_dir = try std.mem.replaceOwned(u8, self.allocator, control_standin_sh, "@DIR@", dir);
+        defer self.allocator.free(with_dir);
+        const script = try std.mem.replaceOwned(u8, self.allocator, with_dir, "@EXE@", exe);
+        defer self.allocator.free(script);
+        const path = try std.fmt.bufPrint(&program_buffer, "{s}/claude", .{bin});
+        try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script, .flags = .{ .permissions = if (windows) .default_file else .fromMode(0o700) } });
+        break :program path;
+    };
+    self.agents.claude_program = program;
+    defer self.agents.claude_program = null;
+    const ingested_before = self.agents.control_events_ingested;
+
+    const key = self.workspace_registry.activeKey() orelse return error.NoWorkspace;
+    _ = if (windows)
+        try controlType(self, io, out, "& '{s}' agent claude", .{exe})
+    else
+        try controlType(self, io, out, "'{s}' agent claude", .{exe});
+    controlCheck(out, failures, try waitForControl(self, io, out, .{ .terminal_text = "STANDIN-ASKING" }), "conduit agent claude started the stand-in harness, which ran its first hooks", .{});
+    const runner = self.agents.runnerForSession(key, self.activePresentation().active_session_id) orelse {
+        controlCheck(out, failures, false, "the stand-in runs as a Claude Code agent", .{});
+        return;
+    };
+    controlCheck(out, failures, runner.choice == .harness and runner.choice.harness == .claude_code, "the stand-in runs as a Claude Code agent", .{});
+    const agent_number = @intFromEnum(runner.agent_id orelse return error.NoAgent);
+    const agent_tab = self.activeWorkspace().activeTabId() orelse return error.NoTab;
+
+    _ = try viewChordKey(self, io, out, 'a');
+    var view_buffer: [64]u8 = undefined;
+    const view_id = try std.fmt.bufPrint(&view_buffer, "agent.view.{d}", .{agent_number});
+    controlCheck(out, failures, try waitForControl(self, io, out, .{ .element = view_id }), "the agent view shows the stand-in's structured events", .{});
+    var prefix_buffer: [80]u8 = undefined;
+    const perm_prefix = try std.fmt.bufPrint(&prefix_buffer, "agent.view.{d}.perm.", .{agent_number});
+
+    // Linux and macOS answer the relay's request, then one from `agent.permission
+    // --wait` run directly; on Windows the settings' own hook is that command.
+    const requests: usize = if (windows) 1 else 2;
+    var answered_buffer: [128]u8 = undefined;
+    var answered: []const u8 = "";
+    for (0..requests) |index| {
+        const shown = try waitForControlAllow(self, io, out, perm_prefix, answered);
+        controlCheck(out, failures, shown != null, "permission request {d} shows its Allow once control in the view", .{index + 1});
+        const allow_id = shown orelse return;
+        if (allow_id.len > answered_buffer.len) return error.NameTooLong;
+        @memcpy(answered_buffer[0..allow_id.len], allow_id);
+        answered = answered_buffer[0..allow_id.len];
+        if (index == 0) try controlNamedScreenshot(self, io, out, "control-test-permission");
+        controlCheck(out, failures, try clickTabsElement(self, io, out, answered), "clicked {s}", .{answered});
+        var reply_buffer: [32]u8 = undefined;
+        const reply_name = try std.fmt.bufPrint(&reply_buffer, "hook-reply-{d}", .{index + 1});
+        controlCheck(out, failures, try waitForControlFile(self, io, out, dir, reply_name, "{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}"), "the waiting hook process returned the allow decision ({s})", .{reply_name});
+    }
+
+    var tab_buffer: [96]u8 = undefined;
+    var row_buffer: [96]u8 = undefined;
+    const done_id = try std.fmt.bufPrint(&tab_buffer, "{s}.agent.done", .{try tabSemanticId(&row_buffer, key, agent_tab)});
+    controlCheck(out, failures, try waitForControl(self, io, out, .{ .terminal_text = "STANDIN-DONE" }) and
+        try waitForControl(self, io, out, .{ .element = done_id }), "the stand-in's Stop hook left the agent done", .{});
+    const ingested = self.agents.control_events_ingested - ingested_before;
+    // Linux: four hooks plus the direct request's two lines and two more
+    // hooks; Windows: all seven lines, the permission pair included.
+    controlCheck(out, failures, ingested >= 7, "the hook lines arrived through conduit control agent.event ({d})", .{ingested});
+    try controlNamedScreenshot(self, io, out, "control-test-hooks");
+    _ = try viewChordKey(self, io, out, 'a');
+    _ = try waitForControl(self, io, out, .{ .element_absent = view_id });
+}
+
+/// Wait for an `Allow once` control under `prefix` other than `except`, and
+/// return its id (borrowed from the semantic tree until the next frame).
+fn waitForControlAllow(self: *App, io: Io, out: *Writer, prefix: []const u8, except: []const u8) !?[]const u8 {
+    const deadline = Io.Clock.real.now(io).nanoseconds + control_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        for (self.ui_tree.elements()) |*element| {
+            if (!std.mem.startsWith(u8, element.id.value, prefix)) continue;
+            if (!std.mem.endsWith(u8, element.id.value, ".allow")) continue;
+            if (std.mem.eql(u8, element.id.value, except)) continue;
+            if (std.mem.indexOf(u8, element.label, "Allow once") != null) return element.id.value;
+        }
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) return null;
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return null;
+        }
+        if (self.outputReadable()) _ = try self.drainChildren(io);
+        if (self.poll()) self.scheduler.invalidate();
+    }
+}
+
+fn controlNamedScreenshot(self: *App, io: Io, out: *Writer, name: []const u8) !void {
+    try self.drawFrame();
+    const pixels = try self.allocator.dupe(u8, try self.capture());
+    defer self.allocator.free(pixels);
+    var path_buffer: [path_capacity]u8 = undefined;
+    var id_buffer: [path_capacity]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}{c}{s}-{s}.png", .{ fallback_log_dir, std.fs.path.sep, name, try generateRunId(io, &id_buffer) });
+    try writePngOffThread(self.allocator, io, path, pixels, self.size);
+    out.print("control-test: screenshot {s}\n", .{path}) catch {};
+}
+
+/// `--control-test` on Windows (TASK-82): the control and instance
+/// endpoints are named pipes, the tabs are PowerShell 7, and every `conduit`
+/// command is a separate `conduit.exe` process: ping, tab.open, pane.split,
+/// notify, tab.status, view.agent and agent.event from a tab; `conduit
+/// <dir>`, `conduit workspace open`, `conduit agent` and a ping with the
+/// instance token from processes without the tab's control variables; the
+/// scratchpad's exclusion and a stolen and a bad token refused; then the
+/// stand-in Claude Code's hooks (`controlHookCheck`).
+fn controlTestWindows(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    var os_trace: AgentOsTrace = .{};
+    self.agents.notifier = .{ .context = &os_trace, .notify_fn = AgentOsTrace.record };
+    defer self.agents.notifier = .{ .notify_fn = App.discardOsNotification };
+    self.focus_override = true;
+    defer self.focus_override = null;
+    const dir = self.agentTestDir() orelse return 1;
+
+    try self.drawFrame();
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "CONTROL-TEST-READY" }), "the first tab's PowerShell started", .{});
+    controlCheck(out, &failures, self.control_server != null and self.instance_server != null, "the control and instance pipes are listening", .{});
+    const exe = self.self_exe orelse {
+        controlCheck(out, &failures, false, "this executable's path is known", .{});
+        return 1;
+    };
+    const endpoint = (self.control_server orelse return 1).endpointPath();
+    const instance_endpoint = (self.instance_server orelse return 1).endpointPath();
+    controlCheck(out, &failures, std.mem.startsWith(u8, endpoint, control_api.windows_pipe_prefix ++ "conduit-S-") and
+        std.mem.startsWith(u8, instance_endpoint, control_api.windows_pipe_prefix ++ "conduit-S-") and
+        std.mem.endsWith(u8, instance_endpoint, "-instance"), "both endpoints are per-user named pipes ({s})", .{endpoint});
+    const first_key = self.workspace_registry.activeKey() orelse return 1;
+    var id_buffer: [128]u8 = undefined;
+    _ = try waitForControl(self, io, out, .{ .terminal_text = "ctl$" });
+
+    // The tab's own control variables.
+    _ = try controlType(self, io, out, "\"ENV=[$($env:CONDUIT_CONTROL_ENDPOINT -eq '{s}')][$($env:CONDUIT_CONTROL_TOKEN.Length)][$([int]$env:CONDUIT_CONTROL_SESSION -gt 0)]\" > '{s}/env'", .{ endpoint, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "env", "ENV=[True][32][True]"), "a PowerShell tab has CONDUIT_CONTROL_ENDPOINT, TOKEN and SESSION", .{});
+
+    // ping, from the first tab's PowerShell, as a separate conduit.exe.
+    _ = try controlType(self, io, out, "& '{s}' control ping *> '{s}/ping'; \"rc=$LASTEXITCODE\" >> '{s}/ping'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "ping", "rc=0") and
+        try waitForControlFile(self, io, out, dir, "ping", "{\"pong\":true}"), "conduit control ping answered from a PowerShell tab", .{});
+
+    // tab.open: a titled tab in this workspace, reported once its shell runs.
+    _ = try controlType(self, io, out, "& '{s}' control tab.open '{{\"title\":\"api\"}}' *> '{s}/tab'; \"rc=$LASTEXITCODE\" >> '{s}/tab'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "tab", "rc=0") and
+        try waitForControlFile(self, io, out, dir, "tab", "\"session\":"), "tab.open replied with the new tab and session", .{});
+    const api_tab = controlTabNamed(self, first_key, "api");
+    controlCheck(out, &failures, api_tab != null and self.activeWorkspace().activeTabId() == api_tab, "the api tab exists in the caller's workspace and is active", .{});
+    const api_id = try tabSemanticId(&id_buffer, first_key, api_tab orelse return 1);
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .label = .{ .id = api_id, .text = "api" } }), "the sidebar lists the api tab", .{});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "ctl$" }), "the api tab's PowerShell started", .{});
+
+    // pane.split from the api tab.
+    _ = try controlType(self, io, out, "& '{s}' control pane.split '{{\"direction\":\"right\"}}' *> '{s}/split'; \"rc=$LASTEXITCODE\" >> '{s}/split'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "split", "rc=0") and
+        try waitForControlFile(self, io, out, dir, "split", "\"pane\":"), "pane.split replied with the new pane", .{});
+    const api_panes = if (self.activeWorkspace().tab(api_tab.?)) |tab| tab.paneCount() else 0;
+    controlCheck(out, &failures, api_panes == 2, "the api tab has two panes ({d})", .{api_panes});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "ctl$" }), "the new pane's PowerShell started", .{});
+
+    // notify and tab.status.
+    _ = try controlType(self, io, out, "& '{s}' control notify '{{\"title\":\"Build\",\"body\":\"control notified\"}}' *> '{s}/notify'; \"rc=$LASTEXITCODE\" >> '{s}/notify'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "notify", "rc=0") and
+        try waitForControl(self, io, out, .{ .entry_body = "control notified" }), "notify added a notification list entry", .{});
+    _ = try controlType(self, io, out, "& '{s}' control tab.status '{{\"text\":\"busy\",\"attention\":true}}' *> '{s}/status'; \"rc=$LASTEXITCODE\" >> '{s}/status'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "status", "rc=0") and
+        try waitForControl(self, io, out, .{ .label = .{ .id = api_id, .text = "! busy api" } }), "tab.status marked the api tab", .{});
+
+    // The single instance, from processes without this tab's control
+    // variables: they find the instance pipe through XDG_RUNTIME_DIR and the
+    // token file through XDG_STATE_HOME, as any program would.
+    var project_buffer: [path_capacity]u8 = undefined;
+    const project_dir = try std.fmt.bufPrint(&project_buffer, "{s}/project", .{dir});
+    _ = try Dir.cwd().createDirPathStatus(io, project_dir, .default_dir);
+    var token_path_buffer: [path_capacity]u8 = undefined;
+    const token_path = self.instance_token_path orelse return 1;
+    @memcpy(token_path_buffer[0..token_path.len], token_path);
+    var instance_log_buffer: [path_capacity]u8 = undefined;
+    const instance_log = try std.fmt.bufPrint(&instance_log_buffer, "{s}/instance", .{dir});
+    _ = try controlType(self, io, out, "$e=$env:CONDUIT_CONTROL_ENDPOINT; $k=$env:CONDUIT_CONTROL_TOKEN; $n=$env:CONDUIT_CONTROL_SESSION; " ++
+        "$env:CONDUIT_CONTROL_ENDPOINT=$null; $env:CONDUIT_CONTROL_TOKEN=$null; $env:CONDUIT_CONTROL_SESSION=$null; " ++
+        "$t=Get-Date; & '{s}' '{s}'; \"dir=$LASTEXITCODE $([int]((Get-Date)-$t).TotalMilliseconds)ms\" > '{s}'; " ++
+        "$t=Get-Date; & '{s}' workspace open default; \"workspace=$LASTEXITCODE $([int]((Get-Date)-$t).TotalMilliseconds)ms\" >> '{s}'; " ++
+        "$t=Get-Date; & '{s}' agent fake; \"agent=$LASTEXITCODE $([int]((Get-Date)-$t).TotalMilliseconds)ms\" >> '{s}'; " ++
+        "$env:CONDUIT_CONTROL_ENDPOINT='{s}'; $env:CONDUIT_CONTROL_TOKEN=(Get-Content -Raw '{s}').Trim(); " ++
+        "& '{s}' control ping *>> '{s}'; \"ping=$LASTEXITCODE\" >> '{s}'; " ++
+        "$env:CONDUIT_CONTROL_ENDPOINT=$e; $env:CONDUIT_CONTROL_TOKEN=$k; $env:CONDUIT_CONTROL_SESSION=$n; 'done' >> '{s}'", .{ exe, project_dir, instance_log, exe, instance_log, exe, instance_log, instance_endpoint, token_path_buffer[0..token_path.len], exe, instance_log, instance_log, instance_log });
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .file = .{ .path = instance_log, .text = "done" } }), "the instance commands finished", .{});
+    for ([_][]const u8{ "dir", "workspace", "agent" }) |name| {
+        const ms = controlCommandMs(io, instance_log, name);
+        controlCheck(out, &failures, ms != null and ms.? < 3000, "conduit {s} exited 0 quickly ({?d} ms)", .{ name, ms });
+    }
+    controlCheck(out, &failures, fileContains(io, instance_log, "{\"pong\":true}") and fileContains(io, instance_log, "ping=0"), "instance.ping answered a separate process holding the instance token", .{});
+    const project_key = controlWorkspaceInWindows(self, project_dir);
+    controlCheck(out, &failures, project_key != null, "conduit <dir> opened a workspace in that directory", .{});
+    controlCheck(out, &failures, self.workspace_registry.activeKey() == first_key, "conduit workspace open focused the named workspace", .{});
+    const agent_runner = self.agents.runnerForSession(first_key, self.activePresentation().active_session_id);
+    controlCheck(out, &failures, agent_runner != null and agent_runner.?.choice == .fake, "conduit agent launched the harness in the current workspace", .{});
+    const runner = agent_runner orelse return 1;
+    const agent_number = @intFromEnum(runner.agent_id orelse return 1);
+
+    // view.agent and agent.event, from the api tab.
+    _ = try clickTabsElement(self, io, out, api_id);
+    _ = try controlFocusTerminal(self, io, out);
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "ctl$" }), "the api tab is back in front", .{});
+    _ = try controlType(self, io, out, "& '{s}' control view.agent '{{\"agent_id\":\"{d}\"}}' *> '{s}/view'; \"rc=$LASTEXITCODE\" >> '{s}/view'", .{ exe, agent_number, dir, dir });
+    var view_buffer: [64]u8 = undefined;
+    const view_id = try std.fmt.bufPrint(&view_buffer, "agent.view.{d}", .{agent_number});
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "view", "rc=0") and
+        try waitForControl(self, io, out, .{ .element = view_id }), "view.agent showed the agent's view", .{});
+    _ = try clickTabsElement(self, io, out, api_id);
+    _ = try controlFocusTerminal(self, io, out);
+    _ = try waitForControl(self, io, out, .{ .terminal_text = "ctl$" });
+    const token = runner.token.text();
+    _ = try controlType(self, io, out, "'{{\"conduit\":{{\"v\":1,\"event\":\"Stop\"}},\"payload\":{{\"probe\":\"control-event\"}}}}' | & '{s}' control agent.event --agent={s} *> '{s}/event'; \"rc=$LASTEXITCODE\" >> '{s}/event'", .{ exe, token, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "event", "rc=0"), "agent.event was accepted", .{});
+    _ = try controlType(self, io, out, "'{{\"probe\":\"hook-event\"}}' | & '{s}' control agent.event --agent={s} --event=Stop *> '{s}/hook'; \"rc=$LASTEXITCODE\" >> '{s}/hook'", .{ exe, token, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "hook", "rc=0"), "the hook form exited 0", .{});
+    var sink_buffer: [path_capacity]u8 = undefined;
+    const sink_events = try std.fmt.bufPrint(&sink_buffer, "{s}/{s}", .{ runner.sink_dir, agent.pi.events_file_name });
+    var hook_line_buffer: [256]u8 = undefined;
+    const hook_line = try std.fmt.bufPrint(&hook_line_buffer, "{{\"conduit\":{{\"v\":1,\"event\":\"Stop\",\"token\":\"{s}\"}},\"payload\":{{\"probe\":\"hook-event\"}}}}", .{token});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .file = .{ .path = sink_events, .text = "{\"conduit\":{\"v\":1,\"event\":\"Stop\"},\"payload\":{\"probe\":\"control-event\"}}" } }) and
+        try waitForControl(self, io, out, .{ .file = .{ .path = sink_events, .text = hook_line } }), "the fake runner's sink received both event lines", .{});
+
+    // The scratchpad: no control variables, and a stolen token naming it is
+    // refused before anything happens.
+    const first_presentation = self.presentationByKey(first_key) orelse return 1;
+    const first_model = self.workspace_registry.byKey(first_key) orelse return 1;
+    const first_token = (first_presentation.control_token orelse return 1).text();
+    const scratchpad_id = @intFromEnum(first_model.scratchpadId());
+    const tabs_before = first_model.tabCount();
+    _ = try scratchpadChord(self, io, out, false);
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .scratchpad_text = "ctl$" }), "the scratchpad's PowerShell is up", .{});
+    _ = try controlType(self, io, out, "\"TOKEN=[$($env:CONDUIT_CONTROL_TOKEN ?? 'unset')][$($env:CONDUIT_CONTROL_ENDPOINT ?? 'unset')][$($env:CONDUIT_CONTROL_SESSION ?? 'unset')]\"", .{});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .scratchpad_text = "TOKEN=[unset][unset][unset]" }), "the scratchpad has no control variables", .{});
+    _ = try controlType(self, io, out, "$env:CONDUIT_CONTROL_ENDPOINT='{s}'; $env:CONDUIT_CONTROL_TOKEN='{s}'; $env:CONDUIT_CONTROL_SESSION='{d}'; & '{s}' control tab.open *> '{s}/stolen'; \"rc=$LASTEXITCODE\" >> '{s}/stolen'", .{ endpoint, first_token, scratchpad_id, exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "stolen", "rc=1") and
+        try waitForControlFile(self, io, out, dir, "stolen", "ScratchpadNotAddressable") and first_model.tabCount() == tabs_before, "a stolen token naming the scratchpad was refused and opened nothing", .{});
+    _ = try controlType(self, io, out, "$env:CONDUIT_CONTROL_SESSION=$null; $env:CONDUIT_CONTROL_TOKEN='00000000000000000000000000000000'; & '{s}' control ping *> '{s}/bad'; \"rc=$LASTEXITCODE\" >> '{s}/bad'", .{ exe, dir, dir });
+    controlCheck(out, &failures, try waitForControlFile(self, io, out, dir, "bad", "rc=1") and
+        try waitForControlFile(self, io, out, dir, "bad", "Unauthorized"), "conduit control with a bad token exits non-zero", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    _ = try waitForControl(self, io, out, .{ .element_absent = "scratchpad" });
+
+    // The stand-in Claude Code's hooks, from the api tab.
+    _ = try clickTabsElement(self, io, out, api_id);
+    _ = try controlFocusTerminal(self, io, out);
+    _ = try waitForControl(self, io, out, .{ .terminal_text = "ctl$" });
+    try controlHookCheck(self, io, out, &failures, dir, exe);
+
+    // The final frame: the API-opened tab, its split and its status mark.
+    _ = try clickTabsElement(self, io, out, api_id);
+    _ = try controlFocusTerminal(self, io, out);
+    _ = try waitForControl(self, io, out, .{ .terminal_text = "ctl$" });
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .label = .{ .id = api_id, .text = "! busy api" } }), "the status mark is still on the api tab", .{});
+    try controlScreenshot(self, io, out);
+
+    out.print("control-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
+/// `controlWorkspaceIn` with Windows spelling: a `/tmp/…` directory a
+/// command resolved against its drive is `X:\tmp\…`.
+fn controlWorkspaceInWindows(self: *App, directory: []const u8) ?workspace.WorkspaceKey {
+    if (controlWorkspaceIn(self, directory)) |key| return key;
+    var index: usize = 0;
+    while (index < self.workspace_registry.count()) : (index += 1) {
+        const key = self.workspace_registry.keyAt(index) orelse continue;
+        const model = self.workspace_registry.byKey(key) orelse continue;
+        const wd = model.workingDirectory();
+        if (wd.len < directory.len) continue;
+        const tail = wd[wd.len - directory.len ..];
+        var same = true;
+        for (tail, directory) |a, b| {
+            const sa: u8 = if (a == '\\') '/' else a;
+            if (sa != b) same = false;
+        }
+        if (same) return key;
+    }
+    return null;
+}
+
 /// Exercise TASK-60 part two and TASK-66 through real PTYs, real child
 /// processes and SDL events: `conduit control` from a tab's shell opens a
 /// tab, splits a pane, raises a notification, marks the tab, shows the agent
@@ -31631,6 +32071,7 @@ fn controlScreenshot(self: *App, io: Io, out: *Writer) !void {
 /// <dir>`, `conduit ssh`, `conduit workspace open` and `conduit agent` run as
 /// separate processes against this run's private instance endpoint.
 fn controlTest(self: *App, io: Io, out: *Writer) !u8 {
+    if (comptime builtin.os.tag == .windows) return controlTestWindows(self, io, out);
     var failures: usize = 0;
     var os_trace: AgentOsTrace = .{};
     self.agents.notifier = .{ .context = &os_trace, .notify_fn = AgentOsTrace.record };
@@ -31771,6 +32212,9 @@ fn controlTest(self: *App, io: Io, out: *Writer) !u8 {
     const hook_line = try std.fmt.bufPrint(&hook_line_buffer, "{{\"conduit\":{{\"v\":1,\"event\":\"Stop\",\"token\":\"{s}\"}},\"payload\":{{\"probe\":\"hook-event\"}}}}", .{token});
     controlCheck(out, &failures, try waitForControl(self, io, out, .{ .file = .{ .path = sink_events, .text = "{\"conduit\":{\"v\":1,\"event\":\"Stop\"},\"payload\":{\"probe\":\"control-event\"}}" } }) and
         try waitForControl(self, io, out, .{ .file = .{ .path = sink_events, .text = hook_line } }), "the fake runner's sink received both event lines", .{});
+
+    // A stand-in Claude Code's generated hooks, from the api tab's shell.
+    try controlHookCheck(self, io, out, &failures, dir, exe);
 
     // view.backlog from the project workspace's shell.
     const project = project_key orelse return 1;
@@ -34635,7 +35079,7 @@ fn runCommand(init: std.process.Init, command: CliCommand, cwd: []const u8) Comm
     var endpoint_buffer: [path_capacity]u8 = undefined;
     var dir_buffer: [path_capacity]u8 = undefined;
     const dir = controlRuntimeDir(&dir_buffer, env, null) orelse return .start;
-    const endpoint = std.fmt.bufPrint(&endpoint_buffer, "{s}/{s}", .{ dir, control_api.instance_endpoint_file_name }) catch return .start;
+    const endpoint = control_api.instanceEndpointIn(&endpoint_buffer, builtin.os.tag, dir) orelse return .start;
     var token_path_buffer: [path_capacity]u8 = undefined;
     const token_path = instanceTokenPath(&token_path_buffer, env, null) orelse return .start;
     var token_buffer: [control_api.Token.text_len + 2]u8 = undefined;
@@ -34776,6 +35220,8 @@ const max_hook_stdin_bytes: usize = 1024 * 1024;
 /// command is a hook: it prints nothing and always exits 0, so Claude Code's
 /// own behaviour never changes.
 fn runControlCommand(init: std.process.Init, env: EnvSource, request: @FieldType(CliCommand, "control")) u8 {
+    if (std.mem.eql(u8, request.method, permission_hook_method)) return runPermissionHook(init, env, request);
+    if (request.wait or request.wait_ms != 0) return usageFailure("--wait is only for agent.permission");
     const arena = init.arena.allocator();
     const hook = request.event != null;
     const is_event = std.mem.eql(u8, request.method, "agent.event");
@@ -34845,11 +35291,11 @@ fn hookLine(init: std.process.Init, arena: Allocator, event: ?[]const u8, agent_
     return out.written();
 }
 
-/// Append one line to `<sink>/events.jsonl` with a single O_APPEND write, as
-/// the relay script does. Best effort: a hook must never fail its harness.
+/// Append one line to `<sink>/events.jsonl` with a single append-mode
+/// write, as the relay script does. Best effort: a hook must never fail its
+/// harness.
 fn appendSinkLine(sink_dir: []const u8, line: []const u8) void {
-    if (comptime builtin.os.tag == .windows) return;
-    if (sink_dir.len == 0 or sink_dir[0] != '/') return;
+    if (!agent.claude_code.isValidSinkPath(sink_dir)) return;
     var path_buffer: [path_capacity]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ sink_dir, agent.pi.events_file_name }) catch return;
     var line_buffer: std.ArrayList(u8) = .empty;
@@ -34857,10 +35303,109 @@ fn appendSinkLine(sink_dir: []const u8, line: []const u8) void {
     line_buffer.ensureTotalCapacity(std.heap.page_allocator, line.len + 1) catch return;
     line_buffer.appendSliceAssumeCapacity(line);
     line_buffer.appendAssumeCapacity('\n');
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true, .CLOEXEC = true }, 0o600) catch return;
-    defer _ = std.posix.system.close(fd);
     // A short or failed append loses this one event; there is no one to tell.
-    _ = std.posix.system.write(fd, line_buffer.items.ptr, line_buffer.items.len);
+    platform.appendToFile(path, line_buffer.items) catch return;
+}
+
+/// The `conduit control` method that is a blocking Claude Code
+/// `PermissionRequest` hook rather than one request (TASK-82).
+const permission_hook_method = "agent.permission";
+/// How long `agent.permission --wait` waits for an answer by default: the
+/// relay's bound (`permission_wait_polls` × 0.2 s), inside the hook's 600 s.
+const permission_wait_default_ms: u32 = 580_000;
+const permission_poll_ms: u32 = 200;
+
+/// Deliver one hook line to the agent: over this terminal's control endpoint
+/// as `agent.event`, else appended to `$CONDUIT_AGENT_SINK/events.jsonl`.
+fn deliverHookLine(arena: Allocator, env: EnvSource, agent_token: []const u8, line: []const u8) void {
+    delivered: {
+        const endpoint = env.get(control_api.endpoint_env_name) orelse break :delivered;
+        const token = env.get(control_api.token_env_name) orelse break :delivered;
+        var out: Io.Writer.Allocating = .init(arena);
+        out.writer.writeAll("{\"agent\":") catch break :delivered;
+        std.json.Stringify.encodeJsonString(agent_token, .{}, &out.writer) catch break :delivered;
+        out.writer.print(",\"payload\":{s}}}", .{line}) catch break :delivered;
+        const frame = controlFrame(arena, "agent.event", token, env.get(control_api.session_env_name), out.written()) catch break :delivered;
+        const reply = exchangeControl(arena, endpoint, frame) orelse break :delivered;
+        if (replyError(reply) == null) return;
+    }
+    if (env.get(agent.pi.sink_env_name)) |sink_dir| appendSinkLine(sink_dir, line);
+}
+
+/// `conduit control agent.permission --wait`: Claude Code's
+/// `PermissionRequest` hook on Windows, where there is no `/bin/sh` for the
+/// relay (TASK-82). It does what `hook.sh` does, in the same line format:
+/// stdin (the hook input) becomes a `PermissionRequest` line with a request
+/// id this process chooses, delivered like `agent.event`; then it waits,
+/// bounded, for the answer the human gives in the agent view, which
+/// `respondPermission` writes to `$CONDUIT_AGENT_SINK/decisions/<id>`;
+/// reports the outcome as a `PermissionEnd` line; and prints Claude Code's
+/// `hookSpecificOutput` allow/deny reply. A timeout reports `aborted`
+/// (resolved elsewhere: Claude Code's own dialog is the answer) and prints
+/// nothing, so Claude Code decides. When Claude Code answers in its own
+/// dialog first it ends this process, and a later hook resolves the request.
+/// Like every hook it exits 0 and never changes Claude Code's behaviour on
+/// its own: nothing it reads is acted on.
+fn runPermissionHook(init: std.process.Init, env: EnvSource, request: @FieldType(CliCommand, "control")) u8 {
+    if (!request.wait) return usageFailure("agent.permission needs --wait");
+    if (request.params != null or request.event != null) return usageFailure("agent.permission takes its input on stdin");
+    const arena = init.arena.allocator();
+    const agent_token = request.agent orelse env.get(agent.correlation_env_name) orelse return 0;
+    const sink_dir = env.get(agent.pi.sink_env_name) orelse return 0;
+    if (!agent.claude_code.isValidSinkPath(sink_dir)) return 0;
+
+    // The request id the relay would choose: digits, one dash, digits.
+    var random: [4]u8 = undefined;
+    init.io.random(&random);
+    const seconds: u64 = @intCast(@max(0, @divTrunc(Io.Clock.real.now(init.io).nanoseconds, std.time.ns_per_s)));
+    var id_buffer: [32]u8 = undefined;
+    const request_id = std.fmt.bufPrint(&id_buffer, "{d}-{d}", .{ std.mem.readInt(u32, &random, .little), seconds }) catch return 0;
+    var answer_buffer: [path_capacity]u8 = undefined;
+    const answer_path = std.fmt.bufPrint(&answer_buffer, "{s}/decisions/{s}", .{ sink_dir, request_id }) catch return 0;
+    Dir.cwd().deleteFile(init.io, answer_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return 0,
+    };
+
+    var buffer: [4096]u8 = undefined;
+    var reader = File.stdin().readerStreaming(init.io, &buffer);
+    // An input too large to forward whole is not a request Conduit can show:
+    // Claude Code's own dialog stays the only one, as with the relay.
+    const input = reader.interface.allocRemaining(arena, .limited(max_hook_stdin_bytes)) catch return 0;
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    const payload = compactObject(arena, if (trimmed.len == 0) "{}" else trimmed) orelse return 0;
+
+    var line: Io.Writer.Allocating = .init(arena);
+    line.writer.writeAll("{\"conduit\":{\"v\":1,\"event\":\"PermissionRequest\",\"token\":") catch return 0;
+    std.json.Stringify.encodeJsonString(agent_token, .{}, &line.writer) catch return 0;
+    line.writer.print(",\"request\":\"{s}\"}},\"payload\":{s}}}", .{ request_id, payload }) catch return 0;
+    deliverHookLine(arena, env, agent_token, line.written());
+
+    const wait_ms: u64 = if (request.wait_ms != 0) request.wait_ms else permission_wait_default_ms;
+    const deadline = Io.Clock.awake.now(init.io).nanoseconds + @as(i96, wait_ms) * std.time.ns_per_ms;
+    const answer: ?agent.claude_code.Answer = answer: while (true) {
+        var file_buffer: [16]u8 = undefined;
+        if (Dir.cwd().readFile(init.io, answer_path, &file_buffer)) |contents| {
+            const word = std.mem.trim(u8, contents, " \t\r\n");
+            if (std.mem.eql(u8, word, "allow")) break :answer .allow;
+            if (std.mem.eql(u8, word, "deny")) break :answer .deny;
+        } else |_| {}
+        if (Io.Clock.awake.now(init.io).nanoseconds >= deadline) break :answer null;
+        // The relay polls the same file at the same rate; an answer is a
+        // human gesture, so 200 ms is well inside what anyone notices.
+        Io.sleep(init.io, .fromMilliseconds(permission_poll_ms), .awake) catch break :answer null;
+    };
+
+    const outcome = if (answer) |value| @tagName(value) else "aborted";
+    var end: Io.Writer.Allocating = .init(arena);
+    end.writer.writeAll("{\"conduit\":{\"v\":1,\"event\":\"PermissionEnd\",\"token\":") catch return 0;
+    std.json.Stringify.encodeJsonString(agent_token, .{}, &end.writer) catch return 0;
+    end.writer.print(",\"request\":\"{s}\",\"outcome\":\"{s}\"}},\"payload\":{{}}}}", .{ request_id, outcome }) catch return 0;
+    deliverHookLine(arena, env, agent_token, end.written());
+    // The answer was read; a leftover file is only private state.
+    Dir.cwd().deleteFile(init.io, answer_path) catch {};
+    if (answer) |value| writeStdoutLine(agent.claude_code.permissionReply(value));
+    return 0;
 }
 
 /// `command` with a directory resolved against `cwd` and checked to exist,
@@ -37958,6 +38503,12 @@ test "conduit subcommands parse, and malformed ones are refused" {
     try std.testing.expectEqualStrings("Stop", hook.event.?);
     try std.testing.expectEqualStrings("abc", hook.agent.?);
     try std.testing.expectEqual(@as(?[]const u8, null), hook.params);
+    const permission = (try parseArgs(&.{ "conduit", "control", "agent.permission", "--wait", "--wait-ms=1500" }, env.source())).command.?.control;
+    try std.testing.expectEqualStrings("agent.permission", permission.method);
+    try std.testing.expect(permission.wait);
+    try std.testing.expectEqual(@as(u32, 1500), permission.wait_ms);
+    try std.testing.expectError(error.MissingValue, parseArgs(&.{ "conduit", "control", "agent.permission", "--wait-ms=0" }, env.source()));
+    try std.testing.expectError(error.MissingValue, parseArgs(&.{ "conduit", "control", "agent.permission", "--wait-ms=x" }, env.source()));
     try std.testing.expectEqual(control_api.Method.instance_open_ssh, (CliCommand{ .open_ssh = "h" }).method().?);
     try std.testing.expectEqual(@as(?control_api.Method, null), (CliCommand{ .control = .{ .method = "ping" } }).method());
     try std.testing.expectEqual(@as(?CliCommand, null), (try parseArgs(&.{ "conduit", "--hidden" }, env.source())).command);

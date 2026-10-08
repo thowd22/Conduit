@@ -1,7 +1,8 @@
 //! The local control API (TASK-60): lets a harness running inside a Conduit
 //! terminal open a tab or split pane in its own workspace, show an agent or
 //! backlog view, set its tab's status, raise a notification and deliver agent
-//! hook/extension events, over a token-scoped local socket.
+//! hook/extension events, over a token-scoped local socket (a protected
+//! named pipe on Windows, TASK-82).
 //!
 //! - `protocol`: tokens, the enumerated methods, typed requests, faults and
 //!   reply encoding (transport-neutral, bounded, untrusted input).
@@ -48,23 +49,42 @@ pub const RuntimeEnv = struct {
     tmpdir: ?[]const u8 = null,
     /// The real user id, for the shared-`/tmp` fallback's name.
     uid: u32 = 0,
+    /// Windows: the user's SID text (`platform.currentUserId`), which names
+    /// the per-user pipes. Unused elsewhere.
+    windows_user: ?[]const u8 = null,
 };
 
-/// The per-user directory Conduit's local sockets live in, written into
+/// The Windows namespace every local endpoint is a pipe in.
+pub const windows_pipe_prefix = "\\\\.\\pipe\\";
+
+/// Where Conduit's local endpoints live for this user, written into
 /// `buffer`:
 ///
-/// - Linux and other Unix: `$XDG_RUNTIME_DIR/conduit` (an absolute
-///   `XDG_RUNTIME_DIR` only), else `/tmp/conduit-<uid>`.
+/// - Linux and other Unix: the directory `$XDG_RUNTIME_DIR/conduit` (an
+///   absolute `XDG_RUNTIME_DIR` only), else `/tmp/conduit-<uid>`.
 /// - macOS: `$XDG_RUNTIME_DIR/conduit` when set, else `$TMPDIR/conduit`
 ///   (the per-user temporary directory), else `/tmp/conduit-<uid>`.
-/// - Windows: null; there is no control transport there yet.
+/// - Windows (TASK-82): not a directory but a pipe-name prefix,
+///   `\\.\pipe\conduit-<user SID>`, with `-x<16 hex>` (a hash of
+///   `XDG_RUNTIME_DIR`) appended when that is set, so an isolated test run
+///   names pipes of its own. Null without a usable user SID.
 ///
-/// The caller creates it 0700; `platform.LocalSocketListener` refuses one
-/// with group or other permissions. `conduit-test launch` and `--control-test`
-/// set an isolated `XDG_RUNTIME_DIR`, so a test never reaches the user's
-/// instance.
+/// The caller creates a POSIX directory 0700, and
+/// `platform.LocalSocketListener` refuses one with group or other
+/// permissions; on Windows it creates each pipe for the current user only.
+/// `conduit-test launch` and `--control-test` set an isolated
+/// `XDG_RUNTIME_DIR`, so a test never reaches the user's instance.
 pub fn runtimeDirectory(buffer: []u8, os: std.Target.Os.Tag, env: RuntimeEnv) ?[]const u8 {
-    if (os == .windows) return null;
+    if (os == .windows) {
+        const user = env.windows_user orelse return null;
+        if (user.len == 0 or user.len > 128) return null;
+        for (user) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return null;
+        if (env.xdg_runtime_dir) |dir| if (dir.len != 0) {
+            const hash = std.hash.Wyhash.hash(0, dir);
+            return std.fmt.bufPrint(buffer, "{s}conduit-{s}-x{x:0>16}", .{ windows_pipe_prefix, user, hash }) catch null;
+        };
+        return std.fmt.bufPrint(buffer, "{s}conduit-{s}", .{ windows_pipe_prefix, user }) catch null;
+    }
     if (env.xdg_runtime_dir) |dir| {
         if (dir.len != 0 and dir[0] == '/') return std.fmt.bufPrint(buffer, "{s}/conduit", .{std.mem.trimEnd(u8, dir, "/")}) catch null;
     }
@@ -74,11 +94,26 @@ pub fn runtimeDirectory(buffer: []u8, os: std.Target.Os.Tag, env: RuntimeEnv) ?[
     return std.fmt.bufPrint(buffer, "/tmp/conduit-{d}", .{env.uid}) catch null;
 }
 
-/// `<runtimeDirectory>/instance.sock`, or null.
+/// The run's control endpoint in the runtime directory `dir`:
+/// `<dir>/r-<8 hex>.sock` (short, since the whole path must fit
+/// `sockaddr_un`), or on Windows the pipe `<dir>-r-<8 hex>`.
+pub fn runEndpoint(buffer: []u8, os: std.Target.Os.Tag, dir: []const u8, suffix: [4]u8) ?[]const u8 {
+    if (os == .windows) return std.fmt.bufPrint(buffer, "{s}-r-{x}", .{ dir, &suffix }) catch null;
+    return std.fmt.bufPrint(buffer, "{s}/r-{x}.sock", .{ dir, &suffix }) catch null;
+}
+
+/// The single-instance endpoint in the runtime directory `dir`:
+/// `<dir>/instance.sock`, or on Windows the pipe `<dir>-instance`.
+pub fn instanceEndpointIn(buffer: []u8, os: std.Target.Os.Tag, dir: []const u8) ?[]const u8 {
+    if (os == .windows) return std.fmt.bufPrint(buffer, "{s}-instance", .{dir}) catch null;
+    return std.fmt.bufPrint(buffer, "{s}/{s}", .{ dir, instance_endpoint_file_name }) catch null;
+}
+
+/// `instanceEndpointIn(runtimeDirectory(...))`, or null.
 pub fn instanceEndpoint(buffer: []u8, os: std.Target.Os.Tag, env: RuntimeEnv) ?[]const u8 {
     var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir = runtimeDirectory(&dir_buffer, os, env) orelse return null;
-    return std.fmt.bufPrint(buffer, "{s}/{s}", .{ dir, instance_endpoint_file_name }) catch null;
+    return instanceEndpointIn(buffer, os, dir);
 }
 
 pub const Token = protocol.Token;
@@ -129,12 +164,35 @@ test "the runtime directory follows XDG_RUNTIME_DIR, then the platform's private
     try testing.expectEqualStrings("/tmp/conduit-1000", runtimeDirectory(&buffer, .linux, .{ .xdg_runtime_dir = "run", .uid = 1000 }).?);
     try testing.expectEqualStrings("/tmp/conduit-501", runtimeDirectory(&buffer, .linux, .{ .tmpdir = "/var/tmp", .uid = 501 }).?);
     try testing.expectEqualStrings("/var/folders/x/T/conduit", runtimeDirectory(&buffer, .macos, .{ .tmpdir = "/var/folders/x/T/", .uid = 501 }).?);
-    try testing.expectEqual(@as(?[]const u8, null), runtimeDirectory(&buffer, .windows, .{ .tmpdir = "C:\\t" }));
     try testing.expectEqualStrings("/run/user/7/conduit/instance.sock", instanceEndpoint(&buffer, .linux, .{ .xdg_runtime_dir = "/run/user/7" }).?);
+    try testing.expectEqualStrings("/run/user/7/conduit/r-0a0b0c0d.sock", runEndpoint(&buffer, .linux, "/run/user/7/conduit", .{ 0x0a, 0x0b, 0x0c, 0x0d }).?);
+}
+
+test "Windows endpoints are per-user pipes, isolated by XDG_RUNTIME_DIR" {
+    var buffer: [256]u8 = undefined;
+    const sid = "S-1-5-21-1004336348-1177238915-682003330-512";
+    // No user SID, or one that is not a SID's text, names no pipe at all.
+    try testing.expectEqual(@as(?[]const u8, null), runtimeDirectory(&buffer, .windows, .{ .tmpdir = "C:\\t" }));
+    try testing.expectEqual(@as(?[]const u8, null), runtimeDirectory(&buffer, .windows, .{ .windows_user = "S-1\\..\\x" }));
+    const dir = runtimeDirectory(&buffer, .windows, .{ .windows_user = sid }).?;
+    try testing.expectEqualStrings("\\\\.\\pipe\\conduit-" ++ sid, dir);
+    var endpoint_buffer: [256]u8 = undefined;
+    try testing.expectEqualStrings("\\\\.\\pipe\\conduit-" ++ sid ++ "-instance", instanceEndpointIn(&endpoint_buffer, .windows, dir).?);
+    try testing.expectEqualStrings("\\\\.\\pipe\\conduit-" ++ sid ++ "-r-0a0b0c0d", runEndpoint(&endpoint_buffer, .windows, dir, .{ 0x0a, 0x0b, 0x0c, 0x0d }).?);
+    // An isolated run's XDG_RUNTIME_DIR gives it pipes of its own, the same
+    // for the server and for every client that sees the same variable.
+    var isolated_buffer: [256]u8 = undefined;
+    const isolated = runtimeDirectory(&isolated_buffer, .windows, .{ .windows_user = sid, .xdg_runtime_dir = "C:\\runs\\a\\rt" }).?;
+    try testing.expect(std.mem.startsWith(u8, isolated, "\\\\.\\pipe\\conduit-" ++ sid ++ "-x"));
+    try testing.expectEqual(dir.len + 18, isolated.len);
+    var other_buffer: [256]u8 = undefined;
+    try testing.expect(!std.mem.eql(u8, isolated, runtimeDirectory(&other_buffer, .windows, .{ .windows_user = sid, .xdg_runtime_dir = "C:\\runs\\b\\rt" }).?));
+    // Every name the pipe listener accepts: letters, digits, '.', '_' and '-'.
+    for (isolated["\\\\.\\pipe\\".len..]) |c| try testing.expect(std.ascii.isAlphanumeric(c) or c == '-');
 }
 
 test "the instance endpoint takes only the instance token and reaches the owner with instance methods" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    try skipWithoutTransport();
     const dir = try TestDir.create(0o700);
     defer dir.remove();
     var endpoint_buffer: [96]u8 = undefined;
@@ -176,17 +234,22 @@ test "the instance endpoint takes only the instance token and reaches the owner 
     );
 }
 
-/// A private directory under /tmp: worktree paths are too long for sun_path.
+/// A private directory under /tmp (worktree paths are too long for
+/// sun_path), or on Windows a unique pipe-name prefix: pipes need no
+/// directory (TASK-82).
 const TestDir = struct {
-    path_buffer: ["/tmp/conduit-ctl-".len + 16]u8,
+    path_buffer: [prefix.len + 16]u8,
 
-    fn create(mode: std.posix.mode_t) !TestDir {
+    const prefix = if (builtin.os.tag == .windows) windows_pipe_prefix ++ "conduit-ctl-" else "/tmp/conduit-ctl-";
+
+    fn create(mode: u32) !TestDir {
         var dir: TestDir = undefined;
         var random: [8]u8 = undefined;
         testing.io.random(&random);
-        _ = try std.fmt.bufPrint(&dir.path_buffer, "/tmp/conduit-ctl-{x:0>16}", .{std.mem.readInt(u64, &random, .little)});
+        _ = try std.fmt.bufPrint(&dir.path_buffer, prefix ++ "{x:0>16}", .{std.mem.readInt(u64, &random, .little)});
+        if (comptime builtin.os.tag == .windows) return dir;
         try std.Io.Dir.cwd().createDir(testing.io, dir.path(), .fromMode(0o700));
-        try std.Io.Dir.cwd().setFilePermissions(testing.io, dir.path(), .fromMode(mode), .{});
+        try std.Io.Dir.cwd().setFilePermissions(testing.io, dir.path(), .fromMode(@intCast(mode)), .{});
         return dir;
     }
 
@@ -195,14 +258,25 @@ const TestDir = struct {
     }
 
     fn join(self: *const TestDir, buffer: []u8, name: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buffer, "{s}/{s}", .{ self.path(), name });
+        const separator: u8 = if (builtin.os.tag == .windows) '-' else '/';
+        return std.fmt.bufPrint(buffer, "{s}{c}{s}", .{ self.path(), separator, name });
     }
 
     fn remove(self: *const TestDir) void {
+        if (comptime builtin.os.tag == .windows) return;
         // Best-effort cleanup of a test directory; a leftover only wastes /tmp space.
         std.Io.Dir.cwd().deleteTree(testing.io, self.path()) catch {};
     }
 };
+
+/// The control server's socket tests run where it has a transport: POSIX
+/// sockets on Linux and macOS, named pipes on Windows.
+fn skipWithoutTransport() !void {
+    switch (builtin.os.tag) {
+        .linux, .macos, .windows => {},
+        else => return error.SkipZigTest,
+    }
+}
 
 const TestWake = struct {
     event: std.Io.Event = .unset,
@@ -304,7 +378,7 @@ fn frameFor(buffer: []u8, id: u32, method: []const u8, token: []const u8, extra:
 }
 
 test "a client in a workspace reaches the owner through a real socket and is scoped by its token" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    try skipWithoutTransport();
     const dir = try TestDir.create(0o700);
     defer dir.remove();
     var endpoint_buffer: [96]u8 = undefined;
@@ -319,12 +393,15 @@ test "a client in a workspace reaches the owner through a real socket and is sco
     });
     defer control_server.deinit();
 
-    // The socket is 0600 inside a 0700 directory.
-    const socket_stat = try std.Io.Dir.cwd().statFile(testing.io, endpoint, .{ .follow_symlinks = false });
-    try testing.expectEqual(std.Io.File.Kind.unix_domain_socket, socket_stat.kind);
-    try testing.expectEqual(@as(std.posix.mode_t, 0o600), socket_stat.permissions.toMode() & 0o777);
-    const dir_stat = try std.Io.Dir.cwd().statFile(testing.io, dir.path(), .{});
-    try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir_stat.permissions.toMode() & 0o777);
+    // The socket is 0600 inside a 0700 directory. (A Windows pipe's
+    // protection is its descriptor, which platform's pipe test covers.)
+    if (comptime builtin.os.tag != .windows) {
+        const socket_stat = try std.Io.Dir.cwd().statFile(testing.io, endpoint, .{ .follow_symlinks = false });
+        try testing.expectEqual(std.Io.File.Kind.unix_domain_socket, socket_stat.kind);
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), socket_stat.permissions.toMode() & 0o777);
+        const dir_stat = try std.Io.Dir.cwd().statFile(testing.io, dir.path(), .{});
+        try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir_stat.permissions.toMode() & 0o777);
+    }
 
     const scratchpad: u32 = 1;
     const token = try control_server.issueToken(.{ .workspace = 7, .scratchpad_session = scratchpad }, @splat(0x5a));
@@ -381,7 +458,7 @@ test "a client in a workspace reaches the owner through a real socket and is sco
 }
 
 test "a revoked token expires, a slow owner times out, and many clients connect at once" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    try skipWithoutTransport();
     const dir = try TestDir.create(0o700);
     defer dir.remove();
     var endpoint_buffer: [96]u8 = undefined;
@@ -438,7 +515,7 @@ test "a revoked token expires, a slow owner times out, and many clients connect 
 }
 
 test "a request queued under a token revoked before service never reaches the owner" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    try skipWithoutTransport();
     const dir = try TestDir.create(0o700);
     defer dir.remove();
     var endpoint_buffer: [96]u8 = undefined;
@@ -591,7 +668,7 @@ test "an oversized frame's tail is still accepted after the refusal" {
 }
 
 test "an oversized frame is refused and its connection closed" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    try skipWithoutTransport();
     const dir = try TestDir.create(0o700);
     defer dir.remove();
     var endpoint_buffer: [96]u8 = undefined;

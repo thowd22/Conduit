@@ -13,10 +13,12 @@
 //! - `registry` and `connections` are guarded by `mutex`; the queue has its
 //!   own lock. Lock order: `mutex` before the queue's, never the reverse.
 //!
-//! Security: the endpoint is a 0600 socket inside a private 0700 directory
-//! (`platform.LocalSocketListener`), every request carries a workspace token
-//! compared in constant time, only the enumerated methods exist, every size
-//! is bounded, and request text is never logged.
+//! Security: the endpoint is a 0600 socket inside a private 0700 directory,
+//! or on Windows a named pipe only the current logon SID may open and no
+//! remote client may reach (`platform.LocalSocketListener`, TASK-82), every
+//! request carries a workspace token compared in constant time, only the
+//! enumerated methods exist, every size is bounded, and request text is
+//! never logged.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -87,7 +89,8 @@ pub const Handler = struct {
 
 pub const Options = struct {
     /// Absolute socket path inside a private (0700) run directory, for
-    /// example `<run state dir>/control.sock`. Copied.
+    /// example `<runtime dir>/r-<hex>.sock`, or on Windows a
+    /// `\\.\pipe\<name>` path (`control.runEndpoint`). Copied.
     endpoint: []const u8,
     /// The `control.enabled` setting. See `enabledIn`.
     enabled: bool = false,
@@ -110,7 +113,7 @@ const Registration = struct {
 const Connection = struct {
     state: enum { free, running, finished } = .free,
     thread: ?std.Thread = null,
-    stream: ?std.Io.net.Stream = null,
+    stream: ?platform.LocalStream = null,
 };
 
 pub const Server = struct {
@@ -246,15 +249,15 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.stopping.store(true, .release);
         self.queue.stop();
-        shutdownStream(self.io, .{ .socket = self.listener.server.socket });
+        self.listener.cancelAccept(self.io);
         // Darwin's shutdown(2) refuses a listening socket and leaves a blocked
         // accept(2) asleep, where Linux's wakes it, so the join below would
         // wait forever (TASK-5). One connection to the server's own endpoint
         // wakes it there; the listener sees `stopping` and refuses it. The
         // connection stays open until the join so that refusal never writes
-        // to a closed peer.
+        // to a closed peer. A Windows pipe's accept is woken by its stop event.
         var waker: ?std.Io.net.Stream = null;
-        if (comptime builtin.os.tag != .linux) {
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .windows) {
             if (std.Io.net.UnixAddress.init(self.endpoint)) |address| {
                 waker = address.connect(self.io) catch null;
             } else |_| {}
@@ -264,7 +267,7 @@ pub const Server = struct {
 
         self.mutex.lockUncancelable(self.io);
         for (self.connections) |*connection| {
-            if (connection.stream) |stream| shutdownStream(self.io, stream);
+            if (connection.stream) |stream| stream.cancel(self.io);
         }
         self.mutex.unlock(self.io);
         for (self.connections) |*connection| {
@@ -283,7 +286,7 @@ pub const Server = struct {
 
     fn listenerMain(self: *Server) void {
         while (!self.stopping.load(.acquire)) {
-            const stream = self.listener.server.accept(self.io) catch |err| {
+            const stream = self.listener.accept(self.io) catch |err| {
                 if (self.stopping.load(.acquire)) return;
                 log.warn("control accept failed: {s}", .{@errorName(err)});
                 // Back off so a persistent failure (descriptor exhaustion) does not spin; the
@@ -296,7 +299,7 @@ pub const Server = struct {
     }
 
     /// Give `stream` a connection thread, or refuse it with `Busy`.
-    fn adopt(self: *Server, stream: std.Io.net.Stream) void {
+    fn adopt(self: *Server, stream: platform.LocalStream) void {
         var finished: ?std.Thread = null;
         const slot = blk: {
             self.mutex.lockUncancelable(self.io);
@@ -341,38 +344,48 @@ pub const Server = struct {
         self.mutex.unlock(self.io);
     }
 
-    fn serve(self: *Server, stream: std.Io.net.Stream) void {
+    fn serve(self: *Server, stream: platform.LocalStream) void {
         const buffer = self.allocator.alloc(u8, protocol.max_frame_bytes + 1) catch {
             writeFrame(self.io, stream, null, .{ .fault = .busy });
             return;
         };
         defer self.allocator.free(buffer);
-        var reader = stream.reader(self.io, buffer);
+        var used: usize = 0;
 
         while (!self.stopping.load(.acquire)) {
-            const framed = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
-                error.StreamTooLong => {
+            const delimiter = std.mem.indexOfScalar(u8, buffer[0..used], '\n') orelse {
+                if (used == buffer.len) {
                     // The rest of the oversized line cannot be resynchronised.
                     // Closing straight away raced a client still sending the
                     // tail of that line (EPIPE before it could read the
                     // refusal), so end only the write side and discard a
                     // bounded tail until the client hangs up.
                     writeFrame(self.io, stream, null, .{ .fault = .invalid_request });
-                    stream.shutdown(self.io, .send) catch {};
-                    // The buffer still holds the refused prefix, and a discard
-                    // that fits in the buffer returns without reading, so skip
-                    // it first; only then does the discard wait on the socket.
-                    reader.interface.toss(reader.interface.bufferedLen());
-                    _ = reader.interface.discardShort(protocol.max_frame_bytes) catch {};
+                    stream.shutdownSend(self.io);
+                    var discarded: usize = 0;
+                    while (discarded < protocol.max_frame_bytes) {
+                        const count = stream.read(self.io, buffer) catch return;
+                        if (count == 0) return;
+                        discarded += count;
+                    }
                     return;
-                },
-                error.EndOfStream, error.ReadFailed => return,
+                }
+                const count = stream.read(self.io, buffer[used..]) catch return;
+                if (count == 0) return;
+                used += count;
+                continue;
             };
-            var frame = framed[0 .. framed.len - 1];
+            var frame = buffer[0..delimiter];
             if (frame.len != 0 and frame[frame.len - 1] == '\r') frame = frame[0 .. frame.len - 1];
-            if (frame.len == 0) continue;
-            const reply = self.handleFrame(frame);
-            writeFrame(self.io, stream, reply.id.get(), reply.reply);
+            if (frame.len != 0) {
+                // The request is parsed into its own arena, so the buffer may
+                // be reused as soon as `handleFrame` returns.
+                const reply = self.handleFrame(frame);
+                writeFrame(self.io, stream, reply.id.get(), reply.reply);
+            }
+            const rest = used - delimiter - 1;
+            std.mem.copyForwards(u8, buffer[0..rest], buffer[delimiter + 1 .. used]);
+            used = rest;
         }
     }
 
@@ -417,20 +430,11 @@ pub const Server = struct {
     }
 };
 
-fn writeFrame(io: std.Io, stream: std.Io.net.Stream, id: ?protocol.RequestId, reply: protocol.Reply) void {
-    var encoded: [protocol.max_reply_bytes]u8 = undefined;
+fn writeFrame(io: std.Io, stream: platform.LocalStream, id: ?protocol.RequestId, reply: protocol.Reply) void {
+    var encoded: [protocol.max_reply_bytes + 1]u8 = undefined;
     // Ids are bounded and messages fixed, so a reply always fits.
-    const bytes = protocol.encodeReply(&encoded, id, reply) catch unreachable;
-    var buffer: [256]u8 = undefined;
-    var writer = stream.writer(io, &buffer);
-    writer.interface.writeAll(bytes) catch return;
-    writer.interface.writeByte('\n') catch return;
+    const bytes = protocol.encodeReply(encoded[0..protocol.max_reply_bytes], id, reply) catch unreachable;
+    encoded[bytes.len] = '\n';
     // A client that hung up gets nothing; there is no one left to tell.
-    writer.interface.flush() catch return;
-}
-
-fn shutdownStream(io: std.Io, stream: std.Io.net.Stream) void {
-    // Shutdown only cancels a blocked accept or read; a peer that already
-    // left (or a listener with no connection) needs no cancelling.
-    stream.shutdown(io, .both) catch {};
+    stream.writeAll(io, encoded[0 .. bytes.len + 1]) catch return;
 }

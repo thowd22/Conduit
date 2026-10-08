@@ -2917,6 +2917,8 @@ const WindowsDriver = struct {
     const open_existing: DWORD = 3;
     const token_query: DWORD = 0x00000008;
     const token_logon_sid: DWORD = 28;
+    const token_user: DWORD = 1;
+    const pipe_unlimited_instances: DWORD = 255;
     const sddl_revision_1: DWORD = 1;
 
     const Listener = struct {
@@ -3009,6 +3011,10 @@ const WindowsDriver = struct {
         timeout_ms: DWORD,
     ) callconv(.winapi) DWORD;
     extern "kernel32" fn LocalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn WaitNamedPipeW(name: windows.LPCWSTR, timeout_ms: DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetCurrentThread() callconv(.winapi) HANDLE;
+    extern "advapi32" fn ImpersonateAnonymousToken(thread: HANDLE) callconv(.winapi) BOOL;
+    extern "advapi32" fn RevertToSelf() callconv(.winapi) BOOL;
 
     extern "advapi32" fn OpenProcessToken(
         process: HANDLE,
@@ -3129,6 +3135,59 @@ const WindowsDriver = struct {
         return .{ .pipe = pipe, .event = event, .stop_event = stop_event };
     }
 
+    /// One more instance of the pipe `name` for a multi-instance listener (the control API): the
+    /// first refuses a name another process already holds, exactly like the driver's single
+    /// instance; later ones join the pipe the first created, whose descriptor already decides who
+    /// may connect. Every instance rejects remote clients. `stop_event` is left null for the
+    /// caller to supply.
+    fn createInstance(name: [:0]const u16, descriptor: *anyopaque, first: bool) error{ EndpointOccupied, ListenerFailed }!struct { pipe: HANDLE, event: HANDLE } {
+        var attributes: windows.SECURITY_ATTRIBUTES = .{
+            .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = descriptor,
+            .bInheritHandle = .FALSE,
+        };
+        const pipe = CreateNamedPipeW(
+            name.ptr,
+            pipe_access_duplex | file_flag_overlapped | (if (first) file_flag_first_pipe_instance else 0),
+            pipe_type_byte | pipe_readmode_byte | pipe_wait | pipe_reject_remote_clients,
+            pipe_unlimited_instances,
+            pipe_buffer_bytes,
+            pipe_buffer_bytes,
+            0,
+            &attributes,
+        );
+        if (pipe == windows.INVALID_HANDLE_VALUE) {
+            if (first and windows.GetLastError() == .ACCESS_DENIED) return error.EndpointOccupied;
+            return error.ListenerFailed;
+        }
+        errdefer windows.CloseHandle(pipe);
+        const event = CreateEventW(null, .TRUE, .FALSE, null) orelse return error.ListenerFailed;
+        return .{ .pipe = pipe, .event = event };
+    }
+
+    /// The current user's SID as text (`S-1-5-21-…`) in `buffer`, or null.
+    fn currentUserSid(buffer: []u8) ?[]const u8 {
+        var token: HANDLE = windows.INVALID_HANDLE_VALUE;
+        if (OpenProcessToken(windows.GetCurrentProcess(), token_query, &token) == .FALSE) return null;
+        defer windows.CloseHandle(token);
+        var information: [256]u8 align(@alignOf(SidAndAttributes)) = undefined;
+        var information_bytes: DWORD = 0;
+        if (GetTokenInformation(token, token_user, &information, information.len, &information_bytes) == .FALSE) return null;
+        const user: *const SidAndAttributes = @ptrCast(&information);
+        const sid = user.sid orelse return null;
+        var sid_wide: ?windows.LPWSTR = null;
+        if (ConvertSidToStringSidW(sid, &sid_wide) == .FALSE) return null;
+        defer _ = LocalFree(@ptrCast(sid_wide.?));
+        const wide = std.mem.span(sid_wide.?);
+        if (wide.len > buffer.len) return null;
+        for (wide, 0..) |unit, index| {
+            // A SID's text is `S`, digits and dashes; anything else is not one.
+            if (unit > 0x7f) return null;
+            buffer[index] = @intCast(unit);
+        }
+        return buffer[0..wide.len];
+    }
+
     fn closeListener(listener: Listener) void {
         windows.CloseHandle(listener.stop_event);
         windows.CloseHandle(listener.event);
@@ -3237,8 +3296,16 @@ const WindowsDriver = struct {
             0,
             null,
         );
-        if (pipe == windows.INVALID_HANDLE_VALUE) return error.ConnectionFailed;
-        return pipe;
+        if (pipe != windows.INVALID_HANDLE_VALUE) return pipe;
+        // Every instance of a multi-instance pipe can be busy for the moment between one
+        // client's connection and the server's next instance; wait for one, briefly.
+        var attempts: usize = 0;
+        while (windows.GetLastError() == .PIPE_BUSY and attempts < 10) : (attempts += 1) {
+            if (WaitNamedPipeW(name.ptr, 500) == .FALSE and windows.GetLastError() != .SEM_TIMEOUT) break;
+            const retried = CreateFileW(name.ptr, generic_read | generic_write, 0, null, open_existing, 0, null);
+            if (retried != windows.INVALID_HANDLE_VALUE) return retried;
+        }
+        return error.ConnectionFailed;
     }
 
     fn clientWriteAll(pipe: HANDLE, bytes: []const u8) error{ConnectionFailed}!void {
@@ -3856,29 +3923,127 @@ pub const DriverClient = struct {
     }
 };
 
-/// A listening filesystem AF_UNIX socket made with the driver endpoint's rules, for a server that
-/// owns its own accept loop.
+/// A local, current-user-only listener for a server that owns its own accept loop and serves many
+/// clients at once: a filesystem AF_UNIX socket on Linux and macOS, a protected multi-instance
+/// named pipe on Windows (TASK-82).
 ///
 /// The TASK-60 control API serves many short-lived harness clients concurrently with reply
 /// deadlines, so it cannot reuse the single-connection, window-bound `DriverTransport`; it reuses
-/// only the endpoint discipline here. `listen` additionally refuses a parent directory that grants
-/// any group or other permission, so the endpoint always sits inside a private (0700) run
-/// directory, and leaves the socket itself 0600. A live socket is never replaced; a stale one is.
+/// the endpoint discipline and, on Windows, the driver's pipe seam:
 ///
-/// Threads: `listen` and `deinit` run on the owning thread; `server.accept` may block on one
-/// worker, which the owner wakes by shutting the listening socket down before `deinit`.
+/// - Linux and macOS: `listen` refuses a parent directory that grants any group or other
+///   permission, so the endpoint always sits inside a private (0700) run directory, and leaves
+///   the socket itself 0600. A live socket is never replaced; a stale one is.
+/// - Windows: `endpoint` is an exact `\\.\pipe\<name>` path. Every instance carries the driver
+///   pipe's descriptor (only the current logon SID may read or write) and rejects remote
+///   clients; the first instance refuses a name another process already holds, so a squatter
+///   cannot pre-create the endpoint. One instance always waits for the next client.
 ///
-/// Linux and macOS only. Windows reports `error.UnsupportedPlatform` until a multi-instance
-/// protected named-pipe listener exists; nothing falls back to TCP.
+/// No platform falls back to TCP.
+///
+/// Threads: `listen` and `deinit` run on the owning thread; `accept` blocks on one worker, which
+/// the owner wakes with `cancelAccept` before `deinit`.
 pub const LocalSocketListener = struct {
+    impl: Impl,
+
+    const Impl = if (builtin.os.tag == .windows) WindowsPipeServer else PosixSocketServer;
+
+    pub const ListenError = DriverTransport.StartError || error{ParentNotPrivate};
+    pub const AcceptError = error{ Cancelled, AcceptFailed };
+
+    /// Listen at `endpoint`. On Linux and macOS its parent directory must already exist and be
+    /// private.
+    pub fn listen(io: std.Io, endpoint: []const u8) ListenError!LocalSocketListener {
+        return .{ .impl = try Impl.listen(io, endpoint) };
+    }
+
+    /// Block until the next client connects. The stream is the caller's to `close`.
+    pub fn accept(self: *LocalSocketListener, io: std.Io) AcceptError!LocalStream {
+        return self.impl.accept(io);
+    }
+
+    /// Wake a blocked `accept` from another thread; every later `accept` fails with `Cancelled`
+    /// (Windows) or an accept error (POSIX). Darwin's shutdown does not wake a blocked accept, so
+    /// a POSIX caller there also connects once to its own endpoint (see `control.Server.deinit`).
+    pub fn cancelAccept(self: *LocalSocketListener, io: std.Io) void {
+        self.impl.cancelAccept(io);
+    }
+
+    /// Close the listener and, on POSIX, remove `endpoint` only if it is still the socket
+    /// `listen` made.
+    pub fn deinit(self: *LocalSocketListener, io: std.Io, endpoint: []const u8) void {
+        self.impl.deinit(io, endpoint);
+        self.* = undefined;
+    }
+};
+
+/// One accepted connection of a `LocalSocketListener`. `read` and `writeAll` run on the one thread
+/// serving it; `cancel` may be called from any thread to wake a blocked `read`; `close` once,
+/// after its thread is done.
+pub const LocalStream = struct {
+    impl: if (builtin.os.tag == .windows) WindowsDriver.Listener else std.Io.net.Stream,
+
+    pub const ReadError = error{ReadFailed};
+    pub const WriteError = error{WriteFailed};
+
+    /// Read what is available into `dest` (blocking until something is): 0 at end of stream.
+    pub fn read(self: *const LocalStream, io: std.Io, dest: []u8) ReadError!usize {
+        if (dest.len == 0) return 0;
+        if (comptime builtin.os.tag == .windows) {
+            return WindowsDriver.overlappedRead(self.impl, dest) catch |err| switch (err) {
+                error.Disconnected => 0,
+                error.Cancelled, error.Failed => error.ReadFailed,
+            };
+        } else {
+            var vector: [1][]u8 = .{dest};
+            return io.vtable.netRead(io.userdata, self.impl.socket.handle, &vector) catch error.ReadFailed;
+        }
+    }
+
+    pub fn writeAll(self: *const LocalStream, io: std.Io, bytes: []const u8) WriteError!void {
+        if (comptime builtin.os.tag == .windows) {
+            WindowsDriver.overlappedWriteAll(self.impl, bytes) catch return error.WriteFailed;
+        } else {
+            var buffer: [256]u8 = undefined;
+            var writer = self.impl.writer(io, &buffer);
+            writer.interface.writeAll(bytes) catch return error.WriteFailed;
+            writer.interface.flush() catch return error.WriteFailed;
+        }
+    }
+
+    /// End the write side so the client sees end of stream after what was written. A named pipe
+    /// has no half-close; the client reads to the end and then sees the pipe close.
+    pub fn shutdownSend(self: *const LocalStream, io: std.Io) void {
+        if (comptime builtin.os.tag == .windows) return;
+        // A peer that already left needs no shutdown.
+        self.impl.shutdown(io, .send) catch {};
+    }
+
+    /// Wake a `read` or `writeAll` blocked on another thread; the stream stays open.
+    pub fn cancel(self: *const LocalStream, io: std.Io) void {
+        if (comptime builtin.os.tag == .windows) {
+            WindowsDriver.cancel(self.impl);
+        } else {
+            // Shutdown only cancels a blocked read; a peer that already left needs no cancelling.
+            self.impl.shutdown(io, .both) catch {};
+        }
+    }
+
+    pub fn close(self: *const LocalStream, io: std.Io) void {
+        if (comptime builtin.os.tag == .windows) {
+            WindowsDriver.closeListener(self.impl);
+        } else {
+            self.impl.close(io);
+        }
+    }
+};
+
+const PosixSocketServer = struct {
     server: std.Io.net.Server,
     endpoint_inode: std.Io.File.INode,
 
-    pub const ListenError = DriverTransport.StartError || error{ParentNotPrivate};
-
-    /// Listen at `endpoint`, whose parent directory must already exist and be private.
-    pub fn listen(io: std.Io, endpoint: []const u8) ListenError!LocalSocketListener {
-        if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
+    fn listen(io: std.Io, endpoint: []const u8) LocalSocketListener.ListenError!PosixSocketServer {
+        if (comptime builtin.os.tag == .windows) unreachable;
         try validateDriverEndpoint(endpoint);
         if (endpoint.len >= @sizeOf(@FieldType(std.posix.sockaddr.un, "path"))) {
             return error.EndpointTooLong;
@@ -3909,13 +4074,166 @@ pub const LocalSocketListener = struct {
         return .{ .server = server, .endpoint_inode = stat.inode };
     }
 
-    /// Close the listener and remove `endpoint` only if it is still the socket `listen` made.
-    pub fn deinit(self: *LocalSocketListener, io: std.Io, endpoint: []const u8) void {
+    fn accept(self: *PosixSocketServer, io: std.Io) LocalSocketListener.AcceptError!LocalStream {
+        const stream = self.server.accept(io) catch return error.AcceptFailed;
+        return .{ .impl = stream };
+    }
+
+    fn cancelAccept(self: *PosixSocketServer, io: std.Io) void {
+        // `shutdown` is the cancellation operation documented for a blocked Server.accept; a
+        // listener with no connection needs nothing more.
+        const listener_stream: std.Io.net.Stream = .{ .socket = self.server.socket };
+        listener_stream.shutdown(io, .both) catch {};
+    }
+
+    fn deinit(self: *PosixSocketServer, io: std.Io, endpoint: []const u8) void {
         self.server.deinit(io);
         removeOwnedDriverEndpoint(io, endpoint, self.endpoint_inode);
-        self.* = undefined;
     }
 };
+
+/// The Windows side of `LocalSocketListener`: one pipe name, many instances. `pending` is the
+/// instance waiting for the next client; `accept` hands a connected instance to its caller and
+/// creates the next one before returning, so the name never disappears between clients.
+const WindowsPipeServer = struct {
+    name: [WindowsDriver.max_pipe_path_chars + 1]u16,
+    name_len: usize,
+    /// From `ConvertStringSecurityDescriptorToSecurityDescriptorW`; `LocalFree`d by `deinit`.
+    descriptor: *anyopaque,
+    /// Set by `cancelAccept`; every connect waits on it.
+    stop_event: std.os.windows.HANDLE,
+    pending: ?Pending,
+
+    const Pending = struct { pipe: std.os.windows.HANDLE, event: std.os.windows.HANDLE };
+
+    fn listen(io: std.Io, endpoint: []const u8) LocalSocketListener.ListenError!WindowsPipeServer {
+        _ = io;
+        if (comptime builtin.os.tag != .windows) unreachable;
+        try validateWindowsDriverEndpoint(endpoint);
+        const descriptor = try WindowsDriver.createSecurityDescriptor(std.heap.page_allocator);
+        errdefer _ = WindowsDriver.LocalFree(descriptor);
+        var self: WindowsPipeServer = .{
+            .name = undefined,
+            .name_len = endpoint.len,
+            .descriptor = descriptor,
+            .stop_event = undefined,
+            .pending = null,
+        };
+        _ = WindowsDriver.pipeName(endpoint, &self.name);
+        const first = try WindowsDriver.createInstance(self.nameZ(), descriptor, true);
+        errdefer {
+            std.os.windows.CloseHandle(first.event);
+            std.os.windows.CloseHandle(first.pipe);
+        }
+        self.stop_event = WindowsDriver.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.ListenerFailed;
+        self.pending = .{ .pipe = first.pipe, .event = first.event };
+        return self;
+    }
+
+    fn nameZ(self: *const WindowsPipeServer) [:0]const u16 {
+        return self.name[0..self.name_len :0];
+    }
+
+    fn accept(self: *WindowsPipeServer, io: std.Io) LocalSocketListener.AcceptError!LocalStream {
+        _ = io;
+        if (comptime builtin.os.tag != .windows) unreachable;
+        const windows = std.os.windows;
+        const instance = self.pending orelse blk: {
+            const made = WindowsDriver.createInstance(self.nameZ(), self.descriptor, false) catch return error.AcceptFailed;
+            self.pending = .{ .pipe = made.pipe, .event = made.event };
+            break :blk self.pending.?;
+        };
+        WindowsDriver.connect(.{ .pipe = instance.pipe, .event = instance.event, .stop_event = self.stop_event }) catch |err| {
+            // The instance is unusable after a failed or cancelled connect; a fresh one replaces
+            // it on the next call.
+            windows.CloseHandle(instance.event);
+            windows.CloseHandle(instance.pipe);
+            self.pending = null;
+            return switch (err) {
+                error.Cancelled => error.Cancelled,
+                error.Disconnected, error.Failed => error.AcceptFailed,
+            };
+        };
+        self.pending = null;
+        if (WindowsDriver.createInstance(self.nameZ(), self.descriptor, false)) |next| {
+            self.pending = .{ .pipe = next.pipe, .event = next.event };
+        } else |_| {
+            // Retried by the next `accept`; this connection is still served.
+        }
+        const stream_stop = WindowsDriver.CreateEventW(null, .TRUE, .FALSE, null) orelse {
+            windows.CloseHandle(instance.event);
+            windows.CloseHandle(instance.pipe);
+            return error.AcceptFailed;
+        };
+        return .{ .impl = .{ .pipe = instance.pipe, .event = instance.event, .stop_event = stream_stop } };
+    }
+
+    fn cancelAccept(self: *WindowsPipeServer, io: std.Io) void {
+        _ = io;
+        if (comptime builtin.os.tag != .windows) unreachable;
+        _ = WindowsDriver.SetEvent(self.stop_event);
+    }
+
+    fn deinit(self: *WindowsPipeServer, io: std.Io, endpoint: []const u8) void {
+        _ = io;
+        _ = endpoint;
+        if (comptime builtin.os.tag != .windows) unreachable;
+        if (self.pending) |instance| {
+            std.os.windows.CloseHandle(instance.event);
+            std.os.windows.CloseHandle(instance.pipe);
+        }
+        std.os.windows.CloseHandle(self.stop_event);
+        _ = WindowsDriver.LocalFree(self.descriptor);
+    }
+};
+
+/// The current user's identity for naming per-user local endpoints: the user SID's text on
+/// Windows (`S-1-5-21-…`), written into `buffer`. Null elsewhere, and when it cannot be read.
+pub fn currentUserId(buffer: []u8) ?[]const u8 {
+    if (comptime builtin.os.tag != .windows) return null;
+    return WindowsDriver.currentUserSid(buffer);
+}
+
+pub const AppendError = error{ InvalidPath, OpenFailed, WriteFailed };
+
+/// Append `bytes` to the file at `path` with one append-mode write, creating it (0600 on POSIX)
+/// when missing: `O_APPEND` on POSIX, `FILE_APPEND_DATA` on Windows. Writers appending whole
+/// lines this way never interleave or overwrite each other's lines, which is what the agent
+/// event files rely on (the hook relay appends with `cat >>`, `conduit control` and the control
+/// endpoint append beside it).
+pub fn appendToFile(path: []const u8, bytes: []const u8) AppendError!void {
+    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+    if (comptime builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        var wide_buffer: [std.fs.max_path_bytes + 1]u16 = undefined;
+        const length = std.unicode.utf8ToUtf16Le(&wide_buffer, path) catch return error.InvalidPath;
+        if (length >= wide_buffer.len) return error.InvalidPath;
+        wide_buffer[length] = 0;
+        const file_append_data: windows.DWORD = 0x0004;
+        const file_share_read_write: windows.DWORD = 0x00000001 | 0x00000002;
+        const open_always: windows.DWORD = 4;
+        const handle = WindowsDriver.CreateFileW(
+            wide_buffer[0..length :0].ptr,
+            file_append_data,
+            file_share_read_write,
+            null,
+            open_always,
+            0,
+            null,
+        );
+        if (handle == windows.INVALID_HANDLE_VALUE) return error.OpenFailed;
+        defer windows.CloseHandle(handle);
+        var transferred: windows.DWORD = 0;
+        if (WindowsDriver.WriteFile(handle, bytes.ptr, @intCast(bytes.len), &transferred, null) == .FALSE or
+            transferred != bytes.len) return error.WriteFailed;
+    } else {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true, .CLOEXEC = true }, 0o600) catch
+            return error.OpenFailed;
+        defer _ = std.posix.system.close(fd);
+        const written = std.posix.system.write(fd, bytes.ptr, bytes.len);
+        if (std.posix.errno(written) != .SUCCESS or @as(usize, @intCast(written)) != bytes.len) return error.WriteFailed;
+    }
+}
 
 fn driverIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -5134,4 +5452,106 @@ test "X11: a real client window is reparented into a container, moved, hidden, a
     released = true;
     // Given back to the desktop, not destroyed.
     try std.testing.expectEqual(@as(?c_ulong, root), api.parentOf(display, client));
+}
+
+const LocalEchoServer = struct {
+    listener: *LocalSocketListener,
+    streams: [4]?LocalStream = @splat(null),
+
+    /// Accept until cancelled, answering one line per connection and keeping each open, so the
+    /// clients hold several instances of the pipe at once.
+    fn run(self: *LocalEchoServer) void {
+        const io = testing.io;
+        for (&self.streams) |*slot| {
+            const stream = self.listener.accept(io) catch return;
+            slot.* = stream;
+            var buffer: [64]u8 = undefined;
+            var used: usize = 0;
+            while (std.mem.indexOfScalar(u8, buffer[0..used], '\n') == null and used < buffer.len) {
+                const count = stream.read(io, buffer[used..]) catch return;
+                if (count == 0) return;
+                used += count;
+            }
+            stream.writeAll(io, buffer[0..used]) catch return;
+        }
+    }
+};
+
+test "the local listener serves concurrent clients and, on Windows, refuses anonymous and remote ones" {
+    if (builtin.os.tag != .windows and builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const io = testing.io;
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    var name_buffer: [128]u8 = undefined;
+    const endpoint = if (builtin.os.tag == .windows)
+        try std.fmt.bufPrint(&name_buffer, "\\\\.\\pipe\\conduit-listener-test-{x}", .{&random})
+    else
+        try std.fmt.bufPrint(&name_buffer, "/tmp/conduit-lt-{x}/l.sock", .{&random});
+    if (builtin.os.tag != .windows) {
+        try std.Io.Dir.cwd().createDir(io, std.fs.path.dirname(endpoint).?, .fromMode(0o700));
+    }
+    // Best-effort cleanup of a test directory; a leftover only wastes /tmp space.
+    defer if (builtin.os.tag != .windows) std.Io.Dir.cwd().deleteTree(io, std.fs.path.dirname(endpoint).?) catch {};
+
+    var listener = try LocalSocketListener.listen(io, endpoint);
+    defer listener.deinit(io, endpoint);
+    if (builtin.os.tag == .windows) {
+        // The first instance owns the name: a second listener cannot take it over.
+        try testing.expectError(error.EndpointOccupied, LocalSocketListener.listen(io, endpoint));
+    }
+    var server: LocalEchoServer = .{ .listener = &listener };
+    const thread = try std.Thread.spawn(.{}, LocalEchoServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) stopEchoServer(&listener, endpoint, thread);
+    defer for (server.streams) |slot| if (slot) |stream| stream.close(io);
+
+    // Two clients stay connected at once.
+    var first = try DriverClient.connect(endpoint);
+    defer first.deinit();
+    var second = try DriverClient.connect(endpoint);
+    defer second.deinit();
+    const first_reply = try first.exchange(testing.allocator, "one");
+    defer testing.allocator.free(first_reply);
+    const second_reply = try second.exchange(testing.allocator, "two");
+    defer testing.allocator.free(second_reply);
+    try testing.expectEqualStrings("one", first_reply);
+    try testing.expectEqualStrings("two", second_reply);
+
+    if (builtin.os.tag == .windows) {
+        // Another user: an anonymous token is not the current logon SID, so the pipe's
+        // descriptor refuses it while an instance is waiting.
+        if (WindowsDriver.ImpersonateAnonymousToken(WindowsDriver.GetCurrentThread()) == .FALSE) return error.TestUnexpectedResult;
+        const anonymous = WindowsDriver.openClient(endpoint);
+        if (WindowsDriver.RevertToSelf() == .FALSE) return error.TestUnexpectedResult;
+        if (anonymous) |handle| {
+            std.os.windows.CloseHandle(handle);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        // A remote client: the same pipe through the network redirector is rejected.
+        var remote_buffer: [160]u8 = undefined;
+        const remote = try std.fmt.bufPrint(&remote_buffer, "\\\\localhost\\pipe\\{s}", .{endpoint["\\\\.\\pipe\\".len..]});
+        if (WindowsDriver.openClient(remote)) |handle| {
+            std.os.windows.CloseHandle(handle);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        // The current user still connects after both refusals.
+        var third = try DriverClient.connect(endpoint);
+        defer third.deinit();
+        const third_reply = try third.exchange(testing.allocator, "three");
+        defer testing.allocator.free(third_reply);
+        try testing.expectEqualStrings("three", third_reply);
+    }
+
+    stopEchoServer(&listener, endpoint, thread);
+    joined = true;
+}
+
+fn stopEchoServer(listener: *LocalSocketListener, endpoint: []const u8, thread: std.Thread) void {
+    listener.cancelAccept(testing.io);
+    // Darwin's shutdown does not wake a blocked accept; one connection does.
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) {
+        var waker = DriverClient.connect(endpoint) catch null;
+        if (waker) |*client| client.deinit();
+    }
+    thread.join();
 }

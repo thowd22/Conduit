@@ -84,12 +84,20 @@
 //! there, and `poll` tails the remote `events.jsonl` over the connection; the
 //! relay is plain POSIX sh and needs nothing else on the host.
 //!
+//! Windows (TASK-82, decision-13): there is no `/bin/sh`, so a local sink's
+//! hooks run the Conduit executable directly (`HookStyle.windows`):
+//! `"<conduit.exe>" control agent.event --event=<Hook>`, and for
+//! `PermissionRequest` the blocking `"<conduit.exe>" control
+//! agent.permission --wait`, which writes the same request and end lines and
+//! waits on the same `decisions/` file as the relay.
+//!
 //! Threads: every method but `harness` and `capabilities` runs on one IO
 //! worker at a time (adapter.zig). Memory: the adapter owns copies of its
 //! option paths, one line buffer per tail and a per-line JSON arena, all from
 //! the allocator given to `init` and released by `deinit`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const api = @import("adapter.zig");
 const event = @import("event.zig");
 const state_model = @import("state.zig");
@@ -216,13 +224,37 @@ pub fn isRequestId(id: []const u8) bool {
 }
 
 /// A sink path must be absolute and safe to embed in single quotes in a
-/// POSIX shell command and in JSON without surprises.
+/// POSIX shell command and in JSON without surprises. On Windows a
+/// drive-absolute path (`C:\…`) is one too (`isValidWindowsPath`): its hooks
+/// never name the sink in a command (TASK-82).
 pub fn isValidSinkPath(path: []const u8) bool {
+    return isValidSinkPathOn(builtin.os.tag, path);
+}
+
+/// `isValidSinkPath` for the host `os`.
+pub fn isValidSinkPathOn(os: std.Target.Os.Tag, path: []const u8) bool {
+    if (os == .windows and isValidWindowsPath(path)) return true;
     if (path.len < 2 or path.len > max_sink_path_bytes or path[0] != '/') return false;
     if (path[path.len - 1] == '/') return false;
     for (path) |c| {
         if (c < 0x20 or c == 0x7f or c == '\'' or c == '\\') return false;
     }
+    return true;
+}
+
+/// A drive-absolute Windows path (`C:\…` or `C:/…`) safe to embed in double
+/// quotes in a hook command, which Claude Code may run through `cmd.exe` or
+/// a POSIX shell (Git Bash): no `"`, no `%` (expanded by `cmd.exe` even
+/// inside quotes), no `$`, `` ` `` or `!` (expanded by bash or delayed
+/// expansion), and no control characters. Backslashes are literal in both.
+pub fn isValidWindowsPath(path: []const u8) bool {
+    if (path.len < 4 or path.len > max_sink_path_bytes) return false;
+    if (!std.ascii.isAlphabetic(path[0]) or path[1] != ':' or (path[2] != '\\' and path[2] != '/')) return false;
+    if (path[path.len - 1] == '\\' or path[path.len - 1] == '/') return false;
+    for (path) |c| switch (c) {
+        0...0x1f, 0x7f, '"', '%', '$', '`', '!' => return false,
+        else => {},
+    };
     return true;
 }
 
@@ -319,9 +351,42 @@ pub fn writeHookCommand(writer: *Io.Writer, sink: []const u8, hook: Hook) Io.Wri
 /// `PermissionRequest` keeps the relay, whose answer comes back through
 /// `decisions/`. `helper` must satisfy `isValidSinkPath` (absolute, quotable).
 pub fn writeHookCommandVia(writer: *Io.Writer, sink: []const u8, helper: ?[]const u8, hook: Hook) Io.Writer.Error!void {
+    return writeHookCommandFor(writer, .posix, sink, helper, hook);
+}
+
+/// How hook commands are spelled for the machine the hooks run on.
+pub const HookStyle = enum {
+    /// A POSIX shell runs them: the `/bin/sh` relay, or the helper in
+    /// single quotes (`writeHookCommandVia`).
+    posix,
+    /// Windows (TASK-82, decision-13): no `/bin/sh`. Every hook runs the
+    /// helper itself, double-quoted so `cmd.exe` and Git Bash read it alike:
+    /// `"<conduit.exe>" control agent.event --event=<Hook>`, and
+    /// `PermissionRequest` runs `"<conduit.exe>" control agent.permission
+    /// --wait`, which submits the request, waits for the answer the human
+    /// gives in the agent view (`<sink>/decisions/<id>`, as the relay does)
+    /// and prints Claude Code's allow/deny reply.
+    windows,
+
+    /// The style of hooks that run on this machine.
+    pub const native: HookStyle = if (builtin.os.tag == .windows) .windows else .posix;
+};
+
+/// The command one hook entry runs in `style`. A Windows command needs the
+/// helper (`isValidWindowsPath`); without one it falls back to the relay,
+/// which a machine with no `/bin/sh` cannot run.
+pub fn writeHookCommandFor(writer: *Io.Writer, style: HookStyle, sink: []const u8, helper: ?[]const u8, hook: Hook) Io.Writer.Error!void {
     const program = helper orelse return writeHookCommand(writer, sink, hook);
-    if (hook == .permission_request) return writeHookCommand(writer, sink, hook);
-    try writer.print("'{s}' control agent.event --event={s}", .{ program, hook.name() });
+    switch (style) {
+        .posix => {
+            if (hook == .permission_request) return writeHookCommand(writer, sink, hook);
+            try writer.print("'{s}' control agent.event --event={s}", .{ program, hook.name() });
+        },
+        .windows => {
+            if (hook == .permission_request) return writer.print("\"{s}\" control agent.permission --wait", .{program});
+            try writer.print("\"{s}\" control agent.event --event={s}", .{ program, hook.name() });
+        },
+    }
 }
 
 /// The `--settings` file: one command hook per registered event, no matcher
@@ -332,12 +397,17 @@ pub fn writeSettings(writer: *Io.Writer, sink: []const u8) Io.Writer.Error!void 
 
 /// `writeSettings` with `writeHookCommandVia`'s command choice.
 pub fn writeSettingsVia(writer: *Io.Writer, sink: []const u8, helper: ?[]const u8) Io.Writer.Error!void {
+    return writeSettingsFor(writer, .posix, sink, helper);
+}
+
+/// `writeSettings` with `writeHookCommandFor`'s command choice in `style`.
+pub fn writeSettingsFor(writer: *Io.Writer, style: HookStyle, sink: []const u8, helper: ?[]const u8) Io.Writer.Error!void {
     var command_buffer: [2 * max_sink_path_bytes + 64]u8 = undefined;
     try writer.writeAll("{\"hooks\":{");
     for (Hook.registered, 0..) |hook, i| {
         if (i != 0) try writer.writeByte(',');
         var command: Io.Writer = .fixed(&command_buffer);
-        try writeHookCommandVia(&command, sink, helper, hook);
+        try writeHookCommandFor(&command, style, sink, helper, hook);
         try writer.print("\"{s}\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":", .{hook.name()});
         try std.json.Stringify.encodeJsonString(command.buffered(), .{}, writer);
         try writer.print(",\"timeout\":{d}}}]}}]", .{hook.timeoutSeconds()});
@@ -819,12 +889,17 @@ pub const Options = struct {
     /// borrowed context in it must outlive the adapter.
     sink_io: ?SinkIo = null,
     /// The `conduit` executable the hooks run as `conduit control
-    /// agent.event` while the control endpoint is up (TASK-60); null keeps
-    /// every hook on the sink relay. Ignored unless it satisfies
-    /// `isValidSinkPath`, and for a remote sink, whose hooks run on another
-    /// machine where this path and the local endpoint do not exist.
+    /// agent.event` while the control endpoint is up (TASK-60), and on
+    /// Windows always (TASK-82: it falls back to the sink itself); null
+    /// keeps every hook on the sink relay. Ignored unless it is a quotable
+    /// absolute path for `hook_style` (`isValidSinkPathOn(.linux, …)` or
+    /// `isValidWindowsPath`), and for a remote sink, whose hooks run on
+    /// another machine where this path and the local endpoint do not exist.
     /// Borrowed for the adapter's life.
     control_helper: ?[]const u8 = null,
+    /// How a local sink's hook commands are spelled; a remote sink's hooks
+    /// always run on a POSIX host. Tests pick the style they assert.
+    hook_style: HookStyle = .native,
     /// An observed agent's foreground process (TASK-56): `attach` without a
     /// harness session id then finds the session by this pid, else by this
     /// cwd (`attachRunning`). Copied.
@@ -852,6 +927,7 @@ pub const ClaudeCodeAdapter = struct {
     /// Every file access: the sink, the transcript, the registry.
     sink: SinkIo,
     control_helper: ?[]const u8 = null,
+    hook_style: HookStyle = .posix,
     mode: Mode = .unbound,
     token: ?api.CorrelationToken = null,
     session_id: ?SessionId = null,
@@ -879,6 +955,8 @@ pub const ClaudeCodeAdapter = struct {
         const observe_cwd: []u8 = if (options.observe) |o| try allocator.dupe(u8, o.cwd) else &.{};
         errdefer allocator.free(observe_cwd);
         const program = try allocator.dupe(u8, options.program);
+        const remote = (options.sink_io orelse SinkIo.local()).isRemote();
+        const style: HookStyle = if (remote) .posix else options.hook_style;
         return .{
             .observe_pid = if (options.observe) |o| o.pid else null,
             .observe_cwd = observe_cwd,
@@ -889,10 +967,11 @@ pub const ClaudeCodeAdapter = struct {
             .program = program,
             .probe_env = options.probe_env,
             .sink = options.sink_io orelse .local(),
-            .control_helper = if (options.control_helper) |helper|
-                (if (isValidSinkPath(helper) and !(options.sink_io orelse SinkIo.local()).isRemote()) helper else null)
-            else
-                null,
+            .control_helper = if (options.control_helper) |helper| (if (!remote and switch (style) {
+                .posix => isValidSinkPathOn(.linux, helper),
+                .windows => isValidWindowsPath(helper),
+            }) helper else null) else null,
+            .hook_style = style,
             .arena = .init(allocator),
         };
     }
@@ -1062,7 +1141,7 @@ pub const ClaudeCodeAdapter = struct {
         writeHookScript(&content.writer, sink) catch return error.OutOfMemory;
         try self.writeSinkFile(&path_buffer, sink, "hook.sh", content.written());
         content.clearRetainingCapacity();
-        writeSettingsVia(&content.writer, sink, self.control_helper) catch return error.OutOfMemory;
+        writeSettingsFor(&content.writer, self.hook_style, sink, self.control_helper) catch return error.OutOfMemory;
         try self.writeSinkFile(&path_buffer, sink, "settings.json", content.written());
         try self.writeSinkFile(&path_buffer, sink, "events.jsonl", "");
     }
@@ -1663,9 +1742,90 @@ test "with the control helper every hook but PermissionRequest goes through cond
         try testing.expectEqualStrings(command, string(entries.items[0], "command").?);
     }
     // An unquotable helper is ignored by the adapter, which keeps the relay.
-    var a = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .sink_dir = sink, .control_helper = "/opt/it's/conduit" });
+    var a = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .sink_dir = sink, .control_helper = "/opt/it's/conduit", .hook_style = .posix });
     defer a.deinit();
     try testing.expectEqual(@as(?[]const u8, null), a.control_helper);
+}
+
+test "Windows hooks run conduit.exe directly, PermissionRequest through agent.permission --wait" {
+    const helper = "C:\\Program Files\\Conduit\\conduit.exe";
+    var content: Io.Writer.Allocating = .init(testing.allocator);
+    defer content.deinit();
+    try writeSettingsFor(&content.writer, .windows, "C:\\Users\\me\\AppData\\Local\\conduit\\agents\\r\\a1", helper);
+    const parsed = try std.json.parseFromSlice(Value, testing.allocator, content.written(), .{});
+    defer parsed.deinit();
+    const hooks = field(parsed.value, "hooks").?.object;
+    try testing.expectEqual(Hook.registered.len, hooks.count());
+    for (Hook.registered) |hook| {
+        const groups = hooks.get(hook.name()).?.array;
+        try testing.expectEqual(@as(usize, 1), groups.items.len);
+        try testing.expect(field(groups.items[0], "matcher") == null);
+        const entries = field(groups.items[0], "hooks").?.array;
+        try testing.expectEqual(@as(usize, 1), entries.items.len);
+        try testing.expectEqualStrings("command", string(entries.items[0], "type").?);
+        var expected: [160]u8 = undefined;
+        const command = if (hook == .permission_request)
+            "\"C:\\Program Files\\Conduit\\conduit.exe\" control agent.permission --wait"
+        else
+            try std.fmt.bufPrint(&expected, "\"C:\\Program Files\\Conduit\\conduit.exe\" control agent.event --event={s}", .{hook.name()});
+        try testing.expectEqualStrings(command, string(entries.items[0], "command").?);
+        // No POSIX shell and no sink path in any command.
+        try testing.expect(std.mem.indexOf(u8, command, "/bin/sh") == null);
+        try testing.expect(std.mem.indexOf(u8, command, "hook.sh") == null);
+        try testing.expectEqual(@as(i64, hook.timeoutSeconds()), integer(entries.items[0], "timeout").?);
+    }
+    try testing.expectEqual(@as(i64, 600), integer(field(hooks.get("PermissionRequest").?.array.items[0], "hooks").?.array.items[0], "timeout").?);
+
+    // The helper must be a drive-absolute path cmd.exe and bash read alike.
+    try testing.expect(isValidWindowsPath(helper));
+    try testing.expect(isValidWindowsPath("D:/a/conduit.exe"));
+    for ([_][]const u8{ "", "conduit.exe", "\\\\server\\share\\c.exe", "C:\\a\"b.exe", "C:\\%PATH%\\c.exe", "C:\\$x\\c.exe", "C:\\a!b\\c.exe", "C:\\a`b\\c.exe", "C:\\a\nb", "C:\\dir\\", "/opt/conduit" }) |bad| {
+        try testing.expect(!isValidWindowsPath(bad));
+    }
+    // A Windows sink path is a sink path only on Windows.
+    try testing.expect(isValidSinkPathOn(.windows, "C:\\Users\\me\\AppData\\Local\\conduit\\agents\\r\\a1"));
+    try testing.expect(!isValidSinkPathOn(.linux, "C:\\Users\\me\\AppData\\Local\\conduit\\agents\\r\\a1"));
+    try testing.expect(isValidSinkPathOn(.windows, "/tmp/conduit-agent-test-1/agents/a1"));
+
+    // The adapter keeps a valid Windows helper and drops an unquotable one;
+    // without a helper a Windows sink still gets the relay command.
+    var kept = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/run/conduit/agent-1", .control_helper = helper, .hook_style = .windows });
+    defer kept.deinit();
+    try testing.expectEqualStrings(helper, kept.control_helper.?);
+    var dropped = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/run/conduit/agent-1", .control_helper = "C:\\100%\\conduit.exe", .hook_style = .windows });
+    defer dropped.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), dropped.control_helper);
+    var command: Io.Writer.Allocating = .init(testing.allocator);
+    defer command.deinit();
+    try writeHookCommandFor(&command.writer, .windows, "/run/conduit/agent-1", null, .stop);
+    try testing.expectEqualStrings("/bin/sh '/run/conduit/agent-1/hook.sh' Stop", command.written());
+}
+
+test "launch writes Windows-style hooks into the sink's settings.json" {
+    var scratch: Scratch = undefined;
+    try scratch.init();
+    defer scratch.deinit();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const sink = scratch.join(&buffer, "agents/w");
+    const helper = "C:\\Conduit\\conduit.exe";
+    var a = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .sink_dir = sink, .control_helper = helper, .hook_style = .windows });
+    const iface = a.adapter();
+    defer iface.destroy();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try iface.launch(arena.allocator(), .{ .context_kind = .local, .cwd = "/w", .token = fixtureToken() });
+
+    var file_buffer: [16 * 1024]u8 = undefined;
+    const written = try scratch.tmp.dir.readFile(testing.io, "agents/w/settings.json", &file_buffer);
+    var expected: Io.Writer.Allocating = .init(testing.allocator);
+    defer expected.deinit();
+    try writeSettingsFor(&expected.writer, .windows, sink, helper);
+    try testing.expectEqualStrings(expected.written(), written);
+    try testing.expect(std.mem.indexOf(u8, written, "\\\"C:\\\\Conduit\\\\conduit.exe\\\" control agent.permission --wait") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "/bin/sh") == null);
+    // `decisions/` is where the human's answer lands, for the waiting hook.
+    const stat = try scratch.tmp.dir.statFile(testing.io, "agents/w/decisions", .{});
+    try testing.expectEqual(File.Kind.directory, stat.kind);
 }
 
 test "the settings file registers every hook with the exact relay command" {
