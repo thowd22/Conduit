@@ -1495,8 +1495,14 @@ const Load = struct {
     font_failure: ?[]const u8 = null,
     spawn_failure: ?[]const u8 = null,
     thread: ?std.Thread = null,
+    /// The window whose loop is woken once the result is published, so a
+    /// finished spawn or face is collected at once rather than at the next
+    /// idle tick (TASK-67). `postDriverWake` is thread-safe and the window
+    /// outlives every job; null for a job nobody waits on through the loop.
+    waker: ?*const platform.Window = null,
 
-    fn start(self: *Load) !void {
+    fn start(self: *Load, waker: ?*const platform.Window) !void {
+        self.waker = waker;
         self.thread = try std.Thread.spawn(.{}, work, .{self});
     }
 
@@ -1519,6 +1525,18 @@ const Load = struct {
 
     fn work(worker_context: *anyopaque) void {
         const self: *Load = @ptrCast(@alignCast(worker_context));
+        // Copied first: once `state` is published the owner may collect the
+        // job, although it joins this thread before freeing it.
+        const waker = self.waker;
+        self.produce();
+        self.state.store(1, .release);
+        if (waker) |window| window.postDriverWake() catch |err| {
+            // The loop still collects the job at its next idle tick.
+            log.debug("could not wake the loop for a finished load: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn produce(self: *Load) void {
         if (self.font_request) |request| {
             const fonts = font.Manager.init(self.allocator, self.io, request);
             if (fonts) |loaded| {
@@ -1535,14 +1553,12 @@ const Load = struct {
         if (self.spawn) |spawn_request| {
             const context = self.execution_context orelse {
                 self.spawn_failure = "MissingExecutionContext";
-                self.state.store(1, .release);
                 return;
             };
             var request = spawn_request;
             if (self.agent_runner) |runner| {
                 const prepared = runner.prepare(request.env) catch |err| {
                     self.spawn_failure = @errorName(err);
-                    self.state.store(1, .release);
                     return;
                 };
                 request.argv = prepared.argv;
@@ -1555,7 +1571,6 @@ const Load = struct {
                 self.spawn_failure = @errorName(err);
             }
         }
-        self.state.store(1, .release);
     }
 };
 
@@ -2144,10 +2159,36 @@ fn gridSizeFor(cell: font.CellSize, size: render.Size) !term.GridSize {
 /// story, and why the grid never has to scale anything itself.
 const font_points: f32 = config.default_font_points;
 
-/// The glyph atlas, in pixels. `font` allocates it and `render` uploads it as
-/// one texture, so both are told the same number.
+/// The glyph atlas edge, in pixels, below `large_atlas_scale`. `font`
+/// allocates it and `render` uploads it as one texture, so both are told the
+/// same number (`atlasSizeFor`).
 const atlas_width_px: u32 = 1024;
 const atlas_height_px: u32 = 1024;
+/// The atlas edge from `large_atlas_scale` up. A face rasterised at 2x has
+/// four times the glyph area, which crowded CJK and symbol-heavy screens out
+/// of a 1024² atlas (TASK-67's profiling); 2048² holds them at 16 MiB of
+/// coverage, still one texture.
+const large_atlas_px: u32 = 2048;
+const large_atlas_scale: f32 = 1.5;
+
+/// The coverage atlas for a face rasterised at display `scale`. Every grid
+/// that draws that face is attached with the same size (TASK-67).
+fn atlasSizeFor(scale: f32) render.AtlasSize {
+    if (scale >= large_atlas_scale) return .{ .width_px = large_atlas_px, .height_px = large_atlas_px };
+    return .{ .width_px = atlas_width_px, .height_px = atlas_height_px };
+}
+
+test "the atlas grows to 2048 square from display scale 1.5" {
+    try std.testing.expectEqual(@as(u32, 1024), atlasSizeFor(1).width_px);
+    try std.testing.expectEqual(@as(u32, 1024), atlasSizeFor(1.25).height_px);
+    try std.testing.expectEqual(@as(u32, 2048), atlasSizeFor(1.5).width_px);
+    try std.testing.expectEqual(@as(u32, 2048), atlasSizeFor(2).height_px);
+    const request = (FontValues{}).request("", try font.Size.init(14, 2), null);
+    try std.testing.expectEqual(@as(u32, 2048), request.atlas_width_px);
+    try std.testing.expectEqual(@as(u32, 2048), request.atlas_height_px);
+    const small = smallFontRequest(request).?;
+    try std.testing.expectEqual(small_atlas.width_px, small.atlas_width_px);
+}
 
 /// The fixed buffer child output is copied into. A program's output
 /// arrives in whatever sizes the pipe hands over, and this buffer is never
@@ -3561,6 +3602,25 @@ const WorkspacePresentation = struct {
     control_token: ?control_api.Token = null,
 };
 
+/// When process startup began, for the debug startup phase log (TASK-67).
+/// Written once by `main` on the main thread before anything else reads it.
+var startup_epoch_ns: i128 = 0;
+
+/// One startup phase as the debug log prints it.
+fn startupPhaseLine(buffer: []u8, phase: []const u8, elapsed_ns: i128) []const u8 {
+    const tenths = @divTrunc(@max(elapsed_ns, 0), std.time.ns_per_ms / 10);
+    return std.fmt.bufPrint(buffer, "startup: {s} after {d}.{d} ms", .{ phase, @divTrunc(tenths, 10), @mod(tenths, 10) }) catch "startup: phase";
+}
+
+test "startup phase lines name the phase and the milliseconds since start" {
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("startup: window after 12.3 ms", startupPhaseLine(&buffer, "window", 12_345_678));
+    try std.testing.expectEqualStrings("startup: first frame after 0.0 ms", startupPhaseLine(&buffer, "first frame", 10));
+    try std.testing.expectEqualStrings("startup: fonts after 0.0 ms", startupPhaseLine(&buffer, "fonts", -5));
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("startup: phase", startupPhaseLine(&tiny, "first child", 1));
+}
+
 /// One control request the owner has not answered yet (TASK-60).
 const ControlPending = struct {
     /// The server that holds the ticket; null for the startup command.
@@ -3860,8 +3920,8 @@ const FontValues = struct {
             .bold_italic_family = self.bold_italic,
             .size = size,
             .home_dir = home_dir,
-            .atlas_width_px = atlas_width_px,
-            .atlas_height_px = atlas_height_px,
+            .atlas_width_px = atlasSizeFor(size.scale).width_px,
+            .atlas_height_px = atlasSizeFor(size.scale).height_px,
             .fallbacks = self.fallbacks,
             .ligatures = self.ligatures,
             .builtin_symbols = self.builtin_symbols,
@@ -5066,6 +5126,15 @@ const App = struct {
     /// permission request. Borrowed from the check, which outlives every use.
     trace: ?*ClipboardTrace = null,
 
+    /// The coverage atlas size the current face was built with; every grid
+    /// is attached at this size (TASK-67: 2048² from scale 1.5).
+    atlas: render.AtlasSize,
+    /// When `init` started, for the debug startup phase log (TASK-67), and
+    /// which of the late phases have been logged.
+    startup_ns: i128 = 0,
+    first_frame_logged: bool = false,
+    first_child_logged: bool = false,
+
     fn init(
         io: Io,
         env: EnvSource,
@@ -5084,7 +5153,7 @@ const App = struct {
         errdefer allocator.free(output);
 
         const scale = window.state.scale.factor;
-        const atlas = render.AtlasSize{ .width_px = atlas_width_px, .height_px = atlas_height_px };
+        const atlas = atlasSizeFor(scale);
         const colors = gridColors(default_palette);
 
         // The settings file is read before the first face, so a configured
@@ -5139,7 +5208,8 @@ const App = struct {
                         env.get("HOME"),
                     )),
                 };
-                try job.start();
+                // Joined right here, so nothing needs waking.
+                try job.start(null);
                 job.thread.?.join();
                 job.thread = null;
                 if (job.font_failure) |name| log.warn("the font could not be loaded: {s}", .{name});
@@ -5875,6 +5945,7 @@ const App = struct {
             .needs_present = true,
             .scheduler = Scheduler.init(options.run.force_redraw),
             .fonts = fonts,
+            .atlas = atlas,
             .small_fonts = small_fonts,
             .workspace_registry = workspace_registry,
             .workspace_presentations = workspace_presentations,
@@ -5941,10 +6012,13 @@ const App = struct {
         // A hidden window is headless automation: its agents notify the list,
         // never the desktop, unless a check installs its own seam.
         if (options.run.hidden) app.agents.notifier = .{ .notify_fn = discardOsNotification };
+        app.startup_ns = startup_epoch_ns;
+        app.logStartupPhase("fonts");
         app.resolveTheme();
         app.theme_catalog.order(app.activeThemeName());
         app.setThemeChoices();
         app.setFontChoices();
+        app.logStartupPhase("theme");
         // Built-in checks other than the agent check never probe harnesses:
         // what is installed on a machine must not change what they measure.
         if (!usesDeterministicScratchpad(options)) app.ensureAgentDetection();
@@ -5966,6 +6040,16 @@ const App = struct {
         app.startChild();
         app.startConfigWatcher();
         return app;
+    }
+
+    // Startup phases (TASK-67) ------------------------------------------------
+
+    /// Log, at debug, how long after process start a startup phase finished.
+    fn logStartupPhase(self: *const App, phase: []const u8) void {
+        if (self.startup_ns == 0) return;
+        var buffer: [96]u8 = undefined;
+        const elapsed = Io.Clock.awake.now(self.io).nanoseconds - self.startup_ns;
+        log.debug("{s}", .{startupPhaseLine(&buffer, phase, elapsed)});
     }
 
     // The control API and the single instance (TASK-60, TASK-66) -------------
@@ -6822,10 +6906,7 @@ const App = struct {
         var scratchpad_grid = try render.Grid.init(self.allocator, gridColors(self.palette));
         var scratchpad_grid_owned = true;
         errdefer if (scratchpad_grid_owned) scratchpad_grid.deinit();
-        try scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), .{
-            .width_px = atlas_width_px,
-            .height_px = atlas_height_px,
-        });
+        try scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), self.atlas);
 
         const record = try self.allocator.create(RemotePresentation);
         errdefer self.allocator.destroy(record);
@@ -7052,7 +7133,7 @@ const App = struct {
             .respawn = !item.scratchpad,
             .execution_context = model.contextRef(),
         };
-        job.start() catch |err| {
+        job.start(self.window) catch |err| {
             log.warn("could not start the worker that restores a session: {s}", .{@errorName(err)});
             job.freeSpawnInputs();
             self.allocator.destroy(job);
@@ -7697,7 +7778,7 @@ const App = struct {
             .workspace_key = presentation.key,
             .execution_context = model.contextRef(),
         };
-        job.start() catch |err| {
+        job.start(self.window) catch |err| {
             log.warn("could not start the worker that spawns the child: {s}", .{@errorName(err)});
             job.freeSpawnInputs();
             self.allocator.destroy(job);
@@ -7744,7 +7825,7 @@ const App = struct {
             .scratchpad_replacement = replacement,
             .execution_context = model.contextRef(),
         };
-        job.start() catch |err| {
+        job.start(self.window) catch |err| {
             log.warn("could not start the scratchpad spawn worker: {s}", .{@errorName(err)});
             self.allocator.destroy(job);
             return;
@@ -7843,10 +7924,7 @@ const App = struct {
     fn newPaneRenderer(self: *App, session_id: session.SessionId) !PaneRenderer {
         var grid = try render.Grid.init(self.allocator, gridColors(self.palette));
         errdefer grid.deinit();
-        try grid.attachAtlas(self.fonts.atlasPixels(), .{
-            .width_px = atlas_width_px,
-            .height_px = atlas_height_px,
-        });
+        try grid.attachAtlas(self.fonts.atlasPixels(), self.atlas);
         return .{ .session_id = session_id, .grid = grid };
     }
 
@@ -7939,7 +8017,7 @@ const App = struct {
             .workspace_key = presentation.key,
             .execution_context = model.contextRef(),
         };
-        job.start() catch |err| {
+        job.start(self.window) catch |err| {
             log.warn("could not start the worker for the new tab: {s}", .{@errorName(err)});
             job.freeSpawnInputs();
             self.allocator.destroy(job);
@@ -7998,7 +8076,7 @@ const App = struct {
             .font_request = owned.values.request(owned.values.family, size, self.home_dir),
             .small_font_request = smallFontRequest(owned.values.request(owned.values.family, size, self.home_dir)),
         };
-        job.start() catch |err| {
+        job.start(self.window) catch |err| {
             log.warn("could not start the worker that re-loads the font: {s}", .{@errorName(err)});
             job.freeSpawnInputs();
             self.allocator.destroy(job);
@@ -8088,6 +8166,10 @@ const App = struct {
                 };
                 const grid = target.terminal().gridSize();
                 log.info("child started, window {d}x{d} cells", .{ grid.cols, grid.rows });
+                if (!self.first_child_logged) {
+                    self.first_child_logged = true;
+                    self.logStartupPhase("first child");
+                }
             };
         }
         if (job.spawn != null) self.spawn_finished = true;
@@ -8125,22 +8207,16 @@ const App = struct {
             self.fonts.deinit();
             self.fonts = fonts;
             job.fonts = null;
+            // The face was rasterised for the request's scale, and so was its
+            // atlas: every grid takes the size it was built with (TASK-67).
+            if (job.font_request) |request| self.atlas = atlasSizeFor(request.size.scale);
             for (self.workspace_presentations.items) |presentation| {
                 for (presentation.pane_renderers.items) |*pane_renderer| {
-                    pane_renderer.grid.attachAtlas(self.fonts.atlasPixels(), .{
-                        .width_px = atlas_width_px,
-                        .height_px = atlas_height_px,
-                    }) catch |err| log.err("the new face could not be uploaded: {s}", .{@errorName(err)});
+                    pane_renderer.grid.attachAtlas(self.fonts.atlasPixels(), self.atlas) catch |err| log.err("the new face could not be uploaded: {s}", .{@errorName(err)});
                 }
-                presentation.scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), .{
-                    .width_px = atlas_width_px,
-                    .height_px = atlas_height_px,
-                }) catch |err| log.err("the new scratchpad face could not be uploaded: {s}", .{@errorName(err)});
+                presentation.scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), self.atlas) catch |err| log.err("the new scratchpad face could not be uploaded: {s}", .{@errorName(err)});
             }
-            self.overlay_grid.attachAtlas(self.fonts.atlasPixels(), .{
-                .width_px = atlas_width_px,
-                .height_px = atlas_height_px,
-            }) catch |err| log.err("the new overlay face could not be uploaded: {s}", .{@errorName(err)});
+            self.overlay_grid.attachAtlas(self.fonts.atlasPixels(), self.atlas) catch |err| log.err("the new overlay face could not be uploaded: {s}", .{@errorName(err)});
             // The small face follows the main one; without a new one the old
             // size would be wrong, so a failed build drops it and small text
             // draws at the normal size until the next load.
@@ -8898,7 +8974,7 @@ const App = struct {
             .agent_runner = runner,
         };
         runner.spawning = true;
-        job.start() catch |err| {
+        job.start(self.window) catch |err| {
             log.warn("could not start the worker for the agent: {s}", .{@errorName(err)});
             job.freeSpawnInputs();
             self.allocator.destroy(job);
@@ -14986,10 +15062,7 @@ const App = struct {
         var scratchpad_grid = try render.Grid.init(self.allocator, gridColors(self.palette));
         var scratchpad_grid_owned = true;
         errdefer if (scratchpad_grid_owned) scratchpad_grid.deinit();
-        try scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), .{
-            .width_px = atlas_width_px,
-            .height_px = atlas_height_px,
-        });
+        try scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), self.atlas);
 
         try self.workspace_presentations.ensureUnusedCapacity(self.allocator, 1);
         const presentation = try self.allocator.create(WorkspacePresentation);
@@ -19296,6 +19369,10 @@ const App = struct {
     /// P6 as call order — the grid renderer and the UI renderer draw into this
     /// one surface in sequence.
     fn drawFrame(self: *App) !void {
+        defer if (!self.first_frame_logged) {
+            self.first_frame_logged = true;
+            self.logStartupPhase("first frame");
+        };
         _ = try self.pumpChild();
         try self.syncGrid();
         for (self.pane_layouts[0..self.pane_layout_count]) |layout| {
@@ -28040,8 +28117,8 @@ fn gridTestAtScale(
             .family = candidate,
             .size = size,
             .home_dir = env.get("HOME"),
-            .atlas_width_px = atlas_width_px,
-            .atlas_height_px = atlas_height_px,
+            .atlas_width_px = atlasSizeFor(scale).width_px,
+            .atlas_height_px = atlasSizeFor(scale).height_px,
         }) catch |err| {
             try out.print("grid-test: scale {d:.2}: {s} could not be loaded: {s}\n", .{
                 scale,
@@ -28096,10 +28173,7 @@ fn gridTestAtScale(
 
     var grid = try render.Grid.init(allocator, gridColors(default_palette));
     defer grid.deinit();
-    try grid.attachAtlas(fonts.atlasPixels(), .{
-        .width_px = atlas_width_px,
-        .height_px = atlas_height_px,
-    });
+    try grid.attachAtlas(fonts.atlasPixels(), atlasSizeFor(scale));
 
     var terminal: term.Terminal = undefined;
     try terminal.init(io, allocator, try term.GridSize.init(check_columns, check_rows));
@@ -28930,6 +29004,7 @@ fn resolveCommand(io: Io, arena: Allocator, command: CliCommand, cwd: []const u8
 }
 
 pub fn main(init: std.process.Init) !void {
+    startup_epoch_ns = Io.Clock.awake.now(init.io).nanoseconds;
     const args = try collectArgs(init.arena.allocator(), init.minimal.args);
     var options = parseArgs(args, processEnv(init)) catch |err| {
         try writeStderrText("conduit: ");
@@ -29152,6 +29227,10 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         else => return err,
     };
     defer window.deinit();
+    if (startup_epoch_ns != 0) {
+        var phase_buffer: [96]u8 = undefined;
+        log.debug("{s}", .{startupPhaseLine(&phase_buffer, "window", Io.Clock.awake.now(init.io).nanoseconds - startup_epoch_ns)});
+    }
     const runtime = window.runtimeInfo();
     log.info("window backend {s}, high-pixel-density {s}", .{
         runtime.video_backend orelse "unknown",
