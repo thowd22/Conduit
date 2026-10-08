@@ -7305,7 +7305,8 @@ const App = struct {
             env,
             workspace_state.contextKind(),
             options.run.no_shell_integration or deterministic_scratchpad,
-            if (deterministic_scratchpad) "/bin/sh" else null,
+            // `--control-test` on Windows: PowerShell, like its tabs (TASK-82).
+            if (builtin.os.tag == .windows and options.run.control_test) "pwsh" else if (deterministic_scratchpad) "/bin/sh" else null,
         );
         errdefer scratchpad_spec.deinit();
 
@@ -31874,7 +31875,11 @@ fn controlNamedScreenshot(self: *App, io: Io, out: *Writer, name: []const u8) !v
     defer self.allocator.free(pixels);
     var path_buffer: [path_capacity]u8 = undefined;
     var id_buffer: [path_capacity]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}{c}{s}-{s}.png", .{ fallback_log_dir, std.fs.path.sep, name, try generateRunId(io, &id_buffer) });
+    // Beside the run's other artifacts when it has a directory for them, so
+    // a CI runner uploads them with its evidence.
+    const base = self.driver_artifact_dir orelse fallback_log_dir;
+    if (self.driver_artifact_dir != null) _ = try Dir.cwd().createDirPathStatus(io, base, .default_dir);
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}{c}{s}-{s}.png", .{ base, std.fs.path.sep, name, try generateRunId(io, &id_buffer) });
     try writePngOffThread(self.allocator, io, path, pixels, self.size);
     out.print("control-test: screenshot {s}\n", .{path}) catch {};
 }
@@ -32012,7 +32017,7 @@ fn controlTestWindows(self: *App, io: Io, out: *Writer) !u8 {
     const scratchpad_id = @intFromEnum(first_model.scratchpadId());
     const tabs_before = first_model.tabCount();
     _ = try scratchpadChord(self, io, out, false);
-    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .scratchpad_text = "ctl$" }), "the scratchpad's PowerShell is up", .{});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .scratchpad_text = "PS " }), "the scratchpad's PowerShell is up", .{});
     _ = try controlType(self, io, out, "\"TOKEN=[$($env:CONDUIT_CONTROL_TOKEN ?? 'unset')][$($env:CONDUIT_CONTROL_ENDPOINT ?? 'unset')][$($env:CONDUIT_CONTROL_SESSION ?? 'unset')]\"", .{});
     controlCheck(out, &failures, try waitForControl(self, io, out, .{ .scratchpad_text = "TOKEN=[unset][unset][unset]" }), "the scratchpad has no control variables", .{});
     _ = try controlType(self, io, out, "$env:CONDUIT_CONTROL_ENDPOINT='{s}'; $env:CONDUIT_CONTROL_TOKEN='{s}'; $env:CONDUIT_CONTROL_SESSION='{d}'; & '{s}' control tab.open *> '{s}/stolen'; \"rc=$LASTEXITCODE\" >> '{s}/stolen'", .{ endpoint, first_token, scratchpad_id, exe, dir, dir });
@@ -32034,7 +32039,8 @@ fn controlTestWindows(self: *App, io: Io, out: *Writer) !u8 {
     _ = try clickTabsElement(self, io, out, api_id);
     _ = try controlFocusTerminal(self, io, out);
     _ = try waitForControl(self, io, out, .{ .terminal_text = "ctl$" });
-    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .label = .{ .id = api_id, .text = "! busy api" } }), "the status mark is still on the api tab", .{});
+    _ = try controlType(self, io, out, "& '{s}' control tab.status '{{\"text\":\"busy\",\"attention\":true}}'", .{exe});
+    controlCheck(out, &failures, try waitForControl(self, io, out, .{ .label = .{ .id = api_id, .text = "! busy api" } }), "the status mark is back for the screenshot", .{});
     try controlScreenshot(self, io, out);
 
     out.print("control-test: {d} failure(s)\n", .{failures}) catch {};
