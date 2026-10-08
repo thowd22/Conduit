@@ -126,12 +126,28 @@ a real VSCodium, Wayland's separate-window fallback and macOS/Windows are unveri
 ### Observed agents
 
 A harness you start yourself in an ordinary tab or pane is noticed and followed on that tab
-(TASK-56, TASK-78). When a terminal produces output, a prompt mark or input, Conduit looks at the
-PTY's foreground process group (at most once every 2 seconds per terminal, never per frame): on
-Linux the group leader's first two command-line words and working directory from `/proc`. The
-program is named by the leader's basename, or for an interpreter (`node`, `bun`, `python3`, `sh`
-and similar) by its script's, so npm's `node …/bin/codex` launcher counts as `codex`. Each
-adapter owns its spelling (`claude`, `codex`, `pi`/`omp`, `opencode`). A recognized program
+(TASK-56, TASK-78, TASK-81). When a terminal produces output, a prompt mark or input, Conduit
+looks at the terminal's foreground job (at most once every 2 seconds per terminal, never per
+frame). On Linux that is the PTY's foreground process group leader, its command line and working
+directory read from `/proc`. Windows has no process groups and a pseudoconsole has no foreground,
+so the ConPTY backend walks the terminal child's process tree instead: from one Toolhelp process
+snapshot (taken at most every 250 ms and shared by every terminal) it steps from the shell to its
+most recently started child while the process reached is itself a shell (`cmd`, PowerShell, Git
+for Windows' `sh`/`bash`), and the first program that is not a shell is the job. A harness's own
+helpers (`git`, a tool's `bash`) therefore never take its place. The job's command line comes
+from `NtQueryInformationProcess` and its working directory from its PEB; a process that will not
+say gives an empty directory. One tree it cannot follow: Git for Windows' `sh`/`bash` exec another
+MSYS program by starting it and ending their own process, so an MSYS program run from Git Bash has
+no live parent to be found through; native programs (`claude.exe`, `node.exe`, `cmd.exe`) are.
+
+The program is named by the job's basename without a Windows or script extension (`claude.exe`,
+`claude.cmd`, `cli.js`), in any case; for an interpreter (`node`, `bun`, `python3`, `sh` and
+similar) by its script's, and a script inside `node_modules` by its npm package, so npm's
+`node …/bin/codex` launcher counts as `@openai/codex` and a Windows shim's
+`node.exe …\@anthropic-ai\claude-code\cli.js` as Claude Code; a shell that runs a command
+(`cmd /c`, `pwsh -Command`/`-File`, `sh -c`) by that command's program. Each adapter owns its
+spellings (`claude` and `@anthropic-ai/claude-code`, `codex` and `@openai/codex`, `pi`/`omp` and
+`@mariozechner/pi-coding-agent`, `opencode` and `opencode-ai`). A recognized program
 becomes an **observed** agent bound to that human terminal: its glyph leads the tab row,
 notifications and the agent manager list it, and **Agent: stop** only stops observing it (the
 process is the human's and is never signalled). What it gets beyond the PTY baseline depends on
@@ -149,7 +165,11 @@ replaces it) the observed agent ends as `done`; Conduit did not start it and can
 status. Starting it again makes a new observed agent in place of the ended one. The scratchpad,
 an agent's own terminal and an SSH connection terminal are never observed, and neither is a
 terminal in an SSH workspace (there the local foreground is the SSH client). Foreground lookup
-is implemented for the Linux PTY backend only; macOS and Windows report nothing yet.
+is implemented for Linux and Windows; the macOS PTY backend reports nothing yet, so a harness
+started by hand there is not observed. On Windows it is proved on the hosted runner by
+`--agent-test` (a scripted fake started by hand through `cmd /c` in a tab) and by an npm-installed, unauthenticated
+Claude Code started as `claude` in a PowerShell tab, observed as `· claude idle` and marked done
+after Ctrl+C (`windows-claude-observe.sh`).
 
 The work is tracked as TASK-52 (adapter interface), TASK-53 to TASK-55 (Claude Code, Codex and Pi
 adapters), TASK-56 (notifications), TASK-57 (agent view), TASK-58 (agent manager), TASK-59 (prompt viewer and editor), TASK-60

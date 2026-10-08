@@ -259,7 +259,13 @@ has an interactive desktop in which SDL creates real Win32 windows, it:
 The built-in checks that pass on Windows gate the job: `--self-test`,
 `--grid-test`, `--ui-test`, `--driver-test`, `--scroll-test`, `--mouse-test`,
 `--sidebar-test`, `--scratchpad-test`, `--menu-test`, `--theme-test`,
-`--font-test`, `--tabs-test`, `--palette-test` and `--workspaces-test`. Five
+`--font-test`, `--tabs-test`, `--palette-test`, `--workspaces-test` and
+`--agent-test` (whose observed-agent section starts a scripted fake by hand in
+a tab and needs the ConPTY foreground lookup, TASK-81). A further gating step,
+`windows-claude-observe.sh`, installs Claude Code with
+`npm i -g @anthropic-ai/claude-code`, starts it unauthenticated as `claude` in
+a PowerShell tab through `conduit-test`, and requires its observed-agent row
+to read `· claude idle` and, after Ctrl+C, `✓ claude done`. Five
 are run and reported without gating:
 `--clipboard-test` (it pins SDL's offscreen driver, which needs an EGL library
 on Windows; the Windows clipboard step is the real proof), `--ime-test` (its
