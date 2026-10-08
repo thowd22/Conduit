@@ -2655,6 +2655,9 @@ test "end to end against a fake OpenCode server over real TCP" {
 }
 
 test "live: a real opencode serve, when installed" {
+    // Zig 0.16's std cannot compile the environment block walk this test needs
+    // for Windows, and OpenCode has no Windows read path anyway (TASK-5 notes).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const io = testing.io;
     // Pick a free port by binding 0 and releasing it.
     const probe_address = try Io.net.IpAddress.parseIp4(server_host, 0);
