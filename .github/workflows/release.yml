@@ -3,8 +3,9 @@
 # gate has passed on that exact commit.
 #
 # Scope (TASK-69.1): Linux x86_64. TASK-48/TASK-69 add a macOS arm64 disk
-# image beside it (the `macos` and `publish-macos` jobs below); Windows stays
-# deferred to TASK-69.
+# image beside it (the `macos` and `publish-macos` jobs below), and TASK-49/
+# TASK-69 a Windows x86_64 portable zip (the `windows` and `publish-windows`
+# jobs).
 #
 # Flow:
 #   validate-tag  strict SemVer check; emits `version` (tag without `v`) and
@@ -25,6 +26,12 @@
 #                 needs `publish`, but `publish` never needs it: a red macOS
 #                 leg leaves the Linux release published, and only the dmg is
 #                 missing. Unsigned (ad hoc) until the MACOS_* secrets exist.
+#   windows       the reusable Windows workflow (`windows.yml`) at ReleaseSafe
+#                 with the tag's version: the platform checks, then the
+#                 verified portable zip
+#   publish-windows uploads that zip and its .sha256 to the same release,
+#                 like publish-macos: nothing waits for it. Unsigned
+#                 (docs/release.md).
 #
 # The Zig version is never written here: it is read from `.minimum_zig_version`
 # in build.zig.zon exactly as ci.yml does. The glibc baseline lives once, in
@@ -261,5 +268,49 @@ jobs:
           assets=("$RUNNER_TEMP"/conduit-macos-dist/*.dmg "$RUNNER_TEMP"/conduit-macos-dist/*.dmg.sha256)
           [ "${#assets[@]}" -eq 2 ] || { echo "FAIL: expected one dmg and its .sha256" >&2; exit 1; }
           (cd "$RUNNER_TEMP/conduit-macos-dist" && sha256sum --check ./*.dmg.sha256)
+          gh release upload "${{ needs.validate-tag.outputs.tag }}" "${assets[@]}" --clobber
+          gh release view "${{ needs.validate-tag.outputs.tag }}" --json assets --jq '"INFO: assets=" + ([.assets[].name] | join(", "))'
+
+  # TASK-69 (Windows): the reusable Windows workflow at ReleaseSafe with the
+  # tag's version: the smoke, clipboard, font, DPI and WSL checks, then the
+  # portable zip, verified on the runner (checksum, a fresh unpack, the
+  # payload, the embedded manifest and `conduit.exe --version`). Like macOS it
+  # waits for the Linux gate, and nothing waits for it.
+  windows:
+    name: Windows x86_64 portable zip
+    needs: [validate-tag, linux-gate]
+    uses: ./.github/workflows/windows.yml
+    with:
+      version: ${{ needs.validate-tag.outputs.version }}
+      optimize: ReleaseSafe
+    permissions:
+      contents: read
+
+  publish-windows:
+    name: Publish the Windows zip
+    needs: [validate-tag, publish, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download the verified zip
+        uses: actions/download-artifact@v4
+        with:
+          name: conduit-windows-x86_64-${{ needs.validate-tag.outputs.version }}
+          path: ${{ runner.temp }}/conduit-windows-dist
+
+      # `publish` created the release; --clobber makes a rerun replace the
+      # same-named assets rather than fail or duplicate them.
+      - name: Upload the zip to the release
+        shell: bash
+        run: |
+          shopt -s nullglob
+          assets=("$RUNNER_TEMP"/conduit-windows-dist/*.zip "$RUNNER_TEMP"/conduit-windows-dist/*.zip.sha256)
+          [ "${#assets[@]}" -eq 2 ] || { echo "FAIL: expected one zip and its .sha256" >&2; exit 1; }
+          (cd "$RUNNER_TEMP/conduit-windows-dist" && sha256sum --check ./*.zip.sha256)
           gh release upload "${{ needs.validate-tag.outputs.tag }}" "${assets[@]}" --clobber
           gh release view "${{ needs.validate-tag.outputs.tag }}" --json assets --jq '"INFO: assets=" + ([.assets[].name] | join(", "))'
