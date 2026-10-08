@@ -483,6 +483,47 @@ pub const wsl = @import("wsl.zig");
 /// this machine and keep no state in the context, so they are safe from any
 /// thread. `run` children inherit Conduit's process environment, like every
 /// Local child (TASK-73).
+/// `trackedToNative` for `os`: `/C:/Users/me` becomes `C:/Users/me` and `/C:`
+/// becomes `C:/` on Windows; anything else, and every path on other systems,
+/// is returned as given.
+pub fn trackedToNative(path: []const u8, os: std.Target.Os.Tag) []const u8 {
+    if (os != .windows) return path;
+    if (path.len < 3 or path[0] != '/' or !std.ascii.isAlphabetic(path[1]) or path[2] != ':') return path;
+    if (path.len == 3) return path[1..];
+    if (path[3] != '/') return path;
+    return path[1..];
+}
+
+test "a tracked Windows directory loses only its leading slash on Windows" {
+    try std.testing.expectEqualStrings("C:/Users/me/repo/.git", trackedToNative("/C:/Users/me/repo/.git", .windows));
+    try std.testing.expectEqualStrings("D:/", trackedToNative("/D:/", .windows));
+    try std.testing.expectEqualStrings("C:", trackedToNative("/C:", .windows));
+    try std.testing.expectEqualStrings("/home/me", trackedToNative("/home/me", .windows));
+    try std.testing.expectEqualStrings("/c/Users", trackedToNative("/c/Users", .windows));
+    try std.testing.expectEqualStrings("C:/Users", trackedToNative("C:/Users", .windows));
+    try std.testing.expectEqualStrings("/C:/Users/me", trackedToNative("/C:/Users/me", .linux));
+    try std.testing.expectEqualStrings("/C:/Users/me", trackedToNative("/C:/Users/me", .macos));
+}
+
+test "on Windows the Local context reads a tracked drive path" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var context = try LocalExecutionContext.create(std.testing.allocator);
+    defer context.deinit();
+    // The system drive's Windows directory, as PowerShell integration reports it.
+    const stat = try context.borrow().statPath(std.testing.io, "/C:/Windows");
+    try std.testing.expectEqual(PathKind.directory, stat.kind);
+    var seen = false;
+    const Visitor = struct {
+        fn visit(ctx: *anyopaque, _: DirEntry) bool {
+            const flag: *bool = @ptrCast(@alignCast(ctx));
+            flag.* = true;
+            return false;
+        }
+    };
+    try context.borrow().listDir(std.testing.io, "/C:/Windows", .{ .context = @ptrCast(&seen), .visit_fn = Visitor.visit });
+    try std.testing.expect(seen);
+}
+
 pub const LocalExecutionContext = struct {
     allocator: Allocator,
     /// Owned; what `stateDir` reports, when the owner supplied it.
@@ -555,8 +596,18 @@ pub const LocalExecutionContext = struct {
         };
     }
 
+    /// A path as this machine takes it. Terminals keep a Windows directory
+    /// the way OSC 7 spells it, `/C:/Users/me` (PowerShell integration,
+    /// TASK-46), and every tracked-cwd consumer (the git branch lookup, the
+    /// Backlog.md view, agent prompt discovery) hands that form to this
+    /// context. Windows accepts forward slashes, so only the leading slash
+    /// before the drive letter has to go; every other path is unchanged.
+    fn nativePath(path: []const u8) []const u8 {
+        return trackedToNative(path, builtin.os.tag);
+    }
+
     fn readFile(_: *anyopaque, io: std.Io, path: []const u8, buffer: []u8) FsError![]u8 {
-        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| return fsError(err);
+        var file = std.Io.Dir.cwd().openFile(io, nativePath(path), .{}) catch |err| return fsError(err);
         defer file.close(io);
         const stat = file.stat(io) catch |err| return fsError(err);
         if (stat.kind == .directory) return error.IsADirectory;
@@ -574,7 +625,7 @@ pub const LocalExecutionContext = struct {
     }
 
     fn listDir(_: *anyopaque, io: std.Io, path: []const u8, visitor: DirVisitor) FsError!void {
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| return fsError(err);
+        var dir = std.Io.Dir.cwd().openDir(io, nativePath(path), .{ .iterate = true }) catch |err| return fsError(err);
         defer dir.close(io);
         var iterator = dir.iterate();
         while (iterator.next(io) catch |err| return fsError(err)) |entry| {
@@ -592,7 +643,7 @@ pub const LocalExecutionContext = struct {
     }
 
     fn statPath(_: *anyopaque, io: std.Io, path: []const u8) FsError!PathStat {
-        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| return fsError(err);
+        const stat = std.Io.Dir.cwd().statFile(io, nativePath(path), .{}) catch |err| return fsError(err);
         return .{
             .kind = pathKind(stat.kind),
             .size = stat.size,
@@ -602,7 +653,7 @@ pub const LocalExecutionContext = struct {
 
     fn watch(ptr: *anyopaque, allocator: Allocator, io: std.Io, path: []const u8) WatchError!WatchHandle {
         const self: *LocalExecutionContext = @ptrCast(@alignCast(ptr));
-        return LocalWatch.create(allocator, io, path, self.watch_interval_ms);
+        return LocalWatch.create(allocator, io, nativePath(path), self.watch_interval_ms);
     }
 
     fn run(_: *anyopaque, allocator: Allocator, io: std.Io, request: RunRequest) RunError!RunResult {
@@ -610,7 +661,7 @@ pub const LocalExecutionContext = struct {
     }
 
     fn readFileAt(_: *anyopaque, io: std.Io, path: []const u8, offset: u64, buffer: []u8) FsError!usize {
-        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| return fsError(err);
+        var file = std.Io.Dir.cwd().openFile(io, nativePath(path), .{}) catch |err| return fsError(err);
         defer file.close(io);
         var filled: usize = 0;
         while (filled < buffer.len) {
@@ -624,8 +675,9 @@ pub const LocalExecutionContext = struct {
         return filled;
     }
 
-    fn writeFile(_: *anyopaque, io: std.Io, path: []const u8, bytes: []const u8, mode: u32) FsError!void {
+    fn writeFile(_: *anyopaque, io: std.Io, tracked_path: []const u8, bytes: []const u8, mode: u32) FsError!void {
         if (bytes.len > max_write_bytes) return error.TooLarge;
+        const path = nativePath(tracked_path);
         const cwd = std.Io.Dir.cwd();
         if (std.fs.path.dirnamePosix(path)) |parent| {
             _ = cwd.createDirPathStatus(io, parent, private_dir_permissions) catch |err| return fsError(err);
@@ -642,7 +694,8 @@ pub const LocalExecutionContext = struct {
         atomic.replace(io) catch |err| return fsError(err);
     }
 
-    fn makePrivateDir(_: *anyopaque, io: std.Io, path: []const u8) FsError!void {
+    fn makePrivateDir(_: *anyopaque, io: std.Io, tracked_path: []const u8) FsError!void {
+        const path = nativePath(tracked_path);
         const cwd = std.Io.Dir.cwd();
         _ = cwd.createDirPathStatus(io, path, private_dir_permissions) catch |err| return fsError(err);
         if (comptime has_modes) {
