@@ -7790,6 +7790,11 @@ test "tmux runs a command for the keys this module encoded, and its status line 
     var terminal: Terminal = undefined;
     try terminal.init(testIo(), gpa, .{ .cols = 80, .rows = 24 });
     defer terminal.deinit(gpa);
+    // The M-n binding is Alt's: ESC-prefixed. On macOS the key is Option,
+    // which composes characters unless Option-as-Alt is configured (and the
+    // product policy for that is TASK-15), so ask for Alt explicitly there.
+    // Off macOS the setting is inert.
+    terminal.setMacosOptionAsAlt(true);
 
     var encoded: EncodedKey = .{};
     var row: [256]u8 = undefined;
