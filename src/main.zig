@@ -126,6 +126,7 @@ test {
 const inputmod = @import("input");
 
 const builtin = @import("builtin");
+const editor = @import("editor");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -486,6 +487,12 @@ pub const Run = struct {
     /// directory. Runs in `--agent-test`'s environment (the flag sets
     /// `agent_test` too).
     control_test: bool = false,
+    /// Exercise TASK-79's editor pane with a stand-in `codium` that maps a
+    /// real X client window: palette, context menu, the control API from a
+    /// real tab's shell, hosting and the not-installed path. Runs in
+    /// `--control-test`'s environment (the flag sets both `agent_test` and
+    /// `control_test`).
+    editor_test: bool = false,
     /// The runtime directory the control and instance sockets live in instead
     /// of `$XDG_RUNTIME_DIR`. Not a command-line flag: `runApp` sets it for
     /// `--control-test`.
@@ -768,6 +775,10 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
         } else if (std.mem.eql(u8, arg, "--control-test")) {
             run.agent_test = true;
             run.control_test = true;
+        } else if (std.mem.eql(u8, arg, "--editor-test")) {
+            run.agent_test = true;
+            run.control_test = true;
+            run.editor_test = true;
         } else if (std.mem.eql(u8, arg, "--control")) {
             run.control = true;
         } else if (std.mem.eql(u8, arg, "--no-control")) {
@@ -2953,7 +2964,7 @@ const ScratchpadPresentation = enum {
 /// so this only bounds the copy the semantic tree borrows.
 const config_error_capacity: usize = 192;
 /// Registered product actions. `--ui-test` and `--driver-test` add one fixture action.
-const action_capacity_base: usize = 84;
+const action_capacity_base: usize = 86;
 const config_open_action = "config.open";
 const config_reload_action = "config.reload";
 const settings_open_action = "settings.open";
@@ -3007,6 +3018,8 @@ const settings_mouse_fields = [_]SettingsField{settingsField(.mouse_right_click,
 /// summary row that opens the settings file, since a profile is several
 /// repeating lines rather than one value.
 const settings_shell_fields = [_]SettingsField{settingsField(.shell, .text)};
+/// TASK-79: the VSCodium command the editor pane detects and launches.
+const settings_editor_fields = [_]SettingsField{settingsField(.editor_command, .text)};
 const settings_agents_fields = [_]SettingsField{
     settingsField(.notifications_enabled, .toggle),
     settingsField(.notifications_os, .toggle),
@@ -3050,7 +3063,7 @@ const SettingsMode = enum {
 /// Every settings row: headings, the fields, every bindable command and the raw row.
 const settings_row_capacity: usize = 7 + settings_appearance_fields.len + settings_font_fields.len +
     settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len +
-    settings_shell_fields.len + config.max_shell_profiles + action_capacity_base + 1;
+    settings_shell_fields.len + settings_editor_fields.len + 1 + config.max_shell_profiles + action_capacity_base + 1;
 /// The most list rows one frame registers; the list scrolls past this.
 const settings_visible_capacity: usize = 48;
 const settings_semantic_capacity: usize = 96;
@@ -3788,18 +3801,38 @@ const context_menu_open_link_item: ContextMenuItem = .{ .id = "context-menu.open
 const context_menu_split_right_item: ContextMenuItem = .{ .id = "context-menu.split-right", .label = "split right", .action = pane_split_action };
 const context_menu_split_down_item: ContextMenuItem = .{ .id = "context-menu.split-down", .label = "split down", .action = pane_split_action };
 const context_menu_search_item: ContextMenuItem = .{ .id = "context-menu.search", .label = "search", .action = search_open_action };
+/// TASK-79: open the file reference under the pointer in the editor pane.
+const context_menu_open_in_editor_item: ContextMenuItem = .{ .id = "context-menu.open-in-editor", .label = "open in editor", .action = editor_open_action };
 
 /// Every row the menu can show; the composed list is a subset in this order.
-const context_menu_max_items: usize = 6;
+const context_menu_max_items: usize = 7;
 /// Border, one cell of padding each side and the widest label (`split right`).
 const context_menu_width: u32 = 15;
+/// The same with the `open in editor` row (TASK-79).
+const context_menu_editor_width: u32 = 18;
 
-/// The rows the menu shows for one gesture. `copy` needs something to copy and
-/// `open link` needs a link under the pointer; the rest always apply to a
-/// terminal pane. Pure so the rule is unit-testable without a window.
+fn contextMenuWidth(has_editor: bool) u32 {
+    return if (has_editor) context_menu_editor_width else context_menu_width;
+}
+
+/// `contextMenuItemsWith` without the editor row.
 fn contextMenuItems(
     has_selection: bool,
     has_link: bool,
+    storage: *[context_menu_max_items]ContextMenuItem,
+) []const ContextMenuItem {
+    return contextMenuItemsWith(has_selection, has_link, false, storage);
+}
+
+/// The rows the menu shows for one gesture. `copy` needs something to copy and
+/// `open link` needs a link under the pointer; the rest always apply to a
+/// terminal pane. `open in editor` needs a file reference under the pointer
+/// and VSCodium in the workspace (TASK-79). Pure so the rule is unit-testable
+/// without a window.
+fn contextMenuItemsWith(
+    has_selection: bool,
+    has_link: bool,
+    has_editor: bool,
     storage: *[context_menu_max_items]ContextMenuItem,
 ) []const ContextMenuItem {
     var count: usize = 0;
@@ -3811,6 +3844,10 @@ fn contextMenuItems(
     count += 1;
     if (has_link) {
         storage[count] = context_menu_open_link_item;
+        count += 1;
+    }
+    if (has_link and has_editor) {
+        storage[count] = context_menu_open_in_editor_item;
         count += 1;
     }
     storage[count] = context_menu_split_right_item;
@@ -3826,12 +3863,16 @@ fn contextMenuItems(
 /// left or up only as far as needed to keep every row inside the canvas. A
 /// canvas too small for the whole panel gets no menu rather than a clipped one.
 fn contextMenuBounds(anchor_col: u32, anchor_row: u32, item_count: usize, canvas: ui.Rect) ?ui.Rect {
+    return contextMenuBoundsWidth(anchor_col, anchor_row, item_count, canvas, context_menu_width);
+}
+
+fn contextMenuBoundsWidth(anchor_col: u32, anchor_row: u32, item_count: usize, canvas: ui.Rect, width: u32) ?ui.Rect {
     const height: u32 = @as(u32, @intCast(item_count)) + 2;
-    if (canvas.width < context_menu_width or canvas.height < height) return null;
+    if (canvas.width < width or canvas.height < height) return null;
     return .{
-        .x = @min(anchor_col, canvas.width - context_menu_width),
+        .x = @min(anchor_col, canvas.width - width),
         .y = @min(anchor_row, canvas.height - height),
-        .width = context_menu_width,
+        .width = width,
         .height = height,
     };
 }
@@ -3845,6 +3886,9 @@ const ContextMenu = struct {
     row: u32,
     /// Whether the presented terminal had a selection when the menu opened.
     has_selection: bool,
+    /// Whether the link under the pointer is a file reference the
+    /// workspace's editor can open (TASK-79).
+    editor: bool = false,
     /// The stable id of the terminal link under the pointer, if any.
     link_id_len: usize = 0,
     link_id: [terminal_link_semantic_capacity]u8 = undefined,
@@ -4061,6 +4105,9 @@ const DriverPendingState = union(enum) {
     },
     wait: i128,
     screenshot: *ScreenshotJob,
+    /// An editor request waiting for detection or the launch slot, until
+    /// this deadline (TASK-79).
+    editor: i128,
 };
 
 /// One parsed driver request retained across event-loop turns.
@@ -4125,6 +4172,9 @@ const WorkspacePresentation = struct {
     /// whenever `load` is free; an SSH workspace's wait for its connection.
     /// Each cwd is owned.
     restore_queue: std.ArrayList(RestoreStart) = .empty,
+    /// The workspace's editor pane state (TASK-79), created on first use.
+    /// Owned; released (its workers joined) before the workspace.
+    editor: ?*EditorPresentation = null,
 
     fn releaseRestoreQueue(self: *WorkspacePresentation, allocator: Allocator) void {
         for (self.restore_queue.items) |item| allocator.free(item.cwd);
@@ -4140,6 +4190,194 @@ const RestoreStart = struct {
     /// for the inherited (Local) or home (SSH) directory.
     cwd: []u8,
 };
+
+// ---------------------------------------------------------------------------
+// The editor pane (TASK-79, decision-12)
+// ---------------------------------------------------------------------------
+
+const editor_open_action = "editor.open";
+const editor_close_action = "editor.close";
+/// The palette's free-text argument: `path`, `path:line` or `path:line:col`.
+const editor_open_palette: inputmod.PaletteCommand = .{ .argument = .{ .input = .{
+    .name = "path",
+    .prompt = "File (path[:line[:col]])",
+} } };
+/// How long a launched editor's window is looked for before the pane keeps
+/// its placeholder: a separate window where hosting is impossible, or an
+/// editor that never mapped one.
+const editor_embed_timeout_ns: i96 = 20 * std.time.ns_per_s;
+/// How long a driver editor request waits for detection or the launch slot.
+const editor_driver_wait_ns: i128 = 4 * std.time.ns_per_s;
+/// Status lines the palette and the context menu leave in the sidebar.
+const editor_busy_status = "editor: busy starting; try again";
+const editor_missing_status = "editor: file not found";
+const editor_detecting_status = "editor: still looking for VSCodium; try again";
+const editor_not_installed_status = "editor: VSCodium not found; install it or set editor.command";
+
+/// One blocking editor step, run on its own worker thread: detection, or
+/// seeding the user-data-dir and running one VSCodium CLI launch. Everything
+/// it holds is owned and released by `destroy`, which joins the thread.
+const EditorJob = struct {
+    allocator: Allocator,
+    io: Io,
+    /// Borrowed: the workspace's context, which outlives the job because a
+    /// closing workspace joins it first.
+    context: workspace.ExecutionContext.Ref,
+    work: Work,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    /// Detection's answer, owned.
+    detection: ?editor.Detection = null,
+    /// Launch: the CLI ran and exited with status zero.
+    launched: bool = false,
+    failure: ?anyerror = null,
+
+    const Work = union(enum) {
+        detect: struct { configured: []u8, cwd: []u8 },
+        launch: struct { spec: editor.LaunchSpec, seed_dir: ?[]u8, id: [editor.id_len]u8 },
+    };
+
+    /// Start `work` on a new thread. Takes ownership of `work` on success
+    /// only; the caller releases it when this fails.
+    fn start(allocator: Allocator, io: Io, context: workspace.ExecutionContext.Ref, work: Work) !*EditorJob {
+        const job = try allocator.create(EditorJob);
+        errdefer allocator.destroy(job);
+        job.* = .{ .allocator = allocator, .io = io, .context = context, .work = work };
+        job.thread = try std.Thread.spawn(.{}, EditorJob.run, .{job});
+        return job;
+    }
+
+    fn run(self: *EditorJob) void {
+        defer self.done.store(true, .release);
+        switch (self.work) {
+            .detect => |detect| {
+                self.detection = editor.detect(self.allocator, self.io, self.context, detect.configured, detect.cwd) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            },
+            .launch => |*launch| {
+                if (launch.seed_dir) |dir| editor.seedSettings(self.io, self.context, dir, launch.id) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                var result = self.context.run(self.allocator, self.io, launch.spec.runRequest()) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                defer result.deinit(self.allocator);
+                self.launched = result.succeeded();
+            },
+        }
+    }
+
+    fn finished(self: *const EditorJob) bool {
+        return self.done.load(.acquire);
+    }
+
+    fn destroy(self: *EditorJob) void {
+        if (self.thread) |thread| thread.join();
+        switch (self.work) {
+            .detect => |detect| {
+                self.allocator.free(detect.configured);
+                self.allocator.free(detect.cwd);
+            },
+            .launch => |*launch| {
+                launch.spec.deinit();
+                if (launch.seed_dir) |dir| self.allocator.free(dir);
+            },
+        }
+        if (self.detection) |*detection| detection.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+};
+
+/// One workspace's editor: the `editor.Editor` model, what detection found,
+/// the two workers, and the hosted window. The editor pane's leaf names a
+/// placeholder session that never gets a child, so the pane takes part in
+/// focus, resize, zoom and close exactly like a terminal pane, while the
+/// app draws the editor's `Surface` over it and hosts VSCodium's window
+/// inside it. Owner thread only; created on first use, released with the
+/// workspace.
+const EditorPresentation = struct {
+    model: editor.Editor,
+    /// `editor.workspaceId` of the workspace's name and directory.
+    id: [editor.id_len]u8,
+    availability: editor.Availability = .unknown,
+    /// The command detection found, owned.
+    command: ?[]u8 = null,
+    detect_job: ?*EditorJob = null,
+    launch_job: ?*EditorJob = null,
+    /// The editor pane's placeholder session, while the pane exists.
+    session_id: ?session.SessionId = null,
+    /// The hosted VSCodium window (X11), while hosted.
+    embedded: ?platform.EmbeddedWindow = null,
+    /// While the first launch's window is looked for: until when (awake clock).
+    embed_deadline_ns: ?i96 = null,
+    /// Where the hosted window was last placed.
+    last_rect: ?platform.PixelRect = null,
+    /// The first launch failed: the pane says so until it is closed.
+    failed: bool = false,
+    /// The settings changed while detection ran: its answer is stale.
+    redetect: bool = false,
+};
+
+/// Split `text` as `path`, `path:line` or `path:line:col`: trailing
+/// positive numbers after a colon are the position, everything before them
+/// the path. Pure, so the palette's argument rule is unit-testable.
+fn editorLocationFromText(text: []const u8) ?editor.Location {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    if (trimmed.len == 0) return null;
+    var numbers: [2]?u32 = .{ null, null };
+    var end = trimmed.len;
+    var found: usize = 0;
+    while (found < 2) {
+        const colon = std.mem.lastIndexOfScalar(u8, trimmed[0..end], ':') orelse break;
+        const value = std.fmt.parseInt(u32, trimmed[colon + 1 .. end], 10) catch break;
+        if (value == 0 or value > editor.max_position) break;
+        numbers[found] = value;
+        found += 1;
+        end = colon;
+    }
+    if (end == 0) return null;
+    return switch (found) {
+        0 => .{ .path = trimmed },
+        1 => .{ .path = trimmed[0..end], .line = numbers[0] },
+        else => .{ .path = trimmed[0..end], .line = numbers[1], .column = numbers[0] },
+    };
+}
+
+/// Whether two placements differ, so the hosted window moves only when the
+/// pane did.
+fn pixelRectChanged(previous: ?platform.PixelRect, next: platform.PixelRect) bool {
+    const old = previous orelse return true;
+    return old.x != next.x or old.y != next.y or old.width != next.width or old.height != next.height;
+}
+
+test "the palette's editor argument reads path, path:line and path:line:col" {
+    const plain = editorLocationFromText(" src/main.zig ").?;
+    try std.testing.expectEqualStrings("src/main.zig", plain.path);
+    try std.testing.expectEqual(@as(?u32, null), plain.line);
+    const line = editorLocationFromText("src/main.zig:12").?;
+    try std.testing.expectEqualStrings("src/main.zig", line.path);
+    try std.testing.expectEqual(@as(?u32, 12), line.line);
+    try std.testing.expectEqual(@as(?u32, null), line.column);
+    const column = editorLocationFromText("/a/b.zig:3:7").?;
+    try std.testing.expectEqualStrings("/a/b.zig", column.path);
+    try std.testing.expectEqual(@as(?u32, 3), column.line);
+    try std.testing.expectEqual(@as(?u32, 7), column.column);
+    const odd = editorLocationFromText("C:x:0").?;
+    try std.testing.expectEqualStrings("C:x:0", odd.path);
+    try std.testing.expect(editorLocationFromText("   ") == null);
+    try std.testing.expect(editorLocationFromText(":12") == null);
+}
+
+test "the hosted editor moves only when its pane's rectangle changed" {
+    const rect: platform.PixelRect = .{ .x = 10, .y = 20, .width = 300, .height = 200 };
+    try std.testing.expect(pixelRectChanged(null, rect));
+    try std.testing.expect(!pixelRectChanged(rect, rect));
+    try std.testing.expect(pixelRectChanged(rect, .{ .x = 10, .y = 20, .width = 301, .height = 200 }));
+}
 
 // ---------------------------------------------------------------------------
 // Workspace persistence (TASK-65)
@@ -6060,6 +6298,25 @@ const App = struct {
     pending_close_pane: ?PendingPaneClose = null,
     pending_close_workspace: ?workspace.WorkspaceKey = null,
     workspace_status: ?[]const u8 = null,
+    /// TASK-79: whether this run probes for VSCodium. Built-in checks other
+    /// than `--editor-test` never do, so what is installed on a machine cannot
+    /// change what they measure.
+    editor_detect_enabled: bool = true,
+    /// `--editor-test` only: the stand-in detection tries in place of the
+    /// settings file's `editor.command`.
+    editor_command_override: ?[]const u8 = null,
+    /// Conduit's state directory, under which each workspace's editor keeps
+    /// its own `--user-data-dir`; empty when there is no home.
+    editor_state_dir: [path_capacity]u8 = undefined,
+    editor_state_dir_len: usize = 0,
+    editor_open_index: usize = 0,
+    editor_close_index: usize = 0,
+    /// What the editor pane's semantic elements borrow for one frame. A frame
+    /// shows at most one editor pane: the active workspace's.
+    editor_id_storage: [96]u8 = undefined,
+    editor_status_id_storage: [112]u8 = undefined,
+    editor_close_id_storage: [112]u8 = undefined,
+    editor_status_storage: [256]u8 = undefined,
     scratchpad_ui_pointer_owned: bool = false,
     scratchpad_terminal_pointer_owned: bool = false,
     scratchpad_escape_owned: bool = false,
@@ -6906,6 +7163,22 @@ const App = struct {
                 .values = profile_choices.slice(),
             } } },
         });
+        // TASK-79: the editor pane. Both stay out of the palette until the
+        // active workspace has VSCodium (`setEditorActionVisibility`).
+        const editor_open_index = actions.definitions().len;
+        try actions.register(.{
+            .name = editor_open_action,
+            .label = "Editor: open file…",
+            .handler = editorOpenAction,
+            .palette = null,
+        });
+        const editor_close_index = actions.definitions().len;
+        try actions.register(.{
+            .name = editor_close_action,
+            .label = "Editor: close",
+            .handler = editorCloseAction,
+            .palette = null,
+        });
         if (options.run.ui_test or options.run.driver_test) try actions.register(.{
             .name = ui_test_activate_action,
             .label = "Activate UI test action",
@@ -7015,6 +7288,8 @@ const App = struct {
             .claude_config_dir = env.get("CLAUDE_CONFIG_DIR"),
             .codex_home = env.get("CODEX_HOME"),
             .agent_launch_index = agent_launch_index,
+            .editor_open_index = editor_open_index,
+            .editor_close_index = editor_close_index,
             .agent_prompt_index = agent_prompt_index,
             .agent_stop_index = agent_stop_index,
             .agent_focus_index = agent_focus_index,
@@ -7118,6 +7393,8 @@ const App = struct {
         // Decided before the theme so a restored theme name is known when
         // `resolveTheme` runs; the file itself is read further down.
         app.persistence = Persistence.forRun(allocator, io, env, options, loaded_config.settings.restore_enabled);
+        app.editor_detect_enabled = !usesDeterministicScratchpad(options) or options.run.editor_test;
+        app.setEditorStateDir(env, options);
         app.resolveTheme();
         // The window was created dark; a light theme lightens its title bar.
         app.window.setTitleBarDark(paletteIsDark(app.palette));
@@ -8051,8 +8328,7 @@ const App = struct {
             .instance_open_ssh => |open| self.controlOpenSsh(open.destination),
             .instance_open_workspace => |open| self.controlOpenWorkspace(open.name, open.path),
             .instance_agent => |launch| self.controlAgent(caller, launch.harness, launch.prompt),
-            // TASK-79 phase two wires the editor pane (decision-12).
-            .editor_open, .editor_goto, .editor_diff, .editor_reveal, .editor_close => controlFault(.unavailable),
+            .editor_open, .editor_goto, .editor_diff, .editor_reveal, .editor_close => self.controlEditor(caller.?, request.params),
         };
     }
 
@@ -8217,6 +8493,775 @@ const App = struct {
         if (!try self.controlFocus(caller.key, caller.session_id)) return .wait;
         try self.openBacklog();
         return if (self.backlogShown()) controlOk() else controlFault(.unavailable);
+    }
+
+    // -----------------------------------------------------------------------
+    // The editor pane (TASK-79, decision-12)
+    // -----------------------------------------------------------------------
+
+    /// What one editor request came to.
+    const EditorOutcome = union(enum) {
+        /// Not now: detection is running, the launch slot is busy, or input
+        /// or a modal holds the UI. The control and driver paths retry.
+        wait,
+        fault: control_api.FaultCode,
+        opened: struct { tab: workspace.TabId, pane: workspace.PaneId },
+        closed,
+    };
+
+    /// Who asked and where. A control or driver request first brings the
+    /// caller's workspace and pane forward, as `pane.split` does, and leaves
+    /// keyboard focus on the caller's terminal so a harness never loses its
+    /// keystrokes; the palette and the context menu focus the new pane.
+    const EditorTarget = struct {
+        key: workspace.WorkspaceKey,
+        presentation: *WorkspacePresentation,
+        model: *workspace.Workspace,
+        /// The requesting terminal: relative paths resolve against its OSC 7
+        /// cwd, and a new editor pane splits its pane.
+        session_id: ?session.SessionId,
+        from_control: bool,
+    };
+
+    /// `<state>/conduit`, where `state.json` lives; each workspace's editor
+    /// keeps its own user-data-dir under it.
+    fn setEditorStateDir(self: *App, env: EnvSource, options: Options) void {
+        var state_buffer: [path_capacity]u8 = undefined;
+        const state_path = state_mod.statePath(&state_buffer, builtin.os.tag, .{
+            .xdg_state_home = options.run.state_dir orelse env.get("XDG_STATE_HOME"),
+            .home = env.get("HOME"),
+            .local_app_data = env.get("LOCALAPPDATA"),
+        }) orelse return;
+        const dir = std.fs.path.dirname(state_path) orelse return;
+        if (dir.len > self.editor_state_dir.len) return;
+        @memcpy(self.editor_state_dir[0..dir.len], dir);
+        self.editor_state_dir_len = dir.len;
+    }
+
+    /// The workspace's editor state, created on first use.
+    fn editorState(self: *App, presentation: *WorkspacePresentation, model: *workspace.Workspace) !*EditorPresentation {
+        if (presentation.editor) |state| return state;
+        const state = try self.allocator.create(EditorPresentation);
+        state.* = .{
+            .model = editor.Editor.init(self.allocator),
+            .id = editor.workspaceId(model.name(), model.workingDirectory()),
+        };
+        if (model.contextKind().isRemote()) state.availability = .remote;
+        presentation.editor = state;
+        return state;
+    }
+
+    /// Release a closing workspace's editor: join its workers, give a hosted
+    /// window back to the desktop, free the model.
+    fn releaseEditor(self: *App, presentation: *WorkspacePresentation) void {
+        const state = presentation.editor orelse return;
+        if (state.detect_job) |job| job.destroy();
+        if (state.launch_job) |job| job.destroy();
+        self.releaseEditorWindow(state, false);
+        if (state.command) |command| self.allocator.free(command);
+        state.model.deinit();
+        self.allocator.destroy(state);
+        presentation.editor = null;
+    }
+
+    /// Stop hosting the editor's window. With `close`, ask it to close first,
+    /// as its own close button would; a window that already went has nothing
+    /// to close, so that request's failure is only logged.
+    fn releaseEditorWindow(self: *App, state: *EditorPresentation, close: bool) void {
+        if (state.embedded) |*embedded| {
+            if (close) self.window.closeEmbedded(embedded) catch |err| log.debug("the editor window took no close request: {s}", .{@errorName(err)});
+            self.window.unembed(embedded);
+        }
+        state.embedded = null;
+        state.last_rect = null;
+    }
+
+    fn editorConfiguredCommand(self: *const App) []const u8 {
+        return self.editor_command_override orelse self.config_current.settings.editor_command;
+    }
+
+    /// Start looking for VSCodium in a workspace whose answer is unknown, on a
+    /// worker through the workspace's context.
+    fn ensureEditorDetection(self: *App, presentation: *WorkspacePresentation, model: *workspace.Workspace) void {
+        if (!self.editor_detect_enabled or presentation.closing) return;
+        const state = self.editorState(presentation, model) catch return;
+        if (state.availability != .unknown or state.detect_job != null) return;
+        const configured = self.allocator.dupe(u8, self.editorConfiguredCommand()) catch return;
+        const cwd = self.allocator.dupe(u8, model.workingDirectory()) catch {
+            self.allocator.free(configured);
+            return;
+        };
+        state.detect_job = EditorJob.start(self.allocator, self.io, model.contextRef(), .{ .detect = .{ .configured = configured, .cwd = cwd } }) catch |err| {
+            log.debug("editor detection did not start: {s}", .{@errorName(err)});
+            self.allocator.free(configured);
+            self.allocator.free(cwd);
+            return;
+        };
+    }
+
+    /// The settings changed: every Local workspace looks for VSCodium again
+    /// (`editor.command` may name another one now).
+    fn resetEditorDetection(self: *App) void {
+        for (self.workspace_presentations.items) |presentation| {
+            const state = presentation.editor orelse continue;
+            if (state.availability == .remote) continue;
+            if (state.detect_job != null) {
+                state.redetect = true;
+                continue;
+            }
+            state.availability = .unknown;
+        }
+    }
+
+    /// Whether the active workspace offers the editor actions.
+    fn editorAvailability(self: *App) editor.Availability {
+        const state = self.activePresentation().editor orelse return .unknown;
+        return state.availability;
+    }
+
+    /// Show `Editor: open file…` where VSCodium was found (and, falling back
+    /// to vi, in a remote workspace), and `Editor: close` while an editor pane
+    /// is open. Changed only while the palette is closed.
+    fn setEditorActionVisibility(self: *App) void {
+        if (self.paletteVisible()) return;
+        const availability = self.editorAvailability();
+        self.action_definitions[self.editor_open_index].palette = switch (availability) {
+            .installed, .remote => editor_open_palette,
+            .unknown, .not_installed => null,
+        };
+        const open = if (self.activePresentation().editor) |state| state.session_id != null else false;
+        self.action_definitions[self.editor_close_index].palette = if (open) .{} else null;
+    }
+
+    /// Collect finished editor workers, follow editor panes that closed by
+    /// any path (pane close, tab close, Escape), and keep looking for a
+    /// launched window. Returns whether anything visible changed.
+    fn pollEditors(self: *App) bool {
+        var changed = false;
+        for (self.workspace_presentations.items) |presentation| {
+            if (presentation.closing) continue;
+            const state = presentation.editor orelse continue;
+            const model = self.workspace_registry.byKey(presentation.key) orelse continue;
+            if (state.detect_job) |job| {
+                if (job.finished()) {
+                    state.detect_job = null;
+                    defer job.destroy();
+                    if (state.command) |old| self.allocator.free(old);
+                    state.command = null;
+                    if (state.redetect) {
+                        state.redetect = false;
+                        state.availability = .unknown;
+                    } else if (job.detection) |detection| {
+                        state.availability = detection.availability();
+                        switch (detection) {
+                            .found => |found| {
+                                state.command = self.allocator.dupe(u8, found.command) catch null;
+                                if (state.command == null) state.availability = .unknown;
+                                log.info("editor: VSCodium {s} found", .{found.version});
+                            },
+                            .not_installed, .remote => log.info("editor: {s}", .{@tagName(state.availability)}),
+                        }
+                    } else {
+                        state.availability = .not_installed;
+                    }
+                    changed = true;
+                }
+            }
+            if (state.launch_job) |job| {
+                if (job.finished()) {
+                    state.launch_job = null;
+                    defer job.destroy();
+                    if (!job.launched) {
+                        log.warn("the editor launch failed: {s}", .{if (job.failure) |err| @errorName(err) else "it exited unsuccessfully"});
+                        if (state.model.status == .launching) {
+                            state.failed = true;
+                            state.embed_deadline_ns = null;
+                        }
+                    }
+                    changed = true;
+                }
+            }
+            if (state.session_id) |id| {
+                if (model.paneForSession(id) == null) {
+                    self.releaseEditorWindow(state, true);
+                    state.model.noteClosed();
+                    state.session_id = null;
+                    state.embed_deadline_ns = null;
+                    state.failed = false;
+                    changed = true;
+                }
+            }
+        }
+        if (self.workspace_registry.count() != 0) {
+            self.ensureEditorDetection(self.activePresentation(), self.activeWorkspace());
+            if (self.editorEmbedPending()) self.syncEditorHosting();
+        }
+        if (changed) self.setEditorActionVisibility();
+        return changed;
+    }
+
+    /// Whether a worker runs or a launched window is still looked for: the
+    /// loop then wakes on its idle tick.
+    fn editorNeedsTick(self: *const App) bool {
+        for (self.workspace_presentations.items) |presentation| {
+            const state = presentation.editor orelse continue;
+            if (state.detect_job != null or state.launch_job != null or state.embed_deadline_ns != null) return true;
+        }
+        return false;
+    }
+
+    fn editorEmbedPending(self: *const App) bool {
+        for (self.workspace_presentations.items) |presentation| {
+            const state = presentation.editor orelse continue;
+            if (state.embed_deadline_ns != null) return true;
+        }
+        return false;
+    }
+
+    /// Whether something drawn by Conduit sits over the panes: a hosted
+    /// window is a native child above the GL surface, so it is hidden then.
+    fn editorObscured(self: *const App) bool {
+        return self.paletteVisible() or self.settingsVisible() or self.managerVisible() or self.promptsVisible() or
+            self.notificationsVisible() or self.closeModalActive() or self.contextMenuVisible() or
+            self.scratchpadVisible() or self.backlogShown() or self.connectionVisible() or self.rename_tab_id != null;
+    }
+
+    /// The device-pixel rectangle the hosted window fills: the editor pane
+    /// below its one-row header, which keeps the status and close control
+    /// Conduit's own.
+    fn editorHostRect(self: *const App, session_id: session.SessionId) ?platform.PixelRect {
+        for (self.pane_layouts[0..self.pane_layout_count]) |layout| {
+            if (layout.pane_id == connection_pane_id or layout.session_id != session_id) continue;
+            if (layout.rect.rows < 2) return null;
+            const cell = self.fonts.metrics().cell;
+            return .{
+                .x = @intCast(@as(u32, layout.rect.col) * cell.width_px),
+                .y = @intCast((@as(u32, layout.rect.row) + 1) * cell.height_px),
+                .width = @as(u32, layout.rect.cols) * cell.width_px,
+                .height = (@as(u32, layout.rect.rows) - 1) * cell.height_px,
+            };
+        }
+        return null;
+    }
+
+    /// Place every hosted editor window over its pane, hide the ones whose
+    /// pane is not presented, and look for a launched window that is not
+    /// hosted yet. Runs after each frame's layout and while a window is
+    /// looked for.
+    fn syncEditorHosting(self: *App) void {
+        if (self.workspace_registry.count() == 0) return;
+        const active_key = self.activePresentation().key;
+        const obscured = self.editorObscured();
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        for (self.workspace_presentations.items) |presentation| {
+            const state = presentation.editor orelse continue;
+            const id = state.session_id orelse continue;
+            const visible: ?platform.PixelRect = if (presentation.key == active_key and !obscured) self.editorHostRect(id) else null;
+            if (state.embedded == null) {
+                const deadline = state.embed_deadline_ns orelse continue;
+                var marker_buffer: [64]u8 = undefined;
+                const marker = editor.windowMarker(&marker_buffer, state.id) catch continue;
+                const rect = visible orelse state.last_rect orelse platform.PixelRect{ .x = 0, .y = 0, .width = 1, .height = 1 };
+                if (self.window.embedForeignWindow(.{ .title_contains = marker }, rect)) |embedded| {
+                    state.embedded = embedded;
+                    state.last_rect = rect;
+                    state.embed_deadline_ns = null;
+                    state.model.noteOpen(true, embedded.pid);
+                    if (visible == null) self.window.showEmbedded(&state.embedded.?, false) catch |err| log.debug("the editor window stayed shown: {s}", .{@errorName(err)});
+                    log.info("editor: hosting its window over the pane", .{});
+                    self.invalidateUi();
+                } else |err| switch (err) {
+                    error.NotFound => if (now >= deadline) {
+                        log.info("editor: no window to host appeared; the pane keeps its status", .{});
+                        state.embed_deadline_ns = null;
+                        if (!state.failed) state.model.noteOpen(false, null);
+                        self.invalidateUi();
+                    },
+                    // Wayland, macOS and Windows keep the editor's own window
+                    // (decision-12); the pane shows where it is.
+                    error.Unsupported, error.Failed => {
+                        log.info("editor: its window cannot be hosted here ({s})", .{@errorName(err)});
+                        state.embed_deadline_ns = null;
+                        if (!state.failed) state.model.noteOpen(false, null);
+                        self.invalidateUi();
+                    },
+                }
+                continue;
+            }
+            const embedded = &state.embedded.?;
+            if (visible) |rect| {
+                if (pixelRectChanged(state.last_rect, rect)) {
+                    self.window.moveEmbedded(embedded, rect) catch |err| log.debug("the editor window did not move: {s}", .{@errorName(err)});
+                    state.last_rect = rect;
+                }
+                self.window.showEmbedded(embedded, true) catch |err| log.debug("the editor window stayed hidden: {s}", .{@errorName(err)});
+            } else {
+                self.window.showEmbedded(embedded, false) catch |err| log.debug("the editor window stayed shown: {s}", .{@errorName(err)});
+            }
+        }
+    }
+
+    /// The active workspace's editor state while `id` is its editor pane.
+    fn editorForSession(self: *App, id: session.SessionId) ?*EditorPresentation {
+        const state = self.activePresentation().editor orelse return null;
+        const editor_id = state.session_id orelse return null;
+        return if (editor_id == id) state else null;
+    }
+
+    /// Whether the presented pane is the editor pane: it is not a terminal,
+    /// so typed text, keys and pastes reach nobody there.
+    fn presentedIsEditor(self: *App) bool {
+        if (self.scratchpadVisible() or self.connectionVisible()) return false;
+        return self.editorForSession(self.presentedSessionId()) != null;
+    }
+
+    /// Keys over a focused editor pane: Escape closes it and gives its space
+    /// back to the sibling; everything else stops here (the hosted window
+    /// takes its own keys from the windowing system).
+    fn routeEditorPaneKey(self: *App, key: platform.KeyEvent) !bool {
+        if (!self.presentedIsEditor()) return false;
+        if (self.ui_tree.focusedElement() != null) return false;
+        if (key.action == .release) {
+            const owned = if (uiKeyIdentity(key)) |identity| self.terminal_key_state.indexOf(identity) != null else false;
+            return !owned;
+        }
+        const plain = !key.mods.ctrl and !key.mods.alt and !key.mods.shift and !key.mods.super;
+        if (key.key == .escape and plain and key.action == .press) {
+            const identity = uiKeyIdentity(key) orelse return true;
+            if (!self.ui_key_state.claim(identity, .none)) return true;
+            try self.dispatchAction(editor_close_action, .{ .source = .keybinding });
+        }
+        return true;
+    }
+
+    /// The editor pane's semantic elements: an opaque `Surface` over the
+    /// pane, a one-row header of the status `Text` and the clickable
+    /// `close`, and, where the window is not hosted, a line saying where
+    /// the editor is.
+    fn composeEditorPane(self: *App, layout: workspace.PaneLayout, pane_id: ui.Id, state: *EditorPresentation) !void {
+        const surface_text = try editor.elementId(&self.editor_id_storage, @intFromEnum(self.activePresentation().key), @intFromEnum(layout.pane_id));
+        const surface_id: ui.Id = .{ .value = surface_text };
+        const rect: ui.Rect = .{ .x = layout.rect.col, .y = layout.rect.row, .width = layout.rect.cols, .height = layout.rect.rows };
+        const status = if (state.failed) "editor ─ failed to start" else state.model.statusLine(&self.editor_status_storage);
+        try self.ui_tree.addSurface(.{
+            .id = surface_id,
+            .parent = pane_id,
+            .role = "editor",
+            .label = status,
+            .selected = layout.focused,
+            .bounds = rect,
+        }, .{ .rect = rect, .fill = .background });
+        const close_label = "× close";
+        const close_cells: u32 = 7;
+        const status_width = rect.width -| (close_cells + 1);
+        if (status_width != 0) {
+            const status_runs = [_]ui.Run{.{ .text = status, .style = .{ .foreground = if (layout.focused) .strong else .muted } }};
+            try self.ui_tree.addText(.{
+                .id = .{ .value = try std.fmt.bufPrint(&self.editor_status_id_storage, "{s}.status", .{surface_text}) },
+                .parent = surface_id,
+                .role = "status",
+                .label = status,
+                .bounds = .{ .x = rect.x, .y = rect.y, .width = status_width, .height = 1 },
+            }, .{ .runs = &status_runs });
+        }
+        if (rect.width >= close_cells) {
+            const close_id: ui.Id = .{ .value = try std.fmt.bufPrint(&self.editor_close_id_storage, "{s}.close", .{surface_text}) };
+            try self.ui_tree.addInteractiveText(.{
+                .id = close_id,
+                .parent = surface_id,
+                .role = "button",
+                .label = close_label,
+                .action = editor_close_action,
+                .bounds = .{ .x = rect.x + rect.width - close_cells, .y = rect.y, .width = close_cells, .height = 1 },
+            }, .{
+                .id = close_id,
+                .label = close_label,
+                .action = editor_close_action,
+                .normal = .{ .foreground = .muted },
+                .hovered = .{ .foreground = .strong, .underline = .accent },
+                .focused = .{ .foreground = .on_accent, .background = .accent },
+            });
+        }
+        if (!state.model.hosted and rect.height >= 3 and rect.width > 2) {
+            const note = if (state.failed)
+                "VSCodium did not start; see the log"
+            else switch (state.model.status) {
+                .open => "VSCodium is open in its own window",
+                .launching, .closed => "starting VSCodium…",
+            };
+            const note_runs = [_]ui.Run{.{ .text = note, .style = .{ .foreground = .muted } }};
+            try self.ui_tree.addText(.{
+                .id = .{ .value = "editor.placeholder" },
+                .parent = surface_id,
+                .role = "status",
+                .label = note,
+                .bounds = .{ .x = rect.x + 1, .y = rect.y + 2, .width = rect.width - 2, .height = 1 },
+            }, .{ .runs = &note_runs });
+        }
+    }
+
+    /// The directory relative paths resolve against: the requesting
+    /// terminal's OSC 7 cwd, else the workspace's, else Conduit's own.
+    /// Owned by the caller.
+    fn editorCwd(self: *App, target: EditorTarget) ![]u8 {
+        if (target.session_id) |id| if (target.model.sessionById(id)) |live| if (live.workingDirectory()) |cwd| {
+            if (cwd.len != 0 and cwd[0] == '/') return self.allocator.dupe(u8, cwd);
+        };
+        const directory = target.model.workingDirectory();
+        if (directory.len != 0 and directory[0] == '/') return self.allocator.dupe(u8, directory);
+        // The process cwd comes back sentinel-terminated; the caller frees a
+        // plain slice.
+        const current = try std.process.currentPathAlloc(self.io, self.allocator);
+        defer self.allocator.free(current);
+        return self.allocator.dupe(u8, current);
+    }
+
+    const EditorPathError = error{ InvalidPath, NotFound, NotAFile, Unavailable };
+
+    /// Resolve `path` lexically and check it through the workspace's context.
+    /// The editor runs only in Local workspaces, so the check is one local
+    /// `stat` on the owner thread, as the Local backlog view reads its files.
+    fn editorPath(self: *App, buffer: []u8, context: workspace.ExecutionContext.Ref, cwd: []const u8, path: []const u8, kind: editor.TargetKind) EditorPathError![]const u8 {
+        const resolved = editor.resolvePath(buffer, cwd, path) catch return error.InvalidPath;
+        try editor.checkTarget(self.io, context, resolved, kind);
+        return resolved;
+    }
+
+    fn editorPathFault(err: EditorPathError) control_api.FaultCode {
+        return switch (err) {
+            error.InvalidPath, error.NotAFile => .invalid_params,
+            error.NotFound => .not_found,
+            error.Unavailable => .unavailable,
+        };
+    }
+
+    /// Perform one editor request for any caller: refuse it, open a new
+    /// editor pane beside the requesting pane, reuse the open one, or close
+    /// it. Paths are resolved and checked before anything changes.
+    fn performEditor(self: *App, target: EditorTarget, request: editor.Request) !EditorOutcome {
+        const state = try self.editorState(target.presentation, target.model);
+        if (request != .close and state.availability == .unknown) {
+            self.ensureEditorDetection(target.presentation, target.model);
+            // A check that never probes has nothing to wait for.
+            if (state.detect_job == null) return .{ .fault = .editor_not_installed };
+        }
+        var plan = state.model.plan(state.availability, request);
+        // The first launch has handed off: later requests go to that window
+        // while it is still being looked for.
+        if (plan == .wait and state.launch_job == null) plan = .reuse;
+        const split: workspace.PaneSplit = switch (plan) {
+            .refuse => |refusal| return switch (refusal) {
+                .detecting => .wait,
+                .not_installed => .{ .fault = .editor_not_installed },
+                .remote => .{ .fault = .editor_remote_unsupported },
+            },
+            .nothing => return .closed,
+            .wait => return .wait,
+            .close => {
+                if (target.from_control and !try self.controlFocus(target.key, null)) return .wait;
+                try self.closeEditorPane(target.presentation, state);
+                return .closed;
+            },
+            .new_pane => |side| switch (side) {
+                .right => .right,
+                .down => .down,
+            },
+            .reuse => .right,
+        };
+        if (state.launch_job != null) return .wait;
+        const command = state.command orelse return .{ .fault = .editor_not_installed };
+        if (self.editor_state_dir_len == 0) return .{ .fault = .unavailable };
+
+        const cwd = try self.editorCwd(target);
+        defer self.allocator.free(cwd);
+        const context = target.model.contextRef();
+        const kind = request.targetKind();
+        var first_buffer: [editor.max_path_bytes]u8 = undefined;
+        var second_buffer: [editor.max_path_bytes]u8 = undefined;
+        const action: editor.Action = switch (request) {
+            .open => |open| .{ .open = .{
+                .path = self.editorPath(&first_buffer, context, cwd, open.location.path, kind) catch |err| return .{ .fault = editorPathFault(err) },
+                .line = open.location.line,
+                .column = open.location.column,
+            } },
+            .goto => |location| .{ .open = .{
+                .path = self.editorPath(&first_buffer, context, cwd, location.path, kind) catch |err| return .{ .fault = editorPathFault(err) },
+                .line = location.line,
+                .column = location.column,
+            } },
+            .diff => |diff| .{ .diff = .{
+                .left = self.editorPath(&first_buffer, context, cwd, diff.left, kind) catch |err| return .{ .fault = editorPathFault(err) },
+                .right = self.editorPath(&second_buffer, context, cwd, diff.right, kind) catch |err| return .{ .fault = editorPathFault(err) },
+            } },
+            .reveal => |path| .{ .reveal = self.editorPath(&first_buffer, context, cwd, path, kind) catch |err| return .{ .fault = editorPathFault(err) } },
+            .close => unreachable, // planned above
+        };
+
+        var udd_buffer: [path_capacity]u8 = undefined;
+        const user_data_dir = editor.userDataDir(&udd_buffer, self.editor_state_dir[0..self.editor_state_dir_len], state.id) catch
+            return .{ .fault = .unavailable };
+        const window: editor.Window = if (plan == .new_pane) .new else .reuse;
+        var spec = editor.buildLaunch(self.allocator, command, user_data_dir, cwd, window, action) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidPath => return .{ .fault = .invalid_params },
+        };
+        var spec_owned = true;
+        defer if (spec_owned) spec.deinit();
+        const seed: ?[]u8 = if (window == .new) try self.allocator.dupe(u8, user_data_dir) else null;
+        var seed_owned = true;
+        defer if (seed_owned) if (seed) |dir| self.allocator.free(dir);
+
+        if (plan == .new_pane) {
+            if (target.from_control and !try self.controlFocus(target.key, target.session_id)) return .wait;
+            if (!try self.prepareToLeaveActiveSession()) return .wait;
+            const created = (try self.createEditorPane(split, target.from_control)) orelse return .{ .fault = .unavailable };
+            state.session_id = created.session_id;
+            state.failed = false;
+            try state.model.noteLaunching(@intFromEnum(created.pane_id), user_data_dir);
+            state.embed_deadline_ns = Io.Clock.awake.now(self.io).nanoseconds + editor_embed_timeout_ns;
+        }
+        state.launch_job = EditorJob.start(self.allocator, self.io, context, .{ .launch = .{ .spec = spec, .seed_dir = seed, .id = state.id } }) catch |err| blk: {
+            log.warn("the editor launch did not start: {s}", .{@errorName(err)});
+            if (plan == .new_pane) {
+                state.failed = true;
+                state.embed_deadline_ns = null;
+            }
+            break :blk null;
+        };
+        if (state.launch_job != null) {
+            spec_owned = false;
+            seed_owned = false;
+        }
+        switch (action) {
+            .open => |location| try state.model.noteShowing(location),
+            .diff => |diff| try state.model.noteShowing(.{ .path = diff.right }),
+            .reveal => |path| try state.model.noteShowing(.{ .path = path }),
+        }
+        self.setEditorActionVisibility();
+        self.invalidateUi();
+        const where = target.model.paneForSession(state.session_id orelse return .{ .fault = .internal_error }) orelse
+            return .{ .fault = .internal_error };
+        return .{ .opened = .{ .tab = where.tab_id, .pane = where.pane_id } };
+    }
+
+    /// Split the active tab's focused pane with a new editor pane whose leaf
+    /// names a placeholder session that never gets a child. Null when the
+    /// tab has no room. Focus moves to the new pane, or stays on the caller's
+    /// terminal when `keep_focus`.
+    fn createEditorPane(self: *App, split: workspace.PaneSplit, keep_focus: bool) !?workspace.Workspace.CreatedPane {
+        const model = self.activeWorkspace();
+        const tab_id = model.activeTabId() orelse return null;
+        const tab = model.tab(tab_id) orelse return null;
+        if (tab.paneCount() >= pane_ui_capacity) return null;
+        const source_pane = model.focusedPaneId(tab_id) orelse return null;
+        const bounds = self.terminalCellBounds() orelse return null;
+        const presentation = self.activePresentation();
+        try presentation.pane_renderers.ensureUnusedCapacity(self.allocator, 1);
+        const expected_session = session.SessionId.fromOrdinal(@intCast(model.registeredSessionCount()));
+        var pane_renderer = try self.newPaneRenderer(expected_session);
+        var renderer_owned = true;
+        errdefer if (renderer_owned) pane_renderer.deinit();
+        const created = model.createPaneSession(tab_id, source_pane, .human_terminal, self.activeLive().terminal().gridSize(), split, bounds) catch |err| {
+            if (err == error.InvalidGeometry) {
+                pane_renderer.deinit();
+                renderer_owned = false;
+                return null;
+            }
+            return err;
+        };
+        pane_renderer.session_id = created.session_id;
+        presentation.pane_renderers.appendAssumeCapacity(pane_renderer);
+        renderer_owned = false;
+        if (keep_focus) try model.focusPane(tab_id, source_pane);
+        try self.adoptFocusedPane();
+        return created;
+    }
+
+    /// Close the workspace's editor pane: ask the hosted window to close,
+    /// give the pane's space back to its sibling, and forget the editor.
+    fn closeEditorPane(self: *App, presentation: *WorkspacePresentation, state: *EditorPresentation) !void {
+        self.releaseEditorWindow(state, true);
+        if (state.session_id) |id| {
+            if (presentation == self.activePresentation()) {
+                if (self.activeWorkspace().paneForSession(id)) |where| {
+                    self.ui_tree.clearFocus();
+                    try self.closePane(where.tab_id, where.pane_id);
+                }
+            }
+        }
+        state.model.noteClosed();
+        state.session_id = null;
+        state.embed_deadline_ns = null;
+        state.failed = false;
+        self.setEditorActionVisibility();
+        self.invalidateUi();
+    }
+
+    fn controlEditor(self: *App, caller: ControlCaller, params: control_api.protocol.Params) !ControlOutcome {
+        const request: editor.Request = switch (params) {
+            .editor_open => |open| .{ .open = .{
+                .location = .{ .path = open.location.path, .line = open.location.line, .column = open.location.column },
+                .split = if (open.split) |direction| switch (direction) {
+                    .right => .right,
+                    .down => .down,
+                } else .right,
+            } },
+            .editor_goto => |goto| .{ .goto = .{ .path = goto.location.path, .line = goto.location.line, .column = goto.location.column } },
+            .editor_diff => |diff| .{ .diff = .{ .left = diff.left, .right = diff.right } },
+            .editor_reveal => |reveal| .{ .reveal = reveal.path },
+            .editor_close => .close,
+            else => return controlFault(.invalid_params),
+        };
+        const outcome = try self.performEditor(.{
+            .key = caller.key,
+            .presentation = caller.presentation,
+            .model = caller.model,
+            .session_id = caller.session_id,
+            .from_control = true,
+        }, request);
+        return switch (outcome) {
+            .wait => .wait,
+            .fault => |code| controlFault(code),
+            .closed => controlOk(),
+            .opened => |opened| controlOpened(.{ .tab = @intFromEnum(opened.tab), .pane = @intFromEnum(opened.pane) }),
+        };
+    }
+
+    /// The palette's `Editor: open file…` and the context menu's `open in
+    /// editor`: a typed `path[:line[:col]]`, or the file reference the menu
+    /// was opened over. A remote workspace opens the file in vi in a new
+    /// tab and says why.
+    fn editorOpenAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        var path_storage: [link.default_max_target_bytes]u8 = undefined;
+        var location: editor.Location = undefined;
+        var source: ?session.SessionId = null;
+        if (invocation.origin) |origin| {
+            if (self.terminalLinkTarget(origin.value)) |target| {
+                if (target.kind != .file or target.target.len > path_storage.len) return;
+                @memcpy(path_storage[0..target.target.len], target.target);
+                location = .{ .path = path_storage[0..target.target.len], .line = target.line, .column = target.column };
+                source = target.session_id;
+            }
+        }
+        if (source == null) {
+            const text = argument(invocation, "path") orelse return;
+            const typed = editorLocationFromText(text) orelse return;
+            if (typed.path.len > path_storage.len) return;
+            @memcpy(path_storage[0..typed.path.len], typed.path);
+            location = .{ .path = path_storage[0..typed.path.len], .line = typed.line, .column = typed.column };
+            source = self.presentedSessionId();
+        }
+        const model = self.activeWorkspace();
+        if (model.contextKind().isRemote()) {
+            const live = model.sessionById(source.?) orelse return;
+            const cwd = try self.allocator.dupe(u8, live.workingDirectory() orelse model.workingDirectory());
+            var cwd_owned = true;
+            defer if (cwd_owned) self.allocator.free(cwd);
+            const argv = buildFileReferenceArgv(self.allocator, location.path, location.line, cwd) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnsafePath, error.PathTooLong => return,
+            };
+            cwd_owned = false;
+            if (try self.openEditorTab(fileReferenceLabel(location.path), cwd, argv)) self.setWorkspaceStatus(editor.remote_hint);
+            return;
+        }
+        const outcome = try self.performEditor(.{
+            .key = self.activePresentation().key,
+            .presentation = self.activePresentation(),
+            .model = model,
+            .session_id = source,
+            .from_control = false,
+        }, .{ .open = .{ .location = location } });
+        switch (outcome) {
+            .wait => self.setWorkspaceStatus(if (self.editorAvailability() == .unknown) editor_detecting_status else editor_busy_status),
+            .fault => |code| self.setWorkspaceStatus(switch (code) {
+                .editor_not_installed => editor_not_installed_status,
+                .editor_remote_unsupported => editor.remote_hint,
+                .not_found, .invalid_params => editor_missing_status,
+                else => editor_busy_status,
+            }),
+            .opened, .closed => {},
+        }
+        self.ui_tree.clearFocus();
+        try self.refreshActiveUi();
+    }
+
+    /// `Editor: close`, the pane's `close` control and Escape over the pane.
+    fn editorCloseAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
+        _ = invocation;
+        const self: *App = @ptrCast(@alignCast(context));
+        const state = self.activePresentation().editor orelse return;
+        if (state.session_id == null) return;
+        try self.closeEditorPane(self.activePresentation(), state);
+        try self.refreshActiveUi();
+    }
+
+    /// The driver's `editor_open`/`editor_goto`: the control path for the
+    /// active workspace and its presented terminal.
+    fn driverEditor(self: *App, params: testdriver.Params) !EditorOutcome {
+        const request: editor.Request = switch (params) {
+            .editor_open => |open| .{ .open = .{
+                .location = .{ .path = open.location.path, .line = open.location.line, .column = open.location.column },
+                .split = if (open.split) |direction| switch (direction) {
+                    .right => .right,
+                    .down => .down,
+                } else .right,
+            } },
+            .editor_goto => |goto| .{ .goto = .{ .path = goto.location.path, .line = goto.location.line, .column = goto.location.column } },
+            else => return .{ .fault = .invalid_params },
+        };
+        if (self.workspace_registry.count() == 0) return .{ .fault = .unavailable };
+        const presented = self.presentedSessionId();
+        const model = self.activeWorkspace();
+        const source: ?session.SessionId = if (model.sessionKind(presented)) |kind| switch (kind) {
+            .human_terminal, .agent_terminal => presented,
+            .scratchpad, .connection => null,
+        } else null;
+        return self.performEditor(.{
+            .key = self.activePresentation().key,
+            .presentation = self.activePresentation(),
+            .model = model,
+            .session_id = source,
+            .from_control = true,
+        }, request);
+    }
+
+    fn driverEditorFault(code: control_api.FaultCode) testdriver.Fault {
+        return switch (code) {
+            .editor_not_installed => testdriver.Fault.unavailable(editor.install_hint),
+            .editor_remote_unsupported => testdriver.Fault.unavailable(editor.remote_hint),
+            .not_found => testdriver.Fault.notFound("No such file"),
+            .invalid_params => testdriver.Fault.invalid_params,
+            else => testdriver.Fault.unavailable("The editor pane cannot open now"),
+        };
+    }
+
+    /// Answer a driver editor request, or keep it until it can be answered.
+    /// Returns whether `parsed` was retained.
+    fn serveDriverEditor(self: *App, token: u64, parsed: testdriver.ParsedRequest, request: testdriver.Request, deadline: ?i128) bool {
+        const outcome = self.driverEditor(request.params) catch |err| {
+            log.warn("a driver editor request failed: {s}", .{@errorName(err)});
+            self.respondDriverFault(token, request.id, testdriver.Fault.internal_error);
+            return false;
+        };
+        switch (outcome) {
+            .wait => {
+                const now = Io.Clock.real.now(self.io).nanoseconds;
+                const until = deadline orelse now + editor_driver_wait_ns;
+                if (now >= until) {
+                    self.respondDriverFault(token, request.id, testdriver.Fault.unavailable("The editor pane is busy"));
+                    return false;
+                }
+                if (deadline != null) return true;
+                const retained = self.addDriverPending(.{ .token = token, .parsed = parsed, .state = .{ .editor = until } }) != null;
+                if (!retained) self.respondDriverFault(token, request.id, testdriver.Fault.unavailable("Driver queue full"));
+                return retained;
+            },
+            .fault => |code| self.respondDriverFault(token, request.id, driverEditorFault(code)),
+            .opened, .closed => self.respondDriverResult(token, request.id, .ok),
+        }
+        return false;
     }
 
     fn controlStatusFor(self: *const App, key: workspace.WorkspaceKey, tab_id: workspace.TabId) ?*const ControlTabStatus {
@@ -9531,6 +10576,9 @@ const App = struct {
         for (self.workspace_presentations.items) |presentation| {
             self.releaseRemote(presentation);
             releaseBacklog(self.allocator, presentation);
+            // Editor workers borrow the context; a hosted window goes back
+            // to the desktop before Conduit's window closes (TASK-79).
+            self.releaseEditor(presentation);
         }
         self.remote_spec.deinit();
         self.ssh_client_spec.deinit();
@@ -10333,8 +11381,8 @@ const App = struct {
     fn contextMenuBoundsNow(self: *const App) ?ui.Rect {
         const menu = self.context_menu orelse return null;
         var storage: [context_menu_max_items]ContextMenuItem = undefined;
-        const items = contextMenuItems(menu.has_selection, menu.linkId() != null, &storage);
-        return contextMenuBounds(menu.col, menu.row, items.len, self.ui_canvas.bounds());
+        const items = contextMenuItemsWith(menu.has_selection, menu.linkId() != null, menu.editor, &storage);
+        return contextMenuBoundsWidth(menu.col, menu.row, items.len, self.ui_canvas.bounds(), contextMenuWidth(menu.editor));
     }
 
     /// The menu is a `Surface` panel of `InteractiveText` rows registered once
@@ -10343,8 +11391,8 @@ const App = struct {
     fn composeContextMenu(self: *App) !void {
         const menu = self.context_menu orelse return;
         var storage: [context_menu_max_items]ContextMenuItem = undefined;
-        const items = contextMenuItems(menu.has_selection, menu.linkId() != null, &storage);
-        const bounds = contextMenuBounds(menu.col, menu.row, items.len, self.ui_canvas.bounds()) orelse return;
+        const items = contextMenuItemsWith(menu.has_selection, menu.linkId() != null, menu.editor, &storage);
+        const bounds = contextMenuBoundsWidth(menu.col, menu.row, items.len, self.ui_canvas.bounds(), contextMenuWidth(menu.editor)) orelse return;
         const menu_id: ui.Id = .{ .value = "context-menu" };
         try self.ui_tree.addSurface(.{
             .id = menu_id,
@@ -10401,10 +11449,13 @@ const App = struct {
                 @memcpy(menu.link_id[0..id.len], id);
                 menu.link_id_len = id.len;
             }
+            if (self.terminalLinkTarget(id)) |target| {
+                menu.editor = target.kind == .file and self.editorAvailability() == .installed;
+            }
         }
         var storage: [context_menu_max_items]ContextMenuItem = undefined;
-        const items = contextMenuItems(menu.has_selection, menu.linkId() != null, &storage);
-        if (contextMenuBounds(col, row, items.len, self.ui_canvas.bounds()) == null) return;
+        const items = contextMenuItemsWith(menu.has_selection, menu.linkId() != null, menu.editor, &storage);
+        if (contextMenuBoundsWidth(col, row, items.len, self.ui_canvas.bounds(), contextMenuWidth(menu.editor)) == null) return;
         self.composition.cancel();
         _ = takeCommittedText(&self.pending_committed_text);
         try self.window.stopTextInput();
@@ -10453,7 +11504,7 @@ const App = struct {
     fn moveContextMenuFocus(self: *App, next: bool) !void {
         const menu = self.context_menu orelse return;
         var storage: [context_menu_max_items]ContextMenuItem = undefined;
-        const items = contextMenuItems(menu.has_selection, menu.linkId() != null, &storage);
+        const items = contextMenuItemsWith(menu.has_selection, menu.linkId() != null, menu.editor, &storage);
         var current: ?usize = null;
         if (self.ui_tree.focusedElement()) |focused| {
             for (items, 0..) |item, index| {
@@ -10490,6 +11541,12 @@ const App = struct {
         } else if (std.mem.eql(u8, row_id, context_menu_open_link_item.id)) {
             if (link_len == 0) return;
             try self.dispatchAction(terminal_open_link_action, .{
+                .source = source,
+                .origin = .{ .value = link_storage[0..link_len] },
+            });
+        } else if (std.mem.eql(u8, row_id, context_menu_open_in_editor_item.id)) {
+            if (link_len == 0) return;
+            try self.dispatchAction(editor_open_action, .{
                 .source = source,
                 .origin = .{ .value = link_storage[0..link_len] },
             });
@@ -13004,10 +14061,10 @@ const App = struct {
             self.takePromptsDiscovery();
             changed = true;
         };
-        if (self.prompts_editor) |editor| {
+        if (self.prompts_editor) |open_editor| {
             const ended = ended: {
-                const model = self.workspace_registry.byKey(editor.key) orelse break :ended true;
-                const live = model.sessionById(editor.session) orelse break :ended true;
+                const model = self.workspace_registry.byKey(open_editor.key) orelse break :ended true;
+                const live = model.sessionById(open_editor.session) orelse break :ended true;
                 const child = live.child() orelse break :ended false;
                 break :ended child.state() != .running;
             };
@@ -15827,6 +16884,10 @@ const App = struct {
                 try self.composeAgentView(layout, runner, id);
                 continue;
             }
+            if (self.editorForSession(layout.session_id)) |state| {
+                try self.composeEditorPane(layout, id, state);
+                continue;
+            }
             if (self.activeWorkspace().sessionById(layout.session_id)) |live| {
                 try self.composeTerminalLinks(
                     live.terminalConst(),
@@ -16744,6 +17805,8 @@ const App = struct {
             .terminal => |press| {
                 if (!self.paletteVisible() and !self.search_visible and !self.contextMenuVisible() and
                     !self.notificationsVisible() and !modal and try self.routeAgentViewKey(key)) return;
+                if (!self.paletteVisible() and !self.search_visible and !self.contextMenuVisible() and
+                    !self.notificationsVisible() and !modal and try self.routeEditorPaneKey(key)) return;
                 if (try self.routeFocusedUiKey(key, translated)) return;
                 if (self.paletteVisible() or self.search_visible or self.contextMenuVisible() or self.notificationsVisible()) return;
                 // The view covers the panes: their terminals get no keys.
@@ -16965,9 +18028,12 @@ const App = struct {
         self.binding_table.deinit();
         self.binding_table = table;
         self.bindings = self.binding_table.bindings;
+        // TASK-79: another `editor.command` may find (or lose) VSCodium.
+        const editor_changed = !std.mem.eql(u8, self.config_current.settings.editor_command, next.settings.editor_command);
         self.config_current.deinit();
         self.config_current = next;
         self.config_reload_count += 1;
+        if (editor_changed) self.resetEditorDetection();
         logConfigDiagnostics(path, &self.config_current);
         self.applyConfigSettings() catch |err| {
             log.warn("the reloaded settings could not be fully applied: {s}", .{@errorName(err)});
@@ -17977,6 +19043,8 @@ const App = struct {
             self.releaseRemote(presentation);
             // Joins a backlog write that borrows the context.
             releaseBacklog(self.allocator, presentation);
+            // Joins editor workers that borrow the context (TASK-79).
+            self.releaseEditor(presentation);
             const result = self.workspace_registry.remove(presentation.key) catch {
                 log.err("a closing workspace disappeared before teardown", .{});
                 index += 1;
@@ -19058,8 +20126,8 @@ const App = struct {
         }
         rows[count] = .{ .heading = .{ .id = "settings.heading.keys", .label = "Keys" } };
         count += 1;
-        const reserved = 6 + settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len +
-            settings_shell_fields.len + config.max_shell_profiles;
+        const reserved = 7 + settings_scratchpad_fields.len + settings_mouse_fields.len + settings_agents_fields.len +
+            settings_shell_fields.len + settings_editor_fields.len + config.max_shell_profiles;
         for (self.actions.definitions(), 0..) |*definition, definition_index| {
             if (!settingsBindable(definition)) continue;
             if (count + reserved >= rows.len) break;
@@ -19095,6 +20163,12 @@ const App = struct {
             if (count + 1 >= rows.len) break;
             const id = std.fmt.bufPrint(&self.settings_row_ids[count], "settings.row.profile.{s}", .{profile.name}) catch continue;
             rows[count] = .{ .profile = .{ .index = index, .id = id } };
+            count += 1;
+        }
+        rows[count] = .{ .heading = .{ .id = "settings.heading.editor", .label = "Editor" } };
+        count += 1;
+        for (settings_editor_fields) |field| {
+            rows[count] = .{ .field = field };
             count += 1;
         }
         rows[count] = .raw;
@@ -19171,7 +20245,6 @@ const App = struct {
             // as are `restore.enabled` and `accessibility.enabled`.
             .shell => if (self.config_current.settings.shell.len == 0) "(default)" else self.config_current.settings.shell,
             .remote_profile, .remote_recent, .control_enabled, .restore_enabled, .accessibility_enabled, .profile, .keybind => "",
-            // TASK-79 phase two gives it a settings row.
             .editor_command => if (self.config_current.settings.editor_command.len == 0) "(codium)" else self.config_current.settings.editor_command,
         };
     }
@@ -19189,6 +20262,7 @@ const App = struct {
             .scratchpad_size => std.fmt.bufPrint(buffer, "{d}", .{self.scratchpad_percent_small}) catch "",
             .scratchpad_large_size => std.fmt.bufPrint(buffer, "{d}", .{self.scratchpad_percent_large}) catch "",
             .shell => self.config_current.settings.shell,
+            .editor_command => self.config_current.settings.editor_command,
             else => self.settingsValueText(key, buffer),
         };
     }
@@ -19921,6 +20995,8 @@ const App = struct {
         try self.window.stopTextInput();
         clearPaletteInput(&self.palette_query);
         clearPaletteInput(&self.palette_argument);
+        // TASK-79: the editor commands exist where VSCodium was found.
+        self.setEditorActionVisibility();
         self.palette_model.refresh("");
         self.palette_model.selectFirst();
         // Installed families can change between openings (a font installed
@@ -20573,6 +21649,8 @@ const App = struct {
 
     /// Paste `location` into the program, and log what happened by size.
     fn paste(self: *App, location: ClipboardTarget) void {
+        // The editor pane has no child to paste into (TASK-79).
+        if (self.presentedIsEditor()) return;
         self.pasteToTerminal(location) catch |err| {
             log.warn("paste from the {s} clipboard failed: {s}", .{ @tagName(location), @errorName(err) });
         };
@@ -20715,6 +21793,10 @@ const App = struct {
             changed = true;
         }
         if (self.pollControl()) {
+            self.invalidateUi();
+            changed = true;
+        }
+        if (self.pollEditors()) {
             self.invalidateUi();
             changed = true;
         }
@@ -20867,7 +21949,7 @@ const App = struct {
                         used = true;
                         break;
                     },
-                    .wait, .screenshot => {},
+                    .wait, .screenshot, .editor => {},
                 }
             }
             if (!used) return candidate;
@@ -20895,7 +21977,7 @@ const App = struct {
             const pending = slot.* orelse continue;
             const matches = switch (pending.state) {
                 .barrier => |barrier| barrier.id == barrier_id,
-                .wait, .screenshot => false,
+                .wait, .screenshot, .editor => false,
             };
             if (!matches) continue;
             var completed = self.takeDriverPending(index);
@@ -21322,11 +22404,7 @@ const App = struct {
                 self.driver_quit_deadline_ns = Io.Clock.real.now(self.io).nanoseconds + 50 * std.time.ns_per_ms;
                 return false;
             },
-            // TASK-79 phase two wires the editor pane (decision-12).
-            .editor_open, .editor_goto => {
-                self.respondDriverFault(token, request.id, testdriver.Fault.unavailable("Unsupported: the editor pane is not wired yet"));
-                return false;
-            },
+            .editor_open, .editor_goto => return self.serveDriverEditor(token, parsed, request, null),
         }
     }
 
@@ -21390,6 +22468,15 @@ const App = struct {
                     }
                     completed.deinit(self.allocator);
                 },
+                .editor => |deadline| {
+                    const request = switch (pending.parsed.outcome) {
+                        .request => |request| request,
+                        .failure => continue,
+                    };
+                    if (self.serveDriverEditor(pending.token, pending.parsed, request, deadline)) continue;
+                    var completed = self.takeDriverPending(index);
+                    completed.deinit(self.allocator);
+                },
                 .screenshot => |job| {
                     if (!job.finished()) continue;
                     if (job.thread) |thread| {
@@ -21421,7 +22508,7 @@ const App = struct {
         for (self.driver_pending) |slot| {
             const pending = slot orelse continue;
             const deadline = switch (pending.state) {
-                .wait => |deadline| deadline,
+                .wait, .editor => |deadline| deadline,
                 .barrier, .screenshot => continue,
             };
             if (earliest == null or deadline < earliest.?) earliest = deadline;
@@ -21450,7 +22537,7 @@ const App = struct {
         }
         if (self.paletteVisible() or self.settingsVisible() or self.managerVisible() or self.promptsVisible() or self.search_visible) return;
         // A view is not a terminal: text typed over it reaches nobody.
-        if (self.presentedAgentView() != null or self.backlogShown()) return;
+        if (self.presentedAgentView() != null or self.backlogShown() or self.presentedIsEditor()) return;
         self.presentedLive().terminal().userInput();
         queueCommittedText(&self.pending_committed_text, text);
         self.invalidateUi();
@@ -22141,6 +23228,8 @@ const App = struct {
         }
         try self.syncTextInput();
         if (self.ui_test == null) try self.composeUi();
+        // TASK-79: the hosted editor window follows this frame's layout.
+        self.syncEditorHosting();
         const overlay = self.overlayView();
         const repaint_base = try self.overlay_grid.prepareCanvasOverlay(&self.fonts, overlay);
         var base_changed = repaint_base or self.needs_present;
@@ -22356,7 +23445,7 @@ const App = struct {
                 has_attached_child = has_attached_child or model.hasAttachedChild();
             }
         }
-        has_load = has_load or self.restoreQueuesRunnable();
+        has_load = has_load or self.restoreQueuesRunnable() or self.editorNeedsTick();
         if (has_load) {
             if (budget < 0) return idle_tick_ms;
             return @min(budget, idle_tick_ms);
@@ -29678,6 +30767,272 @@ fn backlogTest(self: *App, io: Io, out: *Writer) !u8 {
     return if (failures == 0) 0 else 1;
 }
 
+// --editor-test (TASK-79) ------------------------------------------------------
+
+/// The stand-in `codium`: answers `--version`, records every other argv line,
+/// and on a first launch maps a real X client window whose title carries the
+/// marker Conduit seeded into the user-data-dir, so the X11 hosting path is
+/// exercised for real. `%s` is the log path.
+const editor_test_stand_in =
+    \\#!/bin/sh
+    \\if [ "$1" = --version ]; then printf '1.95.3\nstand-in\nx64\n'; exit 0; fi
+    \\printf '%s\n' "$*" >> '{s}'
+    \\if [ "$1" = --new-window ]; then
+    \\  m=$(grep -o 'conduit-editor-[0-9a-f]*' "$3/User/settings.json")
+    \\  setsid xlogo -title "stand-in $m" </dev/null >/dev/null 2>&1 &
+    \\fi
+    \\exit 0
+    \\
+;
+const editor_test_notes = "one\ntwo\nthree\nfour\nfive\nsix\n";
+
+fn editorCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("editor-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    out.flush() catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// The editor pane's `Surface`, if the frame has one.
+fn editorElement(self: *const App) ?*const ui.Element {
+    for (self.ui_tree.elements()) |*element| {
+        if (std.mem.eql(u8, element.role, "editor")) return element;
+    }
+    return null;
+}
+
+fn waitForEditor(self: *App, io: Io, out: *Writer, condition: EditorWait) !bool {
+    const deadline = Io.Clock.real.now(io).nanoseconds + control_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        if (editorWaitMet(self, io, condition)) return true;
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return false;
+        }
+        if (self.outputReadable()) _ = try self.drainChildren(io);
+        if (self.poll()) self.scheduler.invalidate();
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) {
+            if (self.scheduler.shouldDraw()) try self.drawFrame();
+            return editorWaitMet(self, io, condition);
+        }
+    }
+}
+
+const EditorWait = union(enum) {
+    availability: editor.Availability,
+    /// The editor pane's status label contains this text.
+    label: []const u8,
+    /// No editor pane in the frame.
+    closed,
+    /// The pane hosts the stand-in's window: the placeholder line is gone.
+    hosted,
+    /// The stand-in's log has this line fragment.
+    log: struct { path: []const u8, text: []const u8 },
+    /// The active tab has this many panes.
+    panes: usize,
+    element: []const u8,
+};
+
+fn editorWaitMet(self: *App, io: Io, condition: EditorWait) bool {
+    return switch (condition) {
+        .availability => |want| self.editorAvailability() == want,
+        .label => |text| if (editorElement(self)) |element| std.mem.indexOf(u8, element.label, text) != null else false,
+        .closed => editorElement(self) == null,
+        .hosted => editorElement(self) != null and self.ui_tree.byId(.{ .value = "editor.placeholder" }) == null,
+        .log => |want| fileContains(io, want.path, want.text),
+        .panes => |count| if (self.activeWorkspace().activeTabId()) |tab_id|
+            (if (self.activeWorkspace().tab(tab_id)) |tab| tab.paneCount() == count else false)
+        else
+            false,
+        .element => |id| self.ui_tree.byId(.{ .value = id }) != null,
+    };
+}
+
+/// Point detection at `command` and wait for its answer, as an edit of
+/// `editor.command` followed by a settings reload would.
+fn editorDetectWith(self: *App, io: Io, out: *Writer, command: []const u8, want: editor.Availability) !bool {
+    self.editor_command_override = command;
+    self.resetEditorDetection();
+    return waitForEditor(self, io, out, .{ .availability = want });
+}
+
+fn editorPaletteChord(self: *App, io: Io, out: *Writer) !bool {
+    const mods: platform.Mods = switch (self.binding_profile) {
+        .macos => .{ .shift = true, .super = true },
+        .linux_windows => .{ .ctrl = true, .shift = true },
+    };
+    return postKey(self, io, out, 'p', mods);
+}
+
+/// Exercise TASK-79 through real SDL input, real tab shells running `conduit
+/// control`, a stand-in `codium` and a real X client window.
+fn editorTest(self: *App, io: Io, out: *Writer) !u8 {
+    var failures: usize = 0;
+    self.focus_override = true;
+    defer self.focus_override = null;
+    defer self.editor_command_override = null;
+    const dir = self.agentTestDir() orelse return 1;
+    const exe = self.self_exe orelse return 1;
+
+    try self.drawFrame();
+    editorCheck(out, &failures, try waitForControl(self, io, out, .{ .terminal_text = "CONTROL-TEST-READY" }), "the first tab's shell started", .{});
+    editorCheck(out, &failures, self.control_server != null, "the control endpoint is listening", .{});
+
+    // Fixtures: a project with two files, the stand-in and its log.
+    var paths: [8][path_capacity]u8 = undefined;
+    const project = try std.fmt.bufPrint(&paths[0], "{s}/proj", .{dir});
+    const notes = try std.fmt.bufPrint(&paths[1], "{s}/notes.txt", .{project});
+    const other = try std.fmt.bufPrint(&paths[2], "{s}/other.txt", .{project});
+    const bin = try std.fmt.bufPrint(&paths[3], "{s}/bin", .{dir});
+    const stand_in = try std.fmt.bufPrint(&paths[4], "{s}/codium", .{bin});
+    const absent = try std.fmt.bufPrint(&paths[5], "{s}/absent-codium", .{bin});
+    const log_path = try std.fmt.bufPrint(&paths[6], "{s}/codium.log", .{dir});
+    _ = try Dir.cwd().createDirPathStatus(io, project, .default_dir);
+    _ = try Dir.cwd().createDirPathStatus(io, bin, .default_dir);
+    try Dir.cwd().writeFile(io, .{ .sub_path = notes, .data = editor_test_notes });
+    try Dir.cwd().writeFile(io, .{ .sub_path = other, .data = editor_test_notes });
+    var script_buffer: [2048]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buffer, editor_test_stand_in, .{log_path});
+    try Dir.cwd().writeFile(io, .{ .sub_path = stand_in, .data = script, .flags = .{ .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o700) } });
+
+    // 1. Not installed: the actions are hidden and the API names the fix.
+    editorCheck(out, &failures, try editorDetectWith(self, io, out, absent, .not_installed), "a missing editor.command (and no codium on PATH) means not installed", .{});
+    editorCheck(out, &failures, try editorPaletteChord(self, io, out) and try waitForEditor(self, io, out, .{ .element = "palette.query" }) and
+        try postPaletteText(self, io, out, "Editor"), "the palette opened and was filtered for Editor", .{});
+    editorCheck(out, &failures, viewElement(self, "palette.action.", "Editor:") == null, "no Editor command is offered without VSCodium", .{});
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    const missing_path = try std.fmt.bufPrint(&paths[7], "{s}/missing", .{dir});
+    _ = try controlType(self, io, out, "'{s}' control editor.open '{{\"path\":\"{s}\"}}' > '{s}/missing' 2>&1; echo \"rc=$?\" >> '{s}/missing'", .{ exe, notes, dir, dir });
+    editorCheck(out, &failures, try waitForControlFile(self, io, out, dir, "missing", "rc=") and
+        !fileContains(io, missing_path, "rc=0") and fileContains(io, missing_path, "vscodium.com"), "conduit control editor.open failed with the install hint", .{});
+    editorCheck(out, &failures, editorElement(self) == null and !fileContains(io, log_path, "--"), "nothing was launched and no pane opened", .{});
+
+    // 2. Installed: the palette opens notes.txt:2:3 in a new pane (keyboard).
+    editorCheck(out, &failures, try editorDetectWith(self, io, out, stand_in, .installed), "the stand-in answered --version through the workspace context", .{});
+    var line_buffer: [path_capacity + 16:0]u8 = undefined;
+    editorCheck(out, &failures, try editorPaletteChord(self, io, out) and try waitForEditor(self, io, out, .{ .element = "palette.query" }) and
+        try postPaletteText(self, io, out, "Editor: open") and viewElement(self, "palette.action.", "Editor: open file") != null, "the palette offers Editor: open file…", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try postPaletteText(self, io, out, try std.fmt.bufPrintZ(&line_buffer, "{s}:2:3", .{notes}));
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    editorCheck(out, &failures, try waitForEditor(self, io, out, .{ .panes = 2 }) and try waitForEditor(self, io, out, .{ .label = "notes.txt:2:3" }), "Enter opened an editor pane beside the terminal showing notes.txt:2:3", .{});
+    var want_buffer: [path_capacity * 2]u8 = undefined;
+    var udd_buffer: [path_capacity]u8 = undefined;
+    const state = self.activePresentation().editor orelse return 1;
+    const udd = try editor.userDataDir(&udd_buffer, self.editor_state_dir[0..self.editor_state_dir_len], state.id);
+    editorCheck(out, &failures, std.mem.startsWith(u8, udd, dir), "the user-data-dir '{s}' is under the run's private state directory", .{udd});
+    editorCheck(out, &failures, try waitForEditor(self, io, out, .{ .log = .{ .path = log_path, .text = try std.fmt.bufPrint(&want_buffer, "--new-window --user-data-dir {s} --goto {s}:2:3", .{ udd, notes }) } }), "the first launch was a new window with Conduit's user-data-dir and --goto", .{});
+    var settings_buffer: [path_capacity]u8 = undefined;
+    var marker_buffer: [64]u8 = undefined;
+    editorCheck(out, &failures, fileContains(io, try std.fmt.bufPrint(&settings_buffer, "{s}/User/settings.json", .{udd}), try editor.windowMarker(&marker_buffer, state.id)), "the user-data-dir was seeded with the window-title marker", .{});
+    editorCheck(out, &failures, try waitForEditor(self, io, out, .hosted) and state.model.hosted, "the stand-in's X window is hosted over the pane", .{});
+    const editor_session = state.session_id orelse return 1;
+    editorCheck(out, &failures, self.presentedSessionId() == editor_session, "the palette path focused the editor pane", .{});
+
+    // 3. Escape over the focused pane gives the space back to the terminal.
+    _ = try postNamedKey(self, io, out, .escape, .{});
+    editorCheck(out, &failures, try waitForEditor(self, io, out, .closed) and try waitForEditor(self, io, out, .{ .panes = 1 }) and state.embedded == null, "Escape closed the editor pane and released its window", .{});
+
+    // 4. The context menu over a printed path:line opens it (mouse).
+    // The shell claims the project directory with OSC 7, so the relative
+    // reference resolves against the terminal's own cwd.
+    _ = try controlType(self, io, out, "cd '{s}' && printf '\\033]7;file://localhost%s\\007' \"$PWD\" && printf 'see %s:4\\n' notes.txt", .{project});
+    _ = try waitForControl(self, io, out, .{ .terminal_text = "see notes.txt:4" });
+    try self.drawFrame();
+    var link_element: ?*const ui.Element = null;
+    for (self.ui_tree.elements()) |*element| {
+        if (App.isTerminalLink(element) and std.mem.indexOf(u8, element.label, "notes.txt:4") != null) link_element = element;
+    }
+    editorCheck(out, &failures, link_element != null, "the printed path:line is a file reference", .{});
+    if (link_element) |element| {
+        const point = elementCenter(element, self.window.state.scale);
+        editorCheck(out, &failures, try postRightClick(self, io, out, point.x, point.y, .{}) and
+            try waitForEditor(self, io, out, .{ .element = "context-menu.open-in-editor" }), "a right click over it offers open in editor", .{});
+        editorCheck(out, &failures, try clickTabsElement(self, io, out, "context-menu.open-in-editor") and
+            try waitForEditor(self, io, out, .{ .label = "notes.txt:4" }) and try waitForEditor(self, io, out, .{ .panes = 2 }), "clicking it opened the editor pane at notes.txt:4", .{});
+        editorCheck(out, &failures, try waitForEditor(self, io, out, .{ .log = .{ .path = log_path, .text = try std.fmt.bufPrint(&want_buffer, "--new-window --user-data-dir {s} --goto {s}:4", .{ udd, notes }) } }) and
+            try waitForEditor(self, io, out, .hosted), "the context-menu launch went through --goto and was hosted", .{});
+    }
+
+    // 5. The control API from the terminal: goto, open, diff and reveal reuse
+    // the pane; the caller keeps keyboard focus.
+    var pane_buffer: [64]u8 = undefined;
+    editorCheck(out, &failures, try clickTabsElement(self, io, out, try paneSemanticId(&pane_buffer, self.activePresentation().key, workspace.PaneId.first)) and
+        !self.presentedIsEditor(), "a click on the terminal pane focused it", .{});
+    const calls = [_]struct { name: []const u8, params: []const u8, log: []const u8 }{
+        .{ .name = "goto", .params = "{{\"path\":\"{s}\",\"line\":5}}", .log = "--reuse-window --user-data-dir" },
+        .{ .name = "open", .params = "{{\"path\":\"{s}\",\"line\":6,\"column\":2}}", .log = "6:2" },
+        .{ .name = "diff", .params = "{{\"left\":\"{s}\",\"right\":\"{s}\"}}", .log = "--diff" },
+        .{ .name = "reveal", .params = "{{\"path\":\"{s}\"}}", .log = "-r --user-data-dir" },
+    };
+    inline for (calls) |call| {
+        const target = if (comptime std.mem.eql(u8, call.name, "goto")) other else notes;
+        var params_buffer: [path_capacity * 2]u8 = undefined;
+        const params = if (comptime std.mem.eql(u8, call.name, "diff"))
+            try std.fmt.bufPrint(&params_buffer, call.params, .{ notes, other })
+        else
+            try std.fmt.bufPrint(&params_buffer, call.params, .{target});
+        _ = try controlType(self, io, out, "'{s}' control editor." ++ call.name ++ " '{s}' > '{s}/" ++ call.name ++ "' 2>&1; echo \"rc=$?\" >> '{s}/" ++ call.name ++ "'", .{ exe, params, dir, dir });
+        editorCheck(out, &failures, try waitForControlFile(self, io, out, dir, call.name, "rc=0") and
+            try waitForEditor(self, io, out, .{ .log = .{ .path = log_path, .text = call.log } }), "editor." ++ call.name ++ " answered and reached the stand-in", .{});
+        editorCheck(out, &failures, try waitForEditor(self, io, out, .{ .panes = 2 }) and !self.presentedIsEditor() and
+            state.session_id != null, "editor." ++ call.name ++ " reused the open pane and left focus on the terminal", .{});
+    }
+    editorCheck(out, &failures, try waitForControlFile(self, io, out, dir, "open", "\"pane\":"), "editor.open replied with the editor pane", .{});
+    _ = try controlType(self, io, out, "'{s}' control editor.goto '{{\"path\":\"{s}/nope.txt\"}}' > '{s}/nope' 2>&1; echo \"rc=$?\" >> '{s}/nope'", .{ exe, project, dir, dir });
+    editorCheck(out, &failures, try waitForControlFile(self, io, out, dir, "nope", "rc=") and
+        !fileContains(io, try std.fmt.bufPrint(&paths[7], "{s}/nope", .{dir}), "rc=0"), "editor.goto of a missing file is refused", .{});
+
+    // 6. The pane takes part in resize and zoom; hidden when not presented.
+    const before = (editorElement(self) orelse return 1).bounds.width;
+    const rect_before = state.last_rect;
+    // The terminal (left) pane is focused: its right edge moves right.
+    _ = try postNamedKey(self, io, out, .right, .{ .ctrl = true, .alt = true });
+    try self.drawFrame();
+    const after = if (editorElement(self)) |element| element.bounds.width else 0;
+    editorCheck(out, &failures, after < before and state.last_rect != null and rect_before != null and state.last_rect.?.width == after, "Ctrl+Alt+Right narrowed the editor pane ({d} -> {d} px) and the hosted window followed", .{ before, after });
+    _ = try postNamedKey(self, io, out, .enter, .{ .ctrl = true, .shift = true });
+    try self.drawFrame();
+    editorCheck(out, &failures, editorElement(self) == null and state.embedded != null and !state.embedded.?.visible, "zooming the terminal hides the editor pane and its window", .{});
+    _ = try postNamedKey(self, io, out, .enter, .{ .ctrl = true, .shift = true });
+    try self.drawFrame();
+    editorCheck(out, &failures, editorElement(self) != null and state.embedded != null and state.embedded.?.visible, "unzooming shows it again", .{});
+    _ = try postNamedKey(self, io, out, .right, .{ .alt = true });
+    _ = try postNamedKey(self, io, out, .enter, .{ .ctrl = true, .shift = true });
+    try self.drawFrame();
+    const canvas = self.terminalCellBounds() orelse return 1;
+    const full_width = @as(u32, canvas.cols) * self.fonts.metrics().cell.width_px;
+    editorCheck(out, &failures, self.presentedIsEditor() and if (editorElement(self)) |element| element.bounds.width == full_width else false, "Alt+Right focused the editor pane and zoom filled the tab with it ({} {d} px of {d})", .{ self.presentedIsEditor(), if (editorElement(self)) |element| element.bounds.width else 0, full_width });
+    _ = try postNamedKey(self, io, out, .enter, .{ .ctrl = true, .shift = true });
+    try self.drawFrame();
+
+    // 7. The pane's close control (mouse), then the API's editor.close.
+    var close_buffer: [128]u8 = undefined;
+    const close_id = try std.fmt.bufPrint(&close_buffer, "{s}.close", .{(editorElement(self) orelse return 1).id.value});
+    editorCheck(out, &failures, try clickTabsElement(self, io, out, close_id) and try waitForEditor(self, io, out, .closed) and
+        try waitForEditor(self, io, out, .{ .panes = 1 }), "clicking close removed the editor pane", .{});
+    _ = try controlType(self, io, out, "'{s}' control editor.open '{{\"path\":\"{s}\",\"split\":\"down\"}}' > '{s}/reopen' 2>&1; echo \"rc=$?\" >> '{s}/reopen'", .{ exe, notes, dir, dir });
+    editorCheck(out, &failures, try waitForControlFile(self, io, out, dir, "reopen", "rc=0") and try waitForEditor(self, io, out, .{ .panes = 2 }) and
+        try waitForEditor(self, io, out, .hosted), "editor.open from the API split a new pane below and hosted it", .{});
+    _ = try controlType(self, io, out, "'{s}' control editor.close > '{s}/close' 2>&1; echo \"rc=$?\" >> '{s}/close'", .{ exe, dir, dir });
+    editorCheck(out, &failures, try waitForControlFile(self, io, out, dir, "close", "rc=0") and try waitForEditor(self, io, out, .closed) and
+        try waitForEditor(self, io, out, .{ .panes = 1 }), "editor.close closed the pane", .{});
+
+    // 8. Leave the editor open beside the terminal for the run's screenshot.
+    _ = try controlType(self, io, out, "'{s}' control editor.open '{{\"path\":\"{s}\",\"line\":3}}' > '{s}/final' 2>&1; echo \"rc=$?\" >> '{s}/final'", .{ exe, notes, dir, dir });
+    editorCheck(out, &failures, try waitForControlFile(self, io, out, dir, "final", "rc=0") and try waitForEditor(self, io, out, .hosted), "the editor pane is open beside the terminal", .{});
+    try self.drawFrame();
+
+    if (failures != 0) {
+        var log_buffer: [16 * 1024]u8 = undefined;
+        const contents = Dir.cwd().readFile(io, log_path, &log_buffer) catch "";
+        out.print("editor-test: stand-in argv log:\n{s}", .{contents}) catch {};
+    }
+    out.print("editor-test: {d} failure(s)\n", .{failures}) catch {};
+    return if (failures == 0) 0 else 1;
+}
+
 // --control-test (TASK-60 part two, TASK-66) -------------------------------------
 
 /// The first tab of `--control-test`: a readiness marker, then an
@@ -33459,6 +34814,8 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         check_status = try profilesTest(app, init.io, out);
     } else if (options.run.git_test) {
         check_status = try gitTest(app, init.io, out);
+    } else if (options.run.editor_test) {
+        check_status = try editorTest(app, init.io, out);
     } else if (options.run.control_test) {
         check_status = try controlTest(app, init.io, out);
     } else if (options.run.agent_view_test) {
@@ -34348,11 +35705,20 @@ test "context menu rows depend only on selection and link presence" {
     try std.testing.expectEqualStrings(terminal_open_link_action, linked[1].action);
 
     const full = contextMenuItems(true, true, &storage);
-    try std.testing.expectEqual(context_menu_max_items, full.len);
+    try std.testing.expectEqual(context_menu_max_items - 1, full.len);
     for (full) |item| {
         try std.testing.expect(std.mem.startsWith(u8, item.id, "context-menu."));
         try std.testing.expect(item.label.len + 4 <= context_menu_width);
     }
+
+    // TASK-79: the editor row follows `open link`, only over a link.
+    try std.testing.expectEqual(@as(usize, 4), contextMenuItemsWith(false, false, true, &storage).len);
+    const edited = contextMenuItemsWith(true, true, true, &storage);
+    try std.testing.expectEqual(context_menu_max_items, edited.len);
+    try std.testing.expectEqualStrings("context-menu.open-in-editor", edited[3].id);
+    try std.testing.expectEqualStrings(editor_open_action, edited[3].action);
+    for (edited) |item| try std.testing.expect(item.label.len + 4 <= contextMenuWidth(true));
+    try std.testing.expectEqual(context_menu_editor_width, contextMenuBoundsWidth(0, 0, 7, .{ .x = 0, .y = 0, .width = 80, .height = 24 }, contextMenuWidth(true)).?.width);
 }
 
 test "context menu bounds anchor at the pointer cell and stay inside the canvas" {
