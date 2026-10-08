@@ -266,10 +266,16 @@ step is the real proof), `--ime-test` (its fixed child is an MSYS `sh` script
 that cannot put a ConPTY console into raw mode; the smoke's Unicode text input
 through cmd.exe is the Windows proof of committed text), `--links-test` (it
 opens `vi`, which the runner has only as an MSYS script, not `vi.exe`), and
-`--panes-test` and `--search-test` (a write to a live pane's pseudoconsole
-fails with `ERROR_NO_DATA`, now reported as `Closed`, right after that pane's
-shell draws its prompt, which stops the app; the cause is still open in
-`pty.zig`). The WSL step `windows-wsl-check.sh` (TASK-47) gates: it drives
+`--panes-test` and `--search-test` (their fixed child is a
+`while IFS= read -r line` loop under Git for Windows' `sh`, which is bash in
+POSIX mode: MSYS raises SIGWINCH for a pseudoconsole resize and `read` returns
+status 128, so the loop and its shell end at the first split or resize. The
+pane's terminal is then closed under input the app still owes it, and the
+write fails with `ERROR_NO_DATA`, reported as `Closed`, which stops the app.
+The pseudoconsoles and pipes are sound: `pty.zig`'s tests show two consoles
+kept apart and the same loop surviving a resize once it runs `trap '' WINCH`,
+which the fixtures in `src/main.zig` still need before these two checks can
+gate). The WSL step `windows-wsl-check.sh` (TASK-47) gates: it drives
 Remote: connect, a first tab, a split pane, the scratchpad and a Windows file
 reference inside the runner's WSL2 Ubuntu through `conduit-test`.
 

@@ -30,7 +30,7 @@ name: Windows
 
 on:
   push:
-    branches: ["task-49-windows", "task-49-windows-release", "task-47-wsl*"]
+    branches: ["task-49-windows", "task-49-windows-release", "task-49-conpty", "task-47-wsl*"]
   workflow_dispatch:
     inputs:
       version:
@@ -238,9 +238,11 @@ jobs:
       # --clipboard-test pins SDL's offscreen driver, which needs EGL on Windows;
       # --ime-test's MSYS child cannot put a ConPTY console into raw mode;
       # --links-test opens `vi`, which the runner does not have as vi.exe;
-      # --panes-test and --search-test stop with "conduit stopped: Closed": a
-      # write to a pane whose shell has just drawn its prompt fails with
-      # ERROR_NO_DATA, so a live pseudoconsole's input pipe is closing.
+      # --panes-test and --search-test stop with "conduit stopped: Closed":
+      # their MSYS `sh` read loop ends on the SIGWINCH a pseudoconsole resize
+      # raises (bash in POSIX mode returns 128 from `read`), so the pane's
+      # child exits and owed input meets a closed terminal; the fixtures in
+      # src/main.zig need `trap '' WINCH`.
       - name: Built-in checks (survey)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         continue-on-error: true
