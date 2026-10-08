@@ -1,11 +1,11 @@
 ---
 id: TASK-5
 title: 'CI matrix for Linux, macOS and Windows'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-08 00:32'
+updated_date: '2026-10-08 02:23'
 labels:
   - infra
   - ci
@@ -27,7 +27,7 @@ GitHub Actions workflow that installs the pinned Zig version and runs build and 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Workflow runs 'zig build' and 'zig build test' on ubuntu, macos and windows runners
+- [x] #1 Workflow runs 'zig build' and 'zig build test' on ubuntu, macos and windows runners
 - [x] #2 Zig version in CI comes from one pinned source of truth
 - [x] #3 A failing unit test fails the workflow
 <!-- AC:END -->
@@ -58,4 +58,12 @@ Not verifiable here: the workflow has never run on GitHub, and nothing about the
 2026-10-06 first hosted runs after the initial push: ubuntu-latest passes zig fmt/build/test; windows-latest fails in 'zig build' compiling Ghostty's C++ SIMD sources (zig-pkg/ghostty/src/simd/codepoint_width.cpp via Highway) against Zig 0.16's bundled clang headers: 'argument unused during compilation: -nostdinc++ / -fno-rtlib-defaultlib' followed by 109 errors in mmintrin.h/immintrin.h ('function-style cast to a builtin type can only take one argument'). The pinned-Zig resolution and version check worked on Windows (runs 37539118625 and 37535520847). The macOS leg had not finished before the runs were superseded; see later runs on main for its result. Windows build repair belongs with TASK-49/TASK-16; AC1 stays unchecked.
 
 2026-10-07 (merged as ead499d..a499040): build.zig defaults a Windows host to an explicit <arch>-windows-gnu target (Zig 0.16's fully native Windows target fails every C source); macOS PTY fixes (TIOCSWINSZ 0x80087467, TIOCSCTTY 0x20007461, ioctl request c_ulong, O_NONBLOCK 0x4) and DriverTransport.stop self-connect because Darwin's shutdown does not wake accept; ConPTY string/termination bugs; OS-aware test expectations (Option-as-Alt, Command rows, BASH_SILENCE_DEPRECATION_WARNING, Homebrew tmux PATH, APPDATA, path separators); ci.yml no longer cancels a started matrix, 75/40-minute timeouts, cache paths, brew tmux, per-binary diagnostics with a 240 s alarm. Evidence: ubuntu green; macOS build green and 629/643 tests with only the tmux PATH failures (fixed, unconfirmed); Windows builds and passes every module except the ConPTY runtime tests (write ACCESS_DENIED, resize hang) which are TASK-16's scope. AC1 stays open until one run is green on all three OSes.
+
+Close-out landed (13 commits rebased onto main as ..1369f6b): agent/poll.zig portable poll seam; Codex fake daemon bounded; Darwin SOCK.CLOEXEC shim fix for the Codex socket; backlog CRLF parsing + .gitattributes LF fixtures; configurable Local watch interval (tests use 0); control server accept wake on Darwin; Windows file-permission fix in main.zig; corrected test premises (/private/tmp realpath, tmux Option-as-Alt, sed -i.bak) and Windows skips (POSIX modes, Claude relay /tmp+/bin/sh, OpenCode TCP: Zig 0.16 lacks a timed socket receive on Windows); ci.yml diagnostics fixed. Evidence for AC1: run 37715423153 green on ubuntu (904), macOS (892) and Windows (848). Coordinator 2026-10-08: local gate green (944/957, 31 checks, 20 scenarios) after cleaning 33 stale vim swap files from /tmp that made the term editor test fail with E326 (test now runs vim -n).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Three-OS CI matrix: GitHub Actions builds and unit-tests Conduit on ubuntu, macOS and Windows from one pinned Zig source of truth, a failing unit test fails the workflow, and run 37715423153 is green on all three legs after fixing the macOS PTY ioctls, Darwin socket/accept behaviour, the Windows host target, the ConPTY backend (TASK-16) and the remaining platform test premises.
+<!-- SECTION:FINAL_SUMMARY:END -->

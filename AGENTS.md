@@ -706,18 +706,25 @@ originating session's remote OSC 7 cwd, which is believed because each SSH termi
 remote host's own name, and the context's session script does the remote `cd`. After a reconnect
 the scratchpad is restored in place: same id, a fresh shell in its last remote cwd.
 
-TASK-5 is close: `ci.yml` builds and unit-tests on ubuntu, macOS and Windows runners, and a
-started matrix is never cancelled by a later push (only the newest push queues; 75-minute job and
-40-minute test timeouts; per-binary diagnostics with a 240 s alarm on a failed non-Linux leg). On
-a Windows host `build.zig` defaults to an explicit `<arch>-windows-gnu` target with the native CPU,
-because Zig 0.16's fully native Windows target fails every C source in the tree. The macOS PTY
-ioctl numbers (TIOCSWINSZ `0x80087467`, TIOCSCTTY `0x20007461`, `c_ulong` requests), `O_NONBLOCK`
-(`0x4`) and the driver transport's stop (Darwin's `shutdown` does not wake `accept`, so stop now
-connects once to its own endpoint) are fixed, OS-dependent test expectations name their platform,
-and macOS CI installs tmux. Ubuntu is green. Windows builds and passes every module except the
-ConPTY runtime tests (input write `ACCESS_DENIED`, resize hang), which TASK-16 owns. macOS last
-showed only the tmux PATH failures, since fixed but not yet confirmed green. AC1 stays open until
-one run is green on all three.
+TASK-5 is complete: CI run 37715423153 passed `zig fmt --check`, `zig build` and `zig build test`
+on ubuntu-latest (904 tests), macos-latest (892) and windows-latest (848, with the platform
+skips), and a started matrix is never cancelled by a later push (only the newest push queues;
+75-minute job and 40-minute test timeouts; per-binary diagnostics with a 240 s alarm on a failed
+non-Linux leg). On a Windows host `build.zig` defaults to an explicit `<arch>-windows-gnu` target
+with the native CPU, because Zig 0.16's fully native Windows target fails every C source in the
+tree. The macOS PTY ioctl numbers (TIOCSWINSZ `0x80087467`, TIOCSCTTY `0x20007461`, `c_ulong`
+requests), `O_NONBLOCK` (`0x4`) and the driver transport's and control server's stop (Darwin's
+`shutdown` does not wake `accept`, so both connect once to their own endpoint) are fixed; the
+Codex daemon socket sets close-on-exec with `fcntl` on Darwin because raw `socket(2)` rejects
+Zig's shim `SOCK.CLOEXEC`; the agent layer asks the OS about descriptors only through
+`agent/poll.zig` (poll(2) on POSIX, PeekNamedPipe on Windows pipes); backlog files with CRLF line
+endings parse as LF and the fixtures are pinned to LF; a Local context's polling watch (the
+backend off Linux) rescans once a second and tests pass 0 through
+`ExecutionContext.localWithWatchInterval`; OS-dependent test expectations name their platform.
+On Windows the Claude Code relay tests and the OpenCode TCP test skip: Zig 0.16 has no timed
+socket receive there, so the OpenCode adapter has no Windows read path yet. The term editor test
+runs vim with `-n` because killed test editors left unnamed-buffer swap files in `/tmp` until vim
+refused to start with "E326: Too many swap files found".
 
 TASK-57 is complete on Linux. `agent.view` (Ctrl+Shift+A / Cmd+Shift+A, an app default beside
 the notifications chord, and palette "Agent: toggle view") replaces an agent pane's terminal with

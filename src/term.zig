@@ -7433,7 +7433,12 @@ test "a resize moves the terminal and the child together" {
 /// says nocompatible, which is what makes an editor read the arrow and
 /// function keys as a terminal program. What is left is the editor itself, on
 /// an empty buffer, on the terminal this file's tests give it.
-const vim_argv = [_][]const u8{ "vim", "-u", "NONE", "-i", "NONE", "-N" };
+// `-n`: no swap file. The editor is killed when a check ends, and an unnamed
+// buffer's swap file lands in the first writable directory of vim's list
+// (`/tmp` when the cwd is `/`); enough leftovers and vim refuses to start
+// ("E326: Too many swap files found"), which once failed this test on a box
+// where other checks had been killing editors all day.
+const vim_argv = [_][]const u8{ "vim", "-u", "NONE", "-i", "NONE", "-N", "-n" };
 
 /// The line editor's environment: the fixed test environment, plus the two
 /// settings that would otherwise come from the machine. `INPUTRC=/dev/null`
