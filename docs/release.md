@@ -271,10 +271,13 @@ opens `vi`, which the runner has only as an MSYS script, not `vi.exe`), and
 POSIX mode: MSYS raises SIGWINCH for a pseudoconsole resize and `read` returns
 status 128, so the loop and its shell end at the first split or resize. The
 pane's terminal is then closed under input the app still owes it, and the
-write fails with `ERROR_NO_DATA`. The pseudoconsoles and pipes are sound:
-`pty.zig`'s tests show two consoles kept apart and the same loop surviving a
-resize once it runs `trap '' WINCH`, which the fixtures in `src/main.zig`
-still need before these two checks can gate).
+write fails with `ERROR_NO_DATA`, reported as `Closed`, which stops the app.
+The pseudoconsoles and pipes are sound: `pty.zig`'s tests show two consoles
+kept apart and the same loop surviving a resize once it runs `trap '' WINCH`,
+which the fixtures in `src/main.zig` still need before these two checks can
+gate). The WSL step `windows-wsl-check.sh` (TASK-47) gates: it drives
+Remote: connect, a first tab, a split pane, the scratchpad and a Windows file
+reference inside the runner's WSL2 Ubuntu through `conduit-test`.
 
 `publish-windows` uploads the zip and its `.sha256` to the release with
 `--clobber`. Like `publish-macos` it needs `publish` and nothing needs it.
