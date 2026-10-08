@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-08 17:03'
+updated_date: '2026-10-08 17:07'
 labels:
   - agents
   - ui
@@ -31,4 +32,11 @@ Today an agent (launched through Agent: launch or started by hand in a tab) only
 - [ ] #3 Clicking the row, or focusing it with the sidebar keys and pressing Enter, focuses the agent's workspace, tab and pane and shows the agent view for that agent; the branch row, tab reorder by drag and the sidebar list limit still behave with the extra rows present
 - [ ] #4 The deterministic Linux check (extend --agent-test) and the agent-notifications or agent-view scenario cover launched and observed agents by keyboard and by mouse, and an inspected screenshot shows the nested rows beside the agent view
 - [ ] #5 The config key sidebar.agents and its settings-view row hide the rows; docs/user-guide.md and docs/config.md describe them
+- [ ] #6 The agent rows are drawn at the same size as the tab rows (normal sidebar face), indented under their tab, and their glyph and state text change live on every agent state event
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+User direction 2026-10-08: the nested agent rows are the same size as the tab rows (normal sidebar face, indented one level under the tab), not the small branch-row face, and they are dynamic with status: glyph and state word update live on every state event. Branch row (small) first, then agent rows.
+<!-- SECTION:NOTES:END -->
