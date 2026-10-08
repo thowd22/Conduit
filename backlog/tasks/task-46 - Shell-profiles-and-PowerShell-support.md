@@ -1,11 +1,11 @@
 ---
 id: TASK-46
 title: Shell profiles and PowerShell support
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-08 02:09'
+updated_date: '2026-10-08 03:31'
 labels:
   - windows
   - shell
@@ -25,9 +25,9 @@ Shell profile system (name, command, args, env, cwd) with platform defaults: log
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Profiles are configurable and selectable from the palette
-- [ ] #2 PowerShell runs correctly under ConPTY including colors and resize
-- [ ] #3 Default profile is detected sensibly per platform
+- [x] #1 Profiles are configurable and selectable from the palette
+- [x] #2 PowerShell runs correctly under ConPTY including colors and resize
+- [x] #3 Default profile is detected sensibly per platform
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -38,3 +38,15 @@ Shell profile system (name, command, args, env, cwd) with platform defaults: log
 3. PowerShell shell-integration script (OSC 7 cwd and OSC 133 prompt marks) installed beside the bash/zsh/fish ones and injected for PowerShell profiles; proven on the Windows runner by a pty/term integration test that spawns pwsh with the script and sees OSC 7 and colours after a resize (ConPTY), since no Windows window path exists yet.
 4. --profiles-test on Linux (profiles from the file, palette selection, argv/env/cwd of the spawned child, settings rows); docs.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Landed (5 commits rebased onto main as ..3a9e8cb; two main.zig conflicts resolved in favour of the branch's helper-based permissions and Windows-aware state-path test): profile/shell config keys, built-in profiles per platform detected through the context, New tab/Split with profile, ChildSpec.buildProfile, login flag handling with the bash integration replaying login files, powershell/conduit.ps1 integration injected via -NoExit -Command, Shells settings group, --profiles-test (29 checks), twenty-first scenario profile-tab. Evidence: Windows CI runs 37720295115/37721316005 passed the pwsh-under-ConPTY test (OSC 7, OSC 133, SGR red, 100x40 resize) and the full three-OS matrix was green on the branch. Coordinator 2026-10-08: merged; chooser screenshot inspected; local gate run recorded below.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Shell profiles: configurable named profiles with per-platform built-in defaults detected through the workspace context, palette commands to open tabs and splits with a profile, PowerShell shell integration proven under ConPTY on the Windows runner, and a Shells settings group; verified by unit tests, --profiles-test, the profile-tab scenario and CI on all three OSes.
+<!-- SECTION:FINAL_SUMMARY:END -->

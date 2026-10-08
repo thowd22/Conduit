@@ -2383,16 +2383,17 @@ Which level proves what, by concern:
 
 Rules that apply to all levels:
 
-- The thirty-one verified Linux headless app checks are `--grid-test`, `--self-test`,
+- The thirty-two verified Linux headless app checks are `--grid-test`, `--self-test`,
   `--scroll-test`, `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`,
   `--sidebar-test`, `--tabs-test`, `--panes-test`, `--palette-test`, `--scratchpad-test`,
   `--workspaces-test`, `--links-test`, `--search-test`, `--menu-test`, `--config-test`,
   `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`,
   `--agent-view-test`, `--agent-manager-test`, `--agent-prompts-test`, `--backlog-test`,
-  `--ssh-test`, `--control-test`, `--restore-test`, `--a11y-test` and `--driver-test`; the
-  scripted `zig build e2e` runner has twenty scenarios, the latest being `font-coverage`,
-  `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch`, `agent-notifications`,
-  `agent-view`, `agent-manager`, `backlog-board`, `control-api` and `agent-prompts`. Real-window checks use
+  `--ssh-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--profiles-test` and
+  `--driver-test`; the scripted `zig build e2e` runner has twenty-one scenarios, the latest being
+  `font-coverage`, `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch`,
+  `agent-notifications`, `agent-view`, `agent-manager`, `backlog-board`, `control-api`,
+  `agent-prompts` and `profile-tab`. Real-window checks use
   Xvfb locally; `--clipboard-test` deliberately uses SDL's offscreen driver.
   TASK-28's `--sidebar-test` uses the production sidebar and real SDL events to switch provisioned
   tabs by click and through an independently entered keyboard focus path, hide and reveal the

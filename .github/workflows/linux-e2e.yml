@@ -175,6 +175,7 @@ jobs:
             --restore-test
             --a11y-test
             --agent-prompts-test
+            --profiles-test
             --driver-test
           )
           for check in "${checks[@]}"; do

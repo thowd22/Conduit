@@ -38,6 +38,7 @@ required_payload=(
   "share/applications/$app_id.desktop"
   share/conduit/fonts/JetBrainsMono-Regular.ttf
   share/conduit/shell-integration/bash/conduit.bash
+  share/conduit/shell-integration/powershell/conduit.ps1
   share/conduit/shell-integration/zsh/.zshenv
   share/conduit/shell-integration/zsh/conduit.zsh
   share/conduit/shell-integration/fish/vendor_conf.d/conduit.fish

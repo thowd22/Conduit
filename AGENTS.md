@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its thirty-one Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its thirty-two Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--agent-prompts-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test`, `--restore-test`, `--a11y-test`, `--agent-prompts-test`, `--profiles-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its twenty declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its twenty-one declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -975,6 +975,27 @@ run on macOS (the offscreen driver has no OpenGL there). TASK-69's macOS half ad
 search paging) and are reported, not gating; `window.fullscreen` and a settings row for the
 Option setting are still to do.
 
+TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
+lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
+attributes in any order, and `shell = <name>` for the default (32 profiles, 32 arguments and 32
+variables at most). Built-in profiles are detected through the workspace context: `login` (the
+user's `$SHELL`, else passwd, else `/bin/sh`, as a login shell) on POSIX; `pwsh`, `powershell` and
+`cmd` (whichever exist, the first being the default and now the default local shell) on Windows;
+the remote login shell in SSH workspaces. The palette's New tab with profile and Split with
+profile list them; the chosen argv, variables and cwd flow through `ChildSpec.buildProfile` and
+the workspace `ExecutionContext`, and `tab.new`, `pane.split` and an interactive run's first tab
+follow `shell`. Login uses `-l` (`--login` for bash, whose integration script now replays the
+login startup files because POSIX-mode bash reads only `ENV`).
+`assets/shell-integration/powershell/conduit.ps1` emits OSC 7 (`file://localhost/C%3A/...`,
+mapped back to `C:\...` for Windows spawns) and OSC 133 A/B/C/D, and is injected with `-NoExit
+-Command` dot-sourcing a script block after the user's profile, so no execution policy blocks it.
+The settings view has a Shells group. The deterministic Linux `--profiles-test` and the
+twenty-first scenario `profile-tab` cover keyboard and mouse paths. CI runs 37720295115 and
+37721316005 proved on the hosted Windows runner that PowerShell 7 under ConPTY delivers OSC 7
+after `cd`, OSC 133 marks, SGR red (`palette(9)`) and a 100x40 resize seen by
+`$Host.UI.RawUI.WindowSize`; Windows PowerShell 5.1 and a real remote profile spawn are
+unverified.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -1150,7 +1171,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--restore-test` / `--a11y-test` / `--agent-prompts-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--restore-test` / `--a11y-test` / `--agent-prompts-test` / `--profiles-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:
