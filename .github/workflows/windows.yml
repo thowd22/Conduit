@@ -74,8 +74,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
           use-cache: false
       - run: bash .github/scripts/windows-sh-standin.sh
-      - run: zig test src/pty.zig --test-filter PROBE 2>&1 | tee probe.txt
-      - run: zig test src/pty.zig --test-filter "Windows terminal"
+      - run: zig test src/pty.zig
       - run: powershell.exe -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber | Format-List"
 
   windows:

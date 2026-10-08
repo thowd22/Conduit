@@ -2257,14 +2257,23 @@ const ConPty = struct {
 
     /// Tell the pseudoconsole how large the terminal is. This is what a program in the terminal
     /// sees as a resize, and what it is told about as a window size change.
+    ///
+    /// A terminal whose child has ended is still resized without complaint, exactly as a POSIX
+    /// master outlives its child and still takes `TIOCSWINSZ`: the owner keeps laying out a pane
+    /// until it has read the session's end, and a layout pass is no place to learn of it. There
+    /// is nobody left to tell, so the size is simply not sent.
     fn resizeConsole(self: *ConPty, size: WindowSize) Error!void {
-        if (self.finished()) return error.Closed;
         win.acquireLock(&self.console_lock);
         defer win.releaseLock(&self.console_lock);
         // The watcher closes the pseudoconsole as soon as the child ends, which can be before the
         // read thread has published that end.
-        if (self.console == null) return error.Closed;
-        return win.resizePseudoConsole(self.console, size);
+        if (self.console == null) return;
+        win.resizePseudoConsole(self.console, size) catch |err| {
+            // The child can end between the check above and the call, with the pseudoconsole
+            // already gone and the watcher not yet at its close: that is the same ended terminal.
+            if (self.finished() or win.isSignalled(self.child)) return;
+            return err;
+        };
     }
 };
 
@@ -3125,6 +3134,13 @@ const win = struct {
 
     /// Wait for any of `handles` to be signalled, and report which one. `null` waits as long as it
     /// takes; a timeout and a failed wait both answer `no_signal`.
+    /// Whether `handle` is signalled right now, without waiting: for a process, whether it has
+    /// ended. A failed look answers no.
+    fn isSignalled(handle: HANDLE) bool {
+        const handles = [1]HANDLE{handle};
+        return waitOn(&handles, 0) == 0;
+    }
+
     fn waitOn(handles: []const HANDLE, timeout_ms: ?u32) usize {
         const status = WaitForMultipleObjects(
             @intCast(handles.len),
@@ -4301,78 +4317,55 @@ test "destroying one Windows terminal leaves another's input and resize working"
     try testing.expectEqual(ChildState.running, survivor.state());
 }
 
-// PROBE (temporary, TASK-49): which input or resize makes a live pseudoconsole stop reading.
-const probe_esc = "\x1b";
+/// Git for Windows' MSYS `sh`, which the Windows runner stages as `/bin/sh` for the built-in
+/// checks' fixed children.
+const git_sh = "C:\\Program Files\\Git\\usr\\bin\\sh.exe";
 
-fn probeLine(gpa: Allocator, pty: Pty, name: []const u8, step: []const u8, line: []const u8, marker: []const u8) !bool {
-    writeAll(pty, line) catch |err| {
-        std.debug.print("PROBE {s}: {s}: write failed: {s}, state {any}\n", .{ name, step, @errorName(err), pty.state() });
-        return false;
-    };
-    const out = try readUntil(gpa, pty, marker);
-    defer gpa.free(out);
-    const ok = std.mem.indexOf(u8, out, marker) != null;
-    std.debug.print("PROBE {s}: {s}: {s} (state {any}): {f}\n", .{ name, step, if (ok) "ok" else "NO ECHO", pty.state(), std.ascii.hexEscape(out, .lower) });
-    return ok;
-}
-
-fn probeScenario(gpa: Allocator, name: []const u8, argv: []const []const u8, env: []const []const u8, ready: []const u8, echo_prefix: []const u8, mouse: bool, resizes: []const WindowSize) !void {
-    const pty = spawnConPty(gpa, .{ .argv = argv, .env = env, .cwd = windows_test_cwd, .size = WindowSize.init(18, 56) }) catch |err| {
-        std.debug.print("PROBE {s}: SKIP spawn {s}\n", .{ name, @errorName(err) });
-        return;
-    };
-    defer pty.destroy();
-    const first = try readUntil(gpa, pty, ready);
-    defer gpa.free(first);
-    std.debug.print("PROBE {s}: ready={any} first bytes: {f}\n", .{ name, std.mem.indexOf(u8, first, ready) != null, std.ascii.hexEscape(first, .lower) });
-    var marker_buf: [64]u8 = undefined;
-    if (!try probeLine(gpa, pty, name, "baseline", "one\r", try std.fmt.bufPrint(&marker_buf, "{s}one", .{echo_prefix}))) return;
-    if (mouse) {
-        writeAll(pty, probe_esc ++ "[<0;5;5M") catch |err| std.debug.print("PROBE {s}: mouse press write: {s}\n", .{ name, @errorName(err) });
-        writeAll(pty, probe_esc ++ "[<0;5;5m") catch |err| std.debug.print("PROBE {s}: mouse release write: {s}\n", .{ name, @errorName(err) });
-        if (!try probeLine(gpa, pty, name, "after mouse", "two\r", try std.fmt.bufPrint(&marker_buf, "{s}two", .{echo_prefix}))) return;
-    }
-    for (resizes, 0..) |size, index| {
-        pty.resize(size) catch |err| std.debug.print("PROBE {s}: resize {d}x{d}: {s}\n", .{ name, size.rows, size.cols, @errorName(err) });
-        var step_buf: [32]u8 = undefined;
-        var line_buf: [16]u8 = undefined;
-        const step = try std.fmt.bufPrint(&step_buf, "after {d}x{d}", .{ size.rows, size.cols });
-        const line = try std.fmt.bufPrint(&line_buf, "r{d}\r", .{index});
-        if (!try probeLine(gpa, pty, name, step, line, try std.fmt.bufPrint(&marker_buf, "{s}r{d}", .{ echo_prefix, index }))) return;
-    }
-    std.debug.print("PROBE {s}: SURVIVED\n", .{name});
-}
-
-const probe_ps_mouse = "[Console]::Out.Write([char]27 + '[?1006;1000h'); [Console]::Out.WriteLine('ps-ready'); while ($null -ne ($l = [Console]::In.ReadLine())) { [Console]::Out.WriteLine('echo:' + $l) }";
-const probe_ps_plain = "[Console]::Out.WriteLine('ps-ready'); while ($null -ne ($l = [Console]::In.ReadLine())) { [Console]::Out.WriteLine('echo:' + $l) }";
-const probe_sh_script = "stty -echo; printf 'sh-ready\\r\\n\\033[?1006;1000h'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
-const probe_sh_plain = "stty -echo; printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
-const probe_sh_env = [_][]const u8{
-    "PATH=C:\\bin;C:\\Windows\\System32;C:\\Windows",
+const git_sh_env = [_][]const u8{
+    "PATH=C:\\Program Files\\Git\\usr\\bin;C:\\Windows\\System32;C:\\Windows",
     "PATHEXT=.COM;.EXE;.BAT;.CMD",
     "SYSTEMROOT=C:\\Windows",
     "TEMP=C:\\Windows\\Temp",
-    "TERM=xterm-256color",
 };
 
-// The fixtures of --panes-test and --search-test, verbatim from src/main.zig, then with `trap '' WINCH;` in front.
-const probe_panes = "stty -echo; " ++
-    "printf '\\033]7;file://localhost/tmp\\007\\033]133;A\\007pane$ \\033]133;B\\007PANE-PWD:%s\\r\\n\\033[?1006;1000h' \"$PWD\"; " ++
-    "while IFS= read -r line; do printf '\\033]133;C\\007PANE-ECHO:%s\\r\\n' \"$line\"; done";
-const probe_search = "stty -echo; " ++
-    "printf 'SEARCH-READY\\r\\n'; " ++
-    "while IFS= read -r line; do " ++
-    "if [ \"$line\" = stream ]; then printf 'needle OUTPUT\\r\\n'; " ++
-    "else printf 'SEARCH-ECHO:%s\\r\\n' \"$line\"; fi; done";
+/// Start `script` under Git's `sh`, wait for `ready`, resize the terminal the way a split does,
+/// and report whether the script's read loop still answers a line.
+fn gitShSurvivesResize(gpa: Allocator, script: []const u8) !bool {
+    const pty = spawnConPty(gpa, .{
+        .argv = &.{ git_sh, "-c", script },
+        .env = &git_sh_env,
+        .cwd = windows_test_cwd,
+        .size = WindowSize.init(18, 56),
+    }) catch |err| switch (err) {
+        error.ProgramNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer pty.destroy();
+    const ready = try readUntil(gpa, pty, "sh-ready");
+    defer gpa.free(ready);
+    try testing.expect(std.mem.indexOf(u8, ready, "sh-ready") != null);
 
-test "PROBE conpty input and resize" {
+    try pty.resize(WindowSize.init(18, 28));
+    // A child that ended takes no more input: the write itself may already say so.
+    writeAll(pty, "after\r") catch |err| switch (err) {
+        error.Closed => return false,
+        else => return err,
+    };
+    const answer = try readUntil(gpa, pty, "echo:after");
+    defer gpa.free(answer);
+    return std.mem.indexOf(u8, answer, "echo:after") != null and pty.state() == .running;
+}
+
+test "a Git for Windows sh read loop that ignores WINCH survives a ConPTY resize" {
+    // The root cause of `conduit stopped: Closed` in --panes-test and --search-test on Windows.
+    // MSYS turns the pseudoconsole's window-size event into SIGWINCH, and bash in POSIX mode
+    // (which is what `sh` is) ends `read` with status 128 when a signal interrupts it. An
+    // untrapped `while IFS= read -r line` fixture therefore stops at the first split or resize,
+    // its shell exits 0, and the pane's terminal is closed under input the app still owes it
+    // (seen on every attempt on the windows-latest runner, run 37739618206). Neither
+    // pseudoconsole nor pipe is at fault: with WINCH ignored the very same loop keeps answering.
     if (!has_conpty_backend) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const panes_sizes = [_]WindowSize{ WindowSize.init(18, 28), WindowSize.init(9, 28), WindowSize.init(9, 27) };
-    const search_sizes = [_]WindowSize{ WindowSize.init(2, 4), WindowSize.init(18, 80) };
-    const sh = "C:\\bin\\sh";
-    try probeScenario(gpa, "panes-fixture", &.{ sh, "-c", probe_panes }, &probe_sh_env, "PANE-PWD", "PANE-ECHO:", true, &panes_sizes);
-    try probeScenario(gpa, "panes-fixture-trap", &.{ sh, "-c", "trap '' WINCH; " ++ probe_panes }, &probe_sh_env, "PANE-PWD", "PANE-ECHO:", true, &panes_sizes);
-    try probeScenario(gpa, "search-fixture", &.{ sh, "-c", probe_search }, &probe_sh_env, "SEARCH-READY", "SEARCH-ECHO:", false, &search_sizes);
-    try probeScenario(gpa, "search-fixture-trap", &.{ sh, "-c", "trap '' WINCH; " ++ probe_search }, &probe_sh_env, "SEARCH-READY", "SEARCH-ECHO:", false, &search_sizes);
+    const loop = "printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
+    try testing.expect(try gitShSurvivesResize(gpa, "trap '' WINCH; " ++ loop));
 }
