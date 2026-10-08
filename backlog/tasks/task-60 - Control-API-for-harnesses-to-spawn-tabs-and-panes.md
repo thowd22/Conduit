@@ -1,11 +1,11 @@
 ---
 id: TASK-60
 title: Control API for harnesses to spawn tabs and panes
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-08 00:00'
+updated_date: '2026-10-08 00:45'
 labels:
   - agents
   - cli
@@ -25,8 +25,8 @@ A local control endpoint and matching 'conduit' subcommands (and MCP tools) that
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A process inside a Conduit terminal can open a tab or split pane in its workspace through the API
-- [ ] #2 API exposes agent view and backlog view creation
+- [x] #1 A process inside a Conduit terminal can open a tab or split pane in its workspace through the API
+- [x] #2 API exposes agent view and backlog view creation
 - [x] #3 Scratchpad cannot be targeted or taken over through the API
 - [x] #4 API is documented for harness configuration
 <!-- AC:END -->
@@ -47,4 +47,12 @@ Part 2: app Handler (tab.open, pane.split, view.agent, view.backlog, tab.status,
 
 <!-- SECTION:NOTES:BEGIN -->
 Part one landed (1bfe743, b883268 rebased onto main as 9458afe): src/control.zig token-scoped local control API (private 0700 dir, 0600 socket, per-workspace tokens with entropy from the owner, CONDUIT_CONTROL_ENDPOINT/TOKEN/SESSION env names, JSON line frames capped at 64 KiB, methods ping/tab.open/pane.split/view.agent/view.backlog/tab.status/notify/agent.event, scratchpad refused with ScratchpadNotAddressable before reaching the owner, Handler vtable with deferred replies and timeouts, listener thread + per-connection threads up to 32); platform.LocalSocketListener (additive); build.zig control module; docs/control-api.md with harness snippets. 17 control tests in Debug and ReleaseSafe. Part two: app Handler, ChildSpec env injection, token revoke on workspace close, control.enabled setting, conduit CLI subcommands/MCP tools, --control-test; Windows transport missing.
+
+Part two landed (7d78e3e rebased as 0ac8df7 after resolving four claude_code.zig hunks against TASK-61's SinkIo seam): App implements the control Handler (tab.open, pane.split, view.agent, view.backlog, tab.status, notify, agent.event via Runtime.ingestControlEvent), endpoint at $XDG_RUNTIME_DIR/conduit/r-<hex>.sock when control.enabled (Debug on, release off; --control/--no-control), env injection for human/agent terminals only, token revoke on close, Claude hooks run 'conduit control agent.event --event=<Hook>' for local sinks with the sink fallback; --control-test (35 checks) and the nineteenth scenario control-api. Coordinator 2026-10-08: full gate green (921/934 unit tests, 28 checks, 19 scenarios); screenshot inspected. conduit-test does not forward control requests (documented).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Local token-scoped control API: a process inside a Conduit terminal can open tabs and panes, show the agent and backlog views, set tab status, raise notifications and deliver harness events in its own workspace, with the scratchpad unaddressable and everything documented for harness configuration; verified by protocol unit tests, the deterministic --control-test from real tab shells, the control-api scenario and the full gate.
+<!-- SECTION:FINAL_SUMMARY:END -->

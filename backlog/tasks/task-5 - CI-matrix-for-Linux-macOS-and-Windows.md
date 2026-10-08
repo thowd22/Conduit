@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:38'
-updated_date: '2026-10-07 22:33'
+updated_date: '2026-10-08 00:32'
 labels:
   - infra
   - ci
@@ -39,6 +39,8 @@ GitHub Actions workflow that installs the pinned Zig version and runs build and 
 2. Fix build.zig/dependency options and OS-conditional backend code (platform, pty ConPTY, font discovery) so zig build and the unit-test binaries compile for all three targets; tests that are Linux-only skip on other OSes rather than fail.
 3. Make ci.yml cache the Zig toolchain and global cache, run zig build and zig build test on ubuntu/macos/windows, and not be cancelled by every push (concurrency per ref, matrix completes).
 4. Trigger with workflow_dispatch, iterate until all three legs are green; record the run id.
+
+Close-out (2026-10-08): fix the remaining non-PTY failures on the Windows leg (agent modules' std.posix.pollfd via a portable poll seam inside agent/; backlog fixture CRLF normalisation and the live-watch test on Windows) and the macOS leg (codex websocket test hang, tmux keys test, /private/tmp realpath comparison, backlog live watch), iterate through workflow_dispatch on a branch, and record the run id where all three legs are green.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes

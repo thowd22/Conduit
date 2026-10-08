@@ -11,11 +11,11 @@ Read this file fully before working. It applies to every agent and every harness
 
 The terminal implementation is present: `zig build run` opens a window with the user's shell over
 a PTY, rendered by Conduit's grid renderer, with keyboard, mouse, selection, clipboard, scrollback
-and shell integration (cwd and prompt marks). Its twenty-seven Linux headless self-checks pass through
+and shell integration (cwd and prompt marks). Its twenty-eight Linux headless self-checks pass through
 their deterministic Linux drivers: `conduit --grid-test`, `--self-test`, `--scroll-test`,
 `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`, `--sidebar-test`, `--tabs-test`,
 `--panes-test`, `--palette-test`, `--scratchpad-test`, `--workspaces-test`, `--links-test`,
-`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
+`--search-test`, `--menu-test`, `--config-test`, `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`, `--ssh-test`, `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--control-test` and `--driver-test` (each exits non-zero on failure). The real-window checks run
 under `xvfb-run -a`; the clipboard check deliberately uses SDL's offscreen driver.
 
 An evidence audit reopened TASK-5, TASK-10, TASK-11, TASK-12, TASK-15, TASK-16 and TASK-17, so M0
@@ -67,7 +67,7 @@ verified. TASK-25 is complete with a checked-in `zig build e2e` composition root
 launches a fresh isolated app through `conduit-test` for each scenario, reports launch/prompt,
 command/output, Input-copy/terminal-paste and terminal-link results individually, and retains a
 suite summary plus per-scenario runner log, semantic tree and application log; failed live
-scenarios request an additional current screenshot before shutdown. Its eighteen declarative scenarios
+scenarios request an additional current screenshot before shutdown. Its nineteen declarative scenarios
 include `terminal-links`, which waits for the stable semantic link id and sends a real
 `conduit-test ctrl-click` through the driver and SDL event queue before capturing the frame, and
 `terminal-file-reference`, which ctrl-clicks a `path:line` reference and waits for the new tab's
@@ -828,6 +828,36 @@ leg still fails outside `pty` (agent modules use `std.posix.pollfd`; backlog CRL
 live watch), and the macOS leg times out in the agent codex websocket test and fails the tmux
 keys, `/private/tmp` and backlog watch tests; closing those is what remains of TASK-5.
 
+TASK-60 is complete on Linux. When `control.enabled` resolves on (on in Debug, off in release;
+`--control` / `--no-control` override it for one run), the app runs the token-scoped control
+endpoint at `$XDG_RUNTIME_DIR/conduit/r-<hex>.sock` (fallback `/tmp/conduit-<uid>`); built-in
+checks other than `--control-test` never start it. Local human and agent terminals get
+`CONDUIT_CONTROL_ENDPOINT`, `CONDUIT_CONTROL_TOKEN` and `CONDUIT_CONTROL_SESSION` per spawn; the
+scratchpad, SSH connection terminals and remote children never do, and an enclosing Conduit's are
+never inherited. `App` handles `tab.open`, `pane.split`, `view.agent`, `view.backlog`, `tab.status`
+(sidebar `! busy api`), `notify` and `agent.event` (`Runtime.ingestControlEvent` appends to the
+adapter's event line file) through the workspace's ExecutionContext. Spawning requests reply when
+the child starts; requests that would move focus under held input or a modal wait up to 4 s, then
+reply `Unavailable`. Claude Code agents with a local sink get hooks that run `conduit control
+agent.event --event=<Hook>`, falling back to `CONDUIT_AGENT_SINK`; remote sinks keep the relay.
+`conduit control <method> [json]` is the shell and hook client. The deterministic Linux
+`--control-test` covers every method from real tab shells, the scratchpad's exclusion and a
+refused stolen token; the nineteenth scenario `control-api` types `conduit control tab.open`,
+`pane.split` and `tab.status` into the terminal and switches tabs by mouse. `conduit-test` does
+not forward control requests (tokens exist only inside the app; documented in
+`docs/control-api.md`). Windows has no control transport.
+
+TASK-66 is complete on Linux. `conduit .`/`<dir>`, `conduit ssh <host>`, `conduit workspace open
+<name>` and `conduit agent <harness> [prompt...]` forward `instance.*` requests. Inside a Conduit
+terminal they go to that terminal's own endpoint, so `agent` launches in that workspace; otherwise
+they go to the per-user `$XDG_RUNTIME_DIR/conduit/instance.sock`, whose token is written 0600 to
+`<state dir>/instance.token` at startup and removed at exit, and the instance token accepts only
+`ping` and `instance.*`. When nothing answers, the command starts Conduit and runs at startup;
+plain `conduit` always starts a new window. `conduit-test launch` now sets `XDG_RUNTIME_DIR` to the
+run directory, so test runs never reach the person's instance. `--control-test` proves all four
+commands as separate processes against a private instance endpoint (each exits 0 in under 100 ms)
+and that a bad token exits non-zero. macOS is unverified; Windows always starts a new window.
+
 TASK-74 replaced the sidebar footer. The thirteen dim per-action control rows (`workspaces.*`,
 `tabs.*`, `panes.*`) are gone; the footer is now a centred clickable `sidebar.palette` hint reading
 `Palette  <chord>` (the live `palette.open` binding formatted for the profile: Ctrl+Shift+P on
@@ -1003,7 +1033,7 @@ where the behaviour is user-visible.
 |---|---|---|
 | Unit | Parsers, state machines, layout maths, key encoding, config, adapters | `zig build test` |
 | Integration | Real PTYs and processes, SSH against a local sshd container, file watching | `zig build test` |
-| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
+| E2E | Deterministic real-app built-in checks, including `--workspaces-test`, `--links-test` and `--search-test`, and TASK-25's checked-in scripted scenarios through `conduit-test` | `xvfb-run -a zig build run -- --ui-test` / `--ime-test` / `--sidebar-test` / `--tabs-test` / `--panes-test` / `--palette-test` / `--scratchpad-test` / `--workspaces-test` / `--links-test` / `--search-test` / `--menu-test` / `--config-test` / `--theme-test` / `--font-test` / `--settings-test` / `--git-test` / `--agent-test` / `--ssh-test` / `--agent-view-test` / `--agent-manager-test` / `--backlog-test` / `--control-test` / `--driver-test`; under a display such as Xvfb, `zig build e2e -- --artifact-dir=<private-dir>` |
 | Exploratory | An agent driving the app with the CLI or project MCP server | `conduit-test launch` / `conduit-test mcp` |
 
 Rules:

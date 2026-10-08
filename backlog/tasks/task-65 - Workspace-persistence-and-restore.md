@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-07 21:18'
+updated_date: '2026-10-08 00:44'
 labels:
   - workspace
   - persistence
@@ -37,6 +37,8 @@ Part 1 (state model and file, no app wiring): 1. src/state.zig: a versioned snap
 2. workspace.zig: snapshot() of a live Workspace/WorkspaceRegistry into the model and a restore plan (what to spawn where) that the app executes; SSH workspaces restore as a reconnect prompt rather than auto-connecting.
 3. Atomic write (temp + rename) to the platform state dir (XDG_STATE_HOME/conduit/state.json), bounded size, unit tests for round trip, migration from a lower version, corruption fallback, and pane-tree fidelity.
 Part 2 (after main.zig frees): save on change/exit, restore on launch, reconnect prompt, --restore-test and an e2e scenario.
+
+Part 2 dispatched 2026-10-08 together with the TASK-68 app wiring and TASK-67's app follow-ups.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
