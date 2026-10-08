@@ -99,6 +99,42 @@ pub fn mostUrgent(states: []const State) ?State {
     return best;
 }
 
+// Sidebar agent rows (TASK-80) -----------------------------------------------------
+
+/// The state words a sidebar agent row ends with, the same for every
+/// harness: what the human would say the agent is doing.
+pub fn rowStateWord(state: State) []const u8 {
+    return switch (state) {
+        .idle => "idle",
+        .working => "working",
+        .waiting_input => "waiting for input",
+        .waiting_permission => "needs permission",
+        .done => "done",
+        .errored => "errored",
+    };
+}
+
+/// The command-style name a sidebar agent row shows: the harness's tag up to
+/// its first underscore (`claude_code` reads `claude`), derived the same way
+/// for every harness so nothing here special-cases one.
+pub fn rowHarnessName(harness: Harness) []const u8 {
+    const tag = @tagName(harness);
+    const end = std.mem.indexOfScalar(u8, tag, '_') orelse tag.len;
+    return tag[0..end];
+}
+
+/// The longest row `formatAgentRow` writes: a three-byte glyph, a name of
+/// at most `agent_row_name_bytes` and the longest state words.
+pub const agent_row_name_bytes = 16;
+pub const agent_row_bytes = 3 + 1 + agent_row_name_bytes + 1 + "waiting for input".len;
+
+/// `<glyph> <name> <state>` into `buffer`; a name longer than
+/// `agent_row_name_bytes` is cut so the row always fits `agent_row_bytes`.
+pub fn formatAgentRow(buffer: *[agent_row_bytes]u8, name: []const u8, state: State) []const u8 {
+    const kept = agent.truncateUtf8(name, agent_row_name_bytes);
+    return std.fmt.bufPrint(buffer, "{s} {s} {s}", .{ stateGlyph(state), kept, rowStateWord(state) }) catch stateGlyph(state);
+}
+
 // The agent manager (TASK-58) ------------------------------------------------------
 
 /// The word the manager shows for an agent's state: `exited` once its
@@ -459,7 +495,8 @@ const fake_decisions = [_]agent.Decision{
 };
 
 /// The fake's script: idle → working → waiting for permission → (resolved)
-/// done → working → errored → working → waiting for permission again,
+/// done → working → errored → working → waiting for permission again →
+/// (resolved) waiting for input,
 /// released in the step groups below.
 pub const fake_script = [_]agent.Event{
     .{ .status_change = .{ .state = .working, .source = .structured } },
@@ -470,10 +507,12 @@ pub const fake_script = [_]agent.Event{
     .{ .status_change = .{ .state = .errored, .source = .structured } },
     .{ .status_change = .{ .state = .working, .source = .structured } },
     .{ .permission_request = .{ .id = "fake-2", .title = "Edit: build.zig", .decisions = &fake_decisions } },
+    .{ .permission_resolved = .{ .id = "fake-2", .outcome = .allowed } },
+    .{ .status_change = .{ .state = .waiting_input, .source = .structured } },
 };
 
-/// Events released after 1, 2, 3, 4 and 5 steps.
-pub const fake_step_ends = [_]usize{ 1, 2, 4, 6, 8 };
+/// Events released after 1, 2, 3, 4, 5 and 6 steps.
+pub const fake_step_ends = [_]usize{ 1, 2, 4, 6, 8, 10 };
 
 /// How many script events `steps` typed lines release.
 pub fn fakeReleased(steps: u64) usize {
@@ -2270,6 +2309,15 @@ pub const Runtime = struct {
         return record.harness.displayName();
     }
 
+    /// The name a sidebar agent row shows (TASK-80): `fake` for the scripted
+    /// fake, otherwise `rowHarnessName`.
+    pub fn rowName(self: *const Runtime, record: *const agent.Agent) []const u8 {
+        for (self.runners.items) |runner| {
+            if (runner.agent_id == record.id and runner.choice == .fake) return "fake";
+        }
+        return rowHarnessName(record.harness);
+    }
+
     /// When an agent last produced output or an event, as
     /// `Io.Clock.awake` nanoseconds (TASK-58's "last activity" column).
     pub fn lastActivity(self: *Runtime, id: AgentId) ?i96 {
@@ -2488,6 +2536,16 @@ test "every state has one glyph, and urgency orders the waits first" {
     try testing.expectEqual(@as(?State, null), mostUrgent(&.{}));
 }
 
+test "sidebar agent rows read glyph, harness and state words" {
+    var buffer: [agent_row_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("▸ claude working", formatAgentRow(&buffer, rowHarnessName(.claude_code), .working));
+    try std.testing.expectEqualStrings("! codex needs permission", formatAgentRow(&buffer, rowHarnessName(.codex), .waiting_permission));
+    try std.testing.expectEqualStrings("✓ pi done", formatAgentRow(&buffer, rowHarnessName(.pi), .done));
+    try std.testing.expectEqualStrings("? opencode waiting for input", formatAgentRow(&buffer, rowHarnessName(.opencode), .waiting_input));
+    try std.testing.expectEqualStrings("× fake errored", formatAgentRow(&buffer, "fake", .errored));
+    try std.testing.expectEqualStrings("· aaaaaaaaaaaaaaaa idle", formatAgentRow(&buffer, "a" ** 40, .idle));
+}
+
 test "the notification list is bounded, newest first, and forgets a workspace" {
     var list: NotificationList = .{};
     const one = WorkspaceKey.fromOrdinal(0);
@@ -2546,7 +2604,8 @@ test "the fake's steps release its script in groups" {
     try testing.expectEqual(@as(usize, 4), fakeReleased(3));
     try testing.expectEqual(@as(usize, 6), fakeReleased(4));
     try testing.expectEqual(@as(usize, 8), fakeReleased(5));
-    try testing.expectEqual(@as(usize, 8), fakeReleased(99));
+    try testing.expectEqual(@as(usize, 10), fakeReleased(6));
+    try testing.expectEqual(@as(usize, 10), fakeReleased(99));
 }
 
 const TestNotifier = struct {

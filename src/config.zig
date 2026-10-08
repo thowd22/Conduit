@@ -258,6 +258,7 @@ pub const Key = enum {
     control_enabled,
     restore_enabled,
     accessibility_enabled,
+    sidebar_agents,
     shell,
     profile,
     editor_command,
@@ -295,6 +296,7 @@ pub const Key = enum {
             .control_enabled => "control.enabled",
             .restore_enabled => "restore.enabled",
             .accessibility_enabled => "accessibility.enabled",
+            .sidebar_agents => "sidebar.agents",
             .shell => "shell",
             .profile => "profile",
             .editor_command => "editor.command",
@@ -363,6 +365,10 @@ pub const Settings = struct {
     /// exposes the semantic tree to the platform's assistive technologies
     /// (AT-SPI2 on Linux). Read at startup only.
     accessibility_enabled: bool = true,
+    /// `sidebar.agents` (TASK-80): whether every agent gets its own row,
+    /// `<glyph> <harness> <state>`, nested under its tab in the sidebar.
+    /// False keeps only the glyph in front of the tab's name. Hot-reloaded.
+    sidebar_agents: bool = true,
     /// `shell` (TASK-46): the name of the profile a new tab or pane runs
     /// when none is chosen. Empty keeps the built-in default (the user's
     /// shell on POSIX, the first of PowerShell 7, Windows PowerShell and cmd
@@ -966,6 +972,7 @@ pub const Config = struct {
             .control_enabled => to.control_enabled = from.control_enabled,
             .restore_enabled => to.restore_enabled = from.restore_enabled,
             .accessibility_enabled => to.accessibility_enabled = from.accessibility_enabled,
+            .sidebar_agents => to.sidebar_agents = from.sidebar_agents,
             .shell => to.shell = try self.dupe(from.shell),
             .profile => to.shell_profiles = try self.dupeShellProfiles(from.shell_profiles),
             .editor_command => to.editor_command = try self.dupe(from.editor_command),
@@ -1217,6 +1224,7 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
         .control_enabled => settings.control_enabled = try parseBool(value),
         .restore_enabled => settings.restore_enabled = try parseBool(value),
         .accessibility_enabled => settings.accessibility_enabled = try parseBool(value),
+        .sidebar_agents => settings.sidebar_agents = try parseBool(value),
         .shell => {
             const name = try parseString(value);
             if (name.len != 0 and !validShellProfileName(name)) return error.ShellProfileName;
@@ -1514,6 +1522,10 @@ pub const defaults_document =
     "# notifications.pi = true\n" ++
     "# notifications.opencode = true\n" ++
     "\n" ++
+    "# One sidebar row per agent under its tab: its state glyph, harness and state. Click it,\n" ++
+    "# or Enter on it, to open that agent's view. false keeps only the glyph on the tab.\n" ++
+    "# sidebar.agents = true\n" ++
+    "\n" ++
     "# Remote connections (Remote: connect). Saved profiles hold a destination, never a\n" ++
     "# secret, and repeat one per line: remote.profile = <name> = <user@host[:port]>\n" ++
     "# The last ten destinations connected to, newest first:\n" ++
@@ -1626,6 +1638,7 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
             .control_enabled,
             .restore_enabled,
             .accessibility_enabled,
+            .sidebar_agents,
             .notifications_enabled,
             .notifications_os,
             .notifications_permission,
@@ -2992,6 +3005,25 @@ test "saving a profile replaces its own line, keeps the rest and never writes a 
     defer parsed.deinit();
     try testing.expect(!parsed.hasDiagnostics());
     try testing.expectEqual(@as(usize, 2), parsed.settings.remote_profiles.len);
+}
+
+test "sidebar.agents is a boolean that defaults on and keeps its value on a bad line" {
+    var silent = try parse(testing.allocator, "", null);
+    defer silent.deinit();
+    try testing.expect(silent.settings.sidebar_agents);
+
+    var off = try parse(testing.allocator, "sidebar.agents = false\n", null);
+    defer off.deinit();
+    try testing.expect(!off.hasDiagnostics());
+    try testing.expect(!off.settings.sidebar_agents);
+
+    var bad = try parse(testing.allocator, "sidebar.agents = hidden\n", &off);
+    defer bad.deinit();
+    try testing.expect(bad.hasDiagnostics());
+    try testing.expect(!bad.settings.sidebar_agents);
+    try testing.expectEqual(Key.sidebar_agents, Key.fromName("sidebar.agents").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.sidebar_agents, "true"));
+    try testing.expect(checkValue(.sidebar_agents, "yes") != null);
 }
 
 test "restore.enabled and accessibility.enabled are booleans that default on" {

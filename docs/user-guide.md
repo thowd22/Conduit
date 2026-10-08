@@ -32,8 +32,35 @@ The sidebar is an inset, not an overlay: showing, hiding or resizing it resizes 
 - **Toggle**: Ctrl+Shift+B (Cmd+Shift+B), or click `‹` at its top right.
 - **Resize**: drag its right edge, or Ctrl+Shift+Left/Right (Cmd+Shift+Left/Right).
 - **Keyboard focus**: Ctrl+Shift+Down (Cmd+Shift+Down) focuses the active tab's row. Tab and
-  Shift+Tab move between rows, Up and Down move between workspace rows, and Enter activates the
-  focused row. Until you focus the sidebar, Tab is ordinary terminal input.
+  Shift+Tab move between rows, Up and Down move between workspace rows (on a workspace row) or
+  between tab and agent rows (on a tab or agent row), and Enter activates the focused row. Until
+  you focus the sidebar, Tab is ordinary terminal input.
+
+### Agent rows
+
+Every agent gets a row of its own, nested one level under the tab it runs in, at the same size as
+the tab rows (below the tab's branch row when it has one):
+
+```
+│ ! workspace        │
+│   Terminal 1       │
+│     ✓ claude done  │
+│   ! Fake agent     │
+│     ! codex needs permission
+```
+
+A row reads `<glyph> <harness> <state>` and changes the moment the agent's state does: `·` idle,
+`▸ … working`, `? … waiting for input`, `! … needs permission`, `✓ … done`, `× … errored`. The row
+appears as soon as the agent registers, whether you started it with **Agent: launch** or by
+typing `claude`, `codex`, `pi`/`omp` or `opencode` in a tab yourself (a hand-started agent shows
+its harness name before it reports anything). A finished agent keeps its row, showing `✓` or `×`,
+until the tab closes or the agent is restarted.
+
+Click a row, or focus it with the sidebar keys and press Enter, to bring the agent's workspace,
+tab and pane forward and open its [agent view](#agent-view); activating the row again while that
+view is showing closes it. A tab dragged onto an agent row moves to that row's tab. The glyph in
+front of the tab name stays. Set `sidebar.agents = false` (or turn it off in the settings view's
+Agents group) to keep only the glyphs.
 
 Configuration problems appear in red at the bottom of the sidebar as `config:<line>: <message>`
 (see [config.md, Errors](config.md#errors)).
@@ -303,7 +330,8 @@ An agent launched with **Agent: launch** runs in its own tab as a real terminal.
 (Cmd+Shift+A), or **Agent: toggle view** in the palette, replaces that pane's terminal with the
 agent view: the same session shown as structured, terminal-styled rows built from the events the
 agent's harness reports. The terminal keeps running underneath, and the same chord or command
-switches back to it.
+switches back to it. A click on the agent's row in the sidebar ([Agent rows](#agent-rows)) opens
+the view from anywhere.
 
 - **Messages** start with who wrote them (`you ›`, the harness's name such as `claude ›`, or
   `system ›`) and wrap at the pane width; this is the one place Conduit wraps text. **Tool uses**

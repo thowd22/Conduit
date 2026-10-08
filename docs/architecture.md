@@ -325,6 +325,22 @@ nothing else is a legal dependency.
   `ExecutionContext.watch` on the git directory so a `HEAD` rewritten without a new prompt
   refreshes. Tracks for vanished sessions are dropped, and a closing workspace joins its lookups
   before its context is released.
+- **Sidebar agent rows (TASK-80).** Under each tab, after its branch row, `composeUiTree` adds
+  one `InteractiveText` per `agent.Registry` record whose session sits in one of the tab's panes
+  (`Workspace.paneForSession`): id `workspace.<k>.tab.<n>.agent-row.<agent id>`, role
+  `agent_row`, parent the tab (or its rename input), action `agent.row` (semantic only), one
+  column further in than the tab and in the normal face, so it is as tall as the tab row. The
+  label `<glyph> <harness> <state>` comes from `app_agents.formatAgentRow` with
+  `Runtime.rowName` (`fake`, or the harness tag up to its first `_`) and `rowStateWord`; the row
+  is rebuilt from the registry every frame, so it follows each state event in the frame the tab
+  glyph changes, and a finished agent keeps it until its record is forgotten. Ids alternate
+  between two storage generations like the glyph ids. `agentRowAction` parses the agent id,
+  `focusSession`s its workspace, tab and pane, and sets that runner's `view.active` (clearing it
+  when that view was already the one showing). Up/Down on a tab or agent row step to the
+  neighbouring workspace, tab or agent row in registration order (`moveSidebarRowFocus`); a drop
+  on an agent row targets its parent tab; the rows count against `list_limit` like branch rows.
+  `sidebar.agents = false` (hot-reloaded, settings-view toggle) registers none; the
+  `<row>.agent.<state>` glyph elements are unchanged.
 - **Sidebar workspace gap (TASK-77).** Every workspace after the first listed one, and every row
   of its group, is registered with `ElementRegistration.offset_px = 5 × group index` logical
   pixels (`sidebar_workspace_gap_px`), so a 5-pixel gap scaled by the window scale separates one

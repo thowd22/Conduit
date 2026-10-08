@@ -528,7 +528,64 @@ const agent_notifications_steps = [_]Step{
     .{ .wait_element = .{ .id = "notifications", .state = "exists", .equals = false } },
     .{ .wait_terminal_text = .{ .contains = "FAKE-STEP 3" } },
     .screenshot,
+    // TASK-80: the agent's own sidebar row under its tab. A click on it from
+    // the first tab shows the agent and its view; the sidebar keys reach it
+    // too, and Enter on the row of the view already showing closes it.
+    .{ .click = "workspace.1.tab.1" },
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .click = agent_row_id },
+    // The view is registered only over a pane that is showing, so its
+    // presence proves the agent's tab came forward.
+    .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .key = "CTRL+SHIFT+DOWN" },
+    .{ .wait_element = .{ .id = "workspace.1", .state = "focused", .equals = true } },
+    .{ .key = "TAB" },
+    .{ .key = "DOWN" },
+    .{ .key = "DOWN" },
+    .{ .wait_element = .{ .id = agent_row_id, .state = "focused", .equals = true } },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = false } },
+    // A fake harness started by hand in the first tab is observed: its row
+    // appears under that human tab, a click shows its view, the keys close
+    // it again, and the row stays, done, once the program leaves.
+    .{ .click = "workspace.1.tab.1" },
+    .{ .click = "workspace.1.pane.1" },
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .type_text = observed_fake_command },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = "OBS-READY" } },
+    .{ .wait_element = .{ .id = observed_row_id, .state = "exists", .equals = true, .timeout_ms = 10_000 } },
+    .{ .click = observed_row_id },
+    .{ .wait_element = .{ .id = observed_view_id, .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .key = "CTRL+SHIFT+DOWN" },
+    .{ .wait_element = .{ .id = "workspace.1", .state = "focused", .equals = true } },
+    .{ .key = "TAB" },
+    .{ .key = "DOWN" },
+    .{ .wait_element = .{ .id = observed_row_id, .state = "focused", .equals = true } },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = observed_view_id, .state = "exists", .equals = false } },
+    .{ .click = "workspace.1.pane.1" },
+    .{ .type_text = "bye" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "workspace.1.tab.1.agent.done", .state = "exists", .equals = true, .timeout_ms = 10_000 } },
+    .{ .wait_element = .{ .id = observed_row_id, .state = "exists", .equals = true } },
+    .screenshot,
 };
+
+/// The launched fake's sidebar row and view (agent 1, tab 2), and the
+/// observed fake's (agent 2, tab 1).
+const agent_row_id = agent_tab_id ++ ".agent-row.1";
+const observed_row_id = "workspace.1.tab.1.agent-row.2";
+const observed_view_id = "agent.view.2";
+
+/// Starts the fake harness by hand as its own foreground job, named
+/// `conduit-fake-agent` so it is recognised. Its marker is assembled by
+/// printf, so the typed command's echo never contains `OBS-READY`.
+const observed_fake_command =
+    "set -m; f=\"${TMPDIR:-/tmp}/conduit-fake-agent\"; " ++
+    "printf '%s\\n' 'printf \"OBS-%s\\n\" READY' 'read l' > \"$f\"; sh \"$f\"";
 
 // TASK-57: the same fake agent, stepped to its first permission request,
 // then shown as the structured agent view by its chord. The request's
@@ -1126,6 +1183,26 @@ test "the agent scenario enables the fake only for launch and walks every glyph 
         else => {},
     };
     try std.testing.expect(states >= 5 and clicked_row);
+}
+
+test "the agent scenario opens launched and observed agents from their sidebar rows by mouse and keys" {
+    const scenario = all[14];
+    try std.testing.expectEqualStrings("agent-notifications", scenario.name);
+    var row_clicks: usize = 0;
+    var row_focus: usize = 0;
+    var observed_row = false;
+    for (scenario.steps) |step| switch (step) {
+        .click => |id| if (std.mem.indexOf(u8, id, ".agent-row.") != null) {
+            row_clicks += 1;
+        },
+        .wait_element => |wait| {
+            if (std.mem.indexOf(u8, wait.id, ".agent-row.") != null and std.mem.eql(u8, wait.state, "focused") and wait.equals) row_focus += 1;
+            if (std.mem.eql(u8, wait.id, observed_row_id) and std.mem.eql(u8, wait.state, "exists") and wait.equals) observed_row = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(row_clicks == 2 and row_focus == 2 and observed_row);
+    try std.testing.expect(std.mem.indexOf(u8, observed_fake_command, "OBS-READY") == null);
 }
 
 test "sidebar branch scenario waits on the branch row appearing, leaving and returning" {

@@ -35,8 +35,8 @@ row, **Open config file**, closes the dialog and opens the file itself, as `conf
   the highlighted row on screen. Escape, or a click outside the dialog, closes it. While it is
   open no key, typed text or click reaches the terminal or anything else beneath it.
 - **Editing.** Enter or a click edits a row the way its value needs:
-  - `true`/`false` settings (`font.ligatures`, `font.nerd_symbols` and every `notifications.*`
-    switch in the Agents group) flip;
+  - `true`/`false` settings (`font.ligatures`, `font.nerd_symbols`, and `sidebar.agents` and
+    every `notifications.*` switch in the Agents group) flip;
   - `mouse.right_click` switches between `menu` and `paste`;
   - `theme` and `font.family` close the dialog and open the palette's theme or family chooser,
     with its live preview;
@@ -120,6 +120,7 @@ keybind = ctrl+alt+p=palette.open
 | `notifications.codex` | `true` or `false` | `true` | Every notification from Codex agents |
 | `notifications.pi` | `true` or `false` | `true` | Every notification from Pi agents |
 | `notifications.opencode` | `true` or `false` | `true` | Every notification from OpenCode agents |
+| `sidebar.agents` | `true` or `false` | `true` | Whether each agent has its own sidebar row, `<glyph> <harness> <state>`, nested under its tab; a click or Enter on it opens that agent's view ([user-guide.md](user-guide.md#agent-rows)). `false` keeps only the glyph in front of the tab name. Settings-view row in the Agents group |
 | `remote.profile` | `<name> = <[user@]host[:port]>`, repeats | none | A saved SSH connection listed by **Remote: connect**; see [Remote connections](#remote-connections) |
 | `remote.recent` | comma-separated `[user@]host[:port]`, at most 10 | `""` | The destinations connected to most recently, newest first; written by Conduit |
 | `control.enabled` | `true` or `false` | `true` in development (Debug) builds, `false` in release builds | Read at startup: whether this run starts the local control endpoint harnesses use and the single-instance endpoint `conduit` commands reuse ([control-api.md](control-api.md)). No settings-view row |
