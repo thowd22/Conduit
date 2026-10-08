@@ -5769,7 +5769,13 @@ test "the local context runs a bounded command and reports its exit, output and 
 
     var cwd = try local_ref.run(testing.allocator, testing.io, .{ .argv = &.{"pwd"}, .cwd = "/tmp" });
     defer cwd.deinit(testing.allocator);
-    try testing.expectEqualStrings("/tmp\n", cwd.stdout);
+    // `pwd` the program prints the physical directory, and macOS's /tmp is a
+    // symlink to /private/tmp, so the claim is that the child ran in the
+    // directory /tmp resolves to.
+    var tmp_real: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_len = try std.Io.Dir.realPathFileAbsolute(testing.io, "/tmp", &tmp_real);
+    try testing.expectEqualStrings(tmp_real[0..tmp_len], std.mem.trimEnd(u8, cwd.stdout, "\n"));
+    try testing.expect(std.mem.endsWith(u8, cwd.stdout, "\n"));
 
     try testing.expectError(error.Timeout, local_ref.run(testing.allocator, testing.io, .{
         .argv = &.{ "/bin/sh", "-c", "sleep 5" },
@@ -6116,6 +6122,8 @@ test {
 }
 
 test "the local context writes files atomically with exact modes and private parents" {
+    // POSIX modes are the claim, and Windows files have none to compare.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const testing = std.testing;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
