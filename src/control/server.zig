@@ -353,7 +353,13 @@ pub const Server = struct {
             const framed = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
                 error.StreamTooLong => {
                     // The rest of the oversized line cannot be resynchronised.
+                    // Closing straight away raced a client still sending the
+                    // tail of that line (EPIPE before it could read the
+                    // refusal), so end only the write side and discard a
+                    // bounded tail until the client hangs up.
                     writeFrame(self.io, stream, null, .{ .fault = .invalid_request });
+                    stream.shutdown(self.io, .send) catch {};
+                    _ = reader.interface.discardShort(protocol.max_frame_bytes) catch {};
                     return;
                 },
                 error.EndOfStream, error.ReadFailed => return,
