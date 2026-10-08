@@ -13,8 +13,9 @@ Status: implemented and verified on Linux (`--control-test`, the `control-api` E
 the socket integration tests in `src/control.zig`). The five `editor.*` methods are verified on
 Linux by `--editor-test` and the `editor-pane` E2E scenario against a stand-in `codium` that maps
 a real X window; a real VSCodium has not been driven by a check. macOS uses the same POSIX code
-but has not been run. Windows has no control transport yet: neither endpoint starts there, and `conduit`
-commands always start a new window.
+but has not been run. On Windows both endpoints are named pipes (TASK-82, `decision-13`), verified
+on the hosted Windows runner by `--control-test` with PowerShell 7 tabs and separate `conduit.exe`
+clients, and by the pipe tests in `src/platform.zig` and `src/control.zig`.
 
 ## Enabling
 
@@ -31,14 +32,16 @@ not a remote child, which could not reach a local socket anyway):
 
 | Variable | Value |
 |---|---|
-| `CONDUIT_CONTROL_ENDPOINT` | Absolute path of this run's control socket, `<runtime dir>/conduit/r-<8 hex>.sock`. |
+| `CONDUIT_CONTROL_ENDPOINT` | Absolute path of this run's control socket, `<runtime dir>/conduit/r-<8 hex>.sock`; on Windows the pipe name `\\.\pipe\conduit-<user SID>-r-<8 hex>`. |
 | `CONDUIT_CONTROL_TOKEN` | The workspace's control token: 32 lowercase hex digits (128 random bits). |
 | `CONDUIT_CONTROL_SESSION` | This terminal's session id, a positive integer. Pass it back as `session` so "my tab" and "my pane" mean this terminal. |
 
 The runtime directory is `$XDG_RUNTIME_DIR` (when absolute), else `/tmp/conduit-<uid>`; on macOS
-`$TMPDIR` comes before `/tmp`. Conduit creates `<runtime dir>/conduit` with mode 0700. An
-enclosing Conduit's three variables are never inherited, so a nested Conduit's children only see
-their own.
+`$TMPDIR` comes before `/tmp`. Conduit creates `<runtime dir>/conduit` with mode 0700. On Windows
+there is no directory: every endpoint is a pipe named `\\.\pipe\conduit-<user SID>-…`, with
+`-x<16 hex>` (a hash of `XDG_RUNTIME_DIR`) after the SID when that variable is set, which isolates
+test runs the way a private runtime directory does elsewhere. An enclosing Conduit's three
+variables are never inherited, so a nested Conduit's children only see their own.
 
 Agent children also carry `CONDUIT_AGENT_TOKEN`, the agent's correlation token, which
 `agent.event` names. A program that does not see `CONDUIT_CONTROL_ENDPOINT` is not inside a
@@ -47,8 +50,12 @@ Conduit workspace terminal (or the endpoint is disabled) and should do nothing.
 ## Security model
 
 - **Local only.** Each endpoint is a mode-0600 Unix socket inside a mode-0700 directory owned by
-  the user; Conduit refuses to listen in a directory with any group or other permission. There
-  is no TCP fallback.
+  the user; Conduit refuses to listen in a directory with any group or other permission. On
+  Windows each endpoint is a named pipe whose security descriptor grants read and write only to
+  the current logon session's SID, which rejects remote clients (`PIPE_REJECT_REMOTE_CLIENTS`), and
+  whose first instance refuses a name another process already holds, so nobody can pre-create
+  it; a connection from another user or over the network is refused by the pipe itself. There is
+  no TCP fallback.
 - **Off in release builds unless enabled** (see [Enabling](#enabling)).
 - **Token-scoped.** Every request carries a token, compared in constant time. A workspace token
   reaches only its own workspace. Tokens are random per run (from the OS entropy source), are
@@ -325,6 +332,16 @@ wraps stdin as a Claude Code hook line. With `--event` the command is a hook: it
 always exits 0, and when the endpoint does not take the event (not running, too large, refused)
 appends the line to `$CONDUIT_AGENT_SINK/events.jsonl` instead.
 
+`conduit control agent.permission --wait [--agent=<token>] [--wait-ms=<n>]` is Claude Code's
+`PermissionRequest` hook on Windows (see [Claude Code hooks](#claude-code-hooks)). It reads the
+hook input on stdin, sends a `PermissionRequest` line with a request id it chooses (like
+`--event`, falling back to the sink), waits up to 580 s (or `--wait-ms`) for the human's answer in
+the agent view (`$CONDUIT_AGENT_SINK/decisions/<id>`), sends a `PermissionEnd` line with the
+outcome, and prints Claude Code's reply,
+`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}` (or
+`"deny"`). When no answer comes it reports the request as resolved elsewhere and prints nothing,
+so Claude Code's own dialog decides. It always exits 0, except 2 for a malformed command line.
+
 The other four commands print nothing and exit 0 when the running Conduit carried them out, or
 print `conduit: <Message>` and exit 1 when it refused. A directory is resolved against the current
 directory and must exist.
@@ -334,7 +351,10 @@ directory and must exist.
 A running Conduit answers `conduit` commands on its instance endpoint,
 `<runtime dir>/conduit/instance.sock`, with a token it writes (mode 0600, directory 0700) to
 `<state dir>/instance.token` at startup and removes when it leaves: `$XDG_STATE_HOME/conduit`, else
-`~/.local/state/conduit` (`~/Library/Application Support/conduit` on macOS). A command then:
+`~/.local/state/conduit` (`~/Library/Application Support/conduit` on macOS). On Windows the
+endpoint is the pipe `\\.\pipe\conduit-<user SID>-instance` and the token file
+`%LOCALAPPDATA%\conduit\instance.token` (`%XDG_STATE_HOME%\conduit\instance.token` when that is
+set). A command then:
 
 1. inside a Conduit terminal (its control variables set), sends the method to that terminal's own
    Conduit with the workspace token and session, so `conduit agent` launches in the caller's
@@ -450,6 +470,14 @@ endpoint runs, every hook except `PermissionRequest` runs
 `'<conduit>' control agent.event --event=<Hook>`, which sends the hook input over the endpoint
 (falling back to the agent's sink); `PermissionRequest` keeps its file-based relay, whose answer
 comes back through `decisions/`. Nothing needs configuring.
+
+On Windows there is no `/bin/sh` for the relay, so every hook runs the Conduit executable
+directly, double-quoted so `cmd.exe` and Git Bash read it alike, whether or not the endpoint is
+enabled: `"<conduit.exe>" control agent.event --event=<Hook>`, and for `PermissionRequest`
+`"<conduit.exe>" control agent.permission --wait`, which waits for the answer given in the agent
+view and prints the allow or deny reply (see [the `conduit` command](#the-conduit-command)). The
+executable's path must be drive-absolute without `"`, `%`, `$`, `` ` `` or `!`; otherwise the
+agent gets no hooks and keeps the terminal-level status only.
 
 A Claude Code started by hand in a Conduit terminal has no agent token, but its hooks can still
 mark the tab and notify. In `~/.claude/settings.json` (or the project's `.claude/settings.json`):

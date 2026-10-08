@@ -83,6 +83,23 @@ in `backlog/docs/doc-3`. In short:
   may be edited, opens editable files in `vi`, and for Claude Code restarts the agent to apply an
   edit (TASK-59).
 
+### Agents on Windows (TASK-82)
+
+The control endpoint is a per-user named pipe on Windows (`\\.\pipe\conduit-<your SID>-r-…`,
+open only to your logon session and never to remote clients; see
+[control-api.md](control-api.md#security-model)), so `conduit control` works from PowerShell and
+`cmd.exe` tabs as it does from a POSIX shell. A Claude Code launched with **Agent: launch** gets
+hooks that need no `/bin/sh`: every hook runs `"<conduit.exe>" control agent.event
+--event=<Hook>`, and the permission hook runs `"<conduit.exe>" control agent.permission --wait`,
+which shows the request in the agent view, waits for your answer there and hands Claude Code the
+allow or deny reply; Claude Code's own dialog keeps working beside it. This holds whether or not
+the control endpoint is enabled: without it the hooks write to the agent's private directory under
+`%LOCALAPPDATA%\conduit\agents`. Codex and OpenCode keep their own servers as on Linux (Codex's
+daemon socket and OpenCode's loopback port), Pi's extension writes its sink file directly, and
+none of the three has been run on Windows. Verified on the hosted Windows runner with a stand-in
+Claude Code that runs the generated hook commands through `cmd.exe` (`--control-test`); a real
+Claude Code on Windows has not been run.
+
 ### The editor tool (TASK-79)
 
 A harness running in a Conduit terminal can use VSCodium as its editor through the control API:
