@@ -27,9 +27,14 @@ rm -f "$zip_path"
 parent="$(cd "$portable/.." && pwd)"
 base="$(basename "$portable")"
 [ "$base" = Conduit ] || fail "the portable folder must be named Conduit, not $base"
-powershell.exe -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$parent/$base")' -DestinationPath '$(cygpath -w "$zip_path")' -CompressionLevel Optimal"
+# 7-Zip rather than Compress-Archive: Windows PowerShell 5.1's writes entry
+# names with backslashes, which unzip elsewhere turns into odd file names.
+(cd "$parent" && 7z a -tzip -mx=9 "$(cygpath -w "$zip_path")" "$base" > /dev/null)
 (cd "$out" && sha256sum "$name" > "$name.sha256")
 pass "wrote $name ($(stat -c %s "$zip_path") bytes) and $name.sha256"
+if unzip -Z1 "$zip_path" | grep -q '\\'; then fail "the zip has entry names with backslashes"; fi
+unzip -Z1 "$zip_path" | grep -qx 'Conduit/conduit.exe' || fail "the zip has no Conduit/conduit.exe entry"
+pass "every entry is under Conduit/ with forward slashes"
 
 # Verify.
 (cd "$out" && sha256sum -c "$name.sha256") || fail "the checksum does not match"
