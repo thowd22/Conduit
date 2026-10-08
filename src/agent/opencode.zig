@@ -7,10 +7,27 @@
 //! messages. This file is a minimal HTTP/1.1 + SSE client for that server and
 //! the mapping from OpenCode's events onto `agent.Event`.
 //!
-//! Provenance. OpenCode is not installed on the development machine
-//! (`command -v opencode` fails) and installing it needs the user's approval,
-//! so nothing here was verified against a running opencode. Everything below
-//! was READ, on 2026-10-07, from:
+//! Provenance. OpenCode is not installed on the development machine; it is
+//! verified live only inside a throwaway ubuntu:24.04 container
+//! (`scripts/opencode-container-check.sh`, npm `opencode-ai@1.18.35`, a fixed
+//! local model from `scripts/opencode-mock-provider.py`). Observed there on
+//! 2026-10-08: `opencode --version` prints `1.18.35`; `/event` serves
+//! `data: {"id","type","properties"}` frames starting with `server.connected`
+//! and, per turn, `session.created`/`session.updated`, `message.updated`,
+//! `message.part.updated` (parts `text`, `step-start`, `step-finish`, and
+//! `tool` going pending → running → completed), `message.part.delta`
+//! (`{messageID, partID, field: "text", delta}`), `session.status`
+//! `busy`/`idle`, `session.idle`, `session.diff`, `permission.asked`
+//! `{id, sessionID, permission, patterns, metadata, always, tool:{messageID,
+//! callID}}` (sent after the tool part is already `running`),
+//! `permission.replied {sessionID, requestID, reply}`, plus startup
+//! `plugin.added`/`catalog.updated`/`reference.updated`/`integration.updated`
+//! announcements; `POST /permission/:id/reply {"reply":"once"}` answers 200
+//! `true`. `test/fixtures/agent/opencode/recorded-turn.sse` and
+//! `recorded-messages.json` are that recording. Not observed live:
+//! `question.asked`, subagent child sessions, `session.error`, aborts and the
+//! v1 shapes, which the hand-written fixtures still cover. Before that,
+//! everything was READ, on 2026-10-07, from:
 //!   - https://opencode.ai/docs/server/ (flags, auth, route table);
 //!   - github.com/anomalyco/opencode (formerly sst/opencode), branch `dev` at
 //!     a697115 (latest release v1.18.35):
@@ -40,14 +57,14 @@
 //!     `message.part.updated {part, delta?}`, `session.created {info}` with
 //!     `info.parentID` for child sessions, and the Part shapes `text`,
 //!     `tool {tool, callID, state:{status, input, title?}}`, `file {source?}`).
-//! The fixtures under `test/fixtures/agent/opencode/` are hand-written from
-//! those shapes, not recorded.
+//! The other fixtures there (`turn-*.sse`, `edge-cases.sse`, `messages.json`)
+//! are hand-written from those shapes; the `recorded-*` ones are live.
 //!
 //! Gaps (also in docs/architecture.md):
 //!   - `detect` runs `opencode --version` through the workspace's
 //!     ExecutionContext (so it works wherever the context can run commands)
-//!     and reads the version from stdout. The output format of `--version`
-//!     was not observed; the parser takes the last word of the first line.
+//!     and reads the version from stdout. 1.18.35 prints the bare version
+//!     (`1.18.35`); the parser takes the last word of the first line.
 //!   - The server is reached at 127.0.0.1 only, so the structured channel is
 //!     Local-only. In SSH and WSL workspaces `launch` starts the plain TUI and
 //!     the agent stays on the PTY baseline: TASK-61 carries file-based sinks
@@ -1033,6 +1050,15 @@ fn boolean(value: ?json.Value) bool {
 
 const parse_options: json.ParseOptions = .{ .duplicate_field_behavior = .use_last, .max_value_len = max_response_bytes };
 
+/// Whether a foreground program name (`agent.commandName`, a basename) is
+/// OpenCode, for observed agents (TASK-56). npm's `opencode-ai` installs a
+/// Node launcher `bin/opencode` that runs the native `opencode` binary; the
+/// terminal's foreground leader is the launcher, `node .../bin/opencode`
+/// (observed with 1.18.35), and a native install runs `opencode` itself.
+pub fn recognizeCommand(name: []const u8) bool {
+    return std.mem.eql(u8, name, "opencode");
+}
+
 // Instructions (TASK-59) -------------------------------------------------------
 
 /// Where OpenCode reads its instructions (TASK-59), from its rules and agents
@@ -1111,6 +1137,11 @@ pub const OpenCodeAdapter = struct {
     const Stream = struct {
         connection: ?Connection = null,
         phase: enum { idle, head, body } = .idle,
+        /// When the request was sent: a head that never comes is given up
+        /// after `request_timeout_ns` (OpenCode 1.18.35 accepted a
+        /// connection made while it was still starting and never answered
+        /// it, observed live).
+        sent_ns: i96 = 0,
         head_len: usize = 0,
         raw_start: usize = 0,
         raw_end: usize = 0,
@@ -1372,7 +1403,11 @@ pub const OpenCodeAdapter = struct {
                     const wait = if (may_wait) self.options.poll_wait_ns else 0;
                     may_wait = false;
                     const n = conn.read(self.head[s.head_len..], wait) catch |err| switch (err) {
-                        error.WouldBlock => return,
+                        error.WouldBlock => {
+                            const waited = Io.Clock.awake.now(self.io).nanoseconds - s.sent_ns;
+                            if (waited > self.options.request_timeout_ns) return self.disconnect("no response head");
+                            return;
+                        },
                         else => return self.disconnect("stream read failed"),
                     };
                     if (n == 0) return self.disconnect("stream closed before its head");
@@ -1490,7 +1525,7 @@ pub const OpenCodeAdapter = struct {
             self.scheduleReconnect(now);
             return false;
         };
-        self.stream = .{ .connection = connection, .phase = .head };
+        self.stream = .{ .connection = connection, .phase = .head, .sent_ns = now };
         self.sse.reset();
         return true;
     }
@@ -2105,6 +2140,71 @@ test "a recorded-shape turn maps onto agent events through the common interface"
     try testing.expect(reg.get(id).?.structured);
 }
 
+test "a turn recorded from opencode 1.18.35 maps onto agent events through the common interface" {
+    const recorded = try readFixture("recorded-turn.sse");
+    defer testing.allocator.free(recorded);
+    const response = try sseResponse(testing.allocator, recorded);
+    defer testing.allocator.free(response);
+
+    var scripted: ScriptedTransport = .{ .script = response };
+    defer scripted.written.deinit(testing.allocator);
+    var oc = try OpenCodeAdapter.init(testing.allocator, testing.io, .{ .port = 4096, .transport = scripted.transport(), .directory = "/tmp/proj" });
+    const a = oc.adapter();
+    defer a.destroy();
+
+    var queue = try event.EventQueue.init(testing.allocator, testing.io, 64);
+    defer queue.deinit(testing.allocator);
+    var collected = try Collected.init();
+    defer collected.deinit();
+    while (scripted.at < scripted.script.len) {
+        _ = try a.poll(&queue);
+        collected.drain(&queue);
+    }
+    _ = try a.poll(&queue);
+    collected.drain(&queue);
+
+    // The server's first live turn: the human's prompt, busy, the bash tool
+    // (OpenCode marks it `running` before it asks), its permission request
+    // (answered outside Conduit), the answer and the end of the turn.
+    // Startup `session.updated`/`session.diff`, step parts and the streamed
+    // deltas add nothing of their own.
+    var kinds_buffer: [64]event.Event.Kind = undefined;
+    const K = event.Event.Kind;
+    try testing.expectEqualSlices(K, &.{
+        .message, .status_change, .tool_use, .permission_request, .permission_resolved, .message, .status_change,
+    }, collected.kinds(&kinds_buffer));
+    try testing.expectEqualStrings("run the marker", collected.at(0).message.text);
+    try testing.expectEqual(State.working, collected.at(1).status_change.state);
+    try testing.expectEqualStrings("bash", collected.at(2).tool_use.name);
+    try testing.expectEqualStrings("echo conduit-live", collected.at(2).tool_use.summary);
+    const request = collected.at(3).permission_request;
+    try testing.expectEqualStrings("per_1195b1fc1001hVuStfUdg47luK", request.id);
+    try testing.expectEqualStrings("bash: echo conduit-live", request.title);
+    try testing.expectEqual(event.PermissionOutcome.resolved_elsewhere, collected.at(4).permission_resolved.outcome);
+    try testing.expectEqual(event.Role.assistant, collected.at(5).message.role);
+    try testing.expectEqualStrings("All done.", collected.at(5).message.text);
+    try testing.expectEqual(State.done, collected.at(6).status_change.state);
+    try testing.expectEqualStrings("ses_ee6a4e41affeQFeE4NibVv28Gd", oc.mapper.session.slice());
+
+    // The recorded history replays the same turn as transcript events.
+    const body = try readFixture("recorded-messages.json");
+    defer testing.allocator.free(body);
+    var history: ScriptedTransport = .{ .script = "" };
+    defer history.written.deinit(testing.allocator);
+    var replay = try OpenCodeAdapter.init(testing.allocator, testing.io, .{ .port = 4096, .transport = history.transport(), .directory = "/tmp/proj" });
+    defer replay.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try replay.mapHistory(arena_state.allocator(), body);
+    _ = replay.flush(&queue);
+    var replayed = try Collected.init();
+    defer replayed.deinit();
+    replayed.drain(&queue);
+    try testing.expectEqualSlices(K, &.{ .message, .tool_use, .message }, replayed.kinds(&kinds_buffer));
+    try testing.expectEqualStrings("run the marker", replayed.at(0).message.text);
+    try testing.expectEqualStrings("All done.", replayed.at(2).message.text);
+}
+
 test "older shapes, other sessions, errors, aborts and junk degrade gracefully" {
     const text = try readFixture("edge-cases.sse");
     defer testing.allocator.free(text);
@@ -2141,6 +2241,37 @@ test "older shapes, other sessions, errors, aborts and junk degrade gracefully" 
     // server.instance.disposed ended the stream: back to the baseline.
     try testing.expect(!a.capabilities().structured_status);
     try testing.expect(!scripted.open);
+}
+
+test "a server that accepts but never answers is given up and dialled again" {
+    // Observed live with 1.18.35: a connection made while `opencode` was
+    // still starting was accepted and never answered.
+    var scripted: ScriptedTransport = .{ .script = "" };
+    defer scripted.written.deinit(testing.allocator);
+    var oc = try OpenCodeAdapter.init(testing.allocator, testing.io, .{
+        .port = 4096,
+        .transport = scripted.transport(),
+        .request_timeout_ns = 0,
+        .reconnect_min_ns = 0,
+    });
+    defer oc.deinit();
+    const a = oc.adapter();
+    var queue = try event.EventQueue.init(testing.allocator, testing.io, 4);
+    defer queue.deinit(testing.allocator);
+    // Past the (zero) request timeout with no head: closed and redialled,
+    // rather than waited on for ever.
+    for (0..3) |_| _ = try a.poll(&queue);
+    try testing.expect(scripted.connects >= 2);
+    try testing.expect(!oc.isConnected());
+
+    // With the default timeout a slow head is still waited for.
+    var patient: ScriptedTransport = .{ .script = "" };
+    defer patient.written.deinit(testing.allocator);
+    var slow = try OpenCodeAdapter.init(testing.allocator, testing.io, .{ .port = 4096, .transport = patient.transport(), .reconnect_min_ns = 0 });
+    defer slow.deinit();
+    for (0..3) |_| _ = try slow.adapter().poll(&queue);
+    try testing.expectEqual(@as(usize, 1), patient.connects);
+    try testing.expect(patient.open);
 }
 
 test "an unreachable server leaves the PTY baseline and retries with backoff" {
@@ -2531,8 +2662,14 @@ test "live: a real opencode serve, when installed" {
     const port = probe.socket.address.getPort();
     probe.deinit(io);
     var port_text: [8]u8 = undefined;
+    // The launcher is `#!/usr/bin/env node`: the child needs this process's
+    // PATH (and the check's OPENCODE_CONFIG), passed explicitly as the other
+    // live harness tests do.
+    var env = try testing.environ.createMap(testing.allocator);
+    defer env.deinit();
     var child = std.process.spawn(io, .{
         .argv = &.{ "opencode", "serve", "--port", try std.fmt.bufPrint(&port_text, "{d}", .{port}), "--hostname", server_host },
+        .environ_map = &env,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -2548,11 +2685,18 @@ test "live: a real opencode serve, when installed" {
     defer oc.deinit();
     var queue = try event.EventQueue.init(testing.allocator, io, 64);
     defer queue.deinit(testing.allocator);
-    const deadline = Io.Clock.awake.now(io).nanoseconds + 30 * std.time.ns_per_s;
+    // A first start in a fresh home migrates its database and installs its
+    // plugins before it listens; that took over 30 s in the container.
+    const started = Io.Clock.awake.now(io).nanoseconds;
+    const deadline = started + 120 * std.time.ns_per_s;
     while (!oc.isConnected() and Io.Clock.awake.now(io).nanoseconds < deadline) {
         oc.next_connect_ns = 0;
         _ = try oc.adapter().poll(&queue);
     }
+    std.debug.print("live opencode: event stream {s} after {d} ms\n", .{
+        if (oc.isConnected()) "connected" else "NOT connected",
+        @divTrunc(Io.Clock.awake.now(io).nanoseconds - started, std.time.ns_per_ms),
+    });
     try testing.expect(oc.isConnected());
     // A headless server has no session until one is created.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2561,4 +2705,54 @@ test "live: a real opencode serve, when installed" {
     try testing.expect(oc.mapper.session.len != 0);
     oc.history_pending = true;
     try oc.loadHistory();
+
+    // A whole turn needs a model. `scripts/opencode-container-check.sh`
+    // configures a fixed local one (`scripts/opencode-mock-provider.py`,
+    // `permission.bash = "ask"`) and sets this variable; anywhere else the
+    // check stops at the connection and the session above.
+    if (testing.environ.getPosix("CONDUIT_OPENCODE_LIVE_TURN") == null) {
+        std.debug.print("the live OpenCode turn needs CONDUIT_OPENCODE_LIVE_TURN and a configured mock model; connection and session only\n", .{});
+        return;
+    }
+    const a = oc.adapter();
+    try a.sendInput("run the marker");
+    var out: [16]event.StoredEvent = undefined;
+    var saw_working = false;
+    var saw_tool = false;
+    var saw_answer = false;
+    var answered = false;
+    var resolved: ?event.PermissionOutcome = null;
+    var done = false;
+    const turn_deadline = Io.Clock.awake.now(io).nanoseconds + 120 * std.time.ns_per_s;
+    while (!done and Io.Clock.awake.now(io).nanoseconds < turn_deadline) {
+        _ = try a.poll(&queue);
+        const n = queue.drain(&out);
+        for (out[0..n]) |*stored| {
+            std.debug.print("live opencode event: {t}\n", .{std.meta.activeTag(stored.event)});
+            switch (stored.event) {
+                .status_change => |change| switch (change.state) {
+                    .working => saw_working = true,
+                    .done => done = saw_answer,
+                    else => {},
+                },
+                .tool_use => |tool| if (std.mem.eql(u8, tool.name, "bash")) {
+                    saw_tool = true;
+                },
+                .permission_request => |request| if (!answered) {
+                    // The human's explicit answer, as the agent view sends it.
+                    try testing.expectEqualStrings("bash: echo conduit-live", request.title);
+                    try a.respondPermission(request.id, "once");
+                    answered = true;
+                },
+                .permission_resolved => |r| resolved = r.outcome,
+                .message => |m| if (m.role == .assistant and std.mem.eql(u8, m.text, "All done.")) {
+                    saw_answer = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try testing.expect(saw_working and saw_tool and answered and saw_answer and done);
+    // Conduit answered, so the outcome is `allowed`, not "elsewhere".
+    try testing.expectEqual(@as(?event.PermissionOutcome, .allowed), resolved);
 }

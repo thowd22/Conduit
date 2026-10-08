@@ -1,0 +1,94 @@
+: RECORDED from a real opencode 1.18.35 (npm opencode-ai@1.18.35) on 2026-10-08:
+: 'opencode serve' in an ubuntu:24.04 container with a mock OpenAI-compatible
+: provider (scripts/opencode-mock-provider.py) and permission.bash = ask. One
+: turn: prompt_async 'run the marker', a bash tool call that asked permission,
+: answered 'once' over POST /permission/:id/reply (not through Conduit), then
+: 'All done.'. Only the 45 startup plugin/catalog announcements were removed;
+: every other event is byte for byte as served.
+
+data: {"id":"evt_1195b1802001omrxdOrNuIvNZy","type":"server.connected","properties":{}}
+
+data: {"id":"evt_1195b1be6001xOwQRODHDZ1cik","type":"session.created","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"ses_ee6a4e41affeQFeE4NibVv28Gd","slug":"curious-harbor","version":"1.18.35","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"New session - 2026-10-08T02:32:43.749Z","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791426763749,"updated":1791426763749}}}}
+
+data: {"id":"evt_1195b1c0a001xwgSl7aq1JmeKU","type":"session.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"ses_ee6a4e41affeQFeE4NibVv28Gd","slug":"curious-harbor","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"New session - 2026-10-08T02:32:43.749Z","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791426763749,"updated":1791426763785}}}}
+
+data: {"id":"evt_1195b1c0f0014FVOnAWM6icFl9","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"msg_1195b1c09001ua1p9f6N4ne6wM","role":"user","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","time":{"created":1791426763785},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"}}}}
+
+data: {"id":"evt_1195b1dbc0015CrV8XwutVSqCr","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"type":"text","text":"run the marker","messageID":"msg_1195b1c09001ua1p9f6N4ne6wM","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","id":"prt_1195b1c0f001UITatAYnZOBTsN"},"time":1791426764220}}
+
+data: {"id":"evt_1195b1dbf0018GYXrO53dCxoXF","type":"session.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"ses_ee6a4e41affeQFeE4NibVv28Gd","slug":"curious-harbor","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"New session - 2026-10-08T02:32:43.749Z","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791426763749,"updated":1791426764222}}}}
+
+data: {"id":"evt_1195b1dc30018KnFf535nRpHEh","type":"session.status","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","status":{"type":"busy"}}}
+
+data: {"id":"evt_1195b1dc60010JfUg1HyKyQ53K","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"msg_1195b1dc6001OybccEGKIIqFHU","parentID":"msg_1195b1c09001ua1p9f6N4ne6wM","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791426764230},"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd"}}}
+
+data: {"id":"evt_1195b1de60010mA1oUoOdpFZvc","type":"session.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"ses_ee6a4e41affeQFeE4NibVv28Gd","slug":"curious-harbor","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"New session - 2026-10-08T02:32:43.749Z","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791426763749,"updated":1791426764261}}}}
+
+data: {"id":"evt_1195b1de70016C7HTok31HS7oW","type":"session.diff","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","diff":[]}}
+
+data: {"id":"evt_1195b1de9001YV67Fby1R1ffER","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"role":"user","time":{"created":1791426763785},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"},"id":"msg_1195b1c09001ua1p9f6N4ne6wM","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","summary":{"diffs":[]}}}}
+
+data: {"id":"evt_1195b1e1500144g7WXdMT0ayKY","type":"session.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"ses_ee6a4e41affeQFeE4NibVv28Gd","slug":"curious-harbor","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"Conduit live check","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791426763749,"updated":1791426764261}}}}
+
+data: {"id":"evt_1195b1f7a001OKJm7liSNSWNpE","type":"session.status","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","status":{"type":"busy"}}}
+
+data: {"id":"evt_1195b1f90001PuYcnXTR19RU83","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"id":"prt_1195b1f8f0010QcFY8cn6QEjGq","messageID":"msg_1195b1dc6001OybccEGKIIqFHU","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","type":"step-start"},"time":1791426764687}}
+
+data: {"id":"evt_1195b1f920012GBEfn7o5iVgM2","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"id":"prt_1195b1f920018KzJyUcka1I5ua","messageID":"msg_1195b1dc6001OybccEGKIIqFHU","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","type":"tool","tool":"bash","callID":"call_conduit_1","state":{"status":"pending","input":{},"raw":""}},"time":1791426764690}}
+
+data: {"id":"evt_1195b1f9a001YMUjxcIPp8XU5f","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"type":"tool","tool":"bash","callID":"call_conduit_1","state":{"status":"running","input":{"command":"echo conduit-live","description":"Print a marker"},"time":{"start":1791426764698}},"id":"prt_1195b1f920018KzJyUcka1I5ua","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","messageID":"msg_1195b1dc6001OybccEGKIIqFHU"},"time":1791426764698}}
+
+data: {"id":"evt_1195b1fc1002BOv70Tr0vjx1Yx","type":"permission.asked","properties":{"id":"per_1195b1fc1001hVuStfUdg47luK","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","permission":"bash","patterns":["echo conduit-live"],"metadata":{"command":"echo conduit-live"},"always":["echo *"],"tool":{"messageID":"msg_1195b1dc6001OybccEGKIIqFHU","callID":"call_conduit_1"}}}
+
+data: {"id":"evt_1195b2018001faB7qpTsmJIPOE","type":"permission.replied","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","requestID":"per_1195b1fc1001hVuStfUdg47luK","reply":"once"}}
+
+data: {"id":"evt_1195b201a001XhpYdToiDklwN9","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"type":"tool","tool":"bash","callID":"call_conduit_1","state":{"metadata":{"output":""},"status":"running","input":{"command":"echo conduit-live","description":"Print a marker"},"time":{"start":1791426764698}},"id":"prt_1195b1f920018KzJyUcka1I5ua","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","messageID":"msg_1195b1dc6001OybccEGKIIqFHU"},"time":1791426764826}}
+
+data: {"id":"evt_1195b202b001hrm0uQyx6mjrWg","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"type":"tool","tool":"bash","callID":"call_conduit_1","state":{"metadata":{"output":"conduit-live\n"},"status":"running","input":{"command":"echo conduit-live","description":"Print a marker"},"time":{"start":1791426764698}},"id":"prt_1195b1f920018KzJyUcka1I5ua","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","messageID":"msg_1195b1dc6001OybccEGKIIqFHU"},"time":1791426764843}}
+
+data: {"id":"evt_1195b202f001OOFUoW9UfzLNIP","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"type":"tool","tool":"bash","callID":"call_conduit_1","state":{"status":"completed","input":{"command":"echo conduit-live","description":"Print a marker"},"output":"conduit-live\n","metadata":{"output":"conduit-live\n","exit":0,"truncated":false},"title":"echo conduit-live","time":{"start":1791426764698,"end":1791426764847}},"id":"prt_1195b1f920018KzJyUcka1I5ua","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","messageID":"msg_1195b1dc6001OybccEGKIIqFHU"},"time":1791426764847}}
+
+data: {"id":"evt_1195b2032001IwOB01uIRFg4bN","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"id":"prt_1195b2032001ewqac5fleCpOyl","reason":"tool-calls","messageID":"msg_1195b1dc6001OybccEGKIIqFHU","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","type":"step-finish","tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0},"time":1791426764850}}
+
+data: {"id":"evt_1195b2034001Nzq38hBAg409OV","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"msg_1195b1dc6001OybccEGKIIqFHU","parentID":"msg_1195b1c09001ua1p9f6N4ne6wM","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791426764230,"completed":1791426764855},"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","finish":"tool-calls"}}}
+
+data: {"id":"evt_1195b2037001wdu23jnunktf9K","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"msg_1195b1dc6001OybccEGKIIqFHU","parentID":"msg_1195b1c09001ua1p9f6N4ne6wM","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791426764230,"completed":1791426764855},"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","finish":"tool-calls"}}}
+
+data: {"id":"evt_1195b2039001z7BWDcWEq631UZ","type":"session.status","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","status":{"type":"busy"}}}
+
+data: {"id":"evt_1195b203b001XLmoHemuwe3QVW","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"msg_1195b203a001DJLZM7q4y1iEAs","parentID":"msg_1195b1c09001ua1p9f6N4ne6wM","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791426764858},"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd"}}}
+
+data: {"id":"evt_1195b20490016Q0Bzj5urK2afJ","type":"session.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"ses_ee6a4e41affeQFeE4NibVv28Gd","slug":"curious-harbor","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"Conduit live check","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791426763749,"updated":1791426764872}}}}
+
+data: {"id":"evt_1195b204b001hXnb0OlRg6WYXZ","type":"session.diff","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","diff":[]}}
+
+data: {"id":"evt_1195b204c001Z5kx0RO1Eh2u4Y","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"role":"user","time":{"created":1791426763785},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"},"summary":{"diffs":[]},"id":"msg_1195b1c09001ua1p9f6N4ne6wM","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd"}}}
+
+data: {"id":"evt_1195b204f001CUxOnnAGL3qomN","type":"session.status","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","status":{"type":"busy"}}}
+
+data: {"id":"evt_1195b205d001Xh4at84JcD7zxa","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"id":"prt_1195b205d001f8kxpVu1KD3qam","messageID":"msg_1195b203a001DJLZM7q4y1iEAs","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","type":"step-start"},"time":1791426764893}}
+
+data: {"id":"evt_1195b205f001PM6ViICFxb9DUY","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"id":"prt_1195b205f001w8C1nKr5Kbw5U6","messageID":"msg_1195b203a001DJLZM7q4y1iEAs","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","type":"text","text":"","time":{"start":1791426764895}},"time":1791426764895}}
+
+data: {"id":"evt_1195b2061001i4mA9w7Xa1uSeH","type":"message.part.delta","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","messageID":"msg_1195b203a001DJLZM7q4y1iEAs","partID":"prt_1195b205f001w8C1nKr5Kbw5U6","field":"text","delta":"All done."}}
+
+data: {"id":"evt_1195b2062001f2UecN1jmeQvth","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"id":"prt_1195b205f001w8C1nKr5Kbw5U6","messageID":"msg_1195b203a001DJLZM7q4y1iEAs","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","type":"text","text":"All done.","time":{"start":1791426764895,"end":1791426764898}},"time":1791426764898}}
+
+data: {"id":"evt_1195b2065001KrJXoFiZ31XXek","type":"message.part.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","part":{"id":"prt_1195b2065001ljhNULoEpN9ZS3","reason":"stop","messageID":"msg_1195b203a001DJLZM7q4y1iEAs","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","type":"step-finish","tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0},"time":1791426764901}}
+
+data: {"id":"evt_1195b2068001vG21JcBJmCks4Y","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"msg_1195b203a001DJLZM7q4y1iEAs","parentID":"msg_1195b1c09001ua1p9f6N4ne6wM","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791426764858,"completed":1791426764906},"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","finish":"stop"}}}
+
+data: {"id":"evt_1195b206a001QFl2t0KunOFEJJ","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"msg_1195b203a001DJLZM7q4y1iEAs","parentID":"msg_1195b1c09001ua1p9f6N4ne6wM","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791426764858,"completed":1791426764906},"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","finish":"stop"}}}
+
+data: {"id":"evt_1195b206b001CwTtH4MwSAVR7j","type":"session.status","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","status":{"type":"busy"}}}
+
+data: {"id":"evt_1195b206d001E3r8iwPx5uzx8P","type":"session.status","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","status":{"type":"idle"}}}
+
+data: {"id":"evt_1195b206e001uI31V53dwZvNRB","type":"session.idle","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd"}}
+
+data: {"id":"evt_1195b206f001x5pUov4z5soUNz","type":"session.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"id":"ses_ee6a4e41affeQFeE4NibVv28Gd","slug":"curious-harbor","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"Conduit live check","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":2,"output":2,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791426763749,"updated":1791426764910}}}}
+
+data: {"id":"evt_1195b2070001rhRm1UM3DPt39g","type":"session.diff","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","diff":[]}}
+
+data: {"id":"evt_1195b20710019DhGlB0KWX2A4x","type":"message.updated","properties":{"sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd","info":{"role":"user","time":{"created":1791426763785},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"},"summary":{"diffs":[]},"id":"msg_1195b1c09001ua1p9f6N4ne6wM","sessionID":"ses_ee6a4e41affeQFeE4NibVv28Gd"}}}
+

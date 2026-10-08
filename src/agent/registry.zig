@@ -262,6 +262,19 @@ pub const Registry = struct {
         return &self.agents.items[index];
     }
 
+    /// Record what an agent's adapter can do now. A structured channel may
+    /// come up after registration (OpenCode's event stream, a Codex daemon
+    /// attach), and views offer answers only while it can take them.
+    /// Returns whether anything changed; an unknown or exited agent is left
+    /// alone.
+    pub fn setCapabilities(self: *Registry, id: AgentId, capabilities: adapter.Capabilities) bool {
+        const index = self.indexOf(id) orelse return false;
+        const agent = &self.agents.items[index];
+        if (agent.hasExited() or agent.capabilities == capabilities) return false;
+        agent.capabilities = capabilities;
+        return true;
+    }
+
     /// The live (not exited) agent bound to a session, if any.
     pub fn findBySession(self: *const Registry, key: WorkspaceKey, id: SessionId) ?AgentId {
         for (self.agents.items) |*agent| {
@@ -410,6 +423,19 @@ fn ownedRequest(key: WorkspaceKey, id: SessionId, seed: u8) CreateRequest {
         .ownership = .owned,
         .token = testToken(seed),
     };
+}
+
+test "capabilities follow the adapter until the agent exits" {
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    const id = try registry.create(ownedRequest(WorkspaceKey.fromOrdinal(0), SessionId.fromOrdinal(1), 1));
+    try testing.expect(!registry.get(id).?.capabilities.respond_permission);
+    try testing.expect(registry.setCapabilities(id, .{ .poll = true, .respond_permission = true }));
+    try testing.expect(registry.get(id).?.capabilities.respond_permission);
+    try testing.expect(!registry.setCapabilities(id, .{ .poll = true, .respond_permission = true }));
+    _ = try registry.apply(id, .{ .exited = .{ .code = 0 } });
+    try testing.expect(!registry.setCapabilities(id, .{}));
+    try testing.expect(registry.get(id).?.capabilities.respond_permission);
 }
 
 test "agents group by workspace under monotonic ids that are never reused" {
