@@ -168,8 +168,10 @@ terminal in an SSH workspace (there the local foreground is the SSH client). For
 is implemented for Linux and Windows; the macOS PTY backend reports nothing yet, so a harness
 started by hand there is not observed. On Windows it is proved on the hosted runner by
 `--agent-test` (a scripted fake started by hand through `cmd /c` in a tab) and by an npm-installed, unauthenticated
-Claude Code started as `claude` in a PowerShell tab, observed as `· claude idle` and marked done
-after Ctrl+C (`windows-claude-observe.sh`).
+Claude Code started as `claude` in a PowerShell tab, observed as `· claude idle` and marked
+`✓ claude done` once it leaves (`windows-claude-observe.sh`). On the runner Claude Code answers
+the first Ctrl+C with "Press Ctrl-C again to exit" but has not yet exited on the second one under
+ConPTY, so the check ends it with `taskkill` and reports that with a warning.
 
 The work is tracked as TASK-52 (adapter interface), TASK-53 to TASK-55 (Claude Code, Codex and Pi
 adapters), TASK-56 (notifications), TASK-57 (agent view), TASK-58 (agent manager), TASK-59 (prompt viewer and editor), TASK-60
