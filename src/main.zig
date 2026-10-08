@@ -106,6 +106,8 @@ const backlog = @import("backlog");
 const control_api = @import("control");
 /// The state model and file (TASK-65), and the instance token's directory.
 const state_mod = @import("state");
+/// The accessibility bridge over the semantic tree (TASK-68).
+const accessibility = @import("accessibility");
 const ssh = workspace.ssh;
 
 test {
@@ -490,11 +492,22 @@ pub const Run = struct {
     /// on the same window and prove what came back, then corrupt the file
     /// and write a newer version and prove the clean starts, then exit.
     restore_test: bool = false,
+    /// Exercise TASK-68's app wiring: a private D-Bus session bus and a
+    /// stand-in AT-SPI registry, the bridge publishing the live tree, a bus
+    /// client walking the sidebar, palette and settings, and `DoAction` on a
+    /// palette row running its command, then exit. Skipped (exit 0) without
+    /// `dbus-daemon`.
+    a11y_test: bool = false,
     /// The state file to save to and restore from instead of the platform
     /// one. Not a command-line flag: `runApp` sets it for `--restore-test`,
     /// the one check that persists. Every other check neither saves nor
     /// restores.
     state_path: ?[]const u8 = null,
+    /// The session bus the accessibility bridge connects to instead of
+    /// `DBUS_SESSION_BUS_ADDRESS`. Not a command-line flag: `runApp` sets it
+    /// for `--a11y-test`'s private bus. Every other check runs without the
+    /// bridge, so a check never appears on the person's accessibility bus.
+    a11y_bus_address: ?[]const u8 = null,
     /// Start the shell exactly as it would start without Conduit: no `--posix`,
     /// no `ENV`, no `ZDOTDIR` swap, and therefore no working-directory or prompt
     /// reports from Conduit's scripts. The settings file has no shell key yet, so
@@ -556,7 +569,7 @@ fn optionsForRun(options: Options) Options {
         !options.run.search_test and !options.run.menu_test and !options.run.config_test and
         !options.run.theme_test and !options.run.font_test and !options.run.settings_test and
         !options.run.git_test and !options.run.agent_test and !options.run.ssh_test and
-        !options.run.restore_test) return options;
+        !options.run.restore_test and !options.run.a11y_test) return options;
     var resolved = options;
     resolved.run.width = ui_test_width;
     resolved.run.height = ui_test_height;
@@ -567,7 +580,7 @@ fn optionsForRun(options: Options) Options {
     resolved.run.command = null;
     resolved.run.font_family = "";
     resolved.run.no_child = options.run.ui_test or options.run.driver_test or options.run.sidebar_test or
-        options.run.scratchpad_test or options.run.ssh_test;
+        options.run.scratchpad_test or options.run.ssh_test or options.run.a11y_test;
     return resolved;
 }
 
@@ -675,6 +688,8 @@ pub fn parseArgs(args: []const []const u8, env: EnvSource) ConfigError!Options {
             run.no_restore = true;
         } else if (std.mem.eql(u8, arg, "--restore-test")) {
             run.restore_test = true;
+        } else if (std.mem.eql(u8, arg, "--a11y-test")) {
+            run.a11y_test = true;
         } else if (namesValue(arg, "--scale")) {
             run.scale = try parseScale(try takeValue(arg, "--scale", args, &i));
         } else if (namesValue(arg, "--run-ms")) {
@@ -2242,7 +2257,7 @@ const idle_tick_ms: i32 = 16;
 /// not moving under them ask for none; PTY-facing checks ask for their own,
 /// because terminal input is only proved by what a program reads.
 fn wantsChild(options: Options) bool {
-    if (options.run.ui_test or options.run.sidebar_test or options.run.ssh_test) return false;
+    if (options.run.ui_test or options.run.sidebar_test or options.run.ssh_test or options.run.a11y_test) return false;
     if (options.run.restore_test) return true;
     if (options.run.clipboard_test or options.run.ime_test or options.run.tabs_test or
         options.run.panes_test or options.run.palette_test or options.run.workspaces_test or
@@ -2265,7 +2280,7 @@ fn usesDeterministicScratchpad(options: Options) bool {
         run.tabs_test or run.panes_test or run.scratchpad_test or run.palette_test or
         run.workspaces_test or run.links_test or run.search_test or run.menu_test or
         run.config_test or run.theme_test or run.font_test or run.settings_test or run.driver_test or run.git_test or
-        run.agent_test or run.ssh_test or run.restore_test;
+        run.agent_test or run.ssh_test or run.restore_test or run.a11y_test;
 }
 
 /// The two clipboards a user gesture reaches: the standard one (the copy and
@@ -3869,6 +3884,7 @@ test "only a plain run or the restore check persists, and checks never read a st
         .{ .panes_test = true },
         .{ .driver_test = true },
         .{ .ui_test = true },
+        .{ .a11y_test = true },
         .{ .command = "true" },
         .{ .test_driver_endpoint = "/tmp/driver.sock" },
     };
@@ -3883,7 +3899,7 @@ test "only a plain run or the restore check persists, and checks never read a st
     try testing.expectEqualStrings("/tmp/r/state.json", restore.path.?);
 }
 
-test "--no-restore and --restore-test parse, and the check runs fixed and isolated" {
+test "--no-restore, --restore-test and --a11y-test parse, and the checks run fixed and isolated" {
     const env = test_env{ .vars = &.{} };
     const parsed = try parseArgs(&.{ "conduit", "--no-restore", "--width=800" }, env.source());
     try std.testing.expect(parsed.run.no_restore);
@@ -3892,6 +3908,8 @@ test "--no-restore and --restore-test parse, and the check runs fixed and isolat
     const restore = optionsForRun(try parseArgs(&.{ "conduit", "--restore-test" }, env.source()));
     try std.testing.expect(restore.run.restore_test and restore.run.hidden and restore.run.width == ui_test_width);
     try std.testing.expect(wantsChild(restore) and usesDeterministicScratchpad(restore));
+    const a11y = optionsForRun(try parseArgs(&.{ "conduit", "--a11y-test" }, env.source()));
+    try std.testing.expect(a11y.run.a11y_test and a11y.run.no_child and !wantsChild(a11y));
 }
 
 /// Whether `path` is a directory in `context`.
@@ -5577,6 +5595,9 @@ const App = struct {
     /// Workspace persistence (TASK-65): where state is saved, the debounce,
     /// the save worker. Main thread, apart from the worker's owned bytes.
     persistence: Persistence = .{},
+    /// The accessibility bridge (TASK-68), when this run exposes the tree.
+    /// Owned; released before the window.
+    a11y: ?*accessibility.Bridge = null,
     /// When `init` started, for the debug startup phase log (TASK-67), and
     /// which of the late phases have been logged.
     startup_ns: i128 = 0,
@@ -6495,6 +6516,7 @@ const App = struct {
             app.startChild();
         }
         app.startConfigWatcher();
+        app.startAccessibility(env, options, loaded_config.settings.accessibility_enabled);
         app.persistence.noteLayout(app.layoutFingerprint(), Io.Clock.awake.now(io).nanoseconds);
         // What was restored is what the file already says: no save is owed.
         app.persistence.markSaved();
@@ -6509,6 +6531,65 @@ const App = struct {
         var buffer: [96]u8 = undefined;
         const elapsed = Io.Clock.awake.now(self.io).nanoseconds - self.startup_ns;
         log.debug("{s}", .{startupPhaseLine(&buffer, phase, elapsed)});
+    }
+
+    // The accessibility bridge (TASK-68) --------------------------------------
+
+    /// The bridge's waker: post an event so a blocked loop iterates and
+    /// `pollAccessibility` takes the request. Called from the bridge worker.
+    fn accessibilityWake(context: ?*anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(context.?));
+        self.window.postDriverWake() catch |err| {
+            log.debug("could not wake the event loop for an accessibility request: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Start the bridge for an ordinary run on the session bus, or for
+    /// `--a11y-test` on its private bus. Every other check runs without it.
+    /// A bridge that cannot start costs accessibility, never the run.
+    fn startAccessibility(self: *App, env: EnvSource, options: Options, setting: bool) void {
+        const address = options.run.a11y_bus_address orelse address: {
+            if (usesDeterministicScratchpad(options) or options.run.test_driver_endpoint != null) return;
+            break :address env.get("DBUS_SESSION_BUS_ADDRESS");
+        };
+        self.a11y = accessibility.Bridge.init(self.allocator, self.io, .{
+            .enabled = setting,
+            .session_bus_address = address,
+            .application_name = app_name,
+            .version = version,
+            .waker = .{ .context = self, .wakeFn = accessibilityWake },
+        }) catch |err| {
+            log.warn("the accessibility bridge could not start: {s}", .{@errorName(err)});
+            return;
+        };
+        self.publishAccessibility();
+    }
+
+    /// Hand the composed tree to the bridge; a no-op when nothing changed.
+    fn publishAccessibility(self: *App) void {
+        const bridge = self.a11y orelse return;
+        if (self.ui_test != null) return;
+        bridge.publish(&self.ui_tree);
+    }
+
+    /// Perform the requests assistive technology queued: an activation is a
+    /// real click on the element, through SDL like any other, and a focus
+    /// request moves keyboard focus in the tree.
+    fn pollAccessibility(self: *App) bool {
+        const bridge = self.a11y orelse return false;
+        return bridge.drainRequests(self, handleAccessibilityRequest) != 0;
+    }
+
+    fn handleAccessibilityRequest(self: *App, request: *const accessibility.Request) void {
+        const id: ui.Id = .{ .value = request.id() };
+        switch (request.kind) {
+            .activate => self.postDriverClick(.{ .id = id }, .{}) catch |err| {
+                log.debug("an accessibility activation found no target: {s}", .{@errorName(err)});
+            },
+            .focus => if (self.activeUiTree().focus(id)) {
+                self.refreshActiveUi() catch |err| log.warn("focus from assistive technology was not drawn: {s}", .{@errorName(err)});
+            },
+        }
     }
 
     // Workspace persistence (TASK-65) -----------------------------------------
@@ -8589,6 +8670,9 @@ const App = struct {
         // before anything below starts taking the workspaces apart.
         self.saveStateAtExit();
         self.persistence.deinit();
+        // No assistive technology may ask for anything while the tree goes.
+        if (self.a11y) |bridge| bridge.deinit();
+        self.a11y = null;
         // No control request may reach a workspace that is going away.
         self.stopControl();
         if (self.config_watcher) |watcher| watcher.stop();
@@ -14493,6 +14577,8 @@ const App = struct {
         }
         try self.ui_tree.endFrame();
         try self.ui_tree.render(&self.ui_canvas);
+        // Assistive technology reads the same tree the frame was drawn from.
+        self.publishAccessibility();
     }
 
     /// Make the readback buffer big enough for the current surface.
@@ -18920,6 +19006,7 @@ const App = struct {
         var changed = self.pollLoad();
         // A slot freed above starts the next restored shell at once.
         changed = self.driveRestoreQueues() or changed;
+        if (self.pollAccessibility()) changed = true;
         defer self.pollPersistence();
         if (self.config_watcher) |watcher| {
             if (watcher.takeChanged()) {
@@ -25918,6 +26005,169 @@ fn restoreTest(init: std.process.Init, env: EnvSource, window: *platform.Window,
 }
 
 // ---------------------------------------------------------------------------
+// --a11y-test (TASK-68)
+// ---------------------------------------------------------------------------
+
+fn a11yCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
+    out.print("a11y-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
+    out.flush() catch {};
+    if (!ok) failures.* += 1;
+}
+
+/// One loop iteration: an event, the loop's own polling and a frame.
+fn a11yStep(self: *App, io: Io, out: *Writer) !void {
+    if (self.window.pump(20)) |event| {
+        describeEvent(out, event) catch {};
+        _ = try self.handle(event);
+    }
+    if (self.outputReadable()) {
+        if (try self.drainChildren(io) != 0) self.scheduler.invalidate();
+    }
+    if (self.poll()) self.scheduler.invalidate();
+    if (self.scheduler.shouldDraw()) try self.drawFrame();
+}
+
+/// Walk the bridge's tree over the bus until `id` appears, running the app's
+/// loop in between so it can publish.
+fn a11yFind(self: *App, io: Io, out: *Writer, client: *accessibility.check.Client, id: []const u8) !?accessibility.check.Client.Found {
+    const deadline = Io.Clock.real.now(io).nanoseconds + 5000 * std.time.ns_per_ms;
+    while (true) {
+        // The tree may change under a walk (a row goes between two calls);
+        // that walk is simply tried again on the next frame.
+        if (client.find(id) catch null) |found| return found;
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) return null;
+        try a11yStep(self, io, out);
+    }
+}
+
+fn a11yRole(role: accessibility.atspi.Role) u32 {
+    return @intFromEnum(role);
+}
+
+/// TASK-68 in the running app: the live semantic tree reaches an assistive
+/// technology over AT-SPI, and its actions come back as real input.
+fn a11yTest(
+    self: *App,
+    io: Io,
+    gpa: Allocator,
+    out: *Writer,
+    bus: *accessibility.check.PrivateBus,
+    registry: *accessibility.check.FakeRegistry,
+) !u8 {
+    var failures: usize = 0;
+    try self.drawFrame();
+    const bridge = self.a11y orelse {
+        a11yCheck(out, &failures, false, "the app started an accessibility bridge", .{});
+        return 1;
+    };
+    a11yCheck(out, &failures, registry.waitEmbedded(5000), "the bridge found the accessibility bus and embedded itself in the registry", .{});
+    const deadline = Io.Clock.real.now(io).nanoseconds + 5000 * std.time.ns_per_ms;
+    while (bridge.currentStatus() == .starting and Io.Clock.real.now(io).nanoseconds < deadline) try a11yStep(self, io, out);
+    a11yCheck(out, &failures, bridge.currentStatus() == .connected, "the bridge is serving", .{});
+
+    var client: accessibility.check.Client = .{
+        .io = io,
+        .conn = try accessibility.dbus.Connection.open(gpa, bus.address(), 256 * 1024, 64 * 1024),
+        .app = registry.embeddedName(),
+    };
+    defer client.conn.close();
+    try client.connect();
+
+    // The sidebar: the workspace row, its tab and the palette hint.
+    const key = self.workspace_registry.activeKey() orelse return 1;
+    var ids: [2][workspace_semantic_capacity]u8 = undefined;
+    const workspace_row = try workspaceSemanticId(&ids[0], key);
+    const tab_row = try tabSemanticId(&ids[1], key, self.activeWorkspace().activeTabId() orelse return 1);
+    const expectations = [_]struct { id: []const u8, role: accessibility.atspi.Role }{
+        .{ .id = "sidebar", .role = .panel },
+        .{ .id = workspace_row, .role = .tree_item },
+        .{ .id = tab_row, .role = .page_tab },
+        .{ .id = "sidebar.palette", .role = .push_button },
+    };
+    for (expectations) |expected| {
+        const found = try a11yFind(self, io, out, &client, expected.id);
+        const label = if (self.ui_tree.byId(.{ .value = expected.id })) |element| element.label else "";
+        a11yCheck(out, &failures, found != null and found.?.role == a11yRole(expected.role) and std.mem.eql(u8, found.?.name(), label), "{s} is a {s} named '{s}'", .{ expected.id, expected.role.name(), label });
+    }
+
+    // The palette, opened by its chord.
+    _ = try paletteChord(self, io, out);
+    const dialog = try a11yFind(self, io, out, &client, "palette.dialog");
+    a11yCheck(out, &failures, dialog != null and dialog.?.role == a11yRole(.dialog), "the opened palette is a dialog", .{});
+    const query = try a11yFind(self, io, out, &client, "palette.query");
+    a11yCheck(out, &failures, query != null and query.?.role == a11yRole(.entry), "its query field is an entry", .{});
+    _ = try postPaletteText(self, io, out, "Settings");
+    const settings_index = definitionIndex(self, settings_open_action) orelse return 1;
+    var row_buffer: [palette_semantic_capacity]u8 = undefined;
+    const row_id = try std.fmt.bufPrint(&row_buffer, "palette.action.{d}", .{settings_index});
+    const row = try a11yFind(self, io, out, &client, row_id);
+    const row_label = if (self.ui_tree.byId(.{ .value = row_id })) |element| element.label else "";
+    a11yCheck(out, &failures, row != null and row.?.role == a11yRole(.list_item) and std.mem.eql(u8, row.?.name(), row_label), "the Settings command is a list item named '{s}'", .{row_label});
+
+    // DoAction on that row runs the command through a real click.
+    if (row) |found| {
+        a11yCheck(out, &failures, try client.doAction(found.path.slice()), "DoAction on the palette row was accepted", .{});
+        const settings = try a11yFind(self, io, out, &client, "settings.dialog");
+        a11yCheck(out, &failures, settings != null and settings.?.role == a11yRole(.dialog) and self.settingsVisible() and !self.paletteVisible(), "it ran Settings: the settings dialog opened and the palette closed", .{});
+    }
+
+    // The settings rows mirror the tree: headings and settings.
+    var heading_seen = false;
+    var rows_checked: usize = 0;
+    var rows_ok = true;
+    var focus_target: [settings_semantic_capacity]u8 = undefined;
+    var focus_target_len: usize = 0;
+    var row_ids: [6][settings_semantic_capacity]u8 = undefined;
+    var row_id_lens: [6]usize = undefined;
+    var row_count: usize = 0;
+    for (self.ui_tree.elements()) |element| {
+        const is_row = std.mem.startsWith(u8, element.id.value, "settings.row.") or std.mem.startsWith(u8, element.id.value, "settings.heading.");
+        if (!is_row or row_count == row_ids.len) continue;
+        if (element.id.value.len > settings_semantic_capacity) continue;
+        @memcpy(row_ids[row_count][0..element.id.value.len], element.id.value);
+        row_id_lens[row_count] = element.id.value.len;
+        row_count += 1;
+    }
+    for (row_ids[0..row_count], row_id_lens[0..row_count]) |*storage, len| {
+        const id = storage[0..len];
+        const element = self.ui_tree.byId(.{ .value = id }) orelse continue;
+        const found = try a11yFind(self, io, out, &client, id) orelse {
+            rows_ok = false;
+            continue;
+        };
+        rows_checked += 1;
+        if (!std.mem.eql(u8, found.name(), element.label)) rows_ok = false;
+        if (std.mem.eql(u8, element.role, "heading")) {
+            heading_seen = true;
+            if (found.role != a11yRole(.heading)) rows_ok = false;
+        } else if (focus_target_len == 0 and element.primitive.isInteractive() and !element.state.focused) {
+            @memcpy(focus_target[0..len], id);
+            focus_target_len = len;
+        }
+    }
+    a11yCheck(out, &failures, rows_checked >= 3 and rows_ok and heading_seen, "{d} settings rows, headings included, carry the tree's roles and labels", .{rows_checked});
+
+    // GrabFocus moves the tree's keyboard focus.
+    if (focus_target_len != 0) {
+        const target = focus_target[0..focus_target_len];
+        const found = try a11yFind(self, io, out, &client, target);
+        const accepted = if (found) |value| try client.grabFocus(value.path.slice()) else false;
+        const focus_deadline = Io.Clock.real.now(io).nanoseconds + 5000 * std.time.ns_per_ms;
+        while (Io.Clock.real.now(io).nanoseconds < focus_deadline) {
+            if (self.ui_tree.focusedElement()) |focused| if (std.mem.eql(u8, focused.id.value, target)) break;
+            try a11yStep(self, io, out);
+        }
+        const focused_now = if (self.ui_tree.focusedElement()) |focused| std.mem.eql(u8, focused.id.value, target) else false;
+        a11yCheck(out, &failures, accepted and focused_now, "GrabFocus on {s} moved keyboard focus there", .{target});
+    }
+    _ = try postNamedKey(self, io, out, .escape, .{});
+
+    out.print("a11y-test: {d} failure(s)\n", .{failures}) catch {};
+    out.flush() catch {};
+    return if (failures == 0) 0 else 1;
+}
+
+// ---------------------------------------------------------------------------
 // --ssh-test (TASK-43 part two, TASK-44, TASK-45)
 // ---------------------------------------------------------------------------
 
@@ -30064,7 +30314,7 @@ const usage =
     \\          [--ui-test] [--ime-test] [--sidebar-test] [--tabs-test]
     \\          [--panes-test] [--scratchpad-test] [--palette-test]
     \\          [--workspaces-test] [--links-test] [--search-test] [--git-test]
-    \\          [--ssh-test] [--control-test] [--restore-test]
+    \\          [--ssh-test] [--control-test] [--restore-test] [--a11y-test]
     \\          [--no-restore]
     \\          [--test-driver=<endpoint>]
     \\          [--test-artifact-dir=<dir>]
@@ -30088,6 +30338,8 @@ const usage =
     \\                                    workspaces; this run still saves its own
     \\  --restore-test                     save a layout, relaunch, prove it came
     \\                                    back, prove the clean starts, then exit
+    \\  --a11y-test                        walk the live tree over a private AT-SPI
+    \\                                    bus and activate a palette row, then exit
     \\  --log-level=<err|warn|info|debug>  minimum level written (default: debug
     \\                                    in a debug build, info in a release one)
     \\  --log-file=<path>                  log to exactly this path
@@ -30708,7 +30960,7 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
                 options.run.links_test or options.run.search_test or options.run.menu_test or
                 options.run.config_test or options.run.theme_test or options.run.font_test or options.run.settings_test or
                 options.run.git_test or options.run.agent_test or options.run.ssh_test or options.run.driver_test or
-                options.run.restore_test) return err;
+                options.run.restore_test or options.run.a11y_test) return err;
             var buffer: [256]u8 = undefined;
             log.warn(
                 "no usable display ({s}): there is no window to draw in. Set DISPLAY, or run under xvfb-run",
@@ -30787,6 +31039,30 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
         return status;
     }
 
+    // `--a11y-test` points the bridge at a private session bus with a
+    // stand-in AT-SPI registry, so nothing reaches the person's own bus. They
+    // are released after the app (and so after the bridge).
+    var a11y_bus: accessibility.check.PrivateBus = .{ .io = init.io };
+    var a11y_bus_started = false;
+    defer if (a11y_bus_started) a11y_bus.stop();
+    var a11y_registry: ?accessibility.check.FakeRegistry = null;
+    defer if (a11y_registry) |*registry| registry.shutdown();
+    if (options.run.a11y_test) {
+        if (builtin.os.tag != .linux or !try a11y_bus.start()) {
+            try out.writeAll("a11y-test: skipped: dbus-daemon is not installed\n");
+            out_file.interface.flush() catch {};
+            return 0;
+        }
+        a11y_bus_started = true;
+        a11y_registry = .{
+            .io = init.io,
+            .conn = try accessibility.dbus.Connection.open(init.gpa, a11y_bus.address(), 64 * 1024, 64 * 1024),
+            .bus_address = a11y_bus.address(),
+        };
+        try a11y_registry.?.serve();
+        options.run.a11y_bus_address = a11y_bus.address();
+    }
+
     const app = try App.init(init.io, env, init.gpa, &window, options);
     defer app.destroy();
     try app.syncTextInput();
@@ -30796,7 +31072,9 @@ fn runApp(init: std.process.Init, initial_options: Options) !u8 {
     // A check's status is the run's status: `--scroll-test` and `--mouse-test`
     // exit non-zero when a check failed, which is what a test script reads.
     var check_status: u8 = 0;
-    if (options.run.driver_test) {
+    if (options.run.a11y_test) {
+        check_status = try a11yTest(app, init.io, init.gpa, out, &a11y_bus, &a11y_registry.?);
+    } else if (options.run.driver_test) {
         check_status = try driverTest(app, init.io, out, options.run.test_driver_endpoint.?);
     } else if (options.run.self_test) {
         try selfTest(app, init.io, out);

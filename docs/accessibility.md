@@ -44,9 +44,9 @@ Linux (AT-SPI2 over D-Bus) is implemented in `src/accessibility.zig` and
 
 ### The setting
 
-The bridge takes `Options.enabled`. The intended settings key is `accessibility.enabled`
-(boolean, default `true`); `config.zig` does not define it yet, so the app passes `true` until
-it does. Setting it to `false` starts no thread and no bus connection.
+The bridge takes `Options.enabled` from the settings key `accessibility.enabled` (boolean,
+default `true`, read at startup; [config.md](config.md)). Setting it to `false` starts no thread
+and no bus connection.
 
 ## What is exposed on Linux
 
@@ -117,26 +117,30 @@ When a new snapshot differs from the previous one the worker emits
 The new snapshot becomes current before its events are sent, so an AT that reacts to an event
 reads the state it describes.
 
-## App wiring
+## In the app
 
-`app` owns the bridge; three calls connect it (TASK-68 left `main.zig` to its owner):
+`app` owns the bridge (`App.a11y`). It starts after the window exists, on an ordinary run, with
+`DBUS_SESSION_BUS_ADDRESS` from the environment, `accessibility.enabled` from the settings, the
+product name and stamped version, and a waker that posts a driver wake so a blocked event loop
+iterates. Built-in checks and driven (`--test-driver`) runs start no bridge, so automation never
+appears on the person's accessibility bus; `--a11y-test` is the one check that does, on a private
+bus. Every UI composition publishes the semantic tree right after `endFrame`
+(`composeUiTree`); an unchanged tree costs a copy and a fingerprint compare and hands nothing to
+the worker. Each loop iteration drains queued requests in `poll`: `activate` becomes
+`postDriverClick(.{ .id = .{ .value = id } }, .{})`, the same SDL press and release a mouse
+click produces, so palette rows, sidebar rows, context-menu rows and dialog controls behave
+exactly as when clicked; `focus` becomes `ui_tree.focus(id)` followed by a redraw. `deinit`
+stops the bridge before anything else is taken apart and before the window goes.
 
-```zig
-// App.init, after the window exists:
-self.a11y = accessibility.Bridge.init(allocator, io, .{
-    .session_bus_address = env.get("DBUS_SESSION_BUS_ADDRESS"),
-    .version = version.version,
-    .waker = .{ .context = window, .wakeFn = wakeForAccessibility }, // calls postDriverWake
-}) catch null;
-// After each frame's tree is complete (composeUiTree, after endFrame):
-if (self.a11y) |bridge| bridge.publish(self.activeUiTree());
-// On every loop tick, next to pollDriverPending:
-if (self.a11y) |bridge| _ = bridge.drainRequests(self, App.handleAccessibilityRequest);
-```
-
-`handleAccessibilityRequest` performs `activate` as `postDriverClick(.{ .id = .{ .value = id } }, .{})`
-(the same SDL press/release a mouse click produces) and `focus` as `ui_tree.focus(id)` followed by
-a redraw; `deinit` calls `bridge.deinit()` before the window goes.
+The deterministic Linux `--a11y-test` starts a private `dbus-daemon` and the stand-in
+`org.a11y.Bus` and registry (`accessibility.check`, the same pieces the module's integration test
+uses), starts the app with the bridge pointed at that bus, and from a bus client walks the live
+tree: the sidebar (`sidebar` panel, the workspace row as a tree item, its tab as a page tab, the
+`Palette` hint as a button) with the tree's labels; the palette opened by its real chord (dialog,
+entry, the Settings command as a list item); `DoAction` on that row, which must run Settings
+through a real click (the settings dialog opens and the palette closes); six settings rows,
+headings included, with the tree's roles and labels; and `GrabFocus` on a setting, which must
+move the tree's keyboard focus there. It is skipped (exit 0) when `dbus-daemon` is not installed.
 
 ## Inspecting it
 

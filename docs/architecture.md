@@ -528,6 +528,11 @@ nothing else is a legal dependency.
   dropped), encodes on the owner thread and writes through `state.save` on a `SaveJob` worker with
   the owned bytes; `waitBudget` wakes the loop when a save falls due. `deinit` joins any save in
   flight and saves once more before tearing anything down.
+- **Accessibility (TASK-68).** `App.a11y` is the `accessibility.Bridge`, started after the window
+  with `DBUS_SESSION_BUS_ADDRESS` (or `--a11y-test`'s private bus), `accessibility.enabled`, and a
+  waker that posts a driver wake; checks and driven runs start none. `composeUiTree` publishes the
+  tree after `endFrame`; `poll` drains requests, performing `activate` as a real
+  `postDriverClick` on the element and `focus` as `ui_tree.focus`. `deinit` stops it first.
 - **Startup (TASK-67 follow-ups).** A `Load` job is given the window and posts a driver wake once
   its result is published, so a finished spawn or face is collected at once rather than at the next
   16 ms idle tick. The glyph atlas is 2048² from display scale 1.5 (`atlasSizeFor`; the request a
@@ -537,7 +542,7 @@ nothing else is a legal dependency.
 - **Never** duplicate workspace/session/tab/pane records or semantic element state, implement
   behaviour owned by a lower module, call SDL, GL or an OS syscall directly, or hold state another
   module owns. Product views are compositions of model data and the four `ui` primitives.
-- **May depend on** `agent`, `backlog`, `config`, `control`, `font`, `input`, `link`, `palette`, `platform`, `pty`,
+- **May depend on** `accessibility`, `agent`, `backlog`, `config`, `control`, `font`, `input`, `link`, `palette`, `platform`, `pty`,
   `render`, `session`, `state`, `term`, `testdriver`, `theme`, `ui`, and `workspace` — every other Conduit
   module.
 - **Root** `src/main.zig` — this module *is* the executable's root module, so there is no
@@ -874,9 +879,12 @@ nothing else is a legal dependency.
   tree, not a second model, invariant 3), run an AT request anywhere but the owner's loop, expose
   terminal contents or input text, or fail start-up because no bus exists: without a session bus,
   an accessibility bus or the setting, the bridge is `off` and `publish` is a no-op.
-- **May depend on** `ui` and no other Conduit module. `app` imports it.
-- **Lands** M8 — TASK-68 (Linux AT-SPI2; the macOS NSAccessibility and Windows UI Automation
-  plans are in `docs/accessibility.md`).
+- **May depend on** `ui` and no other Conduit module. `app` imports it and owns the one bridge
+  (see `app`). `accessibility.check` is test support only: a private `dbus-daemon`, a stand-in
+  AT-SPI bus launcher and registry, and a bus client, shared by the module's integration test and
+  the app's `--a11y-test`.
+- **Lands** M8 — TASK-68 (Linux AT-SPI2 and the app wiring; the macOS NSAccessibility and Windows
+  UI Automation plans are in `docs/accessibility.md`).
 
 ### `workspace`
 
