@@ -105,3 +105,11 @@ height="$(sips -g pixelHeight "$out/retina-2x.png" | awk '/pixelHeight/ {print $
 [ "$width" = 1280 ] && [ "$height" = 720 ] || fail "the 2x frame is ${width}x${height}, expected 1280x720"
 grep -E "window conduit|physical pixels per logical|window geometry|now drawing|drawing with" "$out/retina-app.log" | sed 's/^/INFO /' || true
 pass "a 640x360 window at scale 2 produced a 1280x720 frame ($out/retina-2x.png)"
+
+# SDL's default Window menu gives Close Command+W; Conduit must have taken it off
+# so Command+W is only tab.close.
+menu="$(grep -o "released Command+W from [0-9]* Close menu item(s)" "$out/retina-app.log" | head -n 1 || true)"
+case "$menu" in
+  "released Command+W from 0 "*|"") fail "the app did not release Command+W from SDL's Close menu item ('$menu')" ;;
+  *) pass "the app $menu" ;;
+esac

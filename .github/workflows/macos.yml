@@ -134,12 +134,17 @@ jobs:
         shell: bash
         run: zig build -Doptimize="$OPTIMIZE" -Dversion="$CONDUIT_VERSION"
 
+      # `--clipboard-test` is not here: it pins SDL's offscreen driver, which
+      # has no OpenGL on macOS (SDL_CreateWindow: "Could not initialize OpenGL
+      # / GLES library"), and it never touches the system pasteboard anyway.
+      # The system clipboard step below is the macOS proof.
       - name: Built-in checks (required)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         run: |
           bash .github/scripts/macos-builtin-checks.sh ./zig-out/bin/conduit "$ARTIFACT_ROOT/builtin" \
-            --self-test --grid-test --ui-test --driver-test --clipboard-test
+            --self-test --grid-test --ui-test --driver-test --scroll-test --mouse-test --ime-test \
+            --sidebar-test --scratchpad-test --links-test --menu-test --theme-test --font-test
 
       - name: Build Conduit.app
         id: bundle
@@ -171,6 +176,17 @@ jobs:
             "$ARTIFACT_ROOT/fonts" \
             "DejaVu Sans Mono=$HOME/Library/Fonts" \
             "Menlo=/System/Library/Fonts"
+
+      # Real keystrokes through the HID event tap. Not gating: it depends on
+      # the runner image granting Accessibility to the posting process, which
+      # GitHub does not document; the step's output says whether it could.
+      - name: Option key with real keystrokes (TASK-48 AC3)
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash .github/scripts/macos-option-check.sh "$PWD/zig-out/Conduit.app/Contents/MacOS/conduit" \
+            "$PWD/zig-out/bin/conduit-test" "$ARTIFACT_ROOT/option"
 
       # Placeholder until the project has Apple credentials: every secret is
       # optional, and with none of them the import is skipped and the dmg step
@@ -205,17 +221,17 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # Every other built-in check, reported but not gating: they were written
-      # and proved on Linux, and this is their first macOS run.
+      # The built-in checks that failed on their first macOS run (most compare
+      # a spawned child's cwd with the one it was given, and /tmp is
+      # /private/tmp on macOS; see the TASK-48 notes). Reported, not gating.
       - name: Built-in checks (survey)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         continue-on-error: true
         shell: bash
         run: |
           bash .github/scripts/macos-builtin-checks.sh ./zig-out/bin/conduit "$ARTIFACT_ROOT/survey" \
-            --scroll-test --mouse-test --ime-test --sidebar-test --tabs-test --panes-test \
-            --palette-test --scratchpad-test --workspaces-test --links-test --search-test \
-            --menu-test --config-test --theme-test --font-test --settings-test
+            --tabs-test --panes-test --palette-test --workspaces-test --search-test \
+            --config-test --settings-test
 
       - name: Unit tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
