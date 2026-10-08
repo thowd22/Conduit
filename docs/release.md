@@ -251,7 +251,10 @@ has an interactive desktop in which SDL creates real Win32 windows, it:
    only, and a negative control), `windows-dpi-check.sh` (a real scale change
    through `windows-set-dpi.ps1` while a window is open), the built-in checks,
    and `zig build test`, whose WSL tests use a real distribution if the image
-   has one and a scripted `wsl.exe` stand-in otherwise.
+   has one and a scripted `wsl.exe` stand-in otherwise. The workflow makes one
+   bounded attempt (`wsl --install -d Ubuntu --no-launch --web-download`); on
+   `windows-latest` it succeeds and Ubuntu runs under WSL2, so the WSL context
+   tests run against a real distribution there.
 
 The built-in checks that pass on Windows gate the job: `--self-test`,
 `--grid-test`, `--ui-test`, `--driver-test`, `--scroll-test`, `--mouse-test`,

@@ -544,10 +544,12 @@ llvmpipe standing in for a display driver): cmd.exe and PowerShell 7 typed into 
 1 and 1.5, Unicode text input, Ctrl+Shift+V from and Ctrl+Shift+C to the Windows clipboard,
 Consolas, Cascadia Mono and a per-user DejaVu Sans Mono found through DirectWrite, a live change
 of the display scale from 100% to 125% re-rendering the open window at 800x450, the portable zip,
-and the built-in checks listed in `docs/release.md`. The WSL context was proved against a scripted
-`wsl.exe` stand-in, because the runner cannot install a distribution; the palette entry that
-opens a WSL workspace is not wired yet. Not verified: a real GPU driver, a second monitor, IME
-composition with a real input method, and a real WSL distribution.
+and the built-in checks listed in `docs/release.md`. The WSL context was proved against a real
+Ubuntu (WSL2) the workflow installs on the runner, and against a scripted `wsl.exe` stand-in:
+commands, file reads and atomic writes, a directory watch, three concurrent sessions in their own
+directories inside the distribution, and path translation that agrees with the distribution's
+`wslpath`. The palette entry that opens a WSL workspace is not wired into the app yet. Not
+verified: a real GPU driver, a second monitor, and IME composition with a real input method.
 
 ## Configuration file
 
