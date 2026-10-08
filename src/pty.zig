@@ -4188,11 +4188,14 @@ test "writing to a Windows terminal whose child has ended is Closed, not a syste
     defer pty.destroy();
 
     try testing.expectEqual(ChildState{ .exited = .{ .code = 0 } }, try waitForExit(pty));
-    // The pipe can still take one buffered write before its reader is gone; a few more
-    // must reach the closed end, and every failure must be `Closed`.
-    var attempts: usize = 0;
-    while (attempts < 64) : (attempts += 1) {
-        _ = pty.write("x\r") catch |err| {
+    // The console host that reads the input pipe can outlive the exit by a moment, and the pipe
+    // buffers a few KiB meanwhile, so tiny writes may keep succeeding for a while (a 64-write
+    // loop was flaky on windows-latest). Keep writing whole buffers until the end is closed,
+    // bounded by the test deadline; every failure must be `Closed`.
+    const chunk = [_]u8{'x'} ** 4096;
+    const deadline = testDeadline();
+    while (monotonicMillis() < deadline) {
+        _ = pty.write(&chunk) catch |err| {
             try testing.expectEqual(error.Closed, err);
             return;
         };
