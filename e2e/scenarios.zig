@@ -650,6 +650,79 @@ const control_api_command =
 const control_api_tab_id = "workspace.1.tab.2";
 const control_api_split_id = "workspace.1.pane.3";
 
+// TASK-79: a stand-in `codium` in the run's private TMPDIR that records its
+// argv and, on a first launch, maps a real X client window whose title
+// carries the marker Conduit seeded into the user-data-dir, so the X11
+// hosting path runs for real. `editor.command` names it through the run's
+// isolated settings file, which the app's watcher reloads. The screen is
+// cleared and `/tmp` claimed with OSC 7 before the relative file reference
+// is printed at row 0, so its link id matches `terminal-file-reference`'s.
+const editor_pane_command =
+    \\d="${TMPDIR:-/tmp}/conduit-e2e-editor"; mkdir -p "$d/proj" || exit 1
+    \\printf '%s\n' one two three four five six > "$d/proj/notes.txt"
+    \\printf '%s\n' '#!/bin/sh' \
+    \\  '[ "$1" = --version ] && { echo 1.95.3; exit 0; }' \
+    \\  'echo "$*" >> "$(dirname "$0")/codium.log"' \
+    \\  '[ "$1" = --new-window ] && { m=$(grep -o "conduit-editor-[0-9a-f]*" "$3/User/settings.json"); setsid xlogo -title "stand-in $m" </dev/null >/dev/null 2>&1 & }' \
+    \\  'exit 0' > "$d/codium"
+    \\chmod 700 "$d/codium"
+    \\c="${XDG_CONFIG_HOME:-$HOME/.config}/conduit"; mkdir -p "$c"
+    \\printf 'editor.command = %s\n' "$d/codium" > "$c/config"
+    \\cd /tmp || exit 1
+    \\printf '\033[2J\033[H\033]7;file://localhost/tmp\007%s\n' './cdt-e2e.txt:3'
+    \\x=$(dirname "$(readlink /proc/$PPID/exe)"); PATH="$x:$PATH"; PS1='CONDUIT_E2E> '; ENV=/dev/null
+    \\export d PATH PS1 ENV; exec /bin/sh -i
+;
+
+// Pane 1 is the first terminal; each new editor pane takes the next id.
+const editor_pane_first = "workspace.1.pane.2.editor";
+const editor_pane_menu = "workspace.1.pane.3.editor";
+const editor_pane_palette = "workspace.1.pane.4.editor";
+
+const editor_pane_steps = [_]Step{
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    // The API: retried while the settings reload finds the stand-in, then
+    // a new pane beside the terminal that hosts the stand-in's window.
+    .{ .type_text = "until conduit control editor.open \"{\\\"path\\\":\\\"$d/proj/notes.txt\\\",\\\"line\\\":2}\" >/dev/null 2>&1; do sleep 0.2; done; printf 'OPEN_%s\\n' OK" },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = "OPEN_OK", .timeout_ms = 10_000 } },
+    .{ .wait_element = .{ .id = editor_pane_first, .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "editor.placeholder", .state = "exists", .equals = false } },
+    .screenshot,
+    // A second request reuses the pane: no third pane appears.
+    .{ .type_text = "conduit control editor.goto \"{\\\"path\\\":\\\"$d/proj/notes.txt\\\",\\\"line\\\":5}\" >/dev/null && printf 'GOTO_%s\\n' OK" },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = "GOTO_OK" } },
+    .{ .wait_element = .{ .id = "workspace.1.pane.3", .state = "exists", .equals = false } },
+    // The pane's close control (mouse).
+    .{ .click = editor_pane_first ++ ".close" },
+    .{ .wait_element = .{ .id = editor_pane_first, .state = "exists", .equals = false } },
+    // The context menu over the printed `path:line` (mouse).
+    .{ .wait_element = .{ .id = editor_pane_link, .state = "exists", .equals = true } },
+    .{ .right_click = editor_pane_link },
+    .{ .wait_element = .{ .id = "context-menu.open-in-editor", .state = "exists", .equals = true } },
+    .{ .click = "context-menu.open-in-editor" },
+    .{ .wait_element = .{ .id = editor_pane_menu, .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "editor.placeholder", .state = "exists", .equals = false } },
+    // Escape over the focused editor pane gives the space back.
+    .{ .key = "ESCAPE" },
+    .{ .wait_element = .{ .id = editor_pane_menu, .state = "exists", .equals = false } },
+    // The palette (keyboard): a path relative to the terminal's OSC 7 cwd.
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "exists", .equals = true } },
+    .{ .type_text = "Editor: open file" },
+    .{ .key = "ENTER" },
+    .{ .type_text = "cdt-e2e.txt:2" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = editor_pane_palette, .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = "editor.placeholder", .state = "exists", .equals = false } },
+    .screenshot,
+};
+
+// The same derivation as `terminal_file_reference_id`: the same text at row
+// 0, column 0 of the first terminal, with `/tmp` as its cwd.
+const editor_pane_link = terminal_file_reference_id;
+
 const control_api_steps = [_]Step{
     .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
     .{ .type_text = "conduit control tab.open '{\"title\":\"api\"}'" },
@@ -857,7 +930,45 @@ pub const all = [_]Scenario{
         .command = deterministic_shell,
         .steps = &profile_tab_steps,
     },
+    .{
+        .name = "editor-pane",
+        .command = editor_pane_command,
+        .steps = &editor_pane_steps,
+    },
 };
+
+test "the editor pane scenario opens by API, context menu and palette and closes by click and Escape" {
+    const scenario = all[21];
+    try std.testing.expectEqualStrings("editor-pane", scenario.name);
+    try std.testing.expectEqual(@as(usize, 22), all.len);
+    var api = false;
+    var goto = false;
+    var menu = false;
+    var palette = false;
+    var clicked_close = false;
+    var escaped = false;
+    for (scenario.steps) |step| switch (step) {
+        .type_text => |text| {
+            if (std.mem.indexOf(u8, text, "conduit control editor.open") != null) api = true;
+            if (std.mem.indexOf(u8, text, "conduit control editor.goto") != null) goto = true;
+            if (std.mem.eql(u8, text, "Editor: open file")) palette = true;
+        },
+        .click => |id| {
+            if (std.mem.eql(u8, id, "context-menu.open-in-editor")) menu = true;
+            if (std.mem.eql(u8, id, editor_pane_first ++ ".close")) clicked_close = true;
+        },
+        .key => |key| if (std.mem.eql(u8, key, "ESCAPE")) {
+            escaped = true;
+        },
+        // The asserted markers are spelled whole only by the shell's printf.
+        .wait_terminal_text => |wait| for (scenario.steps) |other| switch (other) {
+            .type_text => |text| try std.testing.expect(std.mem.indexOf(u8, text, wait.contains) == null),
+            else => {},
+        },
+        else => {},
+    };
+    try std.testing.expect(api and goto and menu and palette and clicked_close and escaped);
+}
 
 test "the profile tab scenario opens the chooser by keyboard and clicks the built-in row" {
     const scenario = all[20];
@@ -884,7 +995,7 @@ test "the profile tab scenario opens the chooser by keyboard and clicks the buil
 test "the agent prompts scenario opens the view from the palette and edits CLAUDE.md by a click" {
     const scenario = all[19];
     try std.testing.expectEqualStrings("agent-prompts", scenario.name);
-    try std.testing.expectEqual(@as(usize, 21), all.len);
+    try std.testing.expectEqual(@as(usize, 22), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
     var opened = false;
     var clicked = false;
@@ -911,7 +1022,7 @@ test "the agent prompts scenario opens the view from the palette and edits CLAUD
 test "the control API scenario opens a tab and a pane from the terminal, then switches by mouse" {
     const scenario = all[18];
     try std.testing.expectEqualStrings("control-api", scenario.name);
-    try std.testing.expectEqual(@as(usize, 21), all.len);
+    try std.testing.expectEqual(@as(usize, 22), all.len);
     var opened = false;
     var split = false;
     var clicked = false;
@@ -931,7 +1042,7 @@ test "the control API scenario opens a tab and a pane from the terminal, then sw
 test "the backlog scenario opens the view by chord, a card by click, and moves the task" {
     const scenario = all[17];
     try std.testing.expectEqualStrings("backlog-board", scenario.name);
-    try std.testing.expectEqual(@as(usize, 21), all.len);
+    try std.testing.expectEqual(@as(usize, 22), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_BACKLOG_CLI", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -956,7 +1067,7 @@ test "the backlog scenario opens the view by chord, a card by click, and moves t
 test "the agent manager scenario opens the manager by chord and focuses by a click" {
     const scenario = all[16];
     try std.testing.expectEqualStrings("agent-manager", scenario.name);
-    try std.testing.expectEqual(@as(usize, 21), all.len);
+    try std.testing.expectEqual(@as(usize, 22), all.len);
     try std.testing.expectEqualStrings("CONDUIT_TEST_FAKE_AGENT", scenario.launch_env[0].name);
     var chord = false;
     var clicked = false;
@@ -979,7 +1090,7 @@ test "the agent manager scenario opens the manager by chord and focuses by a cli
 test "the agent view scenario opens the view by chord and answers by a click" {
     const scenario = all[15];
     try std.testing.expectEqualStrings("agent-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 21), all.len);
+    try std.testing.expectEqual(@as(usize, 22), all.len);
     var chords: usize = 0;
     var clicked = false;
     var outcome = false;
@@ -1247,7 +1358,7 @@ test "picker scenarios drive both pickers by keyboard and by a clicked choice ro
 test "settings view scenario opens by keyboard and by the sidebar hint and clicks a bool row" {
     const scenario = all[12];
     try std.testing.expectEqualStrings("settings-view", scenario.name);
-    try std.testing.expectEqual(@as(usize, 21), all.len);
+    try std.testing.expectEqual(@as(usize, 22), all.len);
     var saw_dialog = false;
     var saw_down = false;
     var saw_escape = false;

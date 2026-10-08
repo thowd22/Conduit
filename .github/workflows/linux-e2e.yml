@@ -53,6 +53,7 @@ jobs:
             jq \
             xclip \
             x11-utils \
+            x11-apps \
             desktop-file-utils \
             fonts-noto-color-emoji \
             fonts-noto-cjk \
@@ -172,6 +173,7 @@ jobs:
             --agent-manager-test
             --backlog-test
             --control-test
+            --editor-test
             --restore-test
             --a11y-test
             --agent-prompts-test

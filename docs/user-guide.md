@@ -225,6 +225,34 @@ Hold Ctrl (Cmd on macOS) over terminal text to underline what Conduit recognises
 
 The context menu's **open link** does the same for the link under the pointer.
 
+## Editor pane (VSCodium)
+
+When VSCodium is installed, a file can open in an editor pane split beside the terminal instead
+of `vi` in a new tab. Conduit never installs VSCodium: it looks for `codium` on `PATH` (or the
+command named by the `editor.command` setting, also in the settings view's Editor group) when a
+workspace opens and whenever that setting changes. Until it is found, the commands below are not
+offered, and a harness asking for the editor is told how to install it.
+
+- **Palette**: `Editor: open file…` asks for `path`, `path:line` or `path:line:col`; a relative
+  path is resolved against the directory the focused terminal reported.
+- **Context menu**: right-click a file reference and choose **open in editor**.
+- **Harnesses** use `conduit control editor.open` and friends (see `docs/agents.md`).
+
+A workspace has one editor pane: the first open splits the current pane (focus moves to the new
+pane), and later opens reuse it. The pane is a normal pane for Alt+Arrow focus, Ctrl+Alt+Arrow
+resize, Ctrl+Shift+Enter zoom and Ctrl+Shift+X close. Its top row shows `editor ─ <file>:<line>`
+and a clickable `× close`; Escape while the pane is focused, `× close` and `Editor: close` all
+close it and give the space back to the neighbouring pane. Keys typed while the pane itself is
+focused in Conduit do not reach any terminal.
+
+On X11 the VSCodium window is hosted inside the pane and follows it as it moves, resizes, zooms,
+or is hidden by another tab, workspace, the scratchpad or a dialog. On Wayland, macOS and Windows
+VSCodium stays in its own window and the pane says so. Conduit runs its own VSCodium instance per
+workspace with a separate `--user-data-dir` under Conduit's state directory, so your usual
+VSCodium windows and settings are untouched (your extensions are shared). In SSH workspaces
+`Editor: open file…` opens the file in `vi` in a new tab instead and says why. Quitting Conduit
+leaves a hosted editor window running on the desktop, so unsaved work is never lost.
+
 ## Search
 
 Ctrl+Shift+F (Cmd+F) opens a search field over the focused pane. Matches in the screen and the
@@ -245,7 +273,8 @@ remove Ctrl+Shift+F (Cmd+F), and the keys inside the field are not rebindable.
 Right-click a terminal pane, or press Shift+F10 to open the menu at the cursor. It offers, as they
 apply: **copy** (only with a selection), **paste**, **open link** (only over a link), **split
 right**, **split down** and **search**. Up/Down or Tab move, Enter chooses, Escape or a click
-outside closes.
+outside closes. Over a file reference in a workspace with VSCodium, **open in editor**
+follows **open link**.
 
 When a program has captured the mouse, a plain right click is sent to the program; Shift+right
 click still opens the menu. Setting `mouse.right_click = paste` (or starting with
@@ -718,7 +747,8 @@ Rename workspace (`workspace.rename`), Switch workspace (`workspace.switch`), Cl
 (`search.previous`), Search: Toggle case sensitivity (`search.toggle-case`), Search: Toggle regex
 (`search.toggle-regex`), Reload config (`config.reload`), Theme: choose (`theme.pick`), Font:
 Change Family (`font.pick`), Font: Toggle Ligatures (`font.ligatures.toggle`), Font: Toggle
-Built-in Symbols (`font.symbols.toggle`) and Font: Configure Fallbacks (`font.fallbacks`). An
+Built-in Symbols (`font.symbols.toggle`), Font: Configure Fallbacks (`font.fallbacks`), and,
+where VSCodium was found, Editor: open file… (`editor.open`) and Editor: close (`editor.close`). An
 argument-taking command needs its argument in a `keybind` line, for example
 `keybind = ctrl+alt+w=workspace.switch:work`.
 

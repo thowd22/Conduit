@@ -4347,6 +4347,15 @@ fn editorLocationFromText(text: []const u8) ?editor.Location {
     };
 }
 
+/// A closed editor window kept hidden in its container until it has gone.
+const RetiredEditorWindow = struct {
+    window: platform.EmbeddedWindow,
+    deadline_ns: i96,
+};
+/// How long a closed editor window may take to go before it is handed back
+/// to the desktop (an editor asking to save keeps its window).
+const editor_retire_timeout_ns: i96 = 10 * std.time.ns_per_s;
+
 /// Whether two placements differ, so the hosted window moves only when the
 /// pane did.
 fn pixelRectChanged(previous: ?platform.PixelRect, next: platform.PixelRect) bool {
@@ -6317,6 +6326,8 @@ const App = struct {
     editor_status_id_storage: [112]u8 = undefined,
     editor_close_id_storage: [112]u8 = undefined,
     editor_status_storage: [256]u8 = undefined,
+    /// Closed editor windows waiting, hidden, until their client has gone.
+    editor_retired: [4]?RetiredEditorWindow = @splat(null),
     scratchpad_ui_pointer_owned: bool = false,
     scratchpad_terminal_pointer_owned: bool = false,
     scratchpad_escape_owned: bool = false,
@@ -8564,16 +8575,48 @@ const App = struct {
         presentation.editor = null;
     }
 
-    /// Stop hosting the editor's window. With `close`, ask it to close first,
-    /// as its own close button would; a window that already went has nothing
-    /// to close, so that request's failure is only logged.
+    /// Stop hosting the editor's window. With `close`, ask it to close, as
+    /// its own close button would, and keep it hidden in its container until
+    /// it has gone (`pollRetiredEditors`): handed back to the desktop at once,
+    /// a closing window would still carry the marker the next launch looks
+    /// for. A window that already went has nothing to close, so that
+    /// request's failure is only logged.
     fn releaseEditorWindow(self: *App, state: *EditorPresentation, close: bool) void {
         if (state.embedded) |*embedded| {
-            if (close) self.window.closeEmbedded(embedded) catch |err| log.debug("the editor window took no close request: {s}", .{@errorName(err)});
-            self.window.unembed(embedded);
+            const retired = if (close) retire: {
+                self.window.closeEmbedded(embedded) catch |err| log.debug("the editor window took no close request: {s}", .{@errorName(err)});
+                self.window.showEmbedded(embedded, false) catch |err| log.debug("the closing editor window stayed shown: {s}", .{@errorName(err)});
+                for (&self.editor_retired) |*slot| {
+                    if (slot.* != null) continue;
+                    slot.* = .{ .window = embedded.*, .deadline_ns = Io.Clock.awake.now(self.io).nanoseconds + editor_retire_timeout_ns };
+                    break :retire true;
+                }
+                break :retire false;
+            } else false;
+            if (!retired) self.window.unembed(embedded);
         }
         state.embedded = null;
         state.last_rect = null;
+    }
+
+    /// Release closed editor windows once they have gone, or hand them back
+    /// to the desktop when they outlive the wait (an editor asking to save).
+    fn pollRetiredEditors(self: *App) void {
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        for (&self.editor_retired) |*slot| {
+            const retired = if (slot.*) |*value| value else continue;
+            const gone = if (self.window.moveEmbedded(&retired.window, .{ .x = 0, .y = 0, .width = 1, .height = 1 })) |_| false else |_| true;
+            if (!gone and now < retired.deadline_ns) continue;
+            self.window.unembed(&retired.window);
+            slot.* = null;
+        }
+    }
+
+    fn releaseRetiredEditors(self: *App) void {
+        for (&self.editor_retired) |*slot| {
+            if (slot.*) |*retired| self.window.unembed(&retired.window);
+            slot.* = null;
+        }
     }
 
     fn editorConfiguredCommand(self: *const App) []const u8 {
@@ -8683,6 +8726,7 @@ const App = struct {
             }
             if (state.session_id) |id| {
                 if (model.paneForSession(id) == null) {
+                    log.debug("editor: its pane closed", .{});
                     self.releaseEditorWindow(state, true);
                     state.model.noteClosed();
                     state.session_id = null;
@@ -8692,9 +8736,10 @@ const App = struct {
                 }
             }
         }
+        self.pollRetiredEditors();
         if (self.workspace_registry.count() != 0) {
             self.ensureEditorDetection(self.activePresentation(), self.activeWorkspace());
-            if (self.editorEmbedPending()) self.syncEditorHosting();
+            if (self.editorEmbedPending() and self.syncEditorHosting()) changed = true;
         }
         if (changed) self.setEditorActionVisibility();
         return changed;
@@ -8703,6 +8748,7 @@ const App = struct {
     /// Whether a worker runs or a launched window is still looked for: the
     /// loop then wakes on its idle tick.
     fn editorNeedsTick(self: *const App) bool {
+        for (self.editor_retired) |slot| if (slot != null) return true;
         for (self.workspace_presentations.items) |presentation| {
             const state = presentation.editor orelse continue;
             if (state.detect_job != null or state.launch_job != null or state.embed_deadline_ns != null) return true;
@@ -8748,8 +8794,9 @@ const App = struct {
     /// pane is not presented, and look for a launched window that is not
     /// hosted yet. Runs after each frame's layout and while a window is
     /// looked for.
-    fn syncEditorHosting(self: *App) void {
-        if (self.workspace_registry.count() == 0) return;
+    fn syncEditorHosting(self: *App) bool {
+        if (self.workspace_registry.count() == 0) return false;
+        var changed = false;
         const active_key = self.activePresentation().key;
         const obscured = self.editorObscured();
         const now = Io.Clock.awake.now(self.io).nanoseconds;
@@ -8768,14 +8815,14 @@ const App = struct {
                     state.embed_deadline_ns = null;
                     state.model.noteOpen(true, embedded.pid);
                     if (visible == null) self.window.showEmbedded(&state.embedded.?, false) catch |err| log.debug("the editor window stayed shown: {s}", .{@errorName(err)});
-                    log.info("editor: hosting its window over the pane", .{});
-                    self.invalidateUi();
+                    log.info("editor: hosting its window over pane {?d}", .{state.model.pane});
+                    changed = true;
                 } else |err| switch (err) {
                     error.NotFound => if (now >= deadline) {
                         log.info("editor: no window to host appeared; the pane keeps its status", .{});
                         state.embed_deadline_ns = null;
                         if (!state.failed) state.model.noteOpen(false, null);
-                        self.invalidateUi();
+                        changed = true;
                     },
                     // Wayland, macOS and Windows keep the editor's own window
                     // (decision-12); the pane shows where it is.
@@ -8783,7 +8830,7 @@ const App = struct {
                         log.info("editor: its window cannot be hosted here ({s})", .{@errorName(err)});
                         state.embed_deadline_ns = null;
                         if (!state.failed) state.model.noteOpen(false, null);
-                        self.invalidateUi();
+                        changed = true;
                     },
                 }
                 continue;
@@ -8799,6 +8846,7 @@ const App = struct {
                 self.window.showEmbedded(embedded, false) catch |err| log.debug("the editor window stayed shown: {s}", .{@errorName(err)});
             }
         }
+        return changed;
     }
 
     /// The active workspace's editor state while `id` is its editor pane.
@@ -9018,6 +9066,7 @@ const App = struct {
             state.session_id = created.session_id;
             state.failed = false;
             try state.model.noteLaunching(@intFromEnum(created.pane_id), user_data_dir);
+            log.debug("editor: pane {d} opened; launching", .{@intFromEnum(created.pane_id)});
             state.embed_deadline_ns = Io.Clock.awake.now(self.io).nanoseconds + editor_embed_timeout_ns;
         }
         state.launch_job = EditorJob.start(self.allocator, self.io, context, .{ .launch = .{ .spec = spec, .seed_dir = seed, .id = state.id } }) catch |err| blk: {
@@ -10580,6 +10629,7 @@ const App = struct {
             // to the desktop before Conduit's window closes (TASK-79).
             self.releaseEditor(presentation);
         }
+        self.releaseRetiredEditors();
         self.remote_spec.deinit();
         self.ssh_client_spec.deinit();
         self.allocator.destroy(self.profile_choices);
@@ -21860,6 +21910,10 @@ const App = struct {
     /// Whether this run should end because the program it was waiting for has.
     fn childGone(self: *const App) bool {
         if (!self.exit_with_child or !self.spawn_finished) return false;
+        // The editor pane's placeholder session never has a child (TASK-79).
+        if (self.activePresentationConst().editor) |state| {
+            if (state.session_id == self.activePresentationConst().active_session_id) return false;
+        }
         const live = self.activeLiveConst();
         // A tab created in command mode has no child until its worker returns;
         // leaving then would abandon the spawn the user just asked for.
@@ -23228,8 +23282,9 @@ const App = struct {
         }
         try self.syncTextInput();
         if (self.ui_test == null) try self.composeUi();
-        // TASK-79: the hosted editor window follows this frame's layout.
-        self.syncEditorHosting();
+        // TASK-79: the hosted editor window follows this frame's layout; a
+        // window found now changes the pane's elements in this same frame.
+        if (self.syncEditorHosting() and self.ui_test == null) try self.composeUi();
         const overlay = self.overlayView();
         const repaint_base = try self.overlay_grid.prepareCanvasOverlay(&self.fonts, overlay);
         var base_changed = repaint_base or self.needs_present;

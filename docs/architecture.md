@@ -552,6 +552,31 @@ nothing else is a legal dependency.
   it before any log file or window exists (`runCommand`: the terminal's own endpoint when its
   control variables are set, else the instance endpoint and token) and, when nothing answers,
   starts the app and queues it as the startup request.
+- **The editor pane (TASK-79 phase two, decision-12).** Each `WorkspacePresentation` owns an
+  `EditorPresentation` created on first use: the `editor.Editor` model, the workspace's
+  `editor.Availability` and detected command, two `EditorJob` workers (detection, and one launch
+  at a time: `seedSettings` plus a bounded `ExecutionContext.run` of the `buildLaunch` argv), the
+  editor pane's placeholder session and the hosted `platform.EmbeddedWindow`. Detection runs once
+  per workspace when it becomes active (never in built-in checks other than `--editor-test`) and
+  again when `editor.command` changes on reload. The editor pane is an ordinary layout leaf whose
+  `human_terminal` session never gets a child (`createEditorPane` through
+  `Workspace.createPaneSession`), so focus, resize, zoom and close need nothing new;
+  `composeEditorPane` registers an opaque `Surface` `workspace.<k>.pane.<n>.editor` over it
+  (label = `Editor.statusLine`), a `.status` Text and a `.close` InteractiveText on its top row,
+  and an `editor.placeholder` Text while the window is not hosted. Keys over the focused pane stop
+  in `routeEditorPaneKey` (Escape dispatches `editor.close`), and text, pastes and `childGone`
+  ignore it. `performEditor` is the one path for the control API (`controlEditor`), the driver
+  (`serveDriverEditor`, retried in `driver_pending` as `.editor`), the palette and the context
+  menu (`editorOpenAction`): plan, resolve paths against the requesting terminal's OSC 7 cwd and
+  `checkTarget` them (a local `stat` on the owner thread, since the editor is Local-only), then
+  split or reuse and start the launch. `syncEditorHosting` runs after every frame's layout and on
+  the idle tick while a window is looked for: `embedForeignWindow` by the title marker for up to
+  20 s, then `moveEmbedded` on rectangle changes (the pane minus its header row, in device
+  pixels) and `showEmbedded(false)` while the pane is not presented or anything Conduit draws
+  covers it. `pollEditors` collects workers and follows a pane that closed by any path; a closed
+  window is asked to close and kept hidden in its container (`editor_retired`) until its client
+  has gone (at most 10 s), so a dying window never matches the next launch's marker. Workspace
+  close and `deinit` join the workers and hand any still-hosted window back to the desktop.
 - **Workspace persistence (TASK-65 part two).** `App.persistence` (`Persistence`) decides at
   startup whether the run persists: a plain run with `restore.enabled` on uses `state.statePath`;
   `--restore-test` uses its private file; every other check, `--command` run and driven run
@@ -1693,9 +1718,9 @@ nothing else is a legal dependency.
   context (`Detection.remote`; the app falls back to `vi`). Paths are untrusted input and always
   reach VSCodium absolute, so none can be read as an option.
 - **May depend on** `workspace` (the ExecutionContext types).
-- **Lands** M6 — TASK-79 phase one (model, protocol, driver and platform seams); phase two wires
-  `app` (the pane, palette and context-menu actions, control and driver handlers, rectangle
-  tracking, the deterministic check and e2e scenario).
+- **Lands** M6 — TASK-79 phase one (model, protocol, driver and platform seams) and phase two
+  (`app`: the pane, palette and context-menu actions, control and driver handlers, rectangle
+  tracking, `--editor-test` and the `editor-pane` e2e scenario).
 
 ### `backlog`
 

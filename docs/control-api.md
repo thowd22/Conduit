@@ -10,10 +10,10 @@ the wire contract and the harness configuration guide. Code: `src/control.zig` (
 app handler and command-line client in `src/main.zig` (TASK-60 part two, TASK-66).
 
 Status: implemented and verified on Linux (`--control-test`, the `control-api` E2E scenario and
-the socket integration tests in `src/control.zig`). The five `editor.*` methods are part of the
-protocol (parsed, validated and queued like every other method), but until TASK-79's second phase
-wires the editor pane into the app, Conduit answers each of them `Unavailable`. macOS uses the same POSIX code but has not
-been run. Windows has no control transport yet: neither endpoint starts there, and `conduit`
+the socket integration tests in `src/control.zig`). The five `editor.*` methods are verified on
+Linux by `--editor-test` and the `editor-pane` E2E scenario against a stand-in `codium` that maps
+a real X window; a real VSCodium has not been driven by a check. macOS uses the same POSIX code
+but has not been run. Windows has no control transport yet: neither endpoint starts there, and `conduit`
 commands always start a new window.
 
 ## Enabling
@@ -230,9 +230,15 @@ cannot launch. Result: `{"workspace":…,"tab":…,"session":…}`.
 ### `editor.open`
 
 Opens a file in the caller workspace's VSCodium editor pane (decision-12). The first request
-splits the caller's pane (its `session`, else the active tab's focused pane) and starts
-VSCodium in the new pane; while that pane is open, every `editor.open` and `editor.goto` reuses it
-instead of starting another, so a workspace has at most one editor pane. Params:
+brings the caller's workspace and tab forward (waiting, like `pane.split`, while input or a modal
+holds the UI), splits the caller's pane (its `session`, else the active tab's focused pane) and
+starts VSCodium for the new pane; keyboard focus stays on the caller's terminal. The reply comes
+once the pane exists, not when VSCodium has drawn: on X11 its window is hosted over the pane when
+it appears (within 20 s), and the pane's header reads `editor ─ <file>:<line>` with a clickable
+`× close`. While that pane is open, every `editor.open`, `editor.goto`, `editor.diff` and
+`editor.reveal` reuses it instead of starting another, so a workspace has at most one editor
+pane; a request that arrives while the previous launch command is still running waits for it.
+Params:
 
 | Param | Meaning |
 |---|---|
@@ -271,7 +277,13 @@ Params: `path` (required, must exist). Result as for `editor.open`.
 ### `editor.close`
 
 Closes the workspace's editor pane and asks its window to close, returning the space to the
-sibling pane. Params: none. Result: `{}` (also when no editor is open).
+sibling pane. Params: none. Result: `{}` (also when no editor is open). The person closes it the
+same way with the pane's `× close`, Escape while the pane is focused, `Editor: close` in the
+palette, or the normal pane and tab close chords.
+
+A missing file for `editor.goto`, `editor.diff` or `editor.reveal` (or a missing directory for
+`editor.open`) is `NotFound`; a directory where a file is needed, or a path with control
+characters or a leading `~`, is `InvalidParams`.
 
 None of the editor methods can reach the scratchpad, run a command, or read editor text back:
 paths are the only input, and they are handed to VSCodium as single absolute arguments.
