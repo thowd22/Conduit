@@ -212,7 +212,9 @@ Windows x86_64 portable zip, each with checksums; every asset was downloaded and
 re-verified locally, and the zip's payload inspected. `v0.1.10` (https://github.com/thowd22/Conduit/releases/tag/v0.1.10,
 release run 37808087920) carries the TASK-76 follow-ups (branch row on Windows and under
 rc files that reset `precmd_functions`), the real-VSCodium verification notes and the new
-README; its eight assets were checksum-verified locally. `v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
+README; its eight assets were checksum-verified locally. `v0.1.11` (https://github.com/thowd22/Conduit/releases/tag/v0.1.11,
+release run 37817941435) carries TASK-80's sidebar agent rows; its eight assets were
+checksum-verified locally. `v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
 the `less` wheel test ordering and the IBus bridge race that the following commits fixed. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
 re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
