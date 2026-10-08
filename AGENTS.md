@@ -214,6 +214,9 @@ release run 37808087920) carries the TASK-76 follow-ups (branch row on Windows a
 rc files that reset `precmd_functions`), the real-VSCodium verification notes and the new
 README; its eight assets were checksum-verified locally. `v0.1.11` (https://github.com/thowd22/Conduit/releases/tag/v0.1.11,
 release run 37817941435) carries TASK-80's sidebar agent rows; its eight assets were
+checksum-verified locally. `v0.1.12` (https://github.com/thowd22/Conduit/releases/tag/v0.1.12,
+release run ) carries TASK-81 and TASK-82 (Windows agents: process-tree observation,
+named-pipe control transport, /bin/sh-free Claude Code hooks); its eight assets were
 checksum-verified locally. `v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
 the `less` wheel test ordering and the IBus bridge race that the following commits fixed. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
