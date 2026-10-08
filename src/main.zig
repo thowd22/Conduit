@@ -25058,7 +25058,7 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
     defer self.ui_test = null;
 
     const registered_actions = self.actions.definitions();
-    failures += reportCheck(out, registered_actions.len == 85 and
+    failures += reportCheck(out, registered_actions.len == 87 and
         std.mem.eql(u8, registered_actions[0].name, clipboard_copy_action) and
         std.mem.eql(u8, registered_actions[1].name, clipboard_paste_action) and
         std.mem.eql(u8, registered_actions[2].name, sidebar_toggle_action) and
@@ -25143,7 +25143,9 @@ fn uiTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.eql(u8, registered_actions[81].name, agent_prompts_activate_action) and
         std.mem.eql(u8, registered_actions[82].name, tab_new_profile_action) and
         std.mem.eql(u8, registered_actions[83].name, pane_split_profile_action) and
-        std.mem.eql(u8, registered_actions[84].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager, backlog, prompts, shell-profile and fixture actions in stable order", .{});
+        std.mem.eql(u8, registered_actions[84].name, editor_open_action) and
+        std.mem.eql(u8, registered_actions[85].name, editor_close_action) and
+        std.mem.eql(u8, registered_actions[86].name, ui_test_activate_action), "ui-test: registry enumeration exposes clipboard, sidebar, workspace, tab, pane, scratchpad, palette, link, search, context-menu, config, theme, font, settings, agent, notification, remote, agent-manager, backlog, prompts, shell-profile, editor and fixture actions in stable order", .{});
 
     try self.moveUiTest(ui_test_initial_origin);
     try self.drawFrame();
