@@ -4257,6 +4257,50 @@ test "starting and destroying a Windows terminal releases every handle it took" 
     try testing.expectEqual(before, try win.processHandleCount());
 }
 
+test "resizing a Windows terminal whose child has ended is not an error" {
+    // A pane is laid out, and so resized, until the owner has read its session's end, and a POSIX
+    // master takes that resize without complaint. The pseudoconsole is closed by then, so there is
+    // nothing to tell; reporting `Closed` from a layout pass stopped the whole app on Windows
+    // (`conduit stopped: Closed` in --panes-test and --search-test) when a pane's child ended.
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try spawnConPty(gpa, windowsRequest(&.{ "cmd.exe", "/Q", "/C", "exit 0" }));
+    defer pty.destroy();
+
+    try testing.expectEqual(ChildState{ .exited = .{ .code = 0 } }, try waitForExit(pty));
+    try pty.resize(WindowSize.init(9, 28));
+    try pty.resize(WindowSize.init(18, 56));
+}
+
+test "destroying one Windows terminal leaves another's input and resize working" {
+    // Two pseudoconsoles live side by side the way two panes do. Tearing one down must close only
+    // its own pipes, console and child: the survivor keeps taking input, keeps resizing, and keeps
+    // answering, so no handle of one terminal is ever shared with or closed by the other.
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const survivor = try spawnConPty(gpa, windowsRequest(&windows_shell_argv));
+    defer survivor.destroy();
+    const doomed = try spawnConPty(gpa, windowsRequest(&windows_shell_argv));
+
+    try writeAll(doomed, "set conduit=doomed\recho conduit-pty-%conduit%\r");
+    const doomed_output = try readUntil(gpa, doomed, "conduit-pty-doomed");
+    defer gpa.free(doomed_output);
+    try testing.expect(std.mem.indexOf(u8, doomed_output, "conduit-pty-doomed") != null);
+    doomed.destroy();
+
+    try writeAll(survivor, "set conduit=first\recho conduit-pty-%conduit%\r");
+    const first = try readUntil(gpa, survivor, "conduit-pty-first");
+    defer gpa.free(first);
+    try testing.expect(std.mem.indexOf(u8, first, "conduit-pty-first") != null);
+
+    try survivor.resize(WindowSize.init(9, 40));
+    try writeAll(survivor, "set conduit=second\recho conduit-pty-%conduit%\r");
+    const second = try readUntil(gpa, survivor, "conduit-pty-second");
+    defer gpa.free(second);
+    try testing.expect(std.mem.indexOf(u8, second, "conduit-pty-second") != null);
+    try testing.expectEqual(ChildState.running, survivor.state());
+}
+
 // PROBE (temporary, TASK-49): which input or resize makes a live pseudoconsole stop reading.
 const probe_esc = "\x1b";
 
@@ -4311,28 +4355,24 @@ const probe_sh_env = [_][]const u8{
     "TERM=xterm-256color",
 };
 
-const probe_sh_rc = "/bin/stty -echo; printf 'sh-ready\\r\\n'; n=0; while [ $n -lt 30 ]; do n=$((n+1)); IFS= read -r line; rc=$?; printf 'echo:%s rc=%s\\r\\n' \"$line\" \"$rc\"; done";
-const probe_sh_trap_ignore = "trap '' WINCH; /bin/stty -echo; printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
-const probe_sh_trap_noop = "trap : WINCH; /bin/stty -echo; printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
-const probe_sh_stty = "/bin/stty -echo; printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
-const probe_sh_nostty = "printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
+// The fixtures of --panes-test and --search-test, verbatim from src/main.zig, then with `trap '' WINCH;` in front.
+const probe_panes = "stty -echo; " ++
+    "printf '\\033]7;file://localhost/tmp\\007\\033]133;A\\007pane$ \\033]133;B\\007PANE-PWD:%s\\r\\n\\033[?1006;1000h' \"$PWD\"; " ++
+    "while IFS= read -r line; do printf '\\033]133;C\\007PANE-ECHO:%s\\r\\n' \"$line\"; done";
+const probe_search = "stty -echo; " ++
+    "printf 'SEARCH-READY\\r\\n'; " ++
+    "while IFS= read -r line; do " ++
+    "if [ \"$line\" = stream ]; then printf 'needle OUTPUT\\r\\n'; " ++
+    "else printf 'SEARCH-ECHO:%s\\r\\n' \"$line\"; fi; done";
 
 test "PROBE conpty input and resize" {
     if (!has_conpty_backend) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const sizes = [_]WindowSize{ WindowSize.init(9, 28), WindowSize.init(18, 28), WindowSize.init(18, 56) };
+    const panes_sizes = [_]WindowSize{ WindowSize.init(18, 28), WindowSize.init(9, 28), WindowSize.init(9, 27) };
+    const search_sizes = [_]WindowSize{ WindowSize.init(2, 4), WindowSize.init(18, 80) };
     const sh = "C:\\bin\\sh";
-    try probeScenario(gpa, "sh-rc", &.{ sh, "-c", probe_sh_rc }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
-    try probeScenario(gpa, "sh-trap-ignore", &.{ sh, "-c", probe_sh_trap_ignore }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
-    try probeScenario(gpa, "sh-trap-noop", &.{ sh, "-c", probe_sh_trap_noop }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
-    try probeScenario(gpa, "sh-stty", &.{ sh, "-c", probe_sh_stty }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
-    try probeScenario(gpa, "sh-nostty", &.{ sh, "-c", probe_sh_nostty }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
-    try probeScenario(gpa, "bash-nostty", &.{ "C:\\bin\\bash.exe", "-c", probe_sh_nostty }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
-
-    // Resize after the child ended.
-    const pty = try spawnConPty(gpa, windowsRequest(&.{ "cmd.exe", "/Q", "/C", "exit 0" }));
-    defer pty.destroy();
-    _ = try waitForExit(pty);
-    pty.resize(WindowSize.init(10, 10)) catch |err| std.debug.print("PROBE resize-after-end: {s}\n", .{@errorName(err)});
-    std.debug.print("PROBE resize-after-end: done\n", .{});
+    try probeScenario(gpa, "panes-fixture", &.{ sh, "-c", probe_panes }, &probe_sh_env, "PANE-PWD", "PANE-ECHO:", true, &panes_sizes);
+    try probeScenario(gpa, "panes-fixture-trap", &.{ sh, "-c", "trap '' WINCH; " ++ probe_panes }, &probe_sh_env, "PANE-PWD", "PANE-ECHO:", true, &panes_sizes);
+    try probeScenario(gpa, "search-fixture", &.{ sh, "-c", probe_search }, &probe_sh_env, "SEARCH-READY", "SEARCH-ECHO:", false, &search_sizes);
+    try probeScenario(gpa, "search-fixture-trap", &.{ sh, "-c", "trap '' WINCH; " ++ probe_search }, &probe_sh_env, "SEARCH-READY", "SEARCH-ECHO:", false, &search_sizes);
 }
