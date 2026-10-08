@@ -31614,7 +31614,7 @@ const control_standin_ps1 =
     \\$null = Invoke-Hook 'PostToolUse' '{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"toolu_1"}'
     \\$null = Invoke-Hook 'Stop' '{"hook_event_name":"Stop"}'
     \\'STANDIN-DONE'
-    \\while ($true) { $null = [Console]::ReadLine() }
+    \\while ($null -ne [Console]::ReadLine()) { }
     \\
 ;
 
