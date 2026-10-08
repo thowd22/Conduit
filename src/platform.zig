@@ -2431,7 +2431,415 @@ pub const Window = struct {
             .cursor = cursor_bytes,
         });
     }
+
+    /// Host another application's top-level window over `rect` (device pixels in this window),
+    /// for the editor pane (TASK-79, decision-12). Only an X11 session can do this; Wayland,
+    /// macOS and Windows answer `error.Unsupported`, and the app keeps the editor as a separate
+    /// window. `error.NotFound` means nothing matched yet: ask again after the next frame.
+    pub fn embedForeignWindow(self: *const Window, match: ForeignWindowMatch, rect: PixelRect) EmbedError!EmbeddedWindow {
+        if (!embedSupported(videoDriverName())) return error.Unsupported;
+        const handle = self.handle orelse return error.Failed;
+        const properties = sdl.SDL_GetWindowProperties(handle);
+        if (properties == 0) return error.Failed;
+        const parent = sdl.SDL_GetNumberProperty(properties, "SDL.window.x11.window", 0);
+        if (parent <= 0) return error.Unsupported;
+        return embedIntoX11(@intCast(parent), match, rect);
+    }
+
+    /// Move and resize a hosted window to the pane's new rectangle (resize, divider drag, zoom,
+    /// sidebar changes).
+    pub fn moveEmbedded(_: *const Window, embedded: *EmbeddedWindow, rect: PixelRect) EmbedError!void {
+        return moveEmbeddedX11(embedded, rect);
+    }
+
+    /// Show or hide a hosted window, for a pane that is not presented (another tab, a zoomed
+    /// sibling, a modal over it). Hiding never closes it.
+    pub fn showEmbedded(_: *const Window, embedded: *EmbeddedWindow, visible: bool) EmbedError!void {
+        return showEmbeddedX11(embedded, visible);
+    }
+
+    /// Ask a hosted window to close itself (`WM_DELETE_WINDOW`), as its own close button would.
+    pub fn closeEmbedded(_: *const Window, embedded: *EmbeddedWindow) EmbedError!void {
+        return requestCloseX11(embedded);
+    }
+
+    /// Stop hosting: give a still-running client back to the desktop and release everything.
+    pub fn unembed(_: *const Window, embedded: *EmbeddedWindow) void {
+        unembedX11(embedded);
+    }
 };
+
+// ---------------------------------------------------------------------------
+// Hosting a foreign window over a pane (TASK-79, decision-12)
+// ---------------------------------------------------------------------------
+
+/// Why another application's window could not be hosted, moved or released.
+pub const EmbedError = error{
+    /// This windowing system cannot host another client's window (Wayland), or hosting is not
+    /// implemented here yet (macOS, Windows). The app shows the editor as a separate window.
+    Unsupported,
+    /// No top-level window matched yet; an application that was just launched may still be
+    /// mapping it, so the caller asks again later.
+    NotFound,
+    /// The display connection or a window request failed, or the window vanished.
+    Failed,
+};
+
+/// Which top-level window to host. Every field that is set must match; at least one must be.
+pub const ForeignWindowMatch = struct {
+    /// The client's `_NET_WM_PID`.
+    pid: ?u32 = null,
+    /// The client's `WM_CLASS` class or instance name, compared ignoring ASCII case.
+    class: ?[]const u8 = null,
+    /// Text the client's title (`_NET_WM_NAME`, else `WM_NAME`) contains.
+    title_contains: ?[]const u8 = null,
+
+    fn isEmpty(self: ForeignWindowMatch) bool {
+        return self.pid == null and self.class == null and self.title_contains == null;
+    }
+};
+
+/// A rectangle in the window's device pixels, origin top left: where a hosted window sits.
+pub const PixelRect = struct {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+};
+
+/// Whether hosting can work under the named SDL video driver on this build. Only X11 can
+/// reparent another client's window; Xlib is loaded at run time, which needs the C library's
+/// `dlopen`.
+pub fn embedSupported(video_driver: ?[]const u8) bool {
+    if (comptime !x11_embedding_built) return false;
+    const name = video_driver orelse return false;
+    return std.mem.eql(u8, name, "x11");
+}
+
+const x11_embedding_built = builtin.os.tag == .linux and builtin.link_libc;
+
+/// A foreign window hosted inside Conduit's window: Conduit's own child "container" window at
+/// the pane's rectangle, with the client reparented into it.
+///
+/// Owns a private display connection, so hosting never touches SDL's own. Owner (UI) thread
+/// only. Release with `Window.unembed`, which gives the client back to the root window when it
+/// still exists. Never copy a live value.
+pub const EmbeddedWindow = struct {
+    display: *anyopaque,
+    container: c_ulong,
+    client: c_ulong,
+    /// The client's `_NET_WM_PID`, when it set one.
+    pid: ?u32,
+    visible: bool = true,
+};
+
+/// The Xlib entry points hosting uses, resolved once from `libX11.so.6` at run time so Conduit
+/// has no link-time X11 dependency and still starts where libX11 is absent (SDL loads X11 the
+/// same way). The library stays loaded for the life of the process, as SDL's does.
+const X11 = struct {
+    const Display = anyopaque;
+    const XID = c_ulong;
+    const Atom = c_ulong;
+    const ErrorHandler = ?*const fn (?*Display, ?*anyopaque) callconv(.c) c_int;
+
+    const ClassHint = extern struct {
+        res_name: ?[*:0]u8 = null,
+        res_class: ?[*:0]u8 = null,
+    };
+
+    const ClientMessageEvent = extern struct {
+        type: c_int,
+        serial: c_ulong = 0,
+        send_event: c_int = 1,
+        display: ?*Display,
+        window: XID,
+        message_type: Atom,
+        format: c_int,
+        data: [5]c_long,
+    };
+
+    /// Xlib's `XEvent` is a union padded to 24 longs.
+    const XEvent = extern union {
+        client: ClientMessageEvent,
+        pad: [24]c_long,
+    };
+
+    const client_message: c_int = 33;
+    const xa_cardinal: Atom = 6;
+    const any_property_type: Atom = 0;
+    const success: c_int = 0;
+
+    XOpenDisplay: *const fn (?[*:0]const u8) callconv(.c) ?*Display,
+    XCloseDisplay: *const fn (*Display) callconv(.c) c_int,
+    XDefaultRootWindow: *const fn (*Display) callconv(.c) XID,
+    XQueryTree: *const fn (*Display, XID, *XID, *XID, *?[*]XID, *c_uint) callconv(.c) c_int,
+    XFree: *const fn (?*anyopaque) callconv(.c) c_int,
+    XGetClassHint: *const fn (*Display, XID, *ClassHint) callconv(.c) c_int,
+    XFetchName: *const fn (*Display, XID, *?[*:0]u8) callconv(.c) c_int,
+    XInternAtom: *const fn (*Display, [*:0]const u8, c_int) callconv(.c) Atom,
+    XGetWindowProperty: *const fn (*Display, XID, Atom, c_long, c_long, c_int, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *?[*]u8) callconv(.c) c_int,
+    XCreateSimpleWindow: *const fn (*Display, XID, c_int, c_int, c_uint, c_uint, c_uint, c_ulong, c_ulong) callconv(.c) XID,
+    XDestroyWindow: *const fn (*Display, XID) callconv(.c) c_int,
+    XMapWindow: *const fn (*Display, XID) callconv(.c) c_int,
+    XUnmapWindow: *const fn (*Display, XID) callconv(.c) c_int,
+    XReparentWindow: *const fn (*Display, XID, XID, c_int, c_int) callconv(.c) c_int,
+    XMoveResizeWindow: *const fn (*Display, XID, c_int, c_int, c_uint, c_uint) callconv(.c) c_int,
+    XResizeWindow: *const fn (*Display, XID, c_uint, c_uint) callconv(.c) c_int,
+    XSendEvent: *const fn (*Display, XID, c_int, c_long, *XEvent) callconv(.c) c_int,
+    XSync: *const fn (*Display, c_int) callconv(.c) c_int,
+    XSetErrorHandler: *const fn (ErrorHandler) callconv(.c) ErrorHandler,
+
+    var loaded: ?X11 = null;
+    var load_failed = false;
+    var lib: ?std.DynLib = null;
+    /// Set by `recordError` while a guarded request batch runs. Owner thread only.
+    var error_seen = false;
+
+    /// The resolved entry points, or null when libX11 or one of its symbols is missing.
+    fn get() ?*const X11 {
+        if (comptime !x11_embedding_built) return null;
+        if (loaded != null) return &loaded.?;
+        if (load_failed) return null;
+        lib = std.DynLib.open("libX11.so.6") catch {
+            load_failed = true;
+            return null;
+        };
+        var api: X11 = undefined;
+        inline for (@typeInfo(X11).@"struct".fields) |field| {
+            @field(api, field.name) = lib.?.lookup(field.type, field.name ++ "") orelse {
+                load_failed = true;
+                return null;
+            };
+        }
+        loaded = api;
+        return &loaded.?;
+    }
+
+    fn recordError(_: ?*Display, _: ?*anyopaque) callconv(.c) c_int {
+        error_seen = true;
+        return 0;
+    }
+
+    /// Run a batch of requests with Xlib's process-wide error handler replaced, so a client that
+    /// vanished mid-batch is an error value instead of Xlib's default exit. SDL installs its own
+    /// handler; it is restored after the batch has been synced, so no error of ours reaches it.
+    fn guarded(self: *const X11, display: *Display) Guard {
+        error_seen = false;
+        return .{ .api = self, .display = display, .previous = self.XSetErrorHandler(recordError) };
+    }
+
+    const Guard = struct {
+        api: *const X11,
+        display: *Display,
+        previous: ErrorHandler,
+
+        /// Sync, restore the previous handler and report whether any request failed.
+        fn finish(self: Guard) bool {
+            _ = self.api.XSync(self.display, 0);
+            _ = self.api.XSetErrorHandler(self.previous);
+            return !error_seen;
+        }
+    };
+
+    fn propertyCardinal(self: *const X11, display: *Display, window: XID, atom: Atom) ?u32 {
+        var actual_type: Atom = 0;
+        var format: c_int = 0;
+        var items: c_ulong = 0;
+        var after: c_ulong = 0;
+        var data: ?[*]u8 = null;
+        if (self.XGetWindowProperty(display, window, atom, 0, 1, 0, xa_cardinal, &actual_type, &format, &items, &after, &data) != success) return null;
+        defer if (data) |bytes| {
+            _ = self.XFree(bytes);
+        };
+        if (actual_type != xa_cardinal or format != 32 or items < 1) return null;
+        // Format-32 items arrive as C longs whatever the server's word size.
+        const longs: [*]align(1) const c_long = @ptrCast(data orelse return null);
+        const value = longs[0];
+        if (value <= 0 or value > std.math.maxInt(u32)) return null;
+        return @intCast(value);
+    }
+
+    fn titleContains(self: *const X11, display: *Display, window: XID, needle: []const u8) bool {
+        const net_wm_name = self.XInternAtom(display, "_NET_WM_NAME", 1);
+        if (net_wm_name != 0) {
+            var actual_type: Atom = 0;
+            var format: c_int = 0;
+            var items: c_ulong = 0;
+            var after: c_ulong = 0;
+            var data: ?[*]u8 = null;
+            if (self.XGetWindowProperty(display, window, net_wm_name, 0, 1024, 0, any_property_type, &actual_type, &format, &items, &after, &data) == success) {
+                defer if (data) |bytes| {
+                    _ = self.XFree(bytes);
+                };
+                if (data) |bytes| if (format == 8 and items != 0) {
+                    if (std.mem.indexOf(u8, bytes[0..@intCast(items)], needle) != null) return true;
+                };
+            }
+        }
+        var name: ?[*:0]u8 = null;
+        if (self.XFetchName(display, window, &name) == 0) return false;
+        defer if (name) |text| {
+            _ = self.XFree(text);
+        };
+        const text = std.mem.span(name orelse return false);
+        return std.mem.indexOf(u8, text, needle) != null;
+    }
+
+    fn classMatches(self: *const X11, display: *Display, window: XID, class: []const u8) bool {
+        var hint: ClassHint = .{};
+        if (self.XGetClassHint(display, window, &hint) == 0) return false;
+        defer {
+            if (hint.res_name) |text| _ = self.XFree(text);
+            if (hint.res_class) |text| _ = self.XFree(text);
+        }
+        if (hint.res_class) |text| if (std.ascii.eqlIgnoreCase(std.mem.span(text), class)) return true;
+        if (hint.res_name) |text| if (std.ascii.eqlIgnoreCase(std.mem.span(text), class)) return true;
+        return false;
+    }
+
+    fn matches(self: *const X11, display: *Display, window: XID, match: ForeignWindowMatch) bool {
+        if (match.class) |class| if (!self.classMatches(display, window, class)) return false;
+        if (match.title_contains) |needle| if (!self.titleContains(display, window, needle)) return false;
+        if (match.pid) |pid| {
+            const atom = self.XInternAtom(display, "_NET_WM_PID", 1);
+            if (atom == 0 or self.propertyCardinal(display, window, atom) != pid) return false;
+        }
+        return true;
+    }
+
+    /// Search the root's children and two levels below (a window manager's frames hold the
+    /// clients) for the first window matching, skipping `exclude`.
+    fn find(self: *const X11, display: *Display, root: XID, match: ForeignWindowMatch, exclude: XID) ?XID {
+        return self.findBelow(display, root, match, exclude, 3);
+    }
+
+    fn findBelow(self: *const X11, display: *Display, parent: XID, match: ForeignWindowMatch, exclude: XID, depth: u8) ?XID {
+        if (depth == 0) return null;
+        var root_return: XID = 0;
+        var parent_return: XID = 0;
+        var children: ?[*]XID = null;
+        var count: c_uint = 0;
+        if (self.XQueryTree(display, parent, &root_return, &parent_return, &children, &count) == 0) return null;
+        defer if (children) |list| {
+            _ = self.XFree(list);
+        };
+        const list = (children orelse return null)[0..count];
+        for (list) |child| {
+            if (child != exclude and self.matches(display, child, match)) return child;
+        }
+        for (list) |child| {
+            if (child == exclude) continue;
+            if (self.findBelow(display, child, match, exclude, depth - 1)) |found| return found;
+        }
+        return null;
+    }
+
+    fn parentOf(self: *const X11, display: *Display, window: XID) ?XID {
+        var root_return: XID = 0;
+        var parent_return: XID = 0;
+        var children: ?[*]XID = null;
+        var count: c_uint = 0;
+        if (self.XQueryTree(display, window, &root_return, &parent_return, &children, &count) == 0) return null;
+        if (children) |list| _ = self.XFree(list);
+        return parent_return;
+    }
+};
+
+fn clampDimension(value: u32) c_uint {
+    return @intCast(@min(@max(value, 1), std.math.maxInt(u16)));
+}
+
+fn clampOffset(value: i32) c_int {
+    return @intCast(std.math.clamp(value, std.math.minInt(i16), std.math.maxInt(i16)));
+}
+
+/// Host the first top-level window matching `match` inside X11 window `parent` at `rect`: a
+/// container child of `parent` is created there, the client is withdrawn, reparented into it,
+/// sized to it and mapped. Owner thread.
+fn embedIntoX11(parent: c_ulong, match: ForeignWindowMatch, rect: PixelRect) EmbedError!EmbeddedWindow {
+    if (match.isEmpty()) return error.NotFound;
+    const api = X11.get() orelse return error.Unsupported;
+    const display = api.XOpenDisplay(null) orelse return error.Failed;
+    errdefer _ = api.XCloseDisplay(display);
+    const root = api.XDefaultRootWindow(display);
+    const client = api.find(display, root, match, parent) orelse return error.NotFound;
+    const pid: ?u32 = pid: {
+        const atom = api.XInternAtom(display, "_NET_WM_PID", 1);
+        break :pid if (atom == 0) null else api.propertyCardinal(display, client, atom);
+    };
+
+    const guard = api.guarded(display);
+    const width = clampDimension(rect.width);
+    const height = clampDimension(rect.height);
+    const container = api.XCreateSimpleWindow(display, parent, clampOffset(rect.x), clampOffset(rect.y), width, height, 0, 0, 0);
+    _ = api.XMapWindow(display, container);
+    // Unmapping first withdraws a managed client, so the window manager lets go of it before
+    // it moves into the container.
+    _ = api.XUnmapWindow(display, client);
+    _ = api.XReparentWindow(display, client, container, 0, 0);
+    _ = api.XResizeWindow(display, client, width, height);
+    _ = api.XMapWindow(display, client);
+    if (!guard.finish()) {
+        const cleanup = api.guarded(display);
+        _ = api.XDestroyWindow(display, container);
+        _ = cleanup.finish();
+        return error.Failed;
+    }
+    return .{ .display = display, .container = container, .client = client, .pid = pid };
+}
+
+fn moveEmbeddedX11(embedded: *EmbeddedWindow, rect: PixelRect) EmbedError!void {
+    const api = X11.get() orelse return error.Unsupported;
+    const guard = api.guarded(embedded.display);
+    const width = clampDimension(rect.width);
+    const height = clampDimension(rect.height);
+    _ = api.XMoveResizeWindow(embedded.display, embedded.container, clampOffset(rect.x), clampOffset(rect.y), width, height);
+    _ = api.XResizeWindow(embedded.display, embedded.client, width, height);
+    if (!guard.finish()) return error.Failed;
+}
+
+fn showEmbeddedX11(embedded: *EmbeddedWindow, visible: bool) EmbedError!void {
+    if (embedded.visible == visible) return;
+    const api = X11.get() orelse return error.Unsupported;
+    const guard = api.guarded(embedded.display);
+    _ = if (visible) api.XMapWindow(embedded.display, embedded.container) else api.XUnmapWindow(embedded.display, embedded.container);
+    if (!guard.finish()) return error.Failed;
+    embedded.visible = visible;
+}
+
+fn requestCloseX11(embedded: *EmbeddedWindow) EmbedError!void {
+    const api = X11.get() orelse return error.Unsupported;
+    const protocols = api.XInternAtom(embedded.display, "WM_PROTOCOLS", 0);
+    const delete = api.XInternAtom(embedded.display, "WM_DELETE_WINDOW", 0);
+    var event: X11.XEvent = .{ .client = .{
+        .type = X11.client_message,
+        .display = embedded.display,
+        .window = embedded.client,
+        .message_type = protocols,
+        .format = 32,
+        .data = .{ @intCast(delete), 0, 0, 0, 0 },
+    } };
+    const guard = api.guarded(embedded.display);
+    _ = api.XSendEvent(embedded.display, embedded.client, 0, 0, &event);
+    if (!guard.finish()) return error.Failed;
+}
+
+/// Give a still-existing client back to the root window, mapped, then destroy the container
+/// and close the private connection.
+fn unembedX11(embedded: *EmbeddedWindow) void {
+    const api = X11.get() orelse return;
+    const guard = api.guarded(embedded.display);
+    const root = api.XDefaultRootWindow(embedded.display);
+    _ = api.XUnmapWindow(embedded.display, embedded.client);
+    _ = api.XReparentWindow(embedded.display, embedded.client, root, 0, 0);
+    _ = api.XMapWindow(embedded.display, embedded.client);
+    _ = api.XDestroyWindow(embedded.display, embedded.container);
+    // A client that already exited makes the requests above fail; there is nothing left to
+    // give back then, and the container is destroyed either way.
+    _ = guard.finish();
+    _ = api.XCloseDisplay(embedded.display);
+    embedded.* = undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Local test-driver transport
@@ -4652,4 +5060,78 @@ test "notification text is refused when over its bound or carrying controls" {
     try std.testing.expectError(error.InvalidText, validateNotifyText("\xff", 16));
     try std.testing.expectError(error.InvalidText, validateNotifyText("x" ** 17, 16));
     try validateNotifyText("Needs approval \xe2\x9c\x93", 32);
+}
+
+test "foreign windows are hosted only under X11 and refused elsewhere" {
+    try std.testing.expect(!embedSupported(null));
+    try std.testing.expect(!embedSupported("wayland"));
+    try std.testing.expect(!embedSupported("cocoa"));
+    try std.testing.expect(!embedSupported("windows"));
+    try std.testing.expect(!embedSupported("offscreen"));
+    try std.testing.expectEqual(builtin.os.tag == .linux and builtin.link_libc, embedSupported("x11"));
+    // An empty match never picks an arbitrary window.
+    try std.testing.expectError(if (x11_embedding_built) error.NotFound else error.Unsupported, embedIntoX11Checked(0, .{}, .{ .x = 0, .y = 0, .width = 1, .height = 1 }));
+}
+
+/// `embedIntoX11` behind the build gate, so the Unsupported path is testable on every OS.
+fn embedIntoX11Checked(parent: c_ulong, match: ForeignWindowMatch, rect: PixelRect) EmbedError!EmbeddedWindow {
+    if (comptime !x11_embedding_built) return error.Unsupported;
+    return embedIntoX11(parent, match, rect);
+}
+
+test "X11: a real client window is reparented into a container, moved, hidden, and given back" {
+    if (comptime !x11_embedding_built) return error.SkipZigTest;
+    const api = X11.get() orelse return error.SkipZigTest;
+    const display = api.XOpenDisplay(null) orelse return error.SkipZigTest; // no X server
+    defer _ = api.XCloseDisplay(display);
+    const io = std.testing.io;
+
+    // A top-level stand-in for Conduit's SDL window.
+    const root = api.XDefaultRootWindow(display);
+    const host = api.XCreateSimpleWindow(display, root, 0, 0, 400, 300, 0, 0, 0);
+    _ = api.XMapWindow(display, host);
+    _ = api.XSync(display, 0);
+    defer {
+        _ = api.XDestroyWindow(display, host);
+        _ = api.XSync(display, 0);
+    }
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "xlogo", "-geometry", "120x90+500+10" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest; // xlogo is not installed
+    defer child.kill(io);
+
+    // xlogo sets WM_CLASS (xlogo, XLogo); poll until it has mapped, bounded.
+    const match: ForeignWindowMatch = .{ .class = "XLogo" };
+    var embedded: EmbeddedWindow = for (0..200) |_| {
+        if (embedIntoX11(host, match, .{ .x = 10, .y = 20, .width = 200, .height = 150 })) |hosted| {
+            break hosted;
+        } else |err| switch (err) {
+            error.NotFound => std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(25), .clock = .awake }, io) catch {},
+            else => return err,
+        }
+    } else return error.TestUnexpectedResult;
+    var released = false;
+    defer if (!released) unembedX11(&embedded);
+
+    // The client now lives in Conduit's container, which is a child of the host.
+    try std.testing.expectEqual(@as(?c_ulong, embedded.container), api.parentOf(display, embedded.client));
+    try std.testing.expectEqual(@as(?c_ulong, host), api.parentOf(display, embedded.container));
+    // A second search skips nothing hosted already but finds the same client by class.
+    try std.testing.expectEqual(@as(?c_ulong, embedded.client), api.find(display, root, match, 0));
+    try std.testing.expectEqual(@as(?c_ulong, null), api.find(display, root, .{ .class = "NoSuchClass" }, 0));
+
+    try moveEmbeddedX11(&embedded, .{ .x = 5, .y = 6, .width = 300, .height = 200 });
+    try showEmbeddedX11(&embedded, false);
+    try std.testing.expect(!embedded.visible);
+    try showEmbeddedX11(&embedded, true);
+
+    const client = embedded.client;
+    unembedX11(&embedded);
+    released = true;
+    // Given back to the desktop, not destroyed.
+    try std.testing.expectEqual(@as(?c_ulong, root), api.parentOf(display, client));
 }
