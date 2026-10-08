@@ -38584,7 +38584,13 @@ test "a control-test run's tabs see its private runtime and state directories" {
     defer spec.deinit();
     try std.testing.expect(hasEntry(spec.env, "XDG_RUNTIME_DIR=/tmp/conduit-agent-test-x/rt"));
     try std.testing.expect(hasEntry(spec.env, "XDG_STATE_HOME=/tmp/conduit-agent-test-x/state"));
-    try std.testing.expectEqualStrings(control_test_script, spec.argv[2]);
+    if (builtin.os.tag == .windows) {
+        // TASK-82: Windows tabs are PowerShell 7 with the check's prompt.
+        try std.testing.expectEqual(control_test_windows_argv.len, spec.argv.len);
+        for (control_test_windows_argv, spec.argv) |want, got| try std.testing.expectEqualStrings(want, got);
+    } else {
+        try std.testing.expectEqualStrings(control_test_script, spec.argv[2]);
+    }
 }
 
 test "the instance token lives beside the state file, and the client's frames and replies are exact" {
@@ -38594,6 +38600,13 @@ test "the instance token lives beside the state file, and the client's frames an
         try std.testing.expectEqualStrings("/home/me/.state/conduit/instance.token", instanceTokenPath(&buffer, env.source(), null).?);
         try std.testing.expectEqualStrings("/private/state/conduit/instance.token", instanceTokenPath(&buffer, env.source(), "/private/state").?);
         try std.testing.expectEqualStrings("/private/rt/conduit", controlRuntimeDir(&buffer, env.source(), "/private/rt").?);
+    }
+    if (builtin.os.tag == .windows) {
+        // TASK-82: an isolated run's XDG_STATE_HOME holds its token file, and
+        // its runtime "directory" is a per-user pipe prefix.
+        try std.testing.expectEqualStrings("/home/me/.state\\conduit\\instance.token", instanceTokenPath(&buffer, env.source(), null).?);
+        try std.testing.expectEqualStrings("C:\\private\\state\\conduit\\instance.token", instanceTokenPath(&buffer, env.source(), "C:\\private\\state").?);
+        try std.testing.expect(std.mem.startsWith(u8, controlRuntimeDir(&buffer, env.source(), "C:\\private\\rt").?, "\\\\.\\pipe\\conduit-S-"));
     }
 
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
