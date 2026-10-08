@@ -1,0 +1,177 @@
+# macOS platform evidence (TASK-48, TASK-15 AC1, TASK-69's macOS half).
+#
+# The dev box is Linux, so everything macOS-specific is proved here, on a
+# GitHub arm64 macOS runner with a real window server:
+#
+#   build and unit tests      the same `zig build` / `zig build test` as ci.yml
+#   built-in checks           real Cocoa windows, no Xvfb (see the script)
+#   Conduit.app               `zig build bundle`, its structure, signature,
+#                             Launch Services start and a Retina (2x) frame
+#   system clipboard          Cmd+V from and Cmd+C to the macOS pasteboard
+#   font discovery            per-user (~/Library/Fonts) and system families
+#   disk image                the dmg the release workflow publishes
+#
+# `ci.yml` stays the cross-platform unit-test matrix; this workflow is the
+# macOS acceptance run. The Zig version is read from build.zig.zon exactly as
+# ci.yml does. Artifacts (screenshots, logs, the dmg) are uploaded on every run.
+name: macOS
+
+on:
+  push:
+    branches: ["task-48-macos"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer stamped into the bundle and dmg (no leading v)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS arm64 platform checks
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Resolve the pinned Zig version, the stamped version and the artifact root
+        shell: bash
+        run: |
+          zig_version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)"
+          [ -n "$zig_version" ] || { echo "::error::build.zig.zon declares no .minimum_zig_version" >&2; exit 1; }
+          version="${{ github.event.inputs.version }}"
+          [ -n "$version" ] || version="0.0.0-ci.${{ github.run_number }}"
+          {
+            echo "ZIG_VERSION=$zig_version"
+            echo "CONDUIT_VERSION=$version"
+            # Short: Darwin's Unix socket paths stop at 104 bytes.
+            echo "ARTIFACT_ROOT=$RUNNER_TEMP/m"
+          } >> "$GITHUB_ENV"
+          sw_vers
+          uname -m
+          system_profiler SPDisplaysDataType | sed -n '1,40p' || true
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+
+      - name: Restore the Zig caches and the fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            zig-out
+            zig-pkg
+          key: conduit-${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            conduit-${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-
+            conduit-${{ runner.os }}-zig-
+
+      - name: Install test tools (tmux; DejaVu into ~/Library/Fonts)
+        shell: bash
+        run: |
+          brew install tmux
+          # A Homebrew font cask installs into the per-user font directory.
+          brew install --cask font-dejavu
+          ls -la ~/Library/Fonts | head -n 30
+          mkdir -p "$ARTIFACT_ROOT"
+          chmod 700 "$ARTIFACT_ROOT"
+
+      - name: Build
+        id: build
+        shell: bash
+        run: zig build -Dversion="$CONDUIT_VERSION"
+
+      - name: Built-in checks (required)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          bash .github/scripts/macos-builtin-checks.sh ./zig-out/bin/conduit "$ARTIFACT_ROOT/builtin" \
+            --self-test --grid-test --ui-test --driver-test --clipboard-test
+
+      - name: Build Conduit.app
+        id: bundle
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          zig build bundle -Dversion="$CONDUIT_VERSION"
+          find zig-out/Conduit.app -maxdepth 3 | sort
+
+      - name: Bundle structure, Launch Services and Retina frame
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        shell: bash
+        run: |
+          bash .github/scripts/macos-bundle-check.sh zig-out/Conduit.app "$PWD/zig-out/bin/conduit-test" \
+            "$CONDUIT_VERSION" "$ARTIFACT_ROOT/bundle"
+
+      - name: System clipboard copy and paste (TASK-15 AC1)
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        shell: bash
+        run: |
+          bash .github/scripts/macos-clipboard-check.sh "$PWD/zig-out/Conduit.app/Contents/MacOS/conduit" \
+            "$PWD/zig-out/bin/conduit-test" "$ARTIFACT_ROOT/clipboard"
+
+      - name: Font discovery in per-user and system locations
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        shell: bash
+        run: |
+          bash .github/scripts/macos-font-check.sh "$PWD/zig-out/Conduit.app/Contents/MacOS/conduit" \
+            "$ARTIFACT_ROOT/fonts" \
+            "DejaVu Sans Mono=$HOME/Library/Fonts" \
+            "Menlo=/System/Library/Fonts"
+
+      - name: Disk image
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        shell: bash
+        env:
+          MACOS_SIGNING_IDENTITY: ""
+        run: bash .github/scripts/macos-dmg.sh zig-out/Conduit.app "$CONDUIT_VERSION" "$ARTIFACT_ROOT/dist"
+
+      # Every other built-in check, reported but not gating: they were written
+      # and proved on Linux, and this is their first macOS run.
+      - name: Built-in checks (survey)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash .github/scripts/macos-builtin-checks.sh ./zig-out/bin/conduit "$ARTIFACT_ROOT/survey" \
+            --scroll-test --mouse-test --ime-test --sidebar-test --tabs-test --panes-test \
+            --palette-test --scratchpad-test --workspaces-test --links-test --search-test \
+            --menu-test --config-test --theme-test --font-test --settings-test
+
+      - name: Unit tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 40
+        run: zig build test -Dversion="$CONDUIT_VERSION" --summary all
+
+      - name: Upload the evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conduit-macos-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/m
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Diagnose failing tests
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          for name in platform pty config font input term render ui session workspace testdriver app; do
+            bin="$(ls -t $(find .zig-cache/o -type f -name "$name-test") 2>/dev/null | head -n 1)"
+            [ -n "$bin" ] || { echo "== $name-test: no binary"; continue; }
+            echo "== $name-test ($bin)"
+            perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 240 "$bin" > diag.txt 2>&1 || echo "== $name-test exited $?"
+            tail -n 120 diag.txt
+          done

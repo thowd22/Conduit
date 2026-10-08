@@ -107,7 +107,8 @@ pub fn build(b: *std.Build) !void {
     // TASK-69.1: the release version, validated here so a malformed tag fails
     // at configure time, then stamped into every binary that reports it.
     const build_options = b.addOptions();
-    build_options.addOption([:0]const u8, "version", resolveVersion(b));
+    const build_options_version = resolveVersion(b);
+    build_options.addOption([:0]const u8, "version", build_options_version);
     const build_options_module = build_options.createModule();
     if (wired[moduleIndex("version")]) |version_module| {
         version_module.addImport("build_options", build_options_module);
@@ -124,6 +125,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(exe);
     installLinuxPayload(b, target, optimize);
+    addMacosBundle(b, target, optimize, exe, build_options_version);
 
     // The external driver CLI is a composition root rather than a product
     // module: it consumes the protocol and platform transport without becoming
@@ -301,6 +303,92 @@ fn installLinuxPayload(
     };
     for (payload_files) |file| {
         b.getInstallStep().dependOn(&b.addInstallFile(file.source, file.destination).step);
+    }
+}
+
+/// The bundle's `Info.plist`, with `@VERSION@`, `@SHORT_VERSION@` and
+/// `@MIN_MACOS@` filled in by `addMacosBundle`.
+const macos_info_plist_template = @embedFile("assets/macos/Info.plist.in");
+
+/// TASK-48 and TASK-69: `zig build bundle` stages `Conduit.app` under the
+/// install prefix (`zig-out/Conduit.app` by default).
+///
+/// The layout is the standard one Launch Services reads: the executable in
+/// `Contents/MacOS`, `Info.plist` beside it, and the icon (`AppIcon.icns`,
+/// see `assets/macos/README.md`), the redistributable fonts, the shell
+/// integration scripts and every licence under `Contents/Resources`. The app
+/// embeds its fonts and scripts, so the copies are the shipped, inspectable
+/// payload rather than something it reads at run time, as on Linux.
+///
+/// The step exists only for a macOS target, because a bundle around another
+/// OS's executable is not an app; the default install graph is unchanged on
+/// every target. Signing is not a build step: the release workflow signs
+/// ad hoc, or with a Developer ID when one is configured (docs/release.md).
+fn addMacosBundle(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    exe: *std.Build.Step.Compile,
+    version: []const u8,
+) void {
+    if (target.result.os.tag != .macos) return;
+    const bundle_step = b.step("bundle", "Stage Conduit.app (macOS only) under the install prefix");
+    const contents = "Conduit.app/Contents";
+
+    const install_exe = b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .{ .custom = contents ++ "/MacOS" } },
+    });
+    bundle_step.dependOn(&install_exe.step);
+
+    // CFBundleShortVersionString must be numeric: the SemVer core of the
+    // stamped version. The full version stays in CFBundleGetInfoString.
+    const parsed = std.SemanticVersion.parse(version) catch fail("version {s} is not SemVer", .{version});
+    const short_version = b.fmt("{d}.{d}.{d}", .{ parsed.major, parsed.minor, parsed.patch });
+    const min_macos = target.result.os.version_range.semver.min;
+    const min_text = b.fmt("{d}.{d}", .{ min_macos.major, min_macos.minor });
+    var plist: []const u8 = macos_info_plist_template;
+    for ([_][2][]const u8{
+        .{ "@SHORT_VERSION@", short_version },
+        .{ "@VERSION@", version },
+        .{ "@MIN_MACOS@", min_text },
+    }) |pair| {
+        plist = std.mem.replaceOwned(u8, b.allocator, plist, pair[0], pair[1]) catch @panic("OOM");
+    }
+    const generated = b.addWriteFiles();
+    const plist_file = generated.add("Info.plist", plist);
+    bundle_step.dependOn(&b.addInstallFile(plist_file, contents ++ "/Info.plist").step);
+
+    const icon_source = b.path("assets/macos/AppIcon.icns");
+    const icon_check = b.addCheckFile(icon_source, .{ .expected_matches = &.{ "icns", "ic10", "ic07" } });
+    icon_check.setName("validate the macOS app icon");
+    const icon_install = b.addInstallFile(icon_source, contents ++ "/Resources/AppIcon.icns");
+    icon_install.step.dependOn(&icon_check.step);
+    bundle_step.dependOn(&icon_install.step);
+
+    const resources = [_]struct { source: std.Build.LazyPath, destination: []const u8 }{
+        .{ .source = b.path(bundled_face_asset), .destination = "fonts/JetBrainsMono-Regular.ttf" },
+        .{ .source = b.path(bundled_symbols_asset), .destination = "fonts/SymbolsNerdFontMono-Regular.ttf" },
+        .{ .source = b.path("assets/shell-integration/bash/conduit.bash"), .destination = "shell-integration/bash/conduit.bash" },
+        .{ .source = b.path("assets/shell-integration/zsh/.zshenv"), .destination = "shell-integration/zsh/.zshenv" },
+        .{ .source = b.path("assets/shell-integration/zsh/conduit.zsh"), .destination = "shell-integration/zsh/conduit.zsh" },
+        .{ .source = b.path("assets/shell-integration/fish/vendor_conf.d/conduit.fish"), .destination = "shell-integration/fish/vendor_conf.d/conduit.fish" },
+        .{ .source = b.path("LICENSE"), .destination = "licenses/LICENSE" },
+        .{ .source = b.path("assets/fonts/LICENSE-JetBrainsMono-OFL-1.1.txt"), .destination = "licenses/JetBrainsMono-OFL-1.1.txt" },
+        .{ .source = b.path("assets/fonts/LICENSE-NerdFonts.txt"), .destination = "licenses/NerdFonts-LICENSE.txt" },
+        .{ .source = b.path("assets/fonts/NerdFonts-license-audit.md"), .destination = "licenses/NerdFonts-license-audit.md" },
+        .{ .source = b.path("assets/themes/README.md"), .destination = "licenses/themes-README.md" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/FreeType-FTL.txt"), .destination = "licenses/FreeType-FTL.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/FreeType-LICENSE.TXT"), .destination = "licenses/FreeType-LICENSE.TXT" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/HarfBuzz-COPYING.txt"), .destination = "licenses/HarfBuzz-COPYING.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/Oniguruma-COPYING.txt"), .destination = "licenses/Oniguruma-COPYING.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/zlib-LICENSE.txt"), .destination = "licenses/zlib-LICENSE.txt" },
+        .{ .source = b.path("assets/THIRD-PARTY-LICENSES/libpng-LICENSE.txt"), .destination = "licenses/libpng-LICENSE.txt" },
+        .{ .source = b.dependency("ghostty", ghosttyDependencyOptions(target, optimize)).path("LICENSE"), .destination = "licenses/Ghostty-LICENSE" },
+        .{ .source = b.dependency("sdl", .{ .target = target, .optimize = optimize }).path("LICENSE.txt"), .destination = "licenses/SDL-LICENSE.txt" },
+        .{ .source = b.dependency("zopengl", .{}).path("LICENSE"), .destination = "licenses/zopengl-LICENSE" },
+    };
+    for (resources) |file| {
+        bundle_step.dependOn(&b.addInstallFile(file.source, b.fmt("{s}/Resources/{s}", .{ contents, file.destination })).step);
     }
 }
 
