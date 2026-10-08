@@ -1105,6 +1105,19 @@ WINCH`. With that, both checks get past the resize but fail on something else on
 `OutOfMemory` from the engine's search reload of the active area, so they stay reported rather
 than gating until each has had its own runner iteration.
 
+TASK-76 follow-ups (2026-10-08): the branch row had two ways to stay empty on real machines. On
+Windows the shell reports `/C:/Users/...` and every tracked-cwd consumer (the git lookup, the
+Backlog.md view, prompt discovery) handed that form to the Local context, which cannot open it;
+`LocalExecutionContext` now maps a leading `/X:/` to `X:/` (`trackedToNative`, unit-tested
+everywhere, exercised against `C:\Windows` on the Windows matrix leg). On any platform a `.zshrc`
+that assigns `precmd_functions=(...)` outright removed Conduit's zsh hooks, because they were
+installed from `.zshenv` before the user's rc; the zsh integration now keeps `ZDOTDIR` on its own
+directory through startup with `.zprofile`, `.zshrc` and `.zlogin` wrappers that source the user's
+files with the user's ZDOTDIR in place, load `conduit.zsh` after the user's `.zshrc`, and restore
+ZDOTDIR for good at the end (non-interactive shells restore it at once). A real-zsh test with such
+an rc fails on the old scripts; login, non-login, non-interactive and user-ZDOTDIR startups were
+traced by hand. Bash was already robust (it sources the user's rc first, then prepends its hook).
+
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
 attributes in any order, and `shell = <name>` for the default (32 profiles, 32 arguments and 32

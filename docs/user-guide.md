@@ -94,6 +94,11 @@ answers, Enter chooses, Escape keeps the tab. Closing the last tab quits Conduit
 A background tab that prints output is marked `* `; one that rings the bell is marked `! `.
 Switching to it clears the mark.
 
+When the focused pane's shell sits inside a git work tree, a small dim row under the tab's name
+shows the branch (or the short commit of a detached HEAD). It follows the directory the shell
+reports through shell integration (bash, zsh, fish and PowerShell), so a shell without it never
+shows one; it is read from `.git/HEAD` through the workspace, and no `git` process runs.
+
 ## Panes
 
 Every tab can be split into panes, to any depth. A new pane starts in the focused pane's

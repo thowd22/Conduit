@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-07 15:34'
-updated_date: '2026-10-07 21:02'
+updated_date: '2026-10-08 15:58'
 labels: []
 dependencies: []
 priority: medium
@@ -43,6 +43,8 @@ The sidebar lists tabs by name alone, so a user with several tabs in different c
 
 <!-- SECTION:NOTES:BEGIN -->
 Agent: src/git.zig resolves HEAD only through ExecutionContext statPath/readFile (32-level walk, gitdir: files, 4 KiB HEAD, validated names); app refreshes per session on OSC 7, OSC 133 prompt, reset and a Local-only watch, each as a git.Lookup worker; ui.TextStyle.small via a second font.Manager at 0.6 pt (decision-10); branch row workspace.<k>.tab.<n>.branch in muted; --git-test with two real repos; e2e sidebar-branch (14 scenarios). Coordinator 2026-10-07: merged as 77201ce; local gate green on every check and all 14 scenarios (the one unit failure was the unrelated pty ReaderPark flake, being fixed); screenshots at scale 1 and 1.25 inspected: small dim branch rows, detached short commit, gap, limit case withholding the group.
+
+2026-10-08 follow-up: the branch row stayed empty on Windows because tracked /C:/ paths reached the Local context unconverted (fixed in workspace.zig: trackedToNative, unit-tested; Windows leg stats C:\Windows), and on any platform under a .zshrc that assigns precmd_functions outright (fixed with ZDOTDIR wrappers .zprofile/.zshrc/.zlogin that load conduit.zsh after the user's .zshrc; real-zsh regression test added, startup modes traced by hand).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
