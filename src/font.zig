@@ -230,17 +230,20 @@ const Face = struct {
     origin: Origin,
 
     const Origin = union(enum) {
-        path: [:0]const u8,
+        /// A font file, and which face inside it: a collection (`.ttc`, `.otc`, most of macOS's
+        /// system faces) holds several, and a single-face file is index 0.
+        path: struct { path: [:0]const u8, index: u32 = 0 },
         memory: []const u8,
     };
 
-    /// Open a face from a file. Every failure here is a font file that is not the face it claims to
-    /// be, which is external input: it is returned, never asserted. `path` must outlive the face.
-    fn open(library: ft.FT_Library, path: [:0]const u8, size_px: u32) !Face {
+    /// Open face `index` of a file. Every failure here is a font file that is not the face it
+    /// claims to be, which is external input: it is returned, never asserted. `path` must outlive
+    /// the face.
+    fn open(library: ft.FT_Library, path: [:0]const u8, index: u32, size_px: u32) !Face {
         var handle: ft.FT_Face = undefined;
-        if (ft.FT_New_Face(library, path.ptr, 0, &handle) != 0) return error.FontFileUnreadable;
+        if (ft.FT_New_Face(library, path.ptr, @intCast(index), &handle) != 0) return error.FontFileUnreadable;
         errdefer _ = ft.FT_Done_Face(handle);
-        return sized(handle, .{ .path = path }, size_px);
+        return sized(handle, .{ .path = .{ .path = path, .index = index } }, size_px);
     }
 
     /// Open a face from bytes already in memory: how the bundled fallback is loaded, and how a
@@ -386,6 +389,10 @@ fn classifyStyle(style_flags: ft.FT_Long) FaceStyle {
 pub const FontFile = struct {
     /// The file's path, owned by the `Catalog` that found it.
     path: [:0]u8,
+    /// Which face of the file this is. A collection (`.ttc`, `.otc`) is one entry per face, all
+    /// with the same path; every other file is face 0 (TASK-48: macOS ships Menlo, Courier and
+    /// most system faces as collections).
+    face_index: u32 = 0,
     /// The family name from the file's name table, owned by the `Catalog`.
     family: []u8,
     /// The style name from the file's name table, owned by the `Catalog`.
@@ -520,15 +527,39 @@ pub const Catalog = struct {
         return self;
     }
 
-    /// Open one font file and record its family and style.
+    /// The most faces read from one collection. Real collections hold a handful (Menlo has four,
+    /// the largest CJK collections a few dozen); a file claiming more is bounded rather than
+    /// believed.
+    const max_collection_faces: u32 = 64;
+
+    /// Open one font file and record the family and style of every face in it.
     fn addFile(self: *Catalog, library: ft.FT_Library, path: [:0]const u8) !void {
-        var handle: ft.FT_Face = undefined;
-        if (ft.FT_New_Face(library, path.ptr, 0, &handle) != 0) {
+        var first: ft.FT_Face = undefined;
+        if (ft.FT_New_Face(library, path.ptr, 0, &first) != 0) {
             log.debug("not a font file Conduit can read: {s}", .{path});
             return error.FontFileUnreadable;
         }
-        defer _ = ft.FT_Done_Face(handle);
+        const faces: u32 = @intCast(@min(@max(first.*.num_faces, 1), max_collection_faces));
+        var recorded = false;
+        var index: u32 = 0;
+        while (index < faces) : (index += 1) {
+            var handle: ft.FT_Face = first;
+            if (index != 0 and ft.FT_New_Face(library, path.ptr, @intCast(index), &handle) != 0) {
+                log.debug("face {d} of {s} could not be read", .{ index, path });
+                continue;
+            }
+            defer _ = ft.FT_Done_Face(handle);
+            self.addFace(handle, path, index) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            recorded = true;
+        }
+        if (!recorded) return error.FontFileUnreadable;
+    }
 
+    /// Record one open face of `path`.
+    fn addFace(self: *Catalog, handle: ft.FT_Face, path: [:0]const u8, face_index: u32) !void {
         const family = std.mem.span(handle.*.family_name);
         if (family.len == 0) {
             log.debug("font file has no family name: {s}", .{path});
@@ -546,6 +577,7 @@ pub const Catalog = struct {
         const flags = handle.*.face_flags;
         try self.files.append(self.gpa, .{
             .path = owned_path,
+            .face_index = face_index,
             .family = owned_family,
             .style = owned_style,
             .face_style = classifyStyle(handle.*.style_flags),
@@ -1401,7 +1433,7 @@ pub const Manager = struct {
                 log.warn("fallback font family '{s}' is not installed; skipped", .{family});
                 continue;
             };
-            const face = Face.open(self.library.handle, file.path, self.size_px) catch |err| {
+            const face = Face.open(self.library.handle, file.path, file.face_index, self.size_px) catch |err| {
                 log.warn("fallback font {s} could not be opened ({s}); skipped", .{ file.path, @errorName(err) });
                 continue;
             };
@@ -1613,7 +1645,7 @@ pub const Manager = struct {
         }
         const file = self.catalog.files.items[catalog_index];
         const opened = blk: {
-            const face = Face.open(self.library.handle, file.path, self.size_px) catch |err| break :blk err;
+            const face = Face.open(self.library.handle, file.path, file.face_index, self.size_px) catch |err| break :blk err;
             break :blk self.addExtra(.system, face, catalog_index);
         };
         return opened catch |err| {
@@ -2001,11 +2033,15 @@ fn harfBuzzFont(face: Face, size_px: u32) error{ OutOfMemory, FontFileUnreadable
             null,
             null,
         ) orelse return error.OutOfMemory,
-        .path => |path| hb.hb_blob_create_from_file_or_fail(path.ptr) orelse
+        .path => |file| hb.hb_blob_create_from_file_or_fail(file.path.ptr) orelse
             return error.FontFileUnreadable,
     };
     defer hb.hb_blob_destroy(blob);
-    const hb_face: *hb.hb_face_t = hb.hb_face_create(blob, 0) orelse return error.OutOfMemory;
+    const index: c_uint = switch (face.origin) {
+        .memory => 0,
+        .path => |file| file.index,
+    };
+    const hb_face: *hb.hb_face_t = hb.hb_face_create(blob, index) orelse return error.OutOfMemory;
     defer hb.hb_face_destroy(hb_face);
     const font: *hb.hb_font_t = hb.hb_font_create(hb_face) orelse return error.OutOfMemory;
     const upem: i32 = @intCast(face.unitsPerEm());
@@ -2105,7 +2141,7 @@ fn applyStyleOverrides(
             });
             continue;
         };
-        const face = Face.open(library, file.path, size_px) catch |err| {
+        const face = Face.open(library, file.path, file.face_index, size_px) catch |err| {
             log.warn("font style file {s} could not be opened ({s}); keeping the derived face", .{
                 file.path,
                 @errorName(err),
@@ -2127,7 +2163,7 @@ fn resolvePrimary(
     size_px: u32,
 ) !Resolution {
     if (catalog.findFamily(request.family)) |file| {
-        if (Face.open(library, file.path, size_px)) |face| {
+        if (Face.open(library, file.path, file.face_index, size_px)) |face| {
             var resolution = try makeResolution(gpa, face, file.path, false);
             errdefer resolution.deinit(gpa);
 
@@ -2138,10 +2174,11 @@ fn resolvePrimary(
                 // A family without a regular face can use (for example) its bold face as the
                 // primary resolution. That handle already lives in slot zero and must not be
                 // opened and owned a second time merely because its metadata also says "bold".
-                if (std.mem.eql(u8, style_file.path, file.path)) continue;
+                if (std.mem.eql(u8, style_file.path, file.path) and style_file.face_index == file.face_index) continue;
                 resolution.faces[styleIndex(style)] = Face.open(
                     library,
                     style_file.path,
+                    style_file.face_index,
                     size_px,
                 ) catch |err| {
                     log.warn("font style file {s} could not be opened ({s}); using the primary face", .{
@@ -2654,7 +2691,7 @@ test "a family is resolved by name from a directory of font files" {
     try testing.expectEqual(@as(u8, 0), found.path[found.path.len]);
     var library = try Library.init();
     defer library.deinit();
-    var reopened = try Face.open(library.handle, found.path, 14);
+    var reopened = try Face.open(library.handle, found.path, found.face_index, 14);
     defer reopened.deinit();
     try testing.expectEqualStrings("JetBrains Mono", reopened.familyName());
 
@@ -3412,4 +3449,65 @@ test "the fallback count reports only installed configured families" {
     defer manager.deinit();
     try testing.expectEqual(@as(usize, 0), manager.configuredFallbackCount());
     try testing.expect(!manager.builtinSymbols());
+}
+
+/// A two-face TrueType collection made from `first` and `second`, so the scan can be tested on
+/// the shape macOS ships its system faces in without a system font. A collection's table
+/// records point from the start of the whole file, so each embedded face's records are moved by
+/// where that face lands.
+fn testCollection(gpa: Allocator, first: []const u8, second: []const u8) ![]u8 {
+    const header_len = 12 + 2 * 4;
+    const second_at = header_len + first.len + (4 - first.len % 4) % 4;
+    const out = try gpa.alloc(u8, second_at + second.len);
+    @memset(out, 0);
+    @memcpy(out[0..4], "ttcf");
+    std.mem.writeInt(u32, out[4..8], 0x00010000, .big);
+    std.mem.writeInt(u32, out[8..12], 2, .big);
+    std.mem.writeInt(u32, out[12..16], header_len, .big);
+    std.mem.writeInt(u32, out[16..20], @intCast(second_at), .big);
+    const placed = [_]struct { bytes: []const u8, at: usize }{
+        .{ .bytes = first, .at = header_len },
+        .{ .bytes = second, .at = second_at },
+    };
+    for (placed) |face| {
+        @memcpy(out[face.at..][0..face.bytes.len], face.bytes);
+        const tables = std.mem.readInt(u16, face.bytes[4..6], .big);
+        for (0..tables) |table| {
+            const record = out[face.at + 12 + table * 16 ..][0..16];
+            const offset = std.mem.readInt(u32, record[8..12], .big);
+            std.mem.writeInt(u32, record[8..12], offset + @as(u32, @intCast(face.at)), .big);
+        }
+    }
+    return out;
+}
+
+test "every face of a font collection is discovered and opens at its own index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const collection = try testCollection(testing.allocator, bundled_face, bundled_symbols);
+    defer testing.allocator.free(collection);
+    try tmp.dir.writeFile(io, .{ .sub_path = "Pair.ttc", .data = collection });
+    const root = try tmp.parent_dir.realPathFileAlloc(io, &tmp.sub_path, testing.allocator);
+    defer testing.allocator.free(root);
+
+    var catalog = try Catalog.scan(io, testing.allocator, &.{root});
+    defer catalog.deinit();
+    try testing.expectEqual(@as(usize, 2), catalog.files.items.len);
+
+    const text = catalog.findFamily("JetBrains Mono") orelse return error.TestExpectedEqual;
+    const symbols = catalog.findFamily("Symbols Nerd Font Mono") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings(text.path, symbols.path);
+    try testing.expectEqual(@as(u32, 0), text.face_index);
+    try testing.expectEqual(@as(u32, 1), symbols.face_index);
+
+    // Each face reopens as itself, and the shaper's view of the file picks the same face.
+    var library = try Library.init();
+    defer library.deinit();
+    var second = try Face.open(library.handle, symbols.path, symbols.face_index, 14);
+    defer second.deinit();
+    try testing.expectEqualStrings("Symbols Nerd Font Mono", second.familyName());
+    const shaper = try harfBuzzFont(second, 14);
+    defer hb.hb_font_destroy(shaper);
+    try testing.expectEqual(@as(c_uint, 1), hb.hb_face_get_index(hb.hb_font_get_face(shaper)));
 }
