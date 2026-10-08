@@ -3157,7 +3157,10 @@ const win = struct {
             return written;
         }
         return switch (lastError()) {
-            .BROKEN_PIPE, .HANDLE_EOF => error.Closed,
+            // `NO_DATA` ("the pipe is being closed") is what a write gets once the exit watcher
+            // has closed the pseudoconsole of a child that ended: the terminal is gone, which is
+            // `Closed`, not a fault that should stop the app.
+            .BROKEN_PIPE, .HANDLE_EOF, .NO_DATA => error.Closed,
             else => |err| blk: {
                 log.err("cannot write to the terminal: {s}", .{@tagName(err)});
                 break :blk error.SystemError;
@@ -4157,6 +4160,28 @@ test "a Windows child that exits is reported with the code it exited with" {
     defer pty.destroy();
 
     try testing.expectEqual(ChildState{ .exited = .{ .code = 42 } }, try waitForExit(pty));
+}
+
+test "writing to a Windows terminal whose child has ended is Closed, not a system error" {
+    // Once the exit watcher closes the pseudoconsole its input pipe has no reader, and WriteFile
+    // fails with ERROR_NO_DATA. The owner may still have queued input (a key typed as the child
+    // ended), so that write must report the terminal closed rather than stop the app.
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try spawnConPty(gpa, windowsRequest(&.{ "cmd.exe", "/Q", "/C", "exit 0" }));
+    defer pty.destroy();
+
+    try testing.expectEqual(ChildState{ .exited = .{ .code = 0 } }, try waitForExit(pty));
+    // The pipe can still take one buffered write before its reader is gone; a few more
+    // must reach the closed end, and every failure must be `Closed`.
+    var attempts: usize = 0;
+    while (attempts < 64) : (attempts += 1) {
+        _ = pty.write("x\r") catch |err| {
+            try testing.expectEqual(error.Closed, err);
+            return;
+        };
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "a Windows child's last output arrives before its end is reported" {
