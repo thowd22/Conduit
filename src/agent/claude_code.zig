@@ -2351,6 +2351,9 @@ test "a real interactive claude started by hand is found in the registry, attach
 // SSH workspaces (TASK-61) ------------------------------------------------------
 
 test "the config directory is resolved in the context's own environment" {
+    // The resolution is a POSIX `/bin/sh` script over the context, and the
+    // expectation is read from the POSIX environment.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var context = try workspace.ExecutionContext.local(testing.allocator);
     defer context.deinit();
     var buffer: [Dir.max_path_bytes]u8 = undefined;
