@@ -271,11 +271,19 @@ pub const FdStream = struct {
         const address_len: posix.socklen_t = @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1);
         if (@hasField(posix.sockaddr.un, "len")) address.len = @intCast(address_len);
 
-        const flags: u32 = posix.SOCK.STREAM | if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0;
+        // Darwin has no SOCK_CLOEXEC: Zig's `SOCK.CLOEXEC` there is a shim
+        // value for its own wrappers, and the raw socket(2) refuses it with
+        // EINVAL, so on Darwin the descriptor is marked close-on-exec after.
+        const native_cloexec = comptime !builtin.os.tag.isDarwin() and @hasDecl(posix.SOCK, "CLOEXEC");
+        const flags: u32 = posix.SOCK.STREAM | if (native_cloexec) posix.SOCK.CLOEXEC else 0;
         const socket_result = posix.system.socket(posix.AF.UNIX, flags, 0);
         if (posix.errno(socket_result) != .SUCCESS) return error.ConnectFailed;
         const fd: posix.fd_t = @intCast(socket_result);
         errdefer _ = posix.system.close(fd);
+        if (comptime !native_cloexec) {
+            if (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(u32, posix.FD_CLOEXEC))) != .SUCCESS)
+                return error.ConnectFailed;
+        }
         if (@hasDecl(posix.SO, "NOSIGPIPE")) {
             const one: c_int = 1;
             posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one)) catch
