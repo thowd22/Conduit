@@ -1612,6 +1612,10 @@ const Load = struct {
                 return;
             };
             var request = spawn_request;
+            // A WSL workspace's file references are translated with the
+            // distribution's drive mount root, learned once by the first
+            // spawn's worker because it blocks on an exec (TASK-47).
+            if (workspace.wsl.WslContext.fromRef(context)) |wsl_context| wsl_context.learnMountRoot(self.io);
             if (self.agent_runner) |runner| {
                 const prepared = runner.prepare(request.env) catch |err| {
                     self.spawn_failure = @errorName(err);
@@ -1793,6 +1797,8 @@ const ChildSpec = struct {
         fake_agent_env,
         // The backlog view's test stand-in (TASK-63) is the app's, not a child's.
         backlog_cli_env,
+        // So is the WSL launcher's (TASK-47).
+        wsl_launcher_env,
         // An enclosing Conduit's control endpoint, token and session (TASK-60)
         // name that Conduit's workspace and terminal. They are added per spawn
         // by `appendControlEnv` for this run's own non-scratchpad children
@@ -2868,7 +2874,7 @@ const AgentViewTarget = struct {
 const AgentViewSlot = struct { len: u16 = 0, target: ?AgentViewTarget = null };
 /// The connection manager's list: hosts, profiles, recent destinations and
 /// the `user@host` row.
-const remote_choice_capacity: usize = remote.max_hosts + config.max_remote_profiles + config.max_remote_recent + 1;
+const remote_choice_capacity: usize = remote.max_hosts + config.max_remote_profiles + config.max_remote_recent + workspace.wsl.max_distributions + 1;
 const remote_choice_value_capacity: usize = config.max_string_bytes + 16;
 const remote_save_choices = [_]inputmod.PaletteChoice{
     .{ .label = "Save as profile", .value = "yes" },
@@ -2884,6 +2890,19 @@ const fake_agent_env = "CONDUIT_TEST_FAKE_AGENT";
 /// moves a task without the real CLI. A relative path resolves in the
 /// project directory, where the CLI runs. Ignored without the driver.
 const backlog_cli_env = "CONDUIT_TEST_BACKLOG_CLI";
+/// Names a stand-in for Windows' `wsl.exe` (TASK-47), for a run that also has
+/// the test driver: Remote: connect then lists the distributions the stand-in
+/// answers `--list --quiet` with, and a WSL workspace launches through it. How
+/// the WSL wiring is driven on a machine without WSL. Ignored without the
+/// driver; never inherited by children.
+const wsl_launcher_env = "CONDUIT_TEST_WSL_LAUNCHER";
+
+/// The stand-in `wsl.exe` a driven run was given, or null for the real one.
+fn wslTestLauncher(options: Options, env: EnvSource) ?[]const u8 {
+    if (options.run.test_driver_endpoint == null) return null;
+    const program = env.get(wsl_launcher_env) orelse return null;
+    return if (program.len == 0) null else program;
+}
 
 /// The CLI the backlog view runs: `backlog`, or a driven run's stand-in.
 fn backlogProgram(options: Options, env: EnvSource) []const u8 {
@@ -5428,6 +5447,23 @@ fn fileReferenceTextIsSafe(text: []const u8) bool {
     return true;
 }
 
+/// Whether a theme's window background reads as dark, for the title bar
+/// drawn around it (TASK-49).
+fn paletteIsDark(palette: theme.Palette) bool {
+    return theme.luminance(palette.get(.background)) < 0.5;
+}
+
+/// A file reference as the workspace's context names it: in a WSL workspace
+/// a Windows spelling (`C:\x`, `\\wsl.localhost\<distro>\x`) becomes the
+/// distribution's path (`/mnt/c/x`, `/x`) (TASK-47); everywhere else, and for
+/// a path already in the distribution's syntax, `path` itself. Null when a
+/// Windows path has no translation there (another machine's share). Never
+/// blocks: the mount root was learned by a spawn worker.
+fn fileReferenceContextPath(context: workspace.ExecutionContext.Ref, path: []const u8, buffer: []u8) ?[]const u8 {
+    const wsl_context = workspace.wsl.WslContext.fromRef(context) orelse return path;
+    return wsl_context.toContextPath(path, buffer);
+}
+
 /// Build the owned argv `vi +<line> -- <path>` (or `vi -- <path>`) for one
 /// detected file reference. A relative spelling is joined to `cwd` after
 /// dropping leading `./` segments; nothing is canonicalized, stat'ed or read.
@@ -5934,6 +5970,9 @@ const App = struct {
     /// The CLI the view's writes run, resolved on the context's PATH.
     /// `--backlog-test` points it at a fake.
     backlog_program: []const u8 = "backlog",
+    /// A driven run's stand-in for `wsl.exe` (TASK-47), or null. Borrows the
+    /// process environment.
+    wsl_launcher: ?[]const u8 = null,
     /// The harnesses the detail's start-agent chooser offers (TASK-64).
     backlog_harness: [backlog_harness_capacity]app_agents.Choice = undefined,
     backlog_harness_labels: [backlog_harness_capacity][96]u8 = undefined,
@@ -7031,6 +7070,7 @@ const App = struct {
             .manager_input = manager_input,
             .backlog_frames = .{ .init(allocator), .init(allocator) },
             .backlog_program = backlogProgram(options, env),
+            .wsl_launcher = wslTestLauncher(options, env),
             .right_click = config.Layer.resolve(config.RightClick, config.RightClick.built_in, loaded_config.settings.right_click, options.run.right_click),
             .session_right_click = options.run.right_click,
             .session_font_family = session_font_family,
@@ -7079,6 +7119,8 @@ const App = struct {
         // `resolveTheme` runs; the file itself is read further down.
         app.persistence = Persistence.forRun(allocator, io, env, options, loaded_config.settings.restore_enabled);
         app.resolveTheme();
+        // The window was created dark; a light theme lightens its title bar.
+        app.window.setTitleBarDark(paletteIsDark(app.palette));
         app.theme_catalog.order(app.activeThemeName());
         app.setThemeChoices();
         app.setFontChoices();
@@ -7582,7 +7624,7 @@ const App = struct {
             return;
         };
         const process = self.processFor(model, &self.spec);
-        if (process.argv.len == 0 and model.contextKind() != .ssh) {
+        if (process.argv.len == 0 and !model.contextKind().isRemote()) {
             self.allocator.free(item.cwd);
             return;
         }
@@ -8413,9 +8455,10 @@ const App = struct {
     }
 
     /// What a new terminal in `model` runs: the remote user's login shell
-    /// with the remote overlay in an SSH workspace, otherwise `local`.
+    /// with the remote overlay in an SSH or WSL workspace (whose machine is
+    /// not this one), otherwise `local`.
     fn processFor(self: *const App, model: *const workspace.Workspace, local: *const ChildSpec) workspace.ProcessSpec {
-        const spec = if (model.contextKind() == .ssh) &self.remote_spec else local;
+        const spec = if (model.contextKind().isRemote()) &self.remote_spec else local;
         return .{ .argv = spec.argv, .env = spec.env };
     }
 
@@ -8530,6 +8573,84 @@ const App = struct {
             log.warn("the ssh client could not be started: {s}", .{@errorName(err)});
         };
         record.state = ssh_context.state();
+        return presentation;
+    }
+
+    /// Open a WSL workspace in `distribution`, named after it, and switch to
+    /// it (TASK-47). There is no connection phase: the first tab and the
+    /// scratchpad spawn through the workspace's context at once, and the
+    /// distribution boots on the first of them. Refusals are status lines.
+    fn openWslWorkspace(self: *App, distribution: []const u8) !bool {
+        if (!workspace.wsl.supported and self.wsl_launcher == null) {
+            self.setWorkspaceStatus("wsl: not available here");
+            return false;
+        }
+        if (self.closeModalActive() or self.paletteVisible() or !try self.prepareWorkspaceTransition()) return false;
+        const name = try self.uniqueWorkspaceName(distribution);
+        defer self.allocator.free(name);
+        const presentation = self.createWslPresentation(name, distribution) catch |err| {
+            log.warn("the wsl workspace could not be created: {s}", .{@errorName(err)});
+            self.setRemoteStatus("wsl: could not start ({s})", .{@errorName(err)});
+            return false;
+        };
+        const model = self.workspace_registry.byKey(presentation.key) orelse return false;
+        self.startPresentationChild(presentation, presentation.active_session_id, self.processFor(model, &self.spec));
+        self.startScratchpadFor(presentation, false);
+        try self.commitWorkspaceActivation(presentation.key, false);
+        return true;
+    }
+
+    /// Build a WSL workspace: its context over `wsl.exe -d <distribution>`
+    /// (the launcher gets Conduit's own environment, as the local `ssh`
+    /// client does), a `Terminal 1` tab and their renderers. Nothing starts.
+    fn createWslPresentation(self: *App, name: []const u8, distribution: []const u8) !*WorkspacePresentation {
+        const grid_size = self.activeLive().terminal().gridSize();
+        const context = try workspace.wsl.WslContext.create(self.allocator, .{
+            .distribution = distribution,
+            .program = self.wsl_launcher orelse "wsl.exe",
+            .local_env = self.ssh_client_spec.env,
+        });
+        // The workspace owns the context from here, also on its refusal.
+        var candidate = try workspace.Workspace.init(self.io, self.allocator, name, "", context, grid_size);
+        var candidate_owned = true;
+        errdefer if (candidate_owned) candidate.deinit() catch |err| log.warn(
+            "could not release a refused wsl workspace: {s}",
+            .{@errorName(err)},
+        );
+        const session_id = try candidate.createSession(.human_terminal, grid_size);
+        _ = try candidate.registerTab("Terminal 1", session_id);
+        const live = candidate.sessionById(session_id) orelse return error.SessionNotFound;
+        live.terminal().setClipboardAccess(.{
+            .read_fn = readNativeClipboard,
+            .write_fn = writeNativeClipboard,
+        });
+
+        var pane_renderers: std.ArrayList(PaneRenderer) = .empty;
+        errdefer {
+            for (pane_renderers.items) |*pane_renderer| pane_renderer.deinit();
+            pane_renderers.deinit(self.allocator);
+        }
+        try pane_renderers.ensureUnusedCapacity(self.allocator, 1);
+        pane_renderers.appendAssumeCapacity(try self.newPaneRenderer(session_id));
+
+        var scratchpad_grid = try render.Grid.init(self.allocator, gridColors(self.palette));
+        var scratchpad_grid_owned = true;
+        errdefer if (scratchpad_grid_owned) scratchpad_grid.deinit();
+        try scratchpad_grid.attachAtlas(self.fonts.atlasPixels(), self.atlas);
+
+        try self.workspace_presentations.ensureUnusedCapacity(self.allocator, 1);
+        const presentation = try self.allocator.create(WorkspacePresentation);
+        errdefer self.allocator.destroy(presentation);
+        const key = try self.workspace_registry.insert(&candidate);
+        candidate_owned = false;
+        presentation.* = .{
+            .key = key,
+            .active_session_id = session_id,
+            .pane_renderers = pane_renderers,
+            .scratchpad_grid = scratchpad_grid,
+        };
+        scratchpad_grid_owned = false;
+        self.workspace_presentations.appendAssumeCapacity(presentation);
         return presentation;
     }
 
@@ -8814,6 +8935,7 @@ const App = struct {
         for (self.config_current.settings.remote_recent) |destination| {
             self.addRemoteChoice(&count, .{ .recent = destination }, "{s}  recent", .{destination});
         }
+        self.addWslChoices(&count);
         self.addRemoteChoice(&count, .address, "Enter user@host…", .{});
         self.remote_choice_count = count;
         self.action_definitions[self.remote_connect_index].palette = .{ .argument = .{ .choices = .{
@@ -8900,6 +9022,28 @@ const App = struct {
         return self.allocator.dupe(u8, if (local) spawnDirectory(&buffer, inherited, builtin.os.tag) else inherited);
     }
 
+    /// TASK-47: every installed WSL distribution, where WSL exists (or a
+    /// driven run named a stand-in launcher), as a `wsl:<name>` choice.
+    fn addWslChoices(self: *App, count: *usize) void {
+        var distributions: workspace.wsl.Distributions = .{};
+        if (self.wsl_launcher) |launcher| {
+            // Test-only: a stand-in has no registry entries, so it is asked
+            // through a short bounded process, as `wsl --list` would be.
+            workspace.wsl.listDistributions(self.allocator, self.io, launcher, &.{}, &distributions);
+        } else if (workspace.wsl.supported) {
+            // The registry: no process on the UI thread.
+            workspace.wsl.listRegisteredDistributions(&distributions);
+        } else return;
+        for (0..distributions.count) |index| {
+            if (count.* == remote_choice_capacity) return;
+            const name = distributions.at(index);
+            const value = remote.wslChoiceValue(&self.remote_choice_values[count.*], name) catch continue;
+            const label = remote.wslChoiceLabel(&self.remote_choice_labels[count.*], name) catch continue;
+            self.remote_choices[count.*] = .{ .label = label, .value = value };
+            count.* += 1;
+        }
+    }
+
     fn addRemoteChoice(self: *App, count: *usize, choice: remote.Choice, comptime format: []const u8, args: anytype) void {
         if (count.* == remote_choice_capacity) return;
         const value = choice.format(&self.remote_choice_values[count.*]) catch return;
@@ -8930,6 +9074,10 @@ const App = struct {
         var copy: [remote_choice_value_capacity]u8 = undefined;
         if (value.len > copy.len) return;
         @memcpy(copy[0..value.len], value);
+        if (remote.parseWslChoice(copy[0..value.len])) |distribution| {
+            _ = try self.openWslWorkspace(distribution);
+            return;
+        }
         const choice = remote.Choice.parse(copy[0..value.len]) orelse {
             self.setWorkspaceStatus("ssh: unknown connection");
             return;
@@ -9697,8 +9845,8 @@ const App = struct {
         const program = argv orelse process.argv;
         const base_env: []const []const u8 = owned_env orelse process.env;
         // An empty program is "no child" locally and the remote login shell
-        // in an SSH workspace.
-        if (program.len == 0 and model.contextKind() != .ssh) {
+        // in an SSH or WSL workspace.
+        if (program.len == 0 and !model.contextKind().isRemote()) {
             self.allocator.free(cwd);
             if (argv) |owned| freeEntries(self.allocator, owned);
             if (owned_env) |owned| freeEntries(self.allocator, owned);
@@ -16677,7 +16825,11 @@ const App = struct {
         var path_storage: [link.default_max_target_bytes]u8 = undefined;
         if (target.target.len > path_storage.len) return false;
         @memcpy(path_storage[0..target.target.len], target.target);
-        const path = path_storage[0..target.target.len];
+        var translated_storage: [file_reference_path_max_bytes]u8 = undefined;
+        const path = fileReferenceContextPath(self.activeWorkspace().contextRef(), path_storage[0..target.target.len], &translated_storage) orelse {
+            log.debug("a Windows file reference has no path in this workspace", .{});
+            return false;
+        };
         const line = target.line;
         const source_id = target.session_id;
 
@@ -17041,6 +17193,7 @@ const App = struct {
     /// workspace's scratchpad, the overlay and the cleared surface.
     fn applyPalette(self: *App, palette: theme.Palette) void {
         self.palette = palette;
+        self.window.setTitleBarDark(paletteIsDark(palette));
         const colors = gridColors(palette);
         self.background = colors.background;
         for (self.workspace_presentations.items) |presentation| {
@@ -35467,6 +35620,7 @@ const inheriting_env = test_env{ .vars = &.{
     .{ "CONDUIT_AGENT_GATE", "1" },
     .{ "CONDUIT_TEST_FAKE_AGENT", "1" },
     .{ "CONDUIT_TEST_BACKLOG_CLI", "./fake-backlog" },
+    .{ "CONDUIT_TEST_WSL_LAUNCHER", "/stub/wsl" },
     .{ "CONDUIT_CONTROL_ENDPOINT", "/outer/run.sock" },
     .{ "CONDUIT_CONTROL_TOKEN", "ffffffffffffffffffffffffffffffff" },
     .{ "CONDUIT_CONTROL_SESSION", "3" },
@@ -36514,4 +36668,122 @@ test "PowerShell runs under ConPTY with its integration, colours and resize" {
     try std.testing.expect(command_ends >= 2);
     try std.testing.expect(output_starts >= 2);
     try std.testing.expect(red_found);
+}
+
+test "the WSL launcher stand-in is honoured only by a driven run" {
+    const env = test_env{ .vars = &.{.{ "CONDUIT_TEST_WSL_LAUNCHER", "/stub/wsl" }} };
+    try std.testing.expect(wslTestLauncher(.{}, env.source()) == null);
+    var driven: Options = .{};
+    driven.run.test_driver_endpoint = "/run/driver.sock";
+    try std.testing.expectEqualStrings("/stub/wsl", wslTestLauncher(driven, env.source()).?);
+    const empty = test_env{ .vars = &.{.{ "CONDUIT_TEST_WSL_LAUNCHER", "" }} };
+    try std.testing.expect(wslTestLauncher(driven, empty.source()) == null);
+}
+
+test "the title bar follows whether the theme's background is dark" {
+    try std.testing.expect(paletteIsDark(theme.derive(theme.conduit_dark)));
+    const light = theme.findBundled("Solarized Light") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!paletteIsDark(theme.derive(light.scheme)));
+}
+
+/// A `wsl.exe` stand-in for the tests below: `-d StandIn --cd ~ -e <argv>`
+/// runs the command here with the stand-in's home and a `wslpath` whose
+/// drives live under `/windows/` rather than the default `/mnt/`.
+const wsl_stand_in_launcher =
+    \\home=$(cd "$(dirname "$0")/home" && pwd)
+    \\case "$1" in --list|-l) printf 'StandIn\n'; exit 0 ;; esac
+    \\[ "$1" = -d ] && [ "$2" = StandIn ] || exit 1
+    \\shift 2
+    \\if [ "$1" = --cd ]; then cd "$home"; shift 2; fi
+    \\[ "$1" = -e ] || exit 2
+    \\shift
+    \\PATH="$home/bin:$PATH" HOME="$home" exec "$@"
+    \\
+;
+
+test "a file reference in a WSL workspace names the distribution's path, elsewhere itself" {
+    var wsl_context = try workspace.wsl.WslContext.create(std.testing.allocator, .{ .distribution = "Ubuntu", .local_env = &.{} });
+    defer wsl_context.deinit();
+    var buffer: [file_reference_path_max_bytes]u8 = undefined;
+    const ref = wsl_context.borrow();
+    try std.testing.expectEqualStrings("/mnt/c/Users/me/main.zig", fileReferenceContextPath(ref, "C:\\Users\\me\\main.zig", &buffer).?);
+    try std.testing.expectEqualStrings("/mnt/d/src/a.zig", fileReferenceContextPath(ref, "D:/src/a.zig", &buffer).?);
+    try std.testing.expectEqualStrings("/home/me/x.zig", fileReferenceContextPath(ref, "\\\\wsl.localhost\\Ubuntu\\home\\me\\x.zig", &buffer).?);
+    try std.testing.expectEqualStrings("/home/me/x.zig", fileReferenceContextPath(ref, "/home/me/x.zig", &buffer).?);
+    try std.testing.expectEqualStrings("src/x.zig", fileReferenceContextPath(ref, "src/x.zig", &buffer).?);
+    // Another machine's share has no path inside the distribution.
+    try std.testing.expect(fileReferenceContextPath(ref, "\\\\server\\share\\x.zig", &buffer) == null);
+    // The translated spelling is what the editor is given.
+    const argv = try buildFileReferenceArgv(std.testing.allocator, fileReferenceContextPath(ref, "C:\\src\\main.zig", &buffer).?, 12, "/home/me");
+    defer freeEntries(std.testing.allocator, argv);
+    try std.testing.expectEqualStrings("/mnt/c/src/main.zig", argv[3]);
+
+    var local = try workspace.ExecutionContext.local(std.testing.allocator);
+    defer local.deinit();
+    try std.testing.expectEqualStrings("C:\\src\\main.zig", fileReferenceContextPath(local.borrow(), "C:\\src\\main.zig", &buffer).?);
+}
+
+test "a WSL workspace's spawn worker learns the drive mount root, then starts the session" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/bin");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wsl.sh", .data = wsl_stand_in_launcher });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/bin/wslpath",
+        .data = "#!/bin/sh\n[ \"$1\" = -u ] && printf '/windows/c/\\n'\n",
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const script = try std.fs.path.join(allocator, &.{ root, "wsl.sh" });
+    defer allocator.free(script);
+
+    var context = try workspace.wsl.WslContext.create(allocator, .{
+        .distribution = "StandIn",
+        .program = "/bin/sh",
+        .program_prefix = &.{script},
+        .local_env = &.{"PATH=/usr/local/bin:/usr/bin:/bin"},
+    });
+    defer context.deinit();
+    var buffer: [file_reference_path_max_bytes]u8 = undefined;
+    // Until a worker asks the distribution, drives are assumed under /mnt/.
+    try std.testing.expectEqualStrings("/mnt/c/x.zig", fileReferenceContextPath(context.borrow(), "C:\\x.zig", &buffer).?);
+
+    var job: Load = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .spawn = .{
+            .argv = &.{ "/bin/sh", "-c", "printf 'WSL_SESSION_UP\\n'" },
+            .env = &.{"TERM=xterm-256color"},
+            .cwd = "",
+            .size = .{ .rows = 24, .cols = 80 },
+        },
+        .execution_context = context.borrow(),
+    };
+    job.produce();
+    if (job.spawn_failure) |failure| {
+        std.log.err("the stand-in spawn failed: {s}", .{failure});
+        return error.TestUnexpectedResult;
+    }
+    const child = job.child orelse return error.TestUnexpectedResult;
+    defer child.destroy();
+    try std.testing.expectEqualStrings("/windows/c/x.zig", fileReferenceContextPath(context.borrow(), "C:\\x.zig", &buffer).?);
+
+    // The session really ran inside the stand-in distribution.
+    var collected: std.ArrayList(u8) = .empty;
+    defer collected.deinit(allocator);
+    var chunk: [1024]u8 = undefined;
+    const deadline = Io.Clock.awake.now(std.testing.io).nanoseconds + 10 * std.time.ns_per_s;
+    while (std.mem.indexOf(u8, collected.items, "WSL_SESSION_UP") == null) {
+        const count = child.takeBytes(&chunk);
+        if (count != 0) {
+            try collected.appendSlice(allocator, chunk[0..count]);
+            continue;
+        }
+        const now = Io.Clock.awake.now(std.testing.io).nanoseconds;
+        if (now >= deadline) return error.Timeout;
+        _ = child.waitReadable(@intCast(@divTrunc(deadline - now, std.time.ns_per_ms)));
+    }
 }
