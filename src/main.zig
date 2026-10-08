@@ -33328,7 +33328,10 @@ fn collectArgs(allocator: Allocator, args: std.process.Args) ![]const []const u8
     defer iterator.deinit();
 
     var collected: std.ArrayList([]const u8) = .empty;
-    while (iterator.next()) |arg| try collected.append(allocator, arg);
+    // Copied: on Windows each argument is a slice of the iterator's own
+    // buffer, which `deinit` frees (and Debug overwrites) before the caller
+    // reads them, so every flag would arrive as garbage (TASK-49).
+    while (iterator.next()) |arg| try collected.append(allocator, try allocator.dupe(u8, arg));
     return collected.items;
 }
 

@@ -72,7 +72,9 @@ fn collectArgs(allocator: Allocator, source: std.process.Args) ![]const []const 
     var iterator = try std.process.Args.Iterator.initAllocator(source, allocator);
     defer iterator.deinit();
     var args: std.ArrayList([]const u8) = .empty;
-    while (iterator.next()) |arg| try args.append(allocator, arg);
+    // Copied: on Windows each argument is a slice of the iterator's buffer, which
+    // `deinit` frees (and Debug overwrites) before the caller reads it (TASK-49).
+    while (iterator.next()) |arg| try args.append(allocator, try allocator.dupe(u8, arg));
     return args.items;
 }
 
