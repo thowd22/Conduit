@@ -566,6 +566,137 @@ fn validTargetText(text: []const u8, max_target_bytes: usize, allow_space: bool)
     return true;
 }
 
+/// Whether a file reference is spelled as a Windows path: a drive (`C:\x`,
+/// `C:/x`) or a UNC share (`\\server\share\x`). A WSL workspace translates
+/// such a reference into its own path syntax before resolving it (TASK-47).
+pub fn isWindowsPath(path: []const u8) bool {
+    if (path.len >= 3 and isDriveColon(path, 1) and (path[2] == '\\' or path[2] == '/')) return true;
+    return path.len >= 3 and path[0] == '\\' and path[1] == '\\' and path[2] != '\\';
+}
+
+/// Path translation between one WSL distribution and Windows (TASK-47), the
+/// pure half of what `wslpath -u` and `wslpath -w` do, so a file reference can
+/// be translated on the UI thread without starting a process.
+///
+/// `mount_root` is where the distribution mounts Windows drives (`/mnt/` by
+/// default, `[automount] root` in `/etc/wsl.conf`); the WSL context learns the
+/// real one once with `wslpath` and passes it here. Every result is written
+/// into the caller's buffer; null means the path has no translation (or does
+/// not fit).
+pub const WslPaths = struct {
+    /// The distribution's name, as `wsl --list` reports it.
+    distribution: []const u8,
+    /// Absolute, ending in `/`.
+    mount_root: []const u8 = "/mnt/",
+
+    /// A Windows path as the distribution sees it: `C:\Users\me\a.txt` is
+    /// `/mnt/c/Users/me/a.txt`, and `\\wsl.localhost\<this distro>\home\me`
+    /// (or `\\wsl$\...`) is `/home/me`. A share on another machine or another
+    /// distribution has no path here.
+    pub fn toWsl(self: WslPaths, path: []const u8, buffer: []u8) ?[]const u8 {
+        if (path.len >= 2 and isDriveColon(path, 1) and (path.len == 2 or path[2] == '\\' or path[2] == '/')) {
+            var writer: std.Io.Writer = .fixed(buffer);
+            writer.writeAll(self.mount_root) catch return null;
+            writer.writeByte(std.ascii.toLower(path[0])) catch return null;
+            if (path.len > 2) writeSeparated(&writer, path[2..], '/') catch return null;
+            return writer.buffered();
+        }
+        const rest = stripPrefixIgnoreCase(path, "\\\\wsl.localhost\\") orelse
+            stripPrefixIgnoreCase(path, "\\\\wsl$\\") orelse return null;
+        const separator = std.mem.indexOfScalar(u8, rest, '\\') orelse rest.len;
+        if (!std.ascii.eqlIgnoreCase(rest[0..separator], self.distribution)) return null;
+        var writer: std.Io.Writer = .fixed(buffer);
+        if (separator == rest.len) {
+            writer.writeByte('/') catch return null;
+        } else {
+            writeSeparated(&writer, rest[separator..], '/') catch return null;
+        }
+        return writer.buffered();
+    }
+
+    /// A distribution path as Windows sees it: under the mount root,
+    /// `/mnt/c/Users/me` is `C:\Users\me`; any other absolute path is on the
+    /// distribution's share, `\\wsl.localhost\<distro>\home\me`. A relative
+    /// path has no Windows spelling until it is resolved.
+    pub fn toWindows(self: WslPaths, path: []const u8, buffer: []u8) ?[]const u8 {
+        if (path.len == 0 or path[0] != '/') return null;
+        var writer: std.Io.Writer = .fixed(buffer);
+        if (std.mem.startsWith(u8, path, self.mount_root)) {
+            const rest = path[self.mount_root.len..];
+            if (rest.len >= 1 and std.ascii.isAlphabetic(rest[0]) and (rest.len == 1 or rest[1] == '/')) {
+                writer.writeByte(std.ascii.toUpper(rest[0])) catch return null;
+                writer.writeByte(':') catch return null;
+                if (rest.len <= 2) {
+                    writer.writeByte('\\') catch return null;
+                } else {
+                    writeSeparated(&writer, rest[1..], '\\') catch return null;
+                }
+                return writer.buffered();
+            }
+        }
+        writer.writeAll("\\\\wsl.localhost\\") catch return null;
+        writer.writeAll(self.distribution) catch return null;
+        if (path.len == 1) {
+            writer.writeByte('\\') catch return null;
+        } else {
+            writeSeparated(&writer, path, '\\') catch return null;
+        }
+        return writer.buffered();
+    }
+
+    fn writeSeparated(writer: *std.Io.Writer, path: []const u8, separator: u8) std.Io.Writer.Error!void {
+        for (path) |byte| try writer.writeByte(if (byte == '/' or byte == '\\') separator else byte);
+    }
+
+    fn stripPrefixIgnoreCase(text: []const u8, prefix: []const u8) ?[]const u8 {
+        if (text.len < prefix.len or !std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix)) return null;
+        return text[prefix.len..];
+    }
+};
+
+test "Windows paths are recognised by drive or UNC share" {
+    for ([_][]const u8{ "C:\\Users\\me\\a.txt", "d:/src/main.zig", "\\\\wsl.localhost\\Ubuntu\\home", "\\\\server\\share\\x" }) |path| {
+        try std.testing.expect(isWindowsPath(path));
+    }
+    for ([_][]const u8{ "/home/me", "src/main.zig", "C:", "C:file", "\\\\\\x", "\\x", "1:\\x" }) |path| {
+        try std.testing.expect(!isWindowsPath(path));
+    }
+}
+
+test "WSL path translation matches wslpath for drives and the distribution share" {
+    var buffer: [256]u8 = undefined;
+    const ubuntu: WslPaths = .{ .distribution = "Ubuntu" };
+    try std.testing.expectEqualStrings("/mnt/c/Users/me/a.txt", ubuntu.toWsl("C:\\Users\\me\\a.txt", &buffer).?);
+    try std.testing.expectEqualStrings("/mnt/d/src/main.zig", ubuntu.toWsl("D:/src/main.zig", &buffer).?);
+    try std.testing.expectEqualStrings("/mnt/c/", ubuntu.toWsl("C:\\", &buffer).?);
+    try std.testing.expectEqualStrings("/mnt/c", ubuntu.toWsl("c:", &buffer).?);
+    try std.testing.expectEqualStrings("/home/me/x.zig", ubuntu.toWsl("\\\\wsl.localhost\\Ubuntu\\home\\me\\x.zig", &buffer).?);
+    try std.testing.expectEqualStrings("/etc", ubuntu.toWsl("\\\\wsl$\\ubuntu\\etc", &buffer).?);
+    try std.testing.expectEqualStrings("/", ubuntu.toWsl("\\\\wsl.localhost\\Ubuntu", &buffer).?);
+    // Another distribution's share and another machine's are not this distribution's paths.
+    try std.testing.expect(ubuntu.toWsl("\\\\wsl.localhost\\Debian\\home", &buffer) == null);
+    try std.testing.expect(ubuntu.toWsl("\\\\server\\share\\x", &buffer) == null);
+    try std.testing.expect(ubuntu.toWsl("/home/me", &buffer) == null);
+
+    try std.testing.expectEqualStrings("C:\\Users\\me\\a.txt", ubuntu.toWindows("/mnt/c/Users/me/a.txt", &buffer).?);
+    try std.testing.expectEqualStrings("D:\\", ubuntu.toWindows("/mnt/d", &buffer).?);
+    try std.testing.expectEqualStrings("\\\\wsl.localhost\\Ubuntu\\home\\me\\x.zig", ubuntu.toWindows("/home/me/x.zig", &buffer).?);
+    try std.testing.expectEqualStrings("\\\\wsl.localhost\\Ubuntu\\", ubuntu.toWindows("/", &buffer).?);
+    // `/mnt/data` is a directory under the mount root, not a drive.
+    try std.testing.expectEqualStrings("\\\\wsl.localhost\\Ubuntu\\mnt\\data", ubuntu.toWindows("/mnt/data", &buffer).?);
+    try std.testing.expect(ubuntu.toWindows("relative/x", &buffer) == null);
+
+    // A custom automount root, as /etc/wsl.conf can set and `wslpath` reports.
+    const custom: WslPaths = .{ .distribution = "Arch", .mount_root = "/" };
+    try std.testing.expectEqualStrings("/c/x", custom.toWsl("C:\\x", &buffer).?);
+    try std.testing.expectEqualStrings("C:\\x", custom.toWindows("/c/x", &buffer).?);
+
+    // Round trips, and a result that does not fit is refused rather than cut.
+    try std.testing.expectEqualStrings("C:\\a\\b", ubuntu.toWindows(ubuntu.toWsl("C:\\a\\b", &buffer).?, buffer[128..]).?);
+    var tiny: [4]u8 = undefined;
+    try std.testing.expect(ubuntu.toWsl("C:\\Users", &tiny) == null);
+}
+
 fn expectUrl(input: []const u8, expected: []const u8) !void {
     const parsed = parseCandidate(input, .{}) orelse return error.ExpectedUrl;
     try std.testing.expectEqualStrings(expected, input[parsed.span.start..parsed.span.end]);

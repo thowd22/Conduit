@@ -253,7 +253,50 @@ pub const Choice = union(enum) {
     }
 };
 
+/// TASK-47: an installed WSL distribution as a `remote.connect` choice.
+///
+/// Kept beside `Choice` rather than inside it so the SSH choices keep their
+/// exhaustive switch: the app checks `parseWslChoice` first and hands any
+/// other value to `Choice.parse`. The value is `wsl:<name>`; the label the
+/// chooser shows is `<name>  WSL`. Distributions are offered only where WSL
+/// exists (`workspace.wsl.supported`), listed with
+/// `workspace.wsl.listRegisteredDistributions`, which reads the registry and
+/// never blocks.
+pub const wsl_choice_prefix = "wsl:";
+
+/// Format the choice value for distribution `name` into `buffer`.
+pub fn wslChoiceValue(buffer: []u8, name: []const u8) error{NoSpaceLeft}![]const u8 {
+    return std.fmt.bufPrint(buffer, wsl_choice_prefix ++ "{s}", .{name});
+}
+
+/// Format the chooser label for distribution `name` into `buffer`.
+pub fn wslChoiceLabel(buffer: []u8, name: []const u8) error{NoSpaceLeft}![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}  WSL", .{name});
+}
+
+/// The distribution a choice value names, or null when the value is not a
+/// WSL choice or names something `wsl.exe -d` must not be given.
+pub fn parseWslChoice(value: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, value, wsl_choice_prefix)) return null;
+    const name = value[wsl_choice_prefix.len..];
+    if (!workspace.wsl.validDistributionName(name)) return null;
+    return name;
+}
+
 // ---------------------------------------------------------------- unit tests
+
+test "a WSL distribution round-trips as a connect choice and is never an SSH choice" {
+    var value_buffer: [96]u8 = undefined;
+    const value = try wslChoiceValue(&value_buffer, "Ubuntu-24.04");
+    try testing.expectEqualStrings("wsl:Ubuntu-24.04", value);
+    try testing.expectEqualStrings("Ubuntu-24.04", parseWslChoice(value).?);
+    try testing.expectEqual(@as(?Choice, null), Choice.parse(value));
+    var label_buffer: [96]u8 = undefined;
+    try testing.expectEqualStrings("Ubuntu-24.04  WSL", try wslChoiceLabel(&label_buffer, "Ubuntu-24.04"));
+    for ([_][]const u8{ "wsl:", "wsl:-d", "wsl:a b", "wsl:x;y", "host:Ubuntu", "Ubuntu", "address" }) |other| {
+        try testing.expect(parseWslChoice(other) == null);
+    }
+}
 
 const testing = std.testing;
 

@@ -471,6 +471,11 @@ var local_files_state: LocalExecutionContext = .{ .allocator = std.heap.page_all
 /// OpenSSH ControlMaster connection.
 pub const ssh = @import("ssh.zig");
 
+/// The WSL execution context (TASK-47): `wsl.WslContext.create` builds an
+/// owned `ExecutionContext` of kind `.wsl` whose processes run inside one
+/// installed distribution through Windows' `wsl.exe`.
+pub const wsl = @import("wsl.zig");
+
 /// The local execution implementation. With the SSH context's spawns of the
 /// local `ssh` client (`ssh.zig`), this is deliberately the only production
 /// call to `pty.spawn` in this module; every workspace caller sees only
@@ -679,6 +684,9 @@ pub fn runLocalProcess(allocator: Allocator, io: std.Io, request: RunRequest) Ru
         .stdin = if (request.stdin != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        // Windows: a console program (git, wsl.exe) started by a Conduit with no console of
+        // its own would otherwise open a console window for every run (TASK-47, TASK-49).
+        .create_no_window = true,
     }) catch |err| return switch (err) {
         error.FileNotFound => error.CommandNotFound,
         error.AccessDenied, error.PermissionDenied => error.AccessDenied,
@@ -6119,6 +6127,8 @@ test "an ssh workspace snapshot keeps its target but never its test-only config 
 test {
     // The SSH context's unit and sshd-container integration tests.
     _ = ssh;
+    // The WSL context's unit tests and its stand-in (or real distribution) integration tests.
+    _ = wsl;
 }
 
 test "the local context writes files atomically with exact modes and private parents" {
