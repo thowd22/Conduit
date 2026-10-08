@@ -33,16 +33,23 @@ png_size() { python -c 'import struct,sys; d=open(sys.argv[1],"rb").read(24); pr
 # label starts with <label-prefix> in the current run's semantic tree, or
 # nothing.
 choice_row() {
-  local py
+  local py tree
   py="$(command -v python || command -v python3)"
-  ct --json inspect | "$py" -c '
+  tree="$(mktemp "${RUNNER_TEMP:-/tmp}/ctree.XXXXXX")"
+  ct --json inspect > "$tree" || return 0
+  # Read as UTF-8 from a file: Windows Python decodes a pipe with the ANSI
+  # code page, which cannot decode every UTF-8 label.
+  "$py" -c '
 import json, sys
-prefix = sys.argv[1]
-for element in json.load(sys.stdin).get("elements", []):
+prefix = sys.argv[2]
+with open(sys.argv[1], encoding="utf-8") as tree:
+    reply = json.load(tree)
+# `--json` prints the raw JSON-RPC reply; the tree is its result.
+for element in reply.get("result", reply).get("elements", []):
     if element.get("id", "").startswith("palette.choice.") and element.get("label", "").startswith(prefix):
         print(element["id"])
         break
-' "$1"
+' "$tree" "$1"
 }
 
 # open_profile_tab <profile>: open a new tab running the built-in shell
@@ -57,6 +64,10 @@ open_profile_tab() {
   ct type "New tab with profile" > /dev/null || return 1
   ct key ENTER > /dev/null || return 1
   row="$(choice_row "$1  ")"
-  [ -n "$row" ] || { echo "no '$1' row in New tab with profile" >&2; return 1; }
+  if [ -z "$row" ]; then
+    echo "no '$1' row in New tab with profile" >&2
+    ct key ESCAPE > /dev/null
+    return 1
+  fi
   ct click "$row" > /dev/null
 }
