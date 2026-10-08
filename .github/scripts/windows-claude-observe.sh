@@ -89,6 +89,10 @@ if ct wait-for element workspace.1.tab.1.agent.idle exists true 90000 > /dev/nul
 else
   fail "no idle agent glyph on the PowerShell tab"
 fi
+# The process tree as Windows reports it, for the evidence.
+powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,CommandLine | Format-List" \
+  > "$out/processes.txt" 2>&1 || true
+grep -B2 -A3 -iE "claude|pwsh" "$out/processes.txt" | sed 's/^/INFO /' | head -n 60
 row="$(agent_row)"
 echo "INFO agent row: ${row:-<none>}"
 case "$row" in

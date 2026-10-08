@@ -3511,9 +3511,19 @@ const win_processes = struct {
             win.acquireLock(&lock);
             defer win.releaseLock(&lock);
             refresh();
-            break :blk selectForegroundJob(nodes[0..count], root, Times{}) orelse return null;
+            break :blk selectForegroundJob(nodes[0..count], root, Times{}) orelse {
+                log.debug("foreground of {d}: the child is gone ({d} processes listed)", .{ root, count });
+                return null;
+            };
         };
-        return describe(pid, buffer);
+        const found = describe(pid, buffer) orelse {
+            log.debug("foreground of {d}: pid {d} could not be read", .{ root, pid });
+            return null;
+        };
+        // Debug level only: the first later word is a script path or a program's own argument.
+        const first_word = std.mem.sliceTo(found.argv1, 0);
+        log.debug("foreground of {d}: pid {d} `{s}` `{s}`", .{ root, pid, found.argv0, first_word[0..@min(first_word.len, 160)] });
+        return found;
     }
 
     /// Take a new snapshot when the last one is older than `cache_ms`. A failed snapshot leaves an
