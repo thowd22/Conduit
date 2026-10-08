@@ -140,7 +140,13 @@ jobs:
         if: failure() && runner.os != 'Linux'
         shell: bash
         run: |
-          for name in platform pty config font link version theme term render ui input palette session workspace agent backlog testdriver app conduit-test conduit-e2e; do
+          # A step that timed out leaves whatever held it behind: on Windows, list the
+          # processes still alive (a test binary, or a child or conhost it orphaned that keeps
+          # the build runner's pipe open) before anything else starts.
+          if [ "$RUNNER_OS" = Windows ]; then
+            powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'test|conhost|cmd|powershell|zig|sh' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | Format-Table -AutoSize -Wrap | Out-String -Width 400" || true
+          fi
+          for name in platform pty config font link state version theme term render ui input palette session workspace agent backlog testdriver control app conduit-test conduit-e2e; do
             bin="$(ls -t $(find .zig-cache/o -type f \( -name "$name-test" -o -name "$name-test.exe" \)) 2>/dev/null | head -n 1)"
             [ -n "$bin" ] || { echo "== $name-test: no binary"; continue; }
             echo "== $name-test ($bin)"
