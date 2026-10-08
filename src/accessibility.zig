@@ -531,24 +531,40 @@ test {
 
 const testing = std.testing;
 
+/// The pieces the integration test and the app's `--a11y-test` share: a
+/// private `dbus-daemon`, a stand-in for the AT-SPI bus launcher and
+/// registry, and a plain bus client playing the assistive technology. Test
+/// support only; nothing in a normal run uses it. Every call takes the
+/// caller's `io` so it works outside `zig test` too.
+pub const check = struct {
+    pub const PrivateBus = CheckBus;
+    pub const FakeRegistry = CheckRegistry;
+    pub const Client = CheckClient;
+};
+
+const PrivateBus = CheckBus;
+const FakeRegistry = CheckRegistry;
+const Client = CheckClient;
+
 /// A private `dbus-daemon` listening under /tmp.
-const PrivateBus = struct {
+const CheckBus = struct {
+    io: std.Io,
     dir_buf: ["/tmp/conduit-a11y-".len + 16]u8 = undefined,
     child: std.process.Child = undefined,
     address_buf: [256]u8 = undefined,
     address_len: usize = 0,
 
-    fn dir(self: *const PrivateBus) []const u8 {
+    fn dir(self: *const CheckBus) []const u8 {
         return &self.dir_buf;
     }
 
-    fn address(self: *const PrivateBus) []const u8 {
+    pub fn address(self: *const CheckBus) []const u8 {
         return self.address_buf[0..self.address_len];
     }
 
     /// Start the daemon; false when `dbus-daemon` is not installed.
-    fn start(bus: *PrivateBus) !bool {
-        const io = testing.io;
+    pub fn start(bus: *CheckBus) !bool {
+        const io = bus.io;
         var random: [8]u8 = undefined;
         io.random(&random);
         _ = try std.fmt.bufPrint(&bus.dir_buf, "/tmp/conduit-a11y-{x:0>16}", .{std.mem.readInt(u64, &random, .little)});
@@ -602,16 +618,17 @@ const PrivateBus = struct {
         return true;
     }
 
-    fn stop(bus: *PrivateBus) void {
-        bus.child.kill(testing.io);
-        std.Io.Dir.cwd().deleteTree(testing.io, bus.dir()) catch {}; // best-effort cleanup of a test directory
+    pub fn stop(bus: *CheckBus) void {
+        bus.child.kill(bus.io);
+        std.Io.Dir.cwd().deleteTree(bus.io, bus.dir()) catch {}; // best-effort cleanup of a test directory
     }
 };
 
 /// Stands in for the at-spi bus launcher (`org.a11y.Bus`) and the registry
 /// (`org.a11y.atspi.Registry`) on the private bus, so the bridge's real
 /// discovery and embedding path runs.
-const FakeRegistry = struct {
+const CheckRegistry = struct {
+    io: std.Io,
     conn: dbus.Connection,
     bus_address: []const u8,
     stop: std.atomic.Value(bool) = .init(false),
@@ -621,7 +638,7 @@ const FakeRegistry = struct {
     embedded_name_len: usize = 0,
     thread: ?std.Thread = null,
 
-    fn requestName(self: *FakeRegistry, name: []const u8) !void {
+    pub fn requestName(self: *CheckRegistry, name: []const u8) !void {
         var body_buf: [128]u8 = undefined;
         var body = dbus.Writer.init(&body_buf);
         try body.string(name);
@@ -634,16 +651,48 @@ const FakeRegistry = struct {
             .member = "RequestName",
             .destination = "org.freedesktop.DBus",
             .signature = "su",
-        }, body.written(), 2000, testing.io);
+        }, body.written(), 2000, self.io);
         var r = reply.bodyReader();
-        try testing.expectEqual(@as(u32, 1), try r.uint32()); // primary owner
+        if (try r.uint32() != 1) return error.NameNotOwned; // not the primary owner
     }
 
-    fn run(self: *FakeRegistry) void {
-        self.loop() catch |err| std.log.warn("fake registry stopped: {s}", .{@errorName(err)});
+    /// Claim both well-known names and serve them on a thread until `stop`.
+    pub fn serve(self: *CheckRegistry) !void {
+        try self.conn.hello(2000, self.io);
+        try self.requestName("org.a11y.Bus");
+        try self.requestName("org.a11y.atspi.Registry");
+        self.thread = try std.Thread.spawn(.{}, CheckRegistry.run, .{self});
     }
 
-    fn loop(self: *FakeRegistry) !void {
+    /// Stop serving, join the thread and close the connection.
+    pub fn shutdown(self: *CheckRegistry) void {
+        self.stop.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.conn.close();
+    }
+
+    /// Wait until a bridge has embedded itself, or `timeout_ms` passes.
+    pub fn waitEmbedded(self: *CheckRegistry, timeout_ms: i64) bool {
+        const deadline = dbus.nowMs(self.io) + timeout_ms;
+        while (!self.embedded.load(.acquire)) {
+            // A timeout or spurious wake only means the flag is checked again.
+            self.event.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch {};
+            if (dbus.nowMs(self.io) > deadline) return false;
+        }
+        return true;
+    }
+
+    /// The bus name the embedded application serves its objects under.
+    pub fn embeddedName(self: *const CheckRegistry) []const u8 {
+        return self.embedded_name_buf[0..self.embedded_name_len];
+    }
+
+    fn run(self: *CheckRegistry) void {
+        self.loop() catch |err| log.warn("fake registry stopped: {s}", .{@errorName(err)});
+    }
+
+    fn loop(self: *CheckRegistry) !void {
         while (!self.stop.load(.acquire)) {
             // A short poll so `stop` is noticed; this waits on the socket and
             // is not a sleep standing in for a condition.
@@ -654,7 +703,7 @@ const FakeRegistry = struct {
         }
     }
 
-    fn handle(self: *FakeRegistry, m: *const dbus.Message) !void {
+    fn handle(self: *CheckRegistry, m: *const dbus.Message) !void {
         if (m.type != .method_call) return;
         var body_buf: [512]u8 = undefined;
         var body = dbus.Writer.init(&body_buf);
@@ -673,7 +722,7 @@ const FakeRegistry = struct {
             try body.reference(self.conn.uniqueName(), atspi.root_path);
             signature = "(so)";
             self.embedded.store(true, .release);
-            self.event.set(testing.io);
+            self.event.set(self.io);
         } else {
             return;
         }
@@ -697,15 +746,16 @@ const TestWake = struct {
 };
 
 /// The test's assistive technology: a plain bus client walking the bridge.
-const Client = struct {
+const CheckClient = struct {
+    io: std.Io,
     conn: dbus.Connection,
     app: []const u8,
 
-    const Path = struct {
+    pub const Path = struct {
         buf: [64]u8 = undefined,
         len: usize = 0,
 
-        fn slice(self: *const Path) []const u8 {
+        pub fn slice(self: *const Path) []const u8 {
             return self.buf[0..self.len];
         }
 
@@ -715,7 +765,24 @@ const Client = struct {
         }
     };
 
-    fn call(self: *Client, path: []const u8, interface: []const u8, member: []const u8, signature: []const u8, body: []const u8) !dbus.Message {
+    /// Say hello on the bus and subscribe to `Event.Object` signals.
+    pub fn connect(self: *CheckClient) !void {
+        try self.conn.hello(2000, self.io);
+        var body_buf: [128]u8 = undefined;
+        var body = dbus.Writer.init(&body_buf);
+        try body.string("type='signal',interface='org.a11y.atspi.Event.Object'");
+        _ = try self.conn.call(.{
+            .type = .method_call,
+            .serial = 0,
+            .path = "/org/freedesktop/DBus",
+            .interface = "org.freedesktop.DBus",
+            .member = "AddMatch",
+            .destination = "org.freedesktop.DBus",
+            .signature = "s",
+        }, body.written(), 2000, self.io);
+    }
+
+    pub fn call(self: *CheckClient, path: []const u8, interface: []const u8, member: []const u8, signature: []const u8, body: []const u8) !dbus.Message {
         return self.conn.call(.{
             .type = .method_call,
             .serial = 0,
@@ -724,30 +791,33 @@ const Client = struct {
             .member = member,
             .destination = self.app,
             .signature = signature,
-        }, body, 2000, testing.io);
+        }, body, 2000, self.io);
     }
 
-    fn children(self: *Client, path: []const u8, out: []Path) !usize {
+    pub fn children(self: *CheckClient, path: []const u8, out: []Path) !usize {
         const reply = try self.call(path, atspi.iface_accessible, "GetChildren", "", "");
         var r = reply.bodyReader();
         const end = try r.beginArray(8);
         var n: usize = 0;
         while (r.pos < end) : (n += 1) {
+            if (n == out.len) return error.TooManyChildren;
             try r.beginStruct();
-            try testing.expectEqualStrings(self.app, try r.string());
-            out[n].set(try r.objectPath());
+            if (!std.mem.eql(u8, self.app, try r.string())) return error.WrongApplication;
+            const child = try r.objectPath();
+            if (child.len > out[n].buf.len) return error.PathTooLong;
+            out[n].set(child);
         }
         return n;
     }
 
-    fn role(self: *Client, path: []const u8) !u32 {
+    pub fn role(self: *CheckClient, path: []const u8) !u32 {
         const reply = try self.call(path, atspi.iface_accessible, "GetRole", "", "");
         var r = reply.bodyReader();
         return r.uint32();
     }
 
     /// A string property, or the path of a `(so)` property.
-    fn property(self: *Client, path: []const u8, name: []const u8, out: []u8) ![]const u8 {
+    pub fn property(self: *CheckClient, path: []const u8, name: []const u8, out: []u8) ![]const u8 {
         var body_buf: [128]u8 = undefined;
         var body = dbus.Writer.init(&body_buf);
         try body.string(atspi.iface_accessible);
@@ -760,11 +830,12 @@ const Client = struct {
             _ = try r.string();
             break :blk try r.objectPath();
         };
+        if (text.len > out.len) return error.NoSpaceLeft;
         @memcpy(out[0..text.len], text);
         return out[0..text.len];
     }
 
-    fn states(self: *Client, path: []const u8) !u64 {
+    pub fn states(self: *CheckClient, path: []const u8) !u64 {
         const reply = try self.call(path, atspi.iface_accessible, "GetState", "", "");
         var r = reply.bodyReader();
         _ = try r.beginArray(4);
@@ -774,8 +845,8 @@ const Client = struct {
     }
 
     /// Wait for an `Event.Object` signal; unrelated messages are skipped.
-    fn waitSignal(self: *Client, member: []const u8, path: []const u8, detail: []const u8, detail1: i32) !void {
-        const deadline = dbus.nowMs(testing.io) + 5000;
+    pub fn waitSignal(self: *CheckClient, member: []const u8, path: []const u8, detail: []const u8, detail1: i32) !void {
+        const deadline = dbus.nowMs(self.io) + 5000;
         while (true) {
             while (try self.conn.next()) |m| {
                 if (m.type != .signal) continue;
@@ -785,12 +856,74 @@ const Client = struct {
                 if ((try r.int32()) != detail1) continue;
                 return;
             }
-            const left = deadline - dbus.nowMs(testing.io);
+            const left = deadline - dbus.nowMs(self.io);
             if (left <= 0) return error.TimedOut;
             if (try self.conn.waitReadable(@intCast(left))) {
                 if (!try self.conn.fill()) return error.Disconnected;
             }
         }
+    }
+
+    /// One element found by `find`: its object path, role and name.
+    pub const Found = struct {
+        path: Path = .{},
+        role: u32 = 0,
+        name_buf: [128]u8 = undefined,
+        name_len: usize = 0,
+
+        pub fn name(self: *const Found) []const u8 {
+            return self.name_buf[0..self.name_len];
+        }
+    };
+
+    /// Walk the application's whole tree over the bus, from the window down,
+    /// and return the element whose `AccessibleId` is `id`, or null.
+    pub fn find(self: *CheckClient, id: []const u8) !?Found {
+        var stack: [512]Path = undefined;
+        var stack_len: usize = 0;
+        var top: [64]Path = undefined;
+        const top_count = try self.children(atspi.window_path, &top);
+        for (top[0..top_count]) |p| {
+            stack[stack_len] = p;
+            stack_len += 1;
+        }
+        while (stack_len > 0) {
+            stack_len -= 1;
+            const path = stack[stack_len];
+            var id_buf: [256]u8 = undefined;
+            const element_id = try self.property(path.slice(), "AccessibleId", &id_buf);
+            if (std.mem.eql(u8, element_id, id)) {
+                var found: Found = .{ .path = path };
+                found.role = try self.role(path.slice());
+                found.name_len = (try self.property(path.slice(), "Name", &found.name_buf)).len;
+                return found;
+            }
+            var kids: [64]Path = undefined;
+            const kid_count = try self.children(path.slice(), &kids);
+            for (kids[0..kid_count]) |kid| {
+                if (stack_len == stack.len) return error.TreeTooLarge;
+                stack[stack_len] = kid;
+                stack_len += 1;
+            }
+        }
+        return null;
+    }
+
+    /// `Component.GrabFocus` on `path`; the bridge's answer.
+    pub fn grabFocus(self: *CheckClient, path: []const u8) !bool {
+        const reply = try self.call(path, atspi.iface_component, "GrabFocus", "", "");
+        var r = reply.bodyReader();
+        return r.boolean();
+    }
+
+    /// `Action.DoAction(0)` on `path`; the bridge's answer.
+    pub fn doAction(self: *CheckClient, path: []const u8) !bool {
+        var body_buf: [8]u8 = undefined;
+        var body = dbus.Writer.init(&body_buf);
+        try body.int32(0);
+        const reply = try self.call(path, atspi.iface_action, "DoAction", "i", body.written());
+        var r = reply.bodyReader();
+        return r.boolean();
     }
 };
 
@@ -822,7 +955,7 @@ fn composeFixture(tree: *ui.Tree, query: *ui.Input, field: *ui.Input, focus: []c
 test "bridge serves sidebar, palette and settings over a private AT-SPI bus" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = testing.io;
-    var bus: PrivateBus = .{};
+    var bus: PrivateBus = .{ .io = io };
     if (!try bus.start()) {
         std.log.warn("dbus-daemon is not installed; skipping the AT-SPI integration test", .{});
         return error.SkipZigTest;
@@ -830,6 +963,7 @@ test "bridge serves sidebar, palette and settings over a private AT-SPI bus" {
     defer bus.stop();
 
     var registry: FakeRegistry = .{
+        .io = io,
         .conn = try dbus.Connection.open(testing.allocator, bus.address(), 64 * 1024, 64 * 1024),
         .bus_address = bus.address(),
     };
@@ -867,6 +1001,7 @@ test "bridge serves sidebar, palette and settings over a private AT-SPI bus" {
     try testing.expectEqual(Status.connected, bridge.currentStatus());
 
     var client: Client = .{
+        .io = io,
         .conn = try dbus.Connection.open(testing.allocator, bus.address(), 256 * 1024, 64 * 1024),
         .app = registry.embedded_name_buf[0..registry.embedded_name_len],
     };
