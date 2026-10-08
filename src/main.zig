@@ -4720,6 +4720,16 @@ fn notificationsChord(profile: inputmod.PlatformProfile) inputmod.Chord {
     };
 }
 
+/// `macos.option_as_alt` as the platform's Option-as-Alt choice (TASK-48).
+fn platformOptionAsAlt(value: config.OptionAsAlt) platform.OptionAsAlt {
+    return switch (value) {
+        .false => .none,
+        .true => .both,
+        .left => .left,
+        .right => .right,
+    };
+}
+
 /// Report every diagnostic of a load at warn level as `<path>:<line>: <message>`.
 /// Messages name the key, never the user's value.
 fn logConfigDiagnostics(path: []const u8, loaded: *const config.Config) void {
@@ -6386,6 +6396,7 @@ const App = struct {
         var binding_table = try buildConfiguredBindings(allocator, &actions, binding_profile, &loaded_config, null);
         errdefer binding_table.deinit();
         if (config_path) |path| logConfigDiagnostics(path, &loaded_config);
+        window.setOptionAsAlt(platformOptionAsAlt(loaded_config.settings.macos_option_as_alt));
         // How many app-bound keys may be held at once; independent of the
         // table's length so a reload never reallocates it under a held key.
         const binding_keys = try allocator.alloc(inputmod.BindingKey, binding_key_capacity);
@@ -15985,6 +15996,7 @@ const App = struct {
                             self.agents.observe(self.activePresentation().key, self.presentedSessionId(), .user_input, Io.Clock.awake.now(self.io).nanoseconds);
                         }
                         var encoded: term.EncodedKey = .{};
+                        presented.terminal().setMacosOptionAsAlt(self.window.optionAsAlt() != .none);
                         presented.terminal().encodeKey(press, &encoded);
                         self.stageForChild(encoded.slice());
                         if (encoded.slice().len != 0) self.key_text_echo.recordTerminalPress(key, translated);
@@ -16190,6 +16202,7 @@ const App = struct {
     fn applyConfigSettings(self: *App) !void {
         const settings = self.config_current.settings;
         self.right_click = config.Layer.resolve(config.RightClick, config.RightClick.built_in, settings.right_click, self.session_right_click);
+        self.window.setOptionAsAlt(platformOptionAsAlt(settings.macos_option_as_alt));
 
         const sizes_changed = settings.scratchpad_size != self.scratchpad_percent_small or
             settings.scratchpad_large_size != self.scratchpad_percent_large;
@@ -18315,6 +18328,7 @@ const App = struct {
             .scratchpad_size => std.fmt.bufPrint(buffer, "{d}%", .{self.scratchpad_percent_small}) catch "",
             .scratchpad_large_size => std.fmt.bufPrint(buffer, "{d}%", .{self.scratchpad_percent_large}) catch "",
             .mouse_right_click => self.right_click.text(),
+            .macos_option_as_alt => self.config_current.settings.macos_option_as_alt.text(),
             .notifications_enabled,
             .notifications_os,
             .notifications_permission,
