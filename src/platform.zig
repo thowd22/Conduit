@@ -680,6 +680,10 @@ pub const KeyEvent = struct {
     codepoint: u21 = 0,
     /// The layout's codepoint with shift and caps lock *not* applied, or 0.
     unshifted_codepoint: u21 = 0,
+    /// macOS only (TASK-48): Option is held as a character level, not as Alt, so the character
+    /// comes from the text input that follows and the terminal must not encode this key. Always
+    /// false on other OSes and whenever `macos.option_as_alt` makes the held Option Alt.
+    option_composes: bool = false,
 };
 
 /// What an input method is composing: the text it wants shown, and the selection inside it.
@@ -1173,15 +1177,77 @@ fn layoutCodepoint(scancode: sdl.SDL_Scancode, mods: sdl.SDL_Keymod) u21 {
 }
 
 /// One SDL keyboard event as Conduit's own key event.
-fn keyEvent(raw: sdl.SDL_KeyboardEvent) KeyEvent {
+///
+/// `option_as_alt` only matters on macOS, where it decides `option_composes` (TASK-48).
+fn keyEvent(raw: sdl.SDL_KeyboardEvent, option_as_alt: OptionAsAlt) KeyEvent {
     const action: KeyAction = if (!raw.down) .release else if (raw.repeat) .repeat else .press;
-    return .{
+    var event: KeyEvent = .{
         .action = action,
         .key = keyFromScancode(raw.scancode),
         .mods = modsFrom(raw.mod),
         .codepoint = layoutCodepoint(raw.scancode, raw.mod),
         .unshifted_codepoint = unshiftedCodepoint(raw.scancode, raw.mod),
     };
+    if (builtin.os.tag == .macos) event.option_composes = optionComposes(event, raw.mod, option_as_alt);
+    return event;
+}
+
+/// Which macOS Option keys act as Alt: the `macos.option_as_alt` setting (TASK-48).
+///
+/// macOS convention is that Option is a character level (Option+e is a dead acute accent,
+/// Option+x is `≈`), which is `none` and the default. A terminal user who wants Meta asks for
+/// `both`, or for one side so the other still composes. Inert on every other OS.
+pub const OptionAsAlt = enum {
+    /// Both Option keys compose characters.
+    none,
+    /// The left Option key is Alt; the right one composes.
+    left,
+    /// The right Option key is Alt; the left one composes.
+    right,
+    /// Both Option keys are Alt.
+    both,
+
+    /// SDL's spelling of the same choice, for `SDL_HINT_MAC_OPTION_AS_ALT`.
+    fn sdlHint(self: OptionAsAlt) [:0]const u8 {
+        return switch (self) {
+            .none => "none",
+            .left => "only_left",
+            .right => "only_right",
+            .both => "both",
+        };
+    }
+};
+
+/// Whether the Option key held for `keymod` acts as Alt under `mode`.
+///
+/// Sided like SDL's own hint: with `left`, only a held left Option is Alt. When both Options
+/// are held, either configured side is enough, which is also how SDL decides whether to strip
+/// Option's composition from the text it sends.
+fn optionActsAsAlt(keymod: sdl.SDL_Keymod, mode: OptionAsAlt) bool {
+    const left = keymod & sdl.SDL_KMOD_LALT != 0;
+    const right = keymod & sdl.SDL_KMOD_RALT != 0;
+    return switch (mode) {
+        .none => false,
+        .left => left,
+        .right => right,
+        .both => left or right,
+    };
+}
+
+/// Whether this press is Option composing a character rather than Alt (macOS only).
+///
+/// It is when Option is held on a side that is not configured as Alt, on a key with a
+/// character, with neither Command nor Control: then the character is the text system's
+/// (Option+x arrives as `≈` in the text input that follows, Option+e starts a dead key), so the
+/// terminal must take it from there and not encode the key itself. A named key (Option+Left) and
+/// a command chord (Command+Option+Left) keep Option as a modifier, as they do in every macOS
+/// terminal. Bindings still see the modifier: only the encoding changes (`input.translate`).
+fn optionComposes(event: KeyEvent, keymod: sdl.SDL_Keymod, mode: OptionAsAlt) bool {
+    if (!event.mods.alt) return false;
+    if (event.key != .unidentified) return false;
+    if (event.mods.ctrl or event.mods.super) return false;
+    if (event.unshifted_codepoint == 0) return false;
+    return !optionActsAsAlt(keymod, mode);
 }
 
 /// Whether an input event belongs to this window.
@@ -1291,12 +1357,12 @@ fn isRealCoordinate(value: f32) bool {
 /// Every union member is read only inside the prong for its own event type: `SDL_Event` is a union,
 /// and reading the wrong member is undefined behaviour in C and a panic in a safe build. The type
 /// is therefore switched on before anything is looked at.
-fn translateInput(raw: sdl.SDL_Event, window_id: sdl.SDL_WindowID) ?Event {
+fn translateInput(raw: sdl.SDL_Event, window_id: sdl.SDL_WindowID, option_as_alt: OptionAsAlt) ?Event {
     return switch (eventType(raw)) {
         @intCast(sdl.SDL_EVENT_KEY_DOWN),
         @intCast(sdl.SDL_EVENT_KEY_UP),
         => if (isForWindow(raw.key.windowID, window_id))
-            .{ .key = keyEvent(raw.key) }
+            .{ .key = keyEvent(raw.key, option_as_alt) }
         else
             null,
         @intCast(sdl.SDL_EVENT_MOUSE_WHEEL) => if (isForWindow(raw.wheel.windowID, window_id))
@@ -1408,7 +1474,7 @@ pub fn translate(
     before: State,
     now: State,
 ) ?Event {
-    return translateWithDriverEvents(raw, window_id, before, now, null);
+    return translateWithDriverEvents(raw, window_id, before, now, null, .none);
 }
 
 /// Translate with the application-event ids owned by `Window`.
@@ -1421,6 +1487,7 @@ fn translateWithDriverEvents(
     before: State,
     now: State,
     driver_events: ?DriverEventTypes,
+    option_as_alt: OptionAsAlt,
 ) ?Event {
     const kind = eventType(raw);
     if (driver_events) |events| {
@@ -1440,7 +1507,7 @@ fn translateWithDriverEvents(
     if (kind == @as(SdlEventType, @intCast(sdl.SDL_EVENT_QUIT))) return .quit;
     // Like quit, the system theme belongs to the application, not to one window.
     if (kind == @as(SdlEventType, @intCast(sdl.SDL_EVENT_SYSTEM_THEME_CHANGED))) return .system_theme_changed;
-    if (isInputEvent(kind)) return translateInput(raw, window_id);
+    if (isInputEvent(kind)) return translateInput(raw, window_id, option_as_alt);
     if (!isWindowEvent(kind)) return null;
     if (raw.window.windowID != window_id) return null;
 
@@ -1462,6 +1529,65 @@ fn translateWithDriverEvents(
         else => null,
     };
 }
+
+// ---------------------------------------------------------------------------
+// macOS application menu (TASK-48)
+// ---------------------------------------------------------------------------
+
+/// SDL's Cocoa backend builds a default menu bar when the app has none. Its Window menu gives
+/// Close the key equivalent Command+W, and AppKit runs menu key equivalents *after* SDL has
+/// already delivered the key: so Command+W, Conduit's `tab.close`, would close the tab and then
+/// close the whole window too. `releaseCommandW` takes the equivalent off that item (the item
+/// stays, clickable). Quit (Command+Q), Hide (Command+H), Minimize (Command+M) and Toggle Full
+/// Screen (Control+Command+F) keep theirs: those are the platform's and Conduit binds none.
+///
+/// The Objective-C runtime is called directly, through `objc_msgSend` cast to each call's exact
+/// C signature as arm64 requires. Everything here runs on the main thread after `SDL_Init`.
+const macos_menu = if (builtin.os.tag == .macos) struct {
+    const Id = ?*anyopaque;
+    const Sel = ?*anyopaque;
+    extern "c" fn objc_getClass(name: [*:0]const u8) Id;
+    extern "c" fn sel_registerName(name: [*:0]const u8) Sel;
+    extern "c" fn objc_msgSend() void;
+
+    fn send(comptime Return: type, target: Id, selector: [*:0]const u8) Return {
+        const function: *const fn (Id, Sel) callconv(.c) Return = @ptrCast(&objc_msgSend);
+        return function(target, sel_registerName(selector));
+    }
+
+    fn sendArg(comptime Return: type, comptime Arg: type, target: Id, selector: [*:0]const u8, arg: Arg) Return {
+        const function: *const fn (Id, Sel, Arg) callconv(.c) Return = @ptrCast(&objc_msgSend);
+        return function(target, sel_registerName(selector), arg);
+    }
+
+    /// Remove Command+W from every menu item whose action is `performClose:`, and log how many
+    /// items changed so a run shows whether SDL's menu looked the way it was expected to.
+    fn releaseCommandW() void {
+        const app = send(Id, objc_getClass("NSApplication"), "sharedApplication") orelse return;
+        const menu_bar = send(Id, app, "mainMenu") orelse {
+            log.info("macOS: no menu bar to adjust", .{});
+            return;
+        };
+        const empty = send(Id, objc_getClass("NSString"), "string") orelse return;
+        const close = sel_registerName("performClose:");
+        var released: usize = 0;
+        const menus: isize = send(isize, menu_bar, "numberOfItems");
+        var index: isize = 0;
+        while (index < menus) : (index += 1) {
+            const item = sendArg(Id, isize, menu_bar, "itemAtIndex:", index) orelse continue;
+            const submenu = send(Id, item, "submenu") orelse continue;
+            const items: isize = send(isize, submenu, "numberOfItems");
+            var inner: isize = 0;
+            while (inner < items) : (inner += 1) {
+                const entry = sendArg(Id, isize, submenu, "itemAtIndex:", inner) orelse continue;
+                if (send(Sel, entry, "action") != close) continue;
+                sendArg(void, Id, entry, "setKeyEquivalent:", empty);
+                released += 1;
+            }
+        }
+        log.info("macOS: released Command+W from {d} Close menu item(s)", .{released});
+    }
+} else struct {};
 
 // ---------------------------------------------------------------------------
 // The window
@@ -1589,6 +1715,8 @@ pub const Window = struct {
     /// Cached so that re-asserting it after a cursor move costs nothing when the cursor has not
     /// moved: the call is per-frame work otherwise, and the OS call behind it is not free.
     text_area: ?TextArea = null,
+    /// Which macOS Option keys are Alt for key events from now on (`setOptionAsAlt`).
+    option_as_alt: OptionAsAlt = .none,
 
     /// Create the window, its GL context and its scale, and leave the context current.
     ///
@@ -1648,6 +1776,7 @@ pub const Window = struct {
         };
         errdefer sdl.SDL_DestroyWindow(handle);
         setWindowIcon(handle);
+        if (builtin.os.tag == .macos) macos_menu.releaseCommandW();
 
         const context = sdl.SDL_GL_CreateContext(handle) orelse {
             var buffer: [256]u8 = undefined;
@@ -1702,6 +1831,44 @@ pub const Window = struct {
             sdl.SDL_Quit();
             self.owns_video = false;
         }
+    }
+
+    /// Choose which macOS Option keys are Alt (the `macos.option_as_alt` setting, TASK-48).
+    ///
+    /// Two halves of one decision: SDL is told through `SDL_HINT_MAC_OPTION_AS_ALT` so the text
+    /// it sends for an Alt-side Option is the plain character instead of the composed one, and
+    /// the window remembers the choice so every later key event says whether Option composed
+    /// (`KeyEvent.option_composes`). Applies to the next key event; safe to call at any time on
+    /// the main thread. The hint is macOS-only; elsewhere this only records the value.
+    pub fn setOptionAsAlt(self: *Window, mode: OptionAsAlt) void {
+        if (builtin.os.tag == .macos) {
+            if (!sdl.SDL_SetHintWithPriority(sdl.SDL_HINT_MAC_OPTION_AS_ALT, mode.sdlHint(), sdl.SDL_HINT_OVERRIDE)) {
+                log.warn("SDL refused the Option-as-Alt hint ({s})", .{mode.sdlHint()});
+            }
+        }
+        if (self.option_as_alt != mode) log.info("macOS Option as Alt: {s}", .{@tagName(mode)});
+        self.option_as_alt = mode;
+    }
+
+    /// The Option-as-Alt choice in force.
+    pub fn optionAsAlt(self: *const Window) OptionAsAlt {
+        return self.option_as_alt;
+    }
+
+    /// Enter or leave fullscreen. On macOS this is the native fullscreen space (the green button
+    /// and Control+Command+F in SDL's Window menu do the same); elsewhere SDL's desktop
+    /// fullscreen. The change arrives as an ordinary resize event. Main thread only.
+    pub fn setFullscreen(self: *const Window, fullscreen: bool) !void {
+        if (!sdl.SDL_SetWindowFullscreen(self.handle.?, fullscreen)) {
+            var buffer: [256]u8 = undefined;
+            log.warn("SDL_SetWindowFullscreen({}) failed: {s}", .{ fullscreen, lastError(&buffer) });
+            return error.FullscreenRefused;
+        }
+    }
+
+    /// Whether the window is fullscreen right now.
+    pub fn isFullscreen(self: *const Window) bool {
+        return sdl.SDL_GetWindowFlags(self.handle.?) & sdl.SDL_WINDOW_FULLSCREEN != 0;
     }
 
     /// Ask the OS what the window looks like right now, and remember the answer.
@@ -1793,7 +1960,7 @@ pub const Window = struct {
         // nothing at all — so the window asks the OS before translating. Every other event is
         // translated against the state already known.
         const now = if (changesGeometry(eventType(raw))) self.refresh() else self.state;
-        const event = translateWithDriverEvents(raw, self.id, self.state, now, self.driver_events) orelse return null;
+        const event = translateWithDriverEvents(raw, self.id, self.state, now, self.driver_events, self.option_as_alt) orelse return null;
         self.state = now;
         return event;
     }
@@ -3496,9 +3663,9 @@ test "driver event translation rejects a different window" {
     var raw: sdl.SDL_Event = std.mem.zeroes(sdl.SDL_Event);
     raw.user.type = events.wake;
     raw.user.windowID = 7;
-    try testing.expect(translateWithDriverEvents(raw, 9, state, state, events) == null);
+    try testing.expect(translateWithDriverEvents(raw, 9, state, state, events, .none) == null);
     raw.user.windowID = 9;
-    try testing.expectEqual(Event.driver_wake, translateWithDriverEvents(raw, 9, state, state, events).?);
+    try testing.expectEqual(Event.driver_wake, translateWithDriverEvents(raw, 9, state, state, events, .none).?);
 }
 
 test "Windows driver endpoint accepts only an exact local safe pipe name" {
@@ -3924,6 +4091,67 @@ test "a key's character applies shift, caps lock and level modifiers but not com
     try testing.expectEqual(@as(u21, 'Y'), press.key.codepoint);
     try testing.expectEqual(@as(u21, 'y'), release.key.codepoint);
     try testing.expectEqual(press.key.unshifted_codepoint, release.key.unshifted_codepoint);
+}
+
+test "macOS Option as Alt follows the configured side" {
+    const lalt: sdl.SDL_Keymod = sdl.SDL_KMOD_LALT;
+    const ralt: sdl.SDL_Keymod = sdl.SDL_KMOD_RALT;
+    const both: sdl.SDL_Keymod = lalt | ralt;
+    const cases = [_]struct { mode: OptionAsAlt, keymod: sdl.SDL_Keymod, alt: bool }{
+        .{ .mode = .none, .keymod = lalt, .alt = false },
+        .{ .mode = .none, .keymod = ralt, .alt = false },
+        .{ .mode = .both, .keymod = lalt, .alt = true },
+        .{ .mode = .both, .keymod = ralt, .alt = true },
+        .{ .mode = .left, .keymod = lalt, .alt = true },
+        .{ .mode = .left, .keymod = ralt, .alt = false },
+        .{ .mode = .right, .keymod = lalt, .alt = false },
+        .{ .mode = .right, .keymod = ralt, .alt = true },
+        .{ .mode = .left, .keymod = both, .alt = true },
+        .{ .mode = .right, .keymod = both, .alt = true },
+        .{ .mode = .both, .keymod = 0, .alt = false },
+    };
+    for (cases) |case| try testing.expectEqual(case.alt, optionActsAsAlt(case.keymod, case.mode));
+    try testing.expectEqualStrings("none", OptionAsAlt.none.sdlHint());
+    try testing.expectEqualStrings("only_left", OptionAsAlt.left.sdlHint());
+    try testing.expectEqualStrings("only_right", OptionAsAlt.right.sdlHint());
+    try testing.expectEqualStrings("both", OptionAsAlt.both.sdlHint());
+}
+
+test "macOS Option composes only on a character key with no command modifier on a non-Alt side" {
+    const option_x: KeyEvent = .{ .action = .press, .mods = .{ .alt = true }, .codepoint = 'x', .unshifted_codepoint = 'x' };
+    // Option+x: the text system's character, unless that Option is Alt.
+    try testing.expect(optionComposes(option_x, sdl.SDL_KMOD_LALT, .none));
+    try testing.expect(optionComposes(option_x, sdl.SDL_KMOD_LALT, .right));
+    try testing.expect(!optionComposes(option_x, sdl.SDL_KMOD_LALT, .left));
+    try testing.expect(!optionComposes(option_x, sdl.SDL_KMOD_RALT, .both));
+    // Option+Shift+x is still a composed character.
+    var shifted = option_x;
+    shifted.mods.shift = true;
+    try testing.expect(optionComposes(shifted, sdl.SDL_KMOD_LALT | sdl.SDL_KMOD_LSHIFT, .none));
+    // Option+Left is a modified named key, and Command or Control make a chord.
+    const option_left: KeyEvent = .{ .action = .press, .key = .left, .mods = .{ .alt = true } };
+    try testing.expect(!optionComposes(option_left, sdl.SDL_KMOD_LALT, .none));
+    var command = option_x;
+    command.mods.super = true;
+    try testing.expect(!optionComposes(command, sdl.SDL_KMOD_LALT | sdl.SDL_KMOD_LGUI, .none));
+    var control = option_x;
+    control.mods.ctrl = true;
+    try testing.expect(!optionComposes(control, sdl.SDL_KMOD_LALT | sdl.SDL_KMOD_LCTRL, .none));
+    // No Option, or a key with no character, composes nothing.
+    try testing.expect(!optionComposes(.{ .action = .press, .codepoint = 'x', .unshifted_codepoint = 'x' }, 0, .none));
+    try testing.expect(!optionComposes(.{ .action = .press, .mods = .{ .alt = true } }, sdl.SDL_KMOD_LALT, .none));
+}
+
+test "a translated key reports Option composition only on macOS" {
+    const window_id: sdl.SDL_WindowID = 7;
+    const state = State.init(.{ .width = 800, .height = 600 }, Scale.fromPlatform(1.0));
+    const raw = keyEventFor(window_id, sdl.SDL_EVENT_KEY_DOWN, sdl.SDL_SCANCODE_X, 'x', sdl.SDL_KMOD_LALT);
+    const composing = translateWithDriverEvents(raw, window_id, state, state, null, .none).?;
+    const alt = translateWithDriverEvents(raw, window_id, state, state, null, .both).?;
+    // The modifier is reported either way: bindings and UI keys still see Option.
+    try testing.expect(composing.key.mods.alt and alt.key.mods.alt);
+    try testing.expectEqual(builtin.os.tag == .macos, composing.key.option_composes);
+    try testing.expect(!alt.key.option_composes);
 }
 
 test "a key arrives with its character, its unshifted character and its named key" {

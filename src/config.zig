@@ -123,6 +123,40 @@ pub const RightClick = enum {
     }
 };
 
+/// Which macOS Option keys act as Alt: the `macos.option_as_alt` setting (TASK-48).
+///
+/// `false`, the built-in value, is the macOS convention: Option types the characters the layout
+/// puts on it (Option+e starts an acute accent). `true` makes both Option keys Alt (Meta, ESC
+/// prefixed), and `left` or `right` makes only that one Alt so the other still composes. The
+/// setting is read on every OS and acts only on macOS. The tag names are the file spellings.
+pub const OptionAsAlt = enum {
+    false,
+    true,
+    left,
+    right,
+
+    /// The setting's validated name.
+    pub const name: Name = .{ .bytes = "macos.option_as_alt" };
+
+    /// The value compiled into Conduit: the built-in layer.
+    pub const built_in: OptionAsAlt = .false;
+
+    pub const Error = error{InvalidOptionAsAlt};
+
+    /// Parse the setting's text spelling: exactly `true`, `false`, `left` or `right`.
+    pub fn parse(raw: []const u8) Error!OptionAsAlt {
+        inline for (comptime std.enums.values(OptionAsAlt)) |value| {
+            if (std.mem.eql(u8, raw, @tagName(value))) return value;
+        }
+        return error.InvalidOptionAsAlt;
+    }
+
+    /// Render the value back to the text it was parsed from.
+    pub fn text(self: OptionAsAlt) []const u8 {
+        return @tagName(self);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // The settings file
 // ---------------------------------------------------------------------------
@@ -207,6 +241,7 @@ pub const Key = enum {
     scratchpad_size,
     scratchpad_large_size,
     mouse_right_click,
+    macos_option_as_alt,
     notifications_enabled,
     notifications_os,
     notifications_permission,
@@ -240,6 +275,7 @@ pub const Key = enum {
             .scratchpad_size => "scratchpad.size",
             .scratchpad_large_size => "scratchpad.large_size",
             .mouse_right_click => RightClick.name.text(),
+            .macos_option_as_alt => OptionAsAlt.name.text(),
             .notifications_enabled => "notifications.enabled",
             .notifications_os => "notifications.os",
             .notifications_permission => "notifications.permission",
@@ -298,6 +334,8 @@ pub const Settings = struct {
     scratchpad_large_size: u8 = 90,
     /// The file layer of `mouse.right_click`; null when the file is silent.
     right_click: ?RightClick = null,
+    /// Which macOS Option keys are Alt; inert on other OSes (TASK-48).
+    macos_option_as_alt: OptionAsAlt = OptionAsAlt.built_in,
     /// Which agent and terminal notifications are raised (TASK-56).
     notifications: Notifications = .{},
     /// Saved SSH connection profiles (TASK-44), in file order, one per name.
@@ -606,6 +644,7 @@ pub const Config = struct {
             .scratchpad_size => to.scratchpad_size = from.scratchpad_size,
             .scratchpad_large_size => to.scratchpad_large_size = from.scratchpad_large_size,
             .mouse_right_click => to.right_click = from.right_click,
+            .macos_option_as_alt => to.macos_option_as_alt = from.macos_option_as_alt,
             .notifications_enabled,
             .notifications_os,
             .notifications_permission,
@@ -673,6 +712,7 @@ const ValueError = error{
     OutOfRange,
     NotBool,
     NotRightClick,
+    NotOptionAsAlt,
     NotPercent,
     TooManyFallbacks,
     KeybindShape,
@@ -778,6 +818,7 @@ fn valueMessage(key: Key, err: ValueError) []const u8 {
         },
         error.NotBool => "expected `true` or `false`",
         error.NotRightClick => "expected `menu` or `paste`",
+        error.NotOptionAsAlt => "expected `true`, `false`, `left` or `right`",
         error.NotPercent => "expected a whole percentage from 10 to 100",
         error.TooManyFallbacks => "expected at most 8 comma-separated families",
         error.KeybindShape => "expected `<chord>=<action>[:<argument>]`",
@@ -811,6 +852,7 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
         .scratchpad_size => settings.scratchpad_size = try parsePercent(value),
         .scratchpad_large_size => settings.scratchpad_large_size = try parsePercent(value),
         .mouse_right_click => settings.right_click = RightClick.parse(value) catch return error.NotRightClick,
+        .macos_option_as_alt => settings.macos_option_as_alt = OptionAsAlt.parse(value) catch return error.NotOptionAsAlt,
         .notifications_enabled,
         .notifications_os,
         .notifications_permission,
@@ -1117,6 +1159,10 @@ pub const defaults_document =
     "# Right click over a terminal: menu or paste.\n" ++
     "# mouse.right_click = menu\n" ++
     "\n" ++
+    "# macOS only: which Option keys are Alt (Meta) instead of typing accented characters:\n" ++
+    "# false, true (both), left or right.\n" ++
+    "# macos.option_as_alt = false\n" ++
+    "\n" ++
     "# Agent and terminal notifications: the in-app list, and an OS notification while the\n" ++
     "# window is unfocused. Per kind: permission, input, done, error and terminal (OSC 9/777\n" ++
     "# and a background bell); per harness: claude_code, codex, pi and opencode.\n" ++
@@ -1253,6 +1299,10 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
             },
             .mouse_right_click => {
                 _ = RightClick.parse(value) catch break :check error.NotRightClick;
+                return null;
+            },
+            .macos_option_as_alt => {
+                _ = OptionAsAlt.parse(value) catch break :check error.NotOptionAsAlt;
                 return null;
             },
             .remote_profile => {
@@ -2625,4 +2675,37 @@ test "control.enabled is a boolean the session layer overrides and the build def
     try testing.expectEqual(@as(?bool, null), bad.settings.control_enabled);
     try testing.expectEqual(@as(?[]const u8, null), checkValue(.control_enabled, "true"));
     try testing.expect(checkValue(.control_enabled, "yes") != null);
+}
+
+test "macos.option_as_alt parses its four spellings and rejects the rest" {
+    try testing.expectEqual(OptionAsAlt.false, try OptionAsAlt.parse("false"));
+    try testing.expectEqual(OptionAsAlt.true, try OptionAsAlt.parse("true"));
+    try testing.expectEqual(OptionAsAlt.left, try OptionAsAlt.parse("left"));
+    try testing.expectEqual(OptionAsAlt.right, try OptionAsAlt.parse("right"));
+    for ([_][]const u8{ "", "True", "both", "only_left", "left ", "yes" }) |bad| {
+        try testing.expectError(error.InvalidOptionAsAlt, OptionAsAlt.parse(bad));
+    }
+    for (std.enums.values(OptionAsAlt)) |value| {
+        try testing.expectEqual(value, try OptionAsAlt.parse(value.text()));
+    }
+    try testing.expectEqual(Key.macos_option_as_alt, Key.fromName("macos.option_as_alt").?);
+    _ = try Name.parse(OptionAsAlt.name.text());
+
+    var config = try parse(testing.allocator, "macos.option_as_alt = right\n", null);
+    defer config.deinit();
+    try testing.expect(!config.hasDiagnostics());
+    try testing.expectEqual(OptionAsAlt.right, config.settings.macos_option_as_alt);
+
+    // A bad value is a numbered diagnostic, and the previous value stands.
+    var bad = try parse(testing.allocator, "macos.option_as_alt = both\n", &config);
+    defer bad.deinit();
+    try expectDiagnostic(&bad, 1, "macos.option_as_alt: expected `true`, `false`, `left` or `right`");
+    try testing.expectEqual(OptionAsAlt.right, bad.settings.macos_option_as_alt);
+    try testing.expectEqualStrings("expected `true`, `false`, `left` or `right`", checkValue(.macos_option_as_alt, "Left").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.macos_option_as_alt, "left"));
+
+    // Silent file: the built-in value, the macOS convention.
+    var empty = try parse(testing.allocator, "", null);
+    defer empty.deinit();
+    try testing.expectEqual(OptionAsAlt.false, empty.settings.macos_option_as_alt);
 }

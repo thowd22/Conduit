@@ -489,6 +489,9 @@ fn wireThirdPartySeams(
     if (wired[moduleIndex("platform")]) |platform| {
         platform.addImport("sdl", sdlSeam(b, target, optimize, sdl_lib));
         platform.linkLibrary(sdl_lib);
+        // TASK-48: `platform` adjusts SDL's Cocoa menu through the Objective-C
+        // runtime (the Window menu's Close must not also take Command+W).
+        if (target.result.os.tag == .macos) platform.linkSystemLibrary("objc", .{});
 
         // The window icon, as raw 64x64 RGBA8 pixels handed to SDL so task
         // switchers show it before any desktop entry is consulted. Embedded the

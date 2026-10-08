@@ -280,12 +280,18 @@ pub fn translate(scratch: *TextScratch, raw: platform.KeyEvent, composing: bool)
     else
         raw.codepoint;
 
+    // macOS Option composing a character (TASK-48): the binding layer still sees Option and the
+    // key, but the terminal gets neither the key's character nor Alt, because the composed
+    // character (or a dead key's preedit) arrives through the text input that follows.
+    const text_character: ?u21 = if (raw.option_composes) null else character;
     scratch.len = 0;
-    if (character) |codepoint| {
+    if (text_character) |codepoint| {
         scratch.len = std.unicode.utf8Encode(codepoint, &scratch.buffer) catch 0;
     }
 
     const mods = modifiersFrom(raw.mods);
+    var encoded_mods = keyMods(raw.mods);
+    if (raw.option_composes) encoded_mods.alt = false;
 
     return .{
         .intent = if (named) |entry| KeyEvent{
@@ -298,11 +304,11 @@ pub fn translate(scratch: *TextScratch, raw: platform.KeyEvent, composing: bool)
         .encoded = .{
             .action = actionFrom(raw.action),
             .key = if (named) |entry| entry.encoded else .unidentified,
-            .mods = keyMods(raw.mods),
+            .mods = encoded_mods,
             // Shift is consumed when it is what turned the key into this
             // character. That is the difference between ctrl+a (0x01) and
             // ctrl+shift+a (a sequence), which a program can still tell apart.
-            .consumed_mods = .{ .shift = raw.mods.shift and character != null },
+            .consumed_mods = .{ .shift = raw.mods.shift and text_character != null },
             .text = scratch.text(),
             .unshifted_codepoint = raw.unshifted_codepoint,
             .composing = composing,
@@ -3926,4 +3932,124 @@ test "keybind arguments follow the palette contract or the shipped defaults" {
     try testing.expectEqual(@as(?Argument, null), try keybindArgument(&registry, defaults, "palette.open", null));
     try testing.expectError(error.NotBindable, keybindArgument(&registry, defaults, "tab.activate", null));
     try testing.expectError(error.UnknownAction, keybindArgument(&registry, defaults, "no.such", null));
+}
+
+test "the macOS defaults are the documented Command chords" {
+    const testing = std.testing;
+    // docs/user-guide.md, "Keybinding reference / macOS", row for row. A change to either
+    // the table or the guide has to change this list too.
+    const documented = [_]struct { action: []const u8, argument: ?[]const u8 = null, chord: []const u8 }{
+        .{ .action = "clipboard.copy", .chord = "cmd+c" },
+        .{ .action = "clipboard.paste", .chord = "cmd+v" },
+        .{ .action = "palette.open", .chord = "cmd+shift+p" },
+        .{ .action = "settings.open", .chord = "cmd+shift+," },
+        .{ .action = "config.open", .chord = "cmd+," },
+        .{ .action = "sidebar.toggle", .chord = "cmd+shift+b" },
+        .{ .action = "sidebar.narrow", .chord = "cmd+shift+left" },
+        .{ .action = "sidebar.widen", .chord = "cmd+shift+right" },
+        .{ .action = "sidebar.focus", .chord = "cmd+shift+down" },
+        .{ .action = "tab.new", .chord = "cmd+t" },
+        .{ .action = "tab.close", .chord = "cmd+w" },
+        .{ .action = "tab.rename", .chord = "f2" },
+        .{ .action = "tab.previous", .chord = "cmd+shift+[" },
+        .{ .action = "tab.next", .chord = "cmd+shift+]" },
+        .{ .action = "tab.goto", .argument = "1", .chord = "cmd+1" },
+        .{ .action = "tab.goto", .argument = "2", .chord = "cmd+2" },
+        .{ .action = "tab.goto", .argument = "3", .chord = "cmd+3" },
+        .{ .action = "tab.goto", .argument = "4", .chord = "cmd+4" },
+        .{ .action = "tab.goto", .argument = "5", .chord = "cmd+5" },
+        .{ .action = "tab.goto", .argument = "6", .chord = "cmd+6" },
+        .{ .action = "tab.goto", .argument = "7", .chord = "cmd+7" },
+        .{ .action = "tab.goto", .argument = "8", .chord = "cmd+8" },
+        .{ .action = "tab.goto", .argument = "9", .chord = "cmd+9" },
+        .{ .action = "tab.move", .argument = "up", .chord = "option+shift+up" },
+        .{ .action = "tab.move", .argument = "down", .chord = "option+shift+down" },
+        .{ .action = "pane.split", .argument = "right", .chord = "cmd+d" },
+        .{ .action = "pane.split", .argument = "down", .chord = "cmd+shift+d" },
+        .{ .action = "pane.focus", .argument = "left", .chord = "cmd+option+left" },
+        .{ .action = "pane.focus", .argument = "right", .chord = "cmd+option+right" },
+        .{ .action = "pane.focus", .argument = "up", .chord = "cmd+option+up" },
+        .{ .action = "pane.focus", .argument = "down", .chord = "cmd+option+down" },
+        .{ .action = "pane.resize", .argument = "left", .chord = "cmd+ctrl+left" },
+        .{ .action = "pane.resize", .argument = "right", .chord = "cmd+ctrl+right" },
+        .{ .action = "pane.resize", .argument = "up", .chord = "cmd+ctrl+up" },
+        .{ .action = "pane.resize", .argument = "down", .chord = "cmd+ctrl+down" },
+        .{ .action = "pane.zoom", .chord = "cmd+shift+enter" },
+        .{ .action = "pane.close", .chord = "cmd+shift+x" },
+        .{ .action = "scratchpad.toggle-50", .chord = "cmd+`" },
+        .{ .action = "scratchpad.toggle-90", .chord = "cmd+shift+`" },
+        .{ .action = "terminal.context-menu", .chord = "shift+f10" },
+        .{ .action = "font.size.increase", .chord = "cmd+=" },
+        .{ .action = "font.size.increase", .chord = "cmd+shift+=" },
+        .{ .action = "font.size.decrease", .chord = "cmd+-" },
+        .{ .action = "font.size.reset", .chord = "cmd+0" },
+    };
+    const macos = defaultBindings(.macos);
+    try testing.expectEqual(documented.len, macos.len);
+    for (documented) |row| {
+        const chord = try parseChord(row.chord);
+        const binding = findBinding(macos, chord) orelse {
+            std.debug.print("documented macOS chord {s} is not bound\n", .{row.chord});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqualStrings(row.action, binding.action);
+        if (row.argument) |value| {
+            try testing.expectEqual(@as(usize, 1), binding.arguments.len);
+            try testing.expectEqualStrings(value, binding.arguments[0].value);
+        } else {
+            try testing.expectEqual(@as(usize, 0), binding.arguments.len);
+        }
+    }
+}
+
+test "every Linux and Windows command chord is a Command chord on macOS" {
+    const testing = std.testing;
+    const macos = defaultBindings(.macos);
+    const linux_windows = defaultBindings(.linux_windows);
+    // Parity: the same actions with the same arguments ship on both profiles, row for row.
+    try testing.expectEqual(linux_windows.len, macos.len);
+    for (linux_windows, macos) |other, mac| {
+        try testing.expectEqualStrings(other.action, mac.action);
+        try testing.expectEqual(other.arguments.len, mac.arguments.len);
+        for (other.arguments, mac.arguments) |a, b| try testing.expectEqualStrings(a.value, b.value);
+        // Where Linux and Windows hold Ctrl (Ctrl+Shift+T, Ctrl+PageUp, Ctrl+Alt+Arrow), macOS
+        // holds Command: Control+letter stays the terminal's on a Mac, as Ctrl+C is SIGINT.
+        if (other.chord.modifiers.ctrl) try testing.expect(mac.chord.modifiers.super);
+        // Alt+1..9 and Alt+Arrow become Command chords too. Alt+Shift+Up/Down (tab.move) stays
+        // Option+Shift: its Command form would collide with nothing better.
+        if (other.chord.modifiers.alt and !other.chord.modifiers.shift) try testing.expect(mac.chord.modifiers.super);
+    }
+    // No macOS default is a bare Control chord.
+    for (macos) |binding| {
+        if (binding.chord.modifiers.ctrl) try testing.expect(binding.chord.modifiers.super);
+    }
+}
+
+test "Option composing on macOS sends nothing itself and keeps the chord for bindings" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var terminal: term.Terminal = undefined;
+    try terminal.init(threaded.io(), testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer terminal.deinit(testing.allocator);
+    terminal.setMacosOptionAsAlt(true);
+
+    var scratch: TextScratch = .{};
+    var encoded: term.EncodedKey = .{};
+    var composing = osKey(.unidentified, 'x', 'x', .{ .alt = true });
+    composing.option_composes = true;
+    const press = translate(&scratch, composing, false);
+    // The binding layer still sees Option+x.
+    try testing.expect(press.intent != null);
+    try testing.expect(press.intent.?.modifiers.alt);
+    try testing.expectEqual(@as(u21, 'x'), press.intent.?.key.character);
+    // The terminal gets nothing from the key: the composed character comes as text input.
+    try testing.expectEqualStrings("", press.encoded.text);
+    try testing.expect(!press.encoded.mods.alt);
+    terminal.encodeKey(press.encoded, &encoded);
+    try testing.expectEqualStrings("", encoded.slice());
+
+    // The same key with Option as Alt is Meta: ESC x.
+    const alt = osKey(.unidentified, 'x', 'x', .{ .alt = true });
+    try testing.expectEqualStrings("\x1bx", encode(&terminal, &scratch, alt, &encoded));
 }

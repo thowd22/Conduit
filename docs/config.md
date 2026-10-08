@@ -105,6 +105,7 @@ keybind = ctrl+alt+p=palette.open
 | `scratchpad.size` | whole percent, `10` to `100`, optional `%` | `50` | Height of the scratchpad opened by `scratchpad.toggle-50` |
 | `scratchpad.large_size` | whole percent, `10` to `100`, optional `%` | `90` | Height of the scratchpad opened by `scratchpad.toggle-90` |
 | `mouse.right_click` | `menu` or `paste` | `menu` | What a right click over a terminal does when the program has not captured the mouse |
+| `macos.option_as_alt` | `false`, `true`, `left` or `right` | `false` | macOS only, applies to the next key: which Option keys are Alt (Meta) instead of typing the characters the layout puts on them; see [macOS Option key](#macos-option-key). Read and ignored on Linux and Windows |
 | `notifications.enabled` | `true` or `false` | `true` | Applies to the next notification; `false` lists and raises none (see [Notifications](#notifications)) |
 | `notifications.os` | `true` or `false` | `true` | Applies; `false` keeps notifications in the in-app list only, never the desktop |
 | `notifications.permission` | `true` or `false` | `true` | An agent waiting for permission |
@@ -289,6 +290,26 @@ ones most often rebound are:
 Not configurable yet: the search chord (Ctrl+Shift+F, Cmd+F on macOS) and the keys inside modal
 UI (palette, settings view, search field, context menu, rename and confirmation prompts) are
 handled by those surfaces directly. `search.open` itself can still be given an additional chord with `keybind`.
+
+## macOS Option key
+
+On a Mac, Option is a character key: Option+e starts an acute accent, Option+x types `≈`.
+That is `macos.option_as_alt = false`, the default. Terminal programs that expect Alt (Meta)
+— Emacs, readline's Alt+b / Alt+f, tmux's Meta bindings — want Option to send `ESC` before the
+key instead:
+
+| Value | Left Option | Right Option |
+|---|---|---|
+| `false` | types characters | types characters |
+| `true` | Alt | Alt |
+| `left` | Alt | types characters |
+| `right` | types characters | Alt |
+
+The setting only changes Option with a character key and no Command or Control. Option with a
+named key (Option+Left) and chords with Command (Cmd+Option+Arrow moves pane focus) are
+modifiers whatever the value, and the bindings always see Option as `alt`/`option`. A composed
+character or dead key arrives through macOS's text input exactly as in any other app. The
+setting is applied on save, like every other key; it has no row in the settings view yet.
 
 ## Notifications
 
