@@ -3896,10 +3896,15 @@ test "a completed snapshot carries the app's values and is always representable"
 
 test "only a plain run or the restore check persists, and checks never read a state file" {
     const testing = std.testing;
+    // The state path follows the platform's convention (`state.statePath`
+    // has its own per-OS tests); here only the Linux and macOS spellings are
+    // pinned, and Windows, whose path needs LOCALAPPDATA, skips.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const env = test_env{ .vars = &.{ .{ "XDG_STATE_HOME", "/state" }, .{ "HOME", "/home/u" } } };
     var plain = Persistence.forRun(testing.allocator, testing.io, env.source(), .{}, true);
     defer plain.deinit();
-    try testing.expectEqualStrings("/state/conduit/state.json", plain.path.?);
+    const expected_path = if (builtin.os.tag == .macos) "/home/u/Library/Application Support/conduit/state.json" else "/state/conduit/state.json";
+    try testing.expectEqualStrings(expected_path, plain.path.?);
 
     var off = Persistence.forRun(testing.allocator, testing.io, env.source(), .{}, false);
     defer off.deinit();
@@ -26532,7 +26537,7 @@ fn restoreTest(init: std.process.Init, env: EnvSource, window: *platform.Window,
     for ([_][]const u8{ dir_sub, dir_gone, dir_b, state_dir }) |path| try Dir.cwd().createDirPath(io, path);
     // The SSH control sockets live in a private run directory of the check.
     var run_buffer: [path_capacity]u8 = undefined;
-    _ = try Dir.cwd().createDirPathStatus(io, try std.fmt.bufPrint(&run_buffer, "{s}/run", .{dir}), .fromMode(0o700));
+    _ = try Dir.cwd().createDirPathStatus(io, try std.fmt.bufPrint(&run_buffer, "{s}/run", .{dir}), privateArtifactPermissions(true));
     try Dir.cwd().createDirPath(io, std.fs.path.dirnamePosix(ssh_config).?);
     // A host alias whose port refuses at once: the first run's connection
     // fails without any prompt, and nothing outside this directory is read.
