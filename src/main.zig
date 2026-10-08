@@ -6375,7 +6375,7 @@ const App = struct {
         var sink_root_buffer: [path_capacity]u8 = undefined;
         var agents = try app_agents.Runtime.init(allocator, io, .{
             .sink_root = agentSinkRoot(io, env, options, &sink_root_buffer),
-            .fake_enabled = options.run.agent_test or (options.run.test_driver_endpoint != null and
+            .fake_enabled = options.run.agent_test or options.run.ssh_test or (options.run.test_driver_endpoint != null and
                 std.mem.eql(u8, env.get(fake_agent_env) orelse "", "1")),
             .fake_view = options.run.agent_view_test,
         });
@@ -9759,9 +9759,24 @@ const App = struct {
 
     /// Start finding the active workspace's harnesses, once per workspace.
     fn ensureAgentDetection(self: *App) void {
+        self.startAgentDetection(true);
+    }
+
+    /// Resolve where a remote workspace keeps agent sinks without probing
+    /// its harnesses: what checks that offer only the fake still need before
+    /// an agent can launch there (TASK-61). Nothing for a Local workspace.
+    fn ensureRemoteAgentSetup(self: *App) void {
+        if (self.activeWorkspace().contextKind() == .local) return;
+        self.startAgentDetection(false);
+    }
+
+    /// A remote workspace is probed only once connected: a probe through a
+    /// context that is still connecting would only find nothing.
+    fn startAgentDetection(self: *App, probe_harnesses: bool) void {
         const key = self.workspace_registry.activeKey() orelse return;
         const model = self.workspace_registry.byKey(key) orelse return;
-        self.agents.ensureDetection(key, model.contextRef(), self.agent_spec.env);
+        if (self.activePresentation().remote) |record| if (!record.ready()) return;
+        self.agents.ensureDetection(key, model.contextRef(), self.agent_spec.env, probe_harnesses);
     }
 
     /// A fixed-choice command; an empty list shows its one placeholder row,
@@ -9883,6 +9898,9 @@ const App = struct {
             return;
         }
         if (self.remoteNotReady()) return;
+        // A remote workspace's sink root comes from its detection, which a
+        // launch starts if nothing asked yet (TASK-61).
+        self.ensureRemoteAgentSetup();
         if (!try self.prepareToLeaveActiveSession()) return;
         const key = presentation.key;
         const model = self.activeWorkspace();
@@ -9905,6 +9923,7 @@ const App = struct {
             .workspace = key,
             .session = session_id,
             .context_kind = model.contextKind(),
+            .context = model.contextRef(),
             .cwd = cwd,
             .prompt = prompt,
             .probe_env = self.agent_spec.env,
@@ -9914,8 +9933,10 @@ const App = struct {
             .task_id = options.task_id,
         }) catch |err| {
             self.setWorkspaceStatus(switch (err) {
-                error.RemoteUnsupported => "this agent needs a local workspace for now",
-                error.NoSinkRoot => "no private state directory for the agent",
+                error.NoSinkRoot => if (model.contextKind() == .local)
+                    "no private state directory for the agent"
+                else
+                    "the remote host's state directory is not known yet; try again",
                 error.OutOfMemory => "out of memory",
             });
             pane_renderer.deinit();
@@ -18253,7 +18274,7 @@ const App = struct {
         self.rebuildFontChoices();
         // The same for detected harnesses and live agents (TASK-56). Checks
         // that never probed keep their fixed list.
-        if (!self.agents.fake_enabled) self.ensureAgentDetection();
+        if (!self.agents.fake_enabled) self.ensureAgentDetection() else self.ensureRemoteAgentSetup();
         self.setAgentLaunchChoices();
         self.rebuildAgentChoices();
         // Hosts, profiles and recent destinations can change between
@@ -26230,6 +26251,12 @@ const SshWait = union(enum) {
     replaced: struct { key: workspace.WorkspaceKey, id: session.SessionId, old: *anyopaque, cwd: []const u8 },
     ended: struct { key: workspace.WorkspaceKey, id: session.SessionId },
     child: struct { key: workspace.WorkspaceKey, id: session.SessionId },
+    /// The agent runtime resolved `key`'s remote sink root (TASK-61).
+    remote_sink_root: workspace.WorkspaceKey,
+    /// A file on `key`'s remote host, read through its context, says `text`.
+    remote_file: struct { key: workspace.WorkspaceKey, path: []const u8, text: []const u8 },
+    /// Workspace `key` has an agent notification whose body contains `text`.
+    agent_entry: struct { key: workspace.WorkspaceKey, text: []const u8 },
 };
 
 fn sshSession(self: *App, key: workspace.WorkspaceKey, id: session.SessionId) ?*session.Session {
@@ -26271,6 +26298,20 @@ fn sshWaitMet(self: *App, condition: SshWait) !bool {
         .child => |wanted| {
             const live = sshSession(self, wanted.key, wanted.id) orelse return false;
             return live.child() != null;
+        },
+        .remote_sink_root => |key| return self.agents.remoteSinkRootFor(key) != null,
+        .remote_file => |wanted| {
+            const model = self.workspace_registry.byKey(wanted.key) orelse return false;
+            var buffer: [256]u8 = undefined;
+            const got = model.contextRef().readFile(self.io, wanted.path, &buffer) catch return false;
+            return std.mem.eql(u8, got, wanted.text);
+        },
+        .agent_entry => |wanted| {
+            for (0..self.agents.notifications.count()) |index| {
+                const entry = self.agents.notifications.newest(index) orelse break;
+                if (entry.workspace == wanted.key and entry.agent != null and std.mem.indexOf(u8, entry.body(), wanted.text) != null) return true;
+            }
+            return false;
         },
     }
 }
@@ -26344,6 +26385,113 @@ fn openRemoteConnect(self: *App, io: Io, out: *Writer) !bool {
         .choices => |step| step.definition_index == self.remote_connect_index,
         else => false,
     };
+}
+
+/// One `docker exec` in the test container; whether it exited 0.
+fn sshContainerOk(self: *App, io: Io, container: []const u8, argv: []const []const u8) bool {
+    var full: [12][]const u8 = undefined;
+    if (argv.len + 3 > full.len) return false;
+    full[0] = "docker";
+    full[1] = "exec";
+    full[2] = container;
+    @memcpy(full[3..][0..argv.len], argv);
+    return sshHostOk(self, io, full[0 .. argv.len + 3], 30_000);
+}
+
+/// `--ssh-test`'s TASK-61 part: the fake agent (whose remote mode stages
+/// its script as a launch file in the remote sink) launched through
+/// `agent.launch` in the connected SSH workspace `key`.
+fn sshAgentChecks(
+    self: *App,
+    io: Io,
+    out: *Writer,
+    failures: *usize,
+    key: workspace.WorkspaceKey,
+    row_id: []const u8,
+    container: []const u8,
+    remote_name: []const u8,
+) !void {
+    const model = self.workspace_registry.byKey(key) orelse return error.TestUnexpectedResult;
+    sshCheck(out, failures, self.workspace_registry.activeKey() == key, "the first SSH workspace is shown again", .{});
+    // Opening the palette resolves the remote sink root on a worker (this
+    // check offers only the fake, so no harness is probed).
+    _ = try paletteChord(self, io, out);
+    sshCheck(out, failures, try waitForSsh(self, io, out, .{ .remote_sink_root = key }), "the remote state directory was resolved through the connection", .{});
+    var root_buffer: [path_capacity]u8 = undefined;
+    const remote_root = try std.fmt.bufPrint(&root_buffer, "{s}", .{self.agents.remoteSinkRootFor(key) orelse ""});
+    sshCheck(out, failures, std.mem.startsWith(u8, remote_root, "/home/conduit/.local/state/conduit/agents/"), "the remote sink root is under the remote user's state directory ({s})", .{remote_root});
+    _ = try postPaletteText(self, io, out, "Agent: launch");
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    const prompt_step = self.palette_step == .input and self.palette_step.input == self.agent_prompt_index;
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    const agent_tab = model.activeTabId() orelse return error.TestUnexpectedResult;
+    const agent_session = model.focusedPaneSessionId(agent_tab) orelse return error.TestUnexpectedResult;
+    var tab_buffer: [workspace_semantic_capacity]u8 = undefined;
+    const tab_row = try tabSemanticId(&tab_buffer, key, agent_tab);
+    var glyph_buffers: [3][workspace_semantic_capacity + 32]u8 = undefined;
+    const idle_glyph = try std.fmt.bufPrint(&glyph_buffers[0], "{s}.agent.idle", .{tab_row});
+    sshCheck(out, failures, prompt_step and model.sessionKind(agent_session) == .agent_terminal and
+        try waitForSsh(self, io, out, .{ .element = idle_glyph }), "Agent: launch from the palette started the fake agent in a new agent tab", .{});
+
+    // AC1: the process runs in the container, from a script the launch
+    // staged in the remote sink; nothing of the sink exists on this machine.
+    var host_buffer: [128]u8 = undefined;
+    const host_marker = try std.fmt.bufPrint(&host_buffer, "FAKE-AGENT-HOST:{s}", .{remote_name});
+    sshCheck(out, failures, try waitForSsh(self, io, out, .{ .session_text = .{ .key = key, .id = agent_session, .text = host_marker } }), "the agent's process runs on the remote host ({s})", .{remote_name});
+    const runner = self.agents.runnerForSession(key, agent_session) orelse {
+        sshCheck(out, failures, false, "the agent has a runner", .{});
+        return;
+    };
+    var sink_buffer: [path_capacity]u8 = undefined;
+    const sink_dir = try std.fmt.bufPrint(&sink_buffer, "{s}", .{runner.sink_dir});
+    var script_buffer: [path_capacity]u8 = undefined;
+    const script_path = try std.fmt.bufPrint(&script_buffer, "{s}/{s}", .{ sink_dir, app_agents.fake_remote_script_name });
+    const script_copy = try self.allocator.alloc(u8, app_agents.fake_remote_script.len + 1);
+    defer self.allocator.free(script_copy);
+    const staged = model.contextRef().readFile(io, script_path, script_copy) catch "";
+    const local_absent = if (Dir.cwd().statFile(io, sink_dir, .{})) |_| false else |_| true;
+    sshCheck(out, failures, std.mem.startsWith(u8, sink_dir, remote_root) and std.mem.eql(u8, staged, app_agents.fake_remote_script) and
+        sshContainerOk(self, io, container, &.{ "test", "-d", sink_dir }) and local_absent, "the sink and its launch file were written on the remote host, and no local sink exists", .{});
+
+    // AC2: steps the remote script appends to the remote sink drive the
+    // sidebar glyphs and raise a notification.
+    _ = try sshType(self, io, out, "one", .{});
+    const working_glyph = try std.fmt.bufPrint(&glyph_buffers[1], "{s}.agent.working", .{tab_row});
+    sshCheck(out, failures, try waitForSsh(self, io, out, .{ .element = working_glyph }), "a remote step turned the tab's glyph to working", .{});
+    _ = try sshType(self, io, out, "two", .{});
+    const waiting_glyph = try std.fmt.bufPrint(&glyph_buffers[2], "{s}.agent.waiting_permission", .{tab_row});
+    var workspace_glyph_buffer: [workspace_semantic_capacity + 32]u8 = undefined;
+    const workspace_glyph = try std.fmt.bufPrint(&workspace_glyph_buffer, "{s}.agent.waiting_permission", .{row_id});
+    sshCheck(out, failures, try waitForSsh(self, io, out, .{ .element = waiting_glyph }) and
+        try waitForSsh(self, io, out, .{ .element = workspace_glyph }), "the next remote step showed waiting for permission on the tab and the workspace", .{});
+    sshCheck(out, failures, try waitForSsh(self, io, out, .{ .agent_entry = .{ .key = key, .text = "Run: make test" } }), "the remote agent's permission wait was listed as a notification", .{});
+
+    // AC3: the structured view shows the remote events, and an answer
+    // clicked there reaches the decision file on the remote host.
+    const agent_number = @intFromEnum(runner.agent_id orelse return error.TestUnexpectedResult);
+    var view_ids: [3][agent_view_id_capacity]u8 = undefined;
+    const view_id = try std.fmt.bufPrint(&view_ids[0], "agent.view.{d}", .{agent_number});
+    const allow_id = try std.fmt.bufPrint(&view_ids[1], "agent.view.{d}.perm.fake-1.allow", .{agent_number});
+    const outcome_id = try std.fmt.bufPrint(&view_ids[2], "agent.view.{d}.perm.fake-1.outcome", .{agent_number});
+    _ = try viewChordKey(self, io, out, 'a');
+    sshCheck(out, failures, try waitForSsh(self, io, out, .{ .element = view_id }) and
+        try waitForSsh(self, io, out, .{ .element = allow_id }), "the agent view shows the remote agent's permission request with its decisions", .{});
+    try sshScreenshot(self, io, out, "agent-view");
+    _ = try clickTabsElement(self, io, out, allow_id);
+    var decision_buffer: [path_capacity]u8 = undefined;
+    const decision_path = try std.fmt.bufPrint(&decision_buffer, "{s}/decisions/fake-1", .{sink_dir});
+    sshCheck(out, failures, try waitForSsh(self, io, out, .{ .element = outcome_id }) and
+        try waitForSsh(self, io, out, .{ .remote_file = .{ .key = key, .path = decision_path, .text = "allow" } }), "the answer clicked in the view was written to the remote decision file", .{});
+    _ = try viewChordKey(self, io, out, 'a');
+
+    // Closing the workspace removes this run's remote sinks with it.
+    sshCheck(out, failures, sshContainerOk(self, io, container, &.{ "test", "-d", remote_root }), "the run's remote sink root exists while the workspace is open", .{});
+    _ = try clickPaletteCommand(self, io, out, workspace_close_action, null);
+    _ = try clickTabsElement(self, io, out, "workspace-close.confirm");
+    sshCheck(out, failures, try waitForSsh(self, io, out, .{ .element_absent = row_id }) and self.workspace_registry.byKey(key) == null, "the SSH workspace closed", .{});
+    sshCheck(out, failures, !sshContainerOk(self, io, container, &.{ "test", "-e", remote_root }) and
+        !sshContainerOk(self, io, container, &.{ "test", "-e", sink_dir }), "closing it removed the remote sink root and the agent's sink", .{});
 }
 
 fn sshTest(self: *App, io: Io, out: *Writer) !u8 {
@@ -26641,9 +26789,16 @@ fn sshTest(self: *App, io: Io, out: *Writer) !u8 {
         self.ui_tree.byId(.{ .value = try choiceRowId(&profile_row, self.remote_connect_index, profile_index orelse 0) }) != null, "the saved profile is listed and found by the filter", .{});
     _ = try postNamedKey(self, io, out, .escape, .{});
 
-    // The final frame: the first SSH workspace's split tab.
+    // TASK-61: an agent launched in the first SSH workspace runs on the
+    // remote host, its sink and launch files are written there, its status,
+    // notifications and structured view follow its remote events, a
+    // permission answered in the view reaches the remote decision file, and
+    // closing the workspace removes the remote sinks.
     _ = try clickTabsElement(self, io, out, row_id);
     _ = try waitForSsh(self, io, out, .{ .element_absent = "palette.dialog" });
+    try sshAgentChecks(self, io, out, &failures, key, row_id, container, remote_name);
+
+    // The final frame: whatever the remaining workspace shows.
     try self.drawFrame();
     _ = try self.capture();
 

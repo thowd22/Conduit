@@ -17,8 +17,17 @@
 //! `EventQueue`; the owner drains the queues in `Runtime.poll`. The spawn
 //! worker (`App`'s `Load`) calls `Runner.prepare` before the poll worker
 //! exists, so an adapter never has two callers at once. Harness detection
-//! and OS notifications run on short-lived workers joined by `poll` and
-//! `deinit`. No worker touches the registry, the list or any UI.
+//! (with a remote workspace's sink root and Claude Code config directory),
+//! the removal of a closed remote agent's sink and OS notifications run on
+//! short-lived workers joined by `poll` and `deinit`. No worker touches the
+//! registry, the list or any UI.
+//!
+//! Remote workspaces (TASK-61): an agent's sink lives in its own context,
+//! `<remote state dir>/conduit/agents/<run>/<token prefix>` on the remote
+//! host of an SSH workspace, and every sink access (launch files, the event
+//! tail, decisions, transcripts) goes through the runner's `agent.SinkIo`
+//! over the workspace's connection. The run root is removed when the
+//! workspace closes or the app exits, a bounded wait at that moment.
 //!
 //! Safety (CONDUIT.md §11): harness and terminal text is display data. It is
 //! copied, bounded and shown; nothing here opens, runs or answers anything
@@ -398,13 +407,23 @@ pub const Choice = union(enum) {
         };
     }
 
-    /// Whether the side channel needs files on this machine, which only a
-    /// Local workspace's harness can read today (TASK-61 moves them behind
-    /// the context).
-    pub fn needsLocalSink(self: Choice) bool {
+    /// Whether the side channel keeps a private sink directory: in the
+    /// agent's own context, so on the remote host in an SSH workspace
+    /// (TASK-61).
+    pub fn needsSink(self: Choice) bool {
         return switch (self) {
             .harness => |h| h == .claude_code or h == .pi,
             .fake => true,
+        };
+    }
+
+    /// Whether this choice only gets the PTY baseline in a remote workspace:
+    /// Codex's daemon socket and OpenCode's loopback port are on the remote
+    /// host, and forwarding them is not implemented (TASK-61).
+    pub fn terminalOnlyRemotely(self: Choice) bool {
+        return switch (self) {
+            .harness => |h| h == .codex or h == .opencode,
+            .fake => false,
         };
     }
 };
@@ -423,6 +442,15 @@ pub const fake_agent_script =
     "printf 'FAKE-STEP %s\\n' \"$n\"; done";
 
 const fake_argv = [_][]const u8{ "/bin/sh", "-c", fake_agent_script };
+
+/// The fake's script in a remote workspace (TASK-61): the same loop, staged
+/// as a launch file in the remote sink (so the launch files are proved to be
+/// written on the remote host) and naming the host it runs on first.
+pub const fake_remote_script =
+    "printf 'FAKE-AGENT-HOST:%s\\n' \"$(uname -n)\"; " ++ fake_agent_script ++ "\n";
+
+/// The remote fake's script file, inside its sink.
+pub const fake_remote_script_name = "fake-agent.sh";
 
 const fake_decisions = [_]agent.Decision{
     .{ .id = "allow", .label = "Allow once", .kind = .allow_once },
@@ -498,41 +526,6 @@ pub const fake_view_step_ends = [_]usize{ 12, 14 };
 
 // Owner-side transports ------------------------------------------------------------
 
-/// The owner half of Pi's sink channel: `events.jsonl` read from where the
-/// last read stopped, decisions published by write-then-rename. Local only.
-const PiSink = struct {
-    io: Io,
-    dir_path: []const u8,
-    offset: u64 = 0,
-
-    const vtable: agent.pi.Transport.VTable = .{ .read = read, .decide = decide };
-
-    fn transport(self: *PiSink) agent.pi.Transport {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    fn read(ptr: *anyopaque, out: []u8) agent.AdapterError!usize {
-        const self: *PiSink = @ptrCast(@alignCast(ptr));
-        var path_buffer: [Dir.max_path_bytes]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ self.dir_path, agent.pi.events_file_name }) catch return error.NoSpaceLeft;
-        const file = Dir.cwd().openFile(self.io, path, .{}) catch return 0;
-        defer file.close(self.io);
-        const n = file.readPositional(self.io, &.{out}, self.offset) catch return error.Disconnected;
-        self.offset += n;
-        return n;
-    }
-
-    fn decide(ptr: *anyopaque, id: []const u8, decision: []const u8) agent.AdapterError!void {
-        const self: *PiSink = @ptrCast(@alignCast(ptr));
-        var tmp_buffer: [Dir.max_path_bytes]u8 = undefined;
-        var final_buffer: [Dir.max_path_bytes]u8 = undefined;
-        const tmp = std.fmt.bufPrint(&tmp_buffer, "{s}/{s}/.{s}.tmp", .{ self.dir_path, agent.pi.decisions_dir_name, id }) catch return error.NoSpaceLeft;
-        const final = std.fmt.bufPrint(&final_buffer, "{s}/{s}/{s}", .{ self.dir_path, agent.pi.decisions_dir_name, id }) catch return error.NoSpaceLeft;
-        Dir.cwd().writeFile(self.io, .{ .sub_path = tmp, .data = decision, .flags = .{ .permissions = private_file } }) catch return error.Disconnected;
-        Dir.cwd().rename(tmp, Dir.cwd(), final, self.io) catch return error.Disconnected;
-    }
-};
-
 /// The Codex daemon's control socket, connected lazily: the TUI Conduit
 /// launches starts the daemon, so the socket may not exist until after the
 /// spawn. `connect` opens the Unix socket and then runs the WebSocket
@@ -590,10 +583,6 @@ const CodexDaemon = struct {
     }
 };
 
-const private_dir: File.Permissions = if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700);
-const private_file: File.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
-const private_executable: File.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o700);
-
 /// A free loopback TCP port, by binding port 0 and releasing it. Another
 /// process may take it before OpenCode does; the adapter then reports a
 /// disconnected channel and the agent keeps its PTY baseline.
@@ -611,7 +600,7 @@ fn freeLoopbackPort(io: Io) ?u16 {
 const Backend = union(enum) {
     fake: agent.FakeAdapter,
     claude: agent.claude_code.ClaudeCodeAdapter,
-    pi: struct { adapter: agent.pi.PiAdapter, sink: PiSink },
+    pi: struct { adapter: agent.pi.PiAdapter, sink: agent.pi.SinkTransport },
     codex: struct { adapter: agent.codex.CodexAdapter, daemon: CodexDaemon },
     opencode: agent.opencode.OpenCodeAdapter,
 };
@@ -633,11 +622,23 @@ pub const Runner = struct {
     workspace: WorkspaceKey,
     session: SessionId,
     context_kind: workspace.ExecutionContextKind,
+    /// The workspace's context, borrowed for the runner's life (the
+    /// workspace outlives its runners: `Runtime.removeWorkspace` runs
+    /// first). Null only in tests that never touch a remote sink.
+    context: ?workspace.ExecutionContext.Ref = null,
     token: agent.CorrelationToken,
     /// The registry id, once registered.
     agent_id: ?AgentId = null,
-    /// Owned; empty when this harness keeps no sink.
+    /// Owned; empty when this harness keeps no sink. A path in the agent's
+    /// own context: on the remote host in an SSH workspace (TASK-61).
     sink_dir: []u8,
+    /// Where `sink_dir` lives: this machine's files, or the workspace's
+    /// context. Used by the spawn worker (`prepare`) and then only by the
+    /// IO worker (the fake's steps and decisions), never at once; each
+    /// adapter keeps its own copy.
+    sink: agent.SinkIo = .local(),
+    /// Worker-owned: the fake's step bytes already counted.
+    fake_steps_seen: u64 = 0,
     cwd: []u8,
     prompt: ?[]u8,
     backend: Backend,
@@ -756,8 +757,14 @@ pub const Runner = struct {
                 self.request_len -= 1;
             }
             switch (answer.kind) {
-                .permission => self.adapter().respondPermission(answer.request[0..answer.request_len], answer.decision[0..answer.decision_len]) catch |err| {
-                    log.debug("a permission answer was not delivered: {s}", .{@errorName(err)});
+                .permission => {
+                    const request_id = answer.request[0..answer.request_len];
+                    const decision_id = answer.decision[0..answer.decision_len];
+                    if (self.adapter().respondPermission(request_id, decision_id)) {
+                        if (self.backend == .fake) self.publishFakeDecision(request_id, decision_id);
+                    } else |err| {
+                        log.debug("a permission answer was not delivered: {s}", .{@errorName(err)});
+                    }
                 },
                 .send_input => self.adapter().sendInput(answer.message[0..answer.message_len]) catch |err| {
                     log.debug("a message was not delivered: {s}", .{@errorName(err)});
@@ -784,7 +791,9 @@ pub const Runner = struct {
     pub fn prepare(self: *Runner, base_env: []const []const u8) PrepareError!Prepared {
         const arena = self.arena.allocator();
         if (self.sink_dir.len != 0) {
-            _ = Dir.cwd().createDirPathStatus(self.io, self.sink_dir, private_dir) catch |err| {
+            // Through the sink seam: this machine's files for a Local agent,
+            // the remote host's (one exec channel) in an SSH workspace.
+            self.sink.makePrivateDir(self.io, self.sink_dir) catch |err| {
                 log.debug("the agent sink cannot be created: {s}", .{@errorName(err)});
                 return error.SinkUnavailable;
             };
@@ -823,21 +832,12 @@ pub const Runner = struct {
         return self.prepared.?;
     }
 
+    /// Write one launch file inside the sink, in the agent's context: the
+    /// sink seam replaces it atomically, creates missing parents 0700 and
+    /// gives it exactly 0700 (executable) or 0600 (TASK-61).
     fn writeLaunchFile(self: *Runner, file: agent.LaunchSpec.File) PrepareError!void {
-        // Only a Local workspace's files live on this machine; elsewhere the
-        // context would have to carry them (TASK-61).
-        if (self.context_kind != .local) return error.UnsafeFile;
-        if (self.sink_dir.len == 0 or !std.mem.startsWith(u8, file.path, self.sink_dir) or
-            file.path.len <= self.sink_dir.len + 1 or file.path[self.sink_dir.len] != '/' or
-            std.mem.indexOf(u8, file.path, "/../") != null) return error.UnsafeFile;
-        if (std.fs.path.dirnamePosix(file.path)) |parent| {
-            _ = Dir.cwd().createDirPathStatus(self.io, parent, private_dir) catch return error.SinkUnavailable;
-        }
-        Dir.cwd().writeFile(self.io, .{
-            .sub_path = file.path,
-            .data = file.bytes,
-            .flags = .{ .permissions = if (file.executable) private_executable else private_file },
-        }) catch |err| {
+        if (!insideSink(self.sink_dir, file.path)) return error.UnsafeFile;
+        self.sink.writeFile(self.io, file.path, file.bytes, if (file.executable) 0o700 else agent.sink_io.private_file_mode) catch |err| {
             log.debug("a launch file could not be written: {s}", .{@errorName(err)});
             return error.SinkUnavailable;
         };
@@ -911,11 +911,35 @@ pub const Runner = struct {
 
     /// Lines the human typed into the fake agent, counted by the bytes its
     /// script appended to the sink.
+    /// Followed through the sink seam like an event file: a remote fake's
+    /// steps are bytes its script appended on the remote host. Worker
+    /// thread.
     fn fakeSteps(self: *Runner) u64 {
         var path_buffer: [Dir.max_path_bytes]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buffer, "{s}/steps", .{self.sink_dir}) catch return 0;
-        const stat = Dir.cwd().statFile(self.io, path, .{}) catch return 0;
-        return stat.size;
+        const path = std.fmt.bufPrint(&path_buffer, "{s}/steps", .{self.sink_dir}) catch return self.fake_steps_seen;
+        var buffer: [64]u8 = undefined;
+        while (true) {
+            const read = self.sink.readAt(self.io, path, self.fake_steps_seen, &buffer) catch |err| {
+                log.debug("the fake's steps were not read: {s}", .{@errorName(err)});
+                return self.fake_steps_seen;
+            };
+            const n = read orelse return self.fake_steps_seen;
+            if (n == 0) return self.fake_steps_seen;
+            self.fake_steps_seen += n;
+        }
+    }
+
+    /// The fake has no harness to answer, so it records each answer the way
+    /// a sink harness receives one: a decision file in its sink, written
+    /// through the seam (on the remote host in an SSH workspace). Worker
+    /// thread.
+    fn publishFakeDecision(self: *Runner, request_id: []const u8, decision_id: []const u8) void {
+        if (self.sink_dir.len == 0 or !safeFileName(request_id)) return;
+        var path_buffer: [Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buffer, "{s}/decisions/{s}", .{ self.sink_dir, request_id }) catch return;
+        self.sink.writeFile(self.io, path, decision_id, agent.sink_io.private_file_mode) catch |err| {
+            log.debug("the fake's decision file was not written: {s}", .{@errorName(err)});
+        };
     }
 
     fn destroy(self: *Runner) void {
@@ -929,8 +953,10 @@ pub const Runner = struct {
         self.view.deinit();
         self.arena.deinit();
         if (self.sink_dir.len != 0) {
-            // The sink is private run state: gone with the agent.
-            Dir.cwd().deleteTree(self.io, self.sink_dir) catch |err| {
+            // The sink is private run state: gone with the agent. A remote
+            // sink is removed by the runtime on a worker (`Cleanup`), since
+            // that is a command over the connection.
+            if (!self.sink.isRemote()) Dir.cwd().deleteTree(self.io, self.sink_dir) catch |err| {
                 log.debug("the agent sink was not removed: {s}", .{@errorName(err)});
             };
             self.allocator.free(self.sink_dir);
@@ -940,6 +966,28 @@ pub const Runner = struct {
         self.allocator.destroy(self);
     }
 };
+
+/// Whether `path` names something strictly inside `sink_dir` without
+/// climbing out of it.
+fn insideSink(sink_dir: []const u8, path: []const u8) bool {
+    if (sink_dir.len == 0 or !std.mem.startsWith(u8, path, sink_dir)) return false;
+    if (path.len <= sink_dir.len + 1 or path[sink_dir.len] != '/') return false;
+    var parts = std.mem.splitScalar(u8, path[sink_dir.len + 1 ..], '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
+}
+
+/// Whether a harness-supplied id may be a file name in a sink.
+fn safeFileName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128 or name[0] == '.') return false;
+    for (name) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
+        else => return false,
+    };
+    return true;
+}
 
 const poll_interval_ms = 50;
 const attach_every = 20;
@@ -983,23 +1031,80 @@ pub const Wake = struct {
 
 // Detection --------------------------------------------------------------------
 
-/// Which harnesses one workspace's context has, found once on a worker.
+/// What one workspace's context offers agents, found once on a worker:
+/// which harnesses it has and, for a remote context, where agent sinks go
+/// there and where Claude Code keeps its configuration (TASK-61). Every
+/// blocking call happens here, never on the owner thread.
 const Detection = struct {
     allocator: Allocator,
     io: Io,
     key: WorkspaceKey,
     context: workspace.ExecutionContext.Ref,
     probe_env: []const []const u8,
+    /// Run the harnesses' `--version` probes (checks with only the fake
+    /// skip them, so the machine's harnesses never change what they see).
+    probe_harnesses: bool = true,
+    /// This run's name, the last component of every sink root (copied).
+    run_name_bytes: [64]u8 = undefined,
+    run_name_len: usize = 0,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     versions: [Harness.all.len][64]u8 = undefined,
     version_lens: [Harness.all.len]?usize = @splat(null),
+    /// Remote only, published by `remote_ready`: the run's sink root on the
+    /// remote host (`<state dir>/conduit/agents/<run>`), when resolved.
+    remote_root_bytes: [Dir.max_path_bytes]u8 = undefined,
+    remote_root_len: ?usize = null,
+    /// Remote only: Claude Code's config directory there, when resolved.
+    claude_config_bytes: [Dir.max_path_bytes]u8 = undefined,
+    claude_config_len: ?usize = null,
+    remote_ready: std.atomic.Value(bool) = .init(false),
+    /// Owner thread: an agent sink was created under the remote root, so the
+    /// root is removed when the workspace closes.
+    remote_used: bool = false,
+
+    fn isRemote(self: *const Detection) bool {
+        return self.context.kind().isRemote();
+    }
 
     fn work(self: *Detection) void {
         defer self.done.store(true, .release);
+        if (self.isRemote()) {
+            self.resolveRemote();
+            self.remote_ready.store(true, .release);
+        }
+        if (!self.probe_harnesses) return;
         for (Harness.all, 0..) |harness, index| {
             self.version_lens[index] = self.detectOne(harness, &self.versions[index]);
         }
+    }
+
+    /// The remote state directory and Claude Code's config directory, each
+    /// one bounded command through the context.
+    fn resolveRemote(self: *Detection) void {
+        var state_buffer: [Dir.max_path_bytes]u8 = undefined;
+        if (self.context.stateDir(self.io, &state_buffer)) |state_dir| {
+            const run_name = self.run_name_bytes[0..self.run_name_len];
+            if (remoteSinkRoot(&self.remote_root_bytes, state_dir, run_name)) |root| {
+                self.remote_root_len = root.len;
+            } else |err| log.debug("the remote sink root is unusable: {s}", .{@errorName(err)});
+        } else |err| log.debug("the remote state directory was not found: {s}", .{@errorName(err)});
+        if (agent.claude_code.resolveConfigDir(self.context, self.allocator, self.io, &self.claude_config_bytes)) |found| {
+            if (found) |dir| self.claude_config_len = dir.len;
+        } else |err| log.debug("the remote Claude Code config directory was not found: {s}", .{@errorName(err)});
+    }
+
+    /// The remote sink root, once resolved. Owner thread.
+    fn remoteRoot(self: *const Detection) ?[]const u8 {
+        if (!self.remote_ready.load(.acquire)) return null;
+        const len = self.remote_root_len orelse return null;
+        return self.remote_root_bytes[0..len];
+    }
+
+    fn remoteClaudeConfig(self: *const Detection) ?[]const u8 {
+        if (!self.remote_ready.load(.acquire)) return null;
+        const len = self.claude_config_len orelse return null;
+        return self.claude_config_bytes[0..len];
     }
 
     fn detectOne(self: *Detection, harness: Harness, buffer: *[64]u8) ?usize {
@@ -1048,6 +1153,87 @@ const Track = struct {
     last_activity_ns: i96 = 0,
 };
 
+/// `<state_dir>/conduit/agents/<run_name>` in `out`: where a remote
+/// workspace's agent sinks go. Both parts are checked, since the state
+/// directory is the remote environment's answer: absolute, no controls, no
+/// `.`/`..` components, and a plain run name.
+pub fn remoteSinkRoot(out: []u8, state_dir: []const u8, run_name: []const u8) error{ Unsafe, NoSpaceLeft }![]const u8 {
+    const trimmed = std.mem.trimEnd(u8, state_dir, "/");
+    if (trimmed.len == 0 or trimmed[0] != '/') return error.Unsafe;
+    var parts = std.mem.splitScalar(u8, trimmed[1..], '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.Unsafe;
+    }
+    for (trimmed) |c| if (c < 0x20 or c == 0x7f) return error.Unsafe;
+    if (!safeFileName(run_name)) return error.Unsafe;
+    return std.fmt.bufPrint(out, "{s}/conduit/agents/{s}", .{ trimmed, run_name }) catch error.NoSpaceLeft;
+}
+
+/// Whether `path` is a sink root or sink this runtime may remove with
+/// `rm -rf`: absolute, with no `.`/`..` components, under a
+/// `/conduit/agents/` directory. Guards the one destructive command against
+/// a malformed path ever reaching it.
+pub fn removableSinkPath(path: []const u8) bool {
+    if (path.len == 0 or path[0] != '/') return false;
+    const marker = "/conduit/agents/";
+    const at = std.mem.indexOf(u8, path, marker) orelse return false;
+    if (path.len == at + marker.len) return false;
+    var parts = std.mem.splitScalar(u8, path[1..], '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    for (path) |c| if (c < 0x20 or c == 0x7f) return false;
+    return true;
+}
+
+/// `rm -rf -- <path>` through a remote context: one bounded command. Blocks;
+/// workers (and the bounded waits at a workspace's close) only.
+fn removeRemote(allocator: Allocator, io: Io, context: workspace.ExecutionContext.Ref, path: []const u8) void {
+    if (!removableSinkPath(path)) {
+        log.debug("a remote agent path was not removed: it is not a sink", .{});
+        return;
+    }
+    var result = context.run(allocator, io, .{
+        .argv = &.{ "rm", "-rf", "--", path },
+        .cwd = "",
+        .max_output = 4096,
+        .timeout_ms = remote_cleanup_timeout_ms,
+    }) catch |err| {
+        log.debug("a remote agent sink was not removed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer result.deinit(allocator);
+    if (!result.succeeded()) log.debug("removing a remote agent sink failed", .{});
+}
+
+/// The bound on one remote removal, which a workspace's close may wait for.
+const remote_cleanup_timeout_ms: u32 = 5_000;
+
+/// Removes one closed agent's remote sink on its own thread, so the owner
+/// never waits on the connection. Joined by `Runtime.poll` once done, and
+/// before its workspace's context goes (`removeWorkspace`, `deinit`).
+const Cleanup = struct {
+    allocator: Allocator,
+    io: Io,
+    key: WorkspaceKey,
+    context: workspace.ExecutionContext.Ref,
+    /// Owned.
+    path: []u8,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn work(self: *Cleanup) void {
+        defer self.done.store(true, .release);
+        removeRemote(self.allocator, self.io, self.context, self.path);
+    }
+
+    fn destroy(self: *Cleanup) void {
+        if (self.thread) |thread| thread.join();
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+};
+
 /// A terminal fact the app reports for one session (see `agent.Observation`).
 pub const Observation = agent.Observation;
 
@@ -1067,6 +1253,10 @@ pub const LaunchRequest = struct {
     workspace: WorkspaceKey,
     session: SessionId,
     context_kind: workspace.ExecutionContextKind,
+    /// The workspace's context, borrowed for the agent's life. Required in a
+    /// remote workspace: the sink, the launch files and every side-channel
+    /// read go through it (TASK-61).
+    context: ?workspace.ExecutionContext.Ref = null,
     cwd: []const u8,
     prompt: ?[]const u8 = null,
     /// The workspace's child environment, for the `--version` probes.
@@ -1082,9 +1272,8 @@ pub const LaunchRequest = struct {
 };
 
 pub const LaunchError = Allocator.Error || error{
-    /// The harness's side channel needs a Local workspace.
-    RemoteUnsupported,
-    /// No private state directory for the sink.
+    /// No private state directory for the sink: none on this machine, or a
+    /// remote one not resolved yet (or not usable).
     NoSinkRoot,
 };
 
@@ -1095,6 +1284,7 @@ pub const Runtime = struct {
     runners: std.ArrayList(*Runner) = .empty,
     tracks: std.ArrayList(Track) = .empty,
     detections: std.ArrayList(*Detection) = .empty,
+    cleanups: std.ArrayList(*Cleanup) = .empty,
     os_jobs: std.ArrayList(*OsJob) = .empty,
     notifications: NotificationList = .{},
     settings: config.Notifications = .{},
@@ -1105,6 +1295,11 @@ pub const Runtime = struct {
     /// OS notifications handed to the seam, for checks and diagnostics.
     os_notifications: usize = 0,
     sink_root: ?[]u8,
+    /// This run's name: the last component of `sink_root`, reused for each
+    /// remote workspace's sink root so one run's sinks share a parent there
+    /// too. `run` when there is no local root.
+    run_name_bytes: [64]u8 = undefined,
+    run_name_len: usize = 0,
     fake_enabled: bool,
     fake_view: bool = false,
     wake: Wake,
@@ -1132,7 +1327,7 @@ pub const Runtime = struct {
         const sink_root = if (options.sink_root) |root| try allocator.dupe(u8, root) else null;
         errdefer if (sink_root) |root| allocator.free(root);
         const drained = try allocator.alloc(agent.StoredEvent, drain_capacity);
-        return .{
+        var runtime: Runtime = .{
             .allocator = allocator,
             .io = io,
             .registry = agent.Registry.init(allocator),
@@ -1142,6 +1337,16 @@ pub const Runtime = struct {
             .wake = options.wake,
             .drained = drained,
         };
+        const base = if (sink_root) |root| std.fs.path.basenamePosix(root) else "";
+        const name = if (base.len != 0 and base.len <= runtime.run_name_bytes.len and safeFileName(base)) base else "run";
+        @memcpy(runtime.run_name_bytes[0..name.len], name);
+        runtime.run_name_len = name.len;
+        return runtime;
+    }
+
+    /// The run's name in remote sink roots.
+    pub fn runName(self: *const Runtime) []const u8 {
+        return self.run_name_bytes[0..self.run_name_len];
     }
 
     /// Stop every worker and release everything. Sessions are not touched:
@@ -1149,6 +1354,11 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         for (self.runners.items) |runner| runner.destroy();
         self.runners.deinit(self.allocator);
+        for (self.cleanups.items) |job| job.destroy();
+        self.cleanups.deinit(self.allocator);
+        // The workspaces still exist (the app releases them after the
+        // runtime), so each remote run root can go now, at a bounded wait.
+        for (self.detections.items) |detection| self.removeRemoteRoot(detection);
         for (self.detections.items) |detection| self.destroyDetection(detection);
         self.detections.deinit(self.allocator);
         for (self.os_jobs.items) |job| {
@@ -1170,13 +1380,35 @@ pub const Runtime = struct {
 
     // Detection and choices ---------------------------------------------------
 
-    /// Start finding the harnesses of one workspace's context, once. The
-    /// context and `probe_env` must outlive the detection; `removeWorkspace`
-    /// joins it before the workspace goes.
-    pub fn ensureDetection(self: *Runtime, key: WorkspaceKey, context: workspace.ExecutionContext.Ref, probe_env: []const []const u8) void {
-        for (self.detections.items) |detection| if (detection.key == key) return;
+    /// Start finding what one workspace's context offers, once: its
+    /// harnesses when `probe_harnesses`, and for a remote context its sink
+    /// root and Claude Code config directory. A finished detection is redone
+    /// when it lacks what is asked now (a remote root that did not resolve,
+    /// or probes it skipped). The context and `probe_env` must outlive the
+    /// detection; `removeWorkspace` joins it before the workspace goes.
+    pub fn ensureDetection(self: *Runtime, key: WorkspaceKey, context: workspace.ExecutionContext.Ref, probe_env: []const []const u8, probe_harnesses: bool) void {
+        for (self.detections.items, 0..) |existing, index| {
+            if (existing.key != key) continue;
+            if (!existing.done.load(.acquire)) return;
+            const missing_root = existing.isRemote() and existing.remoteRoot() == null;
+            const missing_probes = probe_harnesses and !existing.probe_harnesses;
+            if (!missing_root and !missing_probes) return;
+            if (existing.remote_used) return;
+            _ = self.detections.swapRemove(index);
+            self.destroyDetection(existing);
+            break;
+        }
         const detection = self.allocator.create(Detection) catch return;
-        detection.* = .{ .allocator = self.allocator, .io = self.io, .key = key, .context = context, .probe_env = probe_env };
+        detection.* = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .key = key,
+            .context = context,
+            .probe_env = probe_env,
+            .probe_harnesses = probe_harnesses,
+        };
+        @memcpy(detection.run_name_bytes[0..self.run_name_len], self.runName());
+        detection.run_name_len = self.run_name_len;
         detection.thread = std.Thread.spawn(.{}, Detection.work, .{detection}) catch |err| {
             log.debug("harness detection did not start: {s}", .{@errorName(err)});
             self.allocator.destroy(detection);
@@ -1193,6 +1425,55 @@ pub const Runtime = struct {
     fn destroyDetection(self: *Runtime, detection: *Detection) void {
         if (detection.thread) |thread| thread.join();
         self.allocator.destroy(detection);
+    }
+
+    fn detectionFor(self: *const Runtime, key: WorkspaceKey) ?*Detection {
+        for (self.detections.items) |detection| {
+            if (detection.key == key) return detection;
+        }
+        return null;
+    }
+
+    /// Where `key`'s remote workspace keeps this run's agent sinks, once
+    /// its detection resolved it; null for a Local workspace or until then.
+    pub fn remoteSinkRootFor(self: *const Runtime, key: WorkspaceKey) ?[]const u8 {
+        const detection = self.detectionFor(key) orelse return null;
+        return detection.remoteRoot();
+    }
+
+    /// Remove a remote workspace's run root, when an agent sink was ever
+    /// made under it. Joins the detection first (it may still be running).
+    /// A bounded wait on the connection (`remote_cleanup_timeout_ms`), taken
+    /// only when a remote workspace closes or the app exits.
+    fn removeRemoteRoot(self: *Runtime, detection: *Detection) void {
+        if (detection.thread) |thread| thread.join();
+        detection.thread = null;
+        if (!detection.remote_used) return;
+        const root = detection.remoteRoot() orelse return;
+        removeRemote(self.allocator, self.io, detection.context, root);
+        detection.remote_used = false;
+    }
+
+    /// Start removing one closed agent's remote sink on a worker.
+    fn startCleanup(self: *Runtime, key: WorkspaceKey, context: workspace.ExecutionContext.Ref, path: []const u8) void {
+        const job = self.allocator.create(Cleanup) catch return;
+        const owned = self.allocator.dupe(u8, path) catch {
+            self.allocator.destroy(job);
+            return;
+        };
+        job.* = .{ .allocator = self.allocator, .io = self.io, .key = key, .context = context, .path = owned };
+        self.cleanups.append(self.allocator, job) catch |err| {
+            log.debug("a remote agent sink cleanup was not queued: {s}", .{@errorName(err)});
+            job.destroy();
+            return;
+        };
+        job.thread = std.Thread.spawn(.{}, Cleanup.work, .{job}) catch |err| {
+            // The workspace close removes the whole run root anyway.
+            log.debug("a remote agent sink cleanup did not start: {s}", .{@errorName(err)});
+            _ = self.cleanups.pop();
+            job.destroy();
+            return;
+        };
     }
 
     /// Whether detection for `key` has finished.
@@ -1225,9 +1506,14 @@ pub const Runtime = struct {
             self.choice_storage[count] = .{ .label = fake_choice_label, .value = fake_choice_value };
             count += 1;
         }
+        const remote = if (self.detectionFor(key)) |detection| detection.isRemote() else false;
         for (Harness.all) |harness| {
             const version = self.detectedVersion(key, harness) orelse continue;
-            const label = std.fmt.bufPrint(&self.choice_labels[count], "{s} {s}", .{ harness.displayName(), version }) catch harness.displayName();
+            // In a remote workspace Codex and OpenCode run as plain TUIs on
+            // the PTY baseline, and the chooser says so (TASK-61).
+            const terminal_only = remote and (Choice{ .harness = harness }).terminalOnlyRemotely();
+            const suffix = if (terminal_only) " (terminal only here)" else "";
+            const label = std.fmt.bufPrint(&self.choice_labels[count], "{s} {s}{s}", .{ harness.displayName(), version, suffix }) catch harness.displayName();
             self.choice_storage[count] = .{ .label = label, .value = @tagName(harness) };
             count += 1;
         }
@@ -1242,17 +1528,17 @@ pub const Runtime = struct {
     /// call `register` once the session exists, then hand `Runner.prepare`
     /// to the spawn worker.
     pub fn createRunner(self: *Runtime, request: LaunchRequest) LaunchError!*Runner {
-        if (request.choice.needsLocalSink() and request.context_kind != .local) return error.RemoteUnsupported;
         var random: [agent.CorrelationToken.byte_count]u8 = undefined;
         self.io.random(&random);
         const token = agent.CorrelationToken.fromBytes(random);
 
-        const needs_sink = switch (request.choice) {
-            .fake => true,
-            .harness => |h| h == .claude_code or h == .pi,
-        };
-        const sink_dir: []u8 = if (needs_sink) blk: {
-            const root = self.sink_root orelse return error.NoSinkRoot;
+        // A remote workspace's sink is on the remote host, under the root
+        // its detection resolved there (TASK-61); a Local one is under this
+        // run's private state directory.
+        const remote = request.context_kind.isRemote();
+        const remote_context: ?workspace.ExecutionContext.Ref = if (remote) request.context orelse return error.NoSinkRoot else null;
+        const sink_dir: []u8 = if (request.choice.needsSink()) blk: {
+            const root = if (remote) self.remoteSinkRootFor(request.workspace) orelse return error.NoSinkRoot else self.sink_root orelse return error.NoSinkRoot;
             break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, token.text()[0..16] });
         } else try self.allocator.dupe(u8, "");
         errdefer self.allocator.free(sink_dir);
@@ -1274,8 +1560,10 @@ pub const Runtime = struct {
             .workspace = request.workspace,
             .session = request.session,
             .context_kind = request.context_kind,
+            .context = request.context,
             .token = token,
             .sink_dir = sink_dir,
+            .sink = if (remote_context) |ref| agent.SinkIo.forContext(ref, .{}) else agent.SinkIo.local(),
             .cwd = cwd,
             .prompt = prompt,
             .backend = undefined,
@@ -1291,6 +1579,9 @@ pub const Runtime = struct {
         };
         try self.initBackend(runner, request);
         try self.runners.append(self.allocator, runner);
+        if (remote and sink_dir.len != 0) {
+            if (self.detectionFor(request.workspace)) |detection| detection.remote_used = true;
+        }
         return runner;
     }
 
@@ -1304,7 +1595,19 @@ pub const Runtime = struct {
                     .launch_argv = &fake_argv,
                     .resolve_on_answer = true,
                 } };
-                if (self.fake_view) {
+                if (runner.sink.isRemote()) {
+                    // The remote fake runs a script staged in its remote
+                    // sink, so its launch files cross the connection too.
+                    const arena = runner.arena.allocator();
+                    const script_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ runner.sink_dir, fake_remote_script_name });
+                    const files = try arena.alloc(agent.LaunchSpec.File, 1);
+                    files[0] = .{ .path = script_path, .bytes = fake_remote_script, .executable = true };
+                    const argv = try arena.alloc([]const u8, 2);
+                    argv[0] = "/bin/sh";
+                    argv[1] = script_path;
+                    runner.backend.fake.launch_files = files;
+                    runner.backend.fake.launch_argv = argv;
+                } else if (self.fake_view) {
                     const root = self.sink_root orelse return error.NoSinkRoot;
                     const parent = std.fs.path.dirnamePosix(root) orelse root;
                     const arena = runner.arena.allocator();
@@ -1316,14 +1619,21 @@ pub const Runtime = struct {
             .harness => |harness| switch (harness) {
                 .claude_code => {
                     var config_buffer: [Dir.max_path_bytes]u8 = undefined;
-                    const config_dir: ?[]const u8 = request.claude_config_dir orelse if (request.home) |home|
-                        std.fmt.bufPrint(&config_buffer, "{s}/.claude", .{home}) catch null
+                    // A remote agent's config directory is the remote
+                    // host's, which its detection resolved there; this
+                    // machine's `$HOME` means nothing on it.
+                    const config_dir: ?[]const u8 = if (runner.sink.isRemote())
+                        (if (self.detectionFor(request.workspace)) |detection| detection.remoteClaudeConfig() else null)
                     else
-                        null;
+                        request.claude_config_dir orelse if (request.home) |home|
+                            std.fmt.bufPrint(&config_buffer, "{s}/.claude", .{home}) catch null
+                        else
+                            null;
                     runner.backend = .{ .claude = agent.claude_code.ClaudeCodeAdapter.init(self.allocator, self.io, .{
                         .sink_dir = runner.sink_dir,
                         .config_dir = config_dir,
                         .probe_env = request.probe_env,
+                        .sink_io = runner.sink,
                         .control_helper = self.control_helper,
                     }) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -1331,7 +1641,7 @@ pub const Runtime = struct {
                     } };
                 },
                 .pi => {
-                    runner.backend = .{ .pi = .{ .adapter = undefined, .sink = .{ .io = self.io, .dir_path = runner.sink_dir } } };
+                    runner.backend = .{ .pi = .{ .adapter = undefined, .sink = .init(self.io, runner.sink_dir, runner.sink) } };
                     const pi = &runner.backend.pi;
                     pi.adapter = try agent.pi.PiAdapter.init(self.allocator, self.io, .{
                         .sink_dir = runner.sink_dir,
@@ -1457,6 +1767,9 @@ pub const Runtime = struct {
         }
         const runner = found orelse return error.NotFound;
         if (runner.sink_dir.len == 0) return error.Unavailable;
+        // A remote agent's sink is on the remote host, and its hooks never
+        // get the local endpoint: they keep the relay (TASK-61).
+        if (runner.sink.isRemote()) return error.Unavailable;
         // The control server re-encodes the payload compactly, so a raw
         // newline cannot be in it; refuse one anyway rather than split lines.
         if (payload_json.len == 0 or std.mem.indexOfAny(u8, payload_json, "\r\n") != null) return error.Rejected;
@@ -1484,6 +1797,11 @@ pub const Runtime = struct {
             if (candidate != runner) continue;
             _ = self.runners.swapRemove(index);
             break;
+        }
+        // A remote sink goes on a worker; the workspace's own close removes
+        // the whole run root, so this is only for an agent closed earlier.
+        if (runner.sink.isRemote() and runner.sink_dir.len != 0) {
+            if (runner.context) |context| self.startCleanup(runner.workspace, context, runner.sink_dir);
         }
         runner.destroy();
     }
@@ -1534,6 +1852,18 @@ pub const Runtime = struct {
             _ = self.runners.swapRemove(index);
             runner.destroy();
         }
+        // Cleanups borrow the context too, and then the run root goes with
+        // the workspace (a bounded wait, at an explicit close).
+        index = 0;
+        while (index < self.cleanups.items.len) {
+            const job = self.cleanups.items[index];
+            if (job.key != key) {
+                index += 1;
+                continue;
+            }
+            _ = self.cleanups.swapRemove(index);
+            job.destroy();
+        }
         index = 0;
         while (index < self.detections.items.len) {
             const detection = self.detections.items[index];
@@ -1542,6 +1872,7 @@ pub const Runtime = struct {
                 continue;
             }
             _ = self.detections.swapRemove(index);
+            self.removeRemoteRoot(detection);
             self.destroyDetection(detection);
         }
         var removed: std.ArrayList(AgentId) = .empty;
@@ -1683,6 +2014,7 @@ pub const Runtime = struct {
             .workspace = runner.workspace,
             .session = runner.session,
             .context_kind = runner.context_kind,
+            .context = runner.context,
             .cwd = runner.cwd,
             .prompt = runner.prompt,
             .task_id = runner.taskId(),
@@ -1815,6 +2147,16 @@ pub const Runtime = struct {
                 detection.thread = null;
                 self.changed = true;
             }
+        }
+        index = 0;
+        while (index < self.cleanups.items.len) {
+            const job = self.cleanups.items[index];
+            if (!job.done.load(.acquire)) {
+                index += 1;
+                continue;
+            }
+            _ = self.cleanups.swapRemove(index);
+            job.destroy();
         }
         const changed = self.changed;
         self.changed = false;
@@ -2206,4 +2548,343 @@ test "a control agent.event reaches its own agent's sink as one line and nothing
     const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ runner.sink_dir, agent.pi.events_file_name });
     var read_buffer: [256]u8 = undefined;
     try testing.expectEqualStrings(line ++ "\n" ++ line ++ "\n", try Dir.cwd().readFile(testing.io, path, &read_buffer));
+}
+
+/// A remote-looking context for the runtime's TASK-61 paths: an in-memory
+/// file system, a state directory and a command log, so remote sinks,
+/// launch files, decisions and cleanups are checked without SSH. Guarded by
+/// a mutex because detections and cleanups call it from their workers.
+const ScriptedRemote = struct {
+    mutex: Io.Mutex = .init,
+    files: std.StringArrayHashMapUnmanaged(Stored) = .empty,
+    dirs: std.StringArrayHashMapUnmanaged(void) = .empty,
+    commands: std.ArrayList([]u8) = .empty,
+    state_dir: []const u8 = "/home/remote/.local/state",
+
+    const Stored = struct { bytes: []u8, mode: u32 };
+
+    const vtable: workspace.ExecutionContext.VTable = .{
+        .spawn = spawn,
+        .kind = kind,
+        .destroy = destroy,
+        .read_file = readFile,
+        .read_file_at = readFileAt,
+        .write_file = writeFile,
+        .make_private_dir = makePrivateDir,
+        .state_dir = stateDir,
+        .run = run,
+    };
+
+    fn ref(self: *ScriptedRemote) workspace.ExecutionContext.Ref {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *ScriptedRemote) void {
+        for (self.files.keys(), self.files.values()) |key, value| {
+            testing.allocator.free(key);
+            testing.allocator.free(value.bytes);
+        }
+        self.files.deinit(testing.allocator);
+        for (self.dirs.keys()) |key| testing.allocator.free(key);
+        self.dirs.deinit(testing.allocator);
+        for (self.commands.items) |command| testing.allocator.free(command);
+        self.commands.deinit(testing.allocator);
+    }
+
+    const spawn_fn = @typeInfo(@typeInfo(workspace.ExecutionContext.SpawnFn).pointer.child).@"fn";
+
+    fn spawn(_: *anyopaque, _: spawn_fn.params[1].type.?) spawn_fn.return_type.? {
+        return error.Closed;
+    }
+
+    fn kind(_: *const anyopaque) workspace.ExecutionContextKind {
+        return .ssh;
+    }
+
+    fn destroy(_: *anyopaque) void {}
+
+    fn cast(ptr: *anyopaque) *ScriptedRemote {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn readFile(ptr: *anyopaque, io: Io, path: []const u8, buffer: []u8) workspace.FsError![]u8 {
+        const self = cast(ptr);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const stored = self.files.get(path) orelse return error.NotFound;
+        if (stored.bytes.len > buffer.len) return error.TooLarge;
+        @memcpy(buffer[0..stored.bytes.len], stored.bytes);
+        return buffer[0..stored.bytes.len];
+    }
+
+    fn readFileAt(ptr: *anyopaque, io: Io, path: []const u8, offset: u64, buffer: []u8) workspace.FsError!usize {
+        const self = cast(ptr);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const stored = self.files.get(path) orelse return error.NotFound;
+        if (offset >= stored.bytes.len) return 0;
+        const rest = stored.bytes[@intCast(offset)..];
+        const n = @min(rest.len, buffer.len);
+        @memcpy(buffer[0..n], rest[0..n]);
+        return n;
+    }
+
+    fn put(self: *ScriptedRemote, path: []const u8, bytes: []const u8, mode: u32) workspace.FsError!void {
+        const copy = testing.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
+        if (self.files.getPtr(path)) |existing| {
+            testing.allocator.free(existing.bytes);
+            existing.* = .{ .bytes = copy, .mode = mode };
+            return;
+        }
+        const key = testing.allocator.dupe(u8, path) catch {
+            testing.allocator.free(copy);
+            return error.OutOfMemory;
+        };
+        self.files.put(testing.allocator, key, .{ .bytes = copy, .mode = mode }) catch {
+            testing.allocator.free(key);
+            testing.allocator.free(copy);
+            return error.OutOfMemory;
+        };
+    }
+
+    fn writeFile(ptr: *anyopaque, io: Io, path: []const u8, bytes: []const u8, mode: u32) workspace.FsError!void {
+        const self = cast(ptr);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.put(path, bytes, mode);
+    }
+
+    fn makePrivateDir(ptr: *anyopaque, io: Io, path: []const u8) workspace.FsError!void {
+        const self = cast(ptr);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.dirs.contains(path)) return;
+        const copy = testing.allocator.dupe(u8, path) catch return error.OutOfMemory;
+        self.dirs.put(testing.allocator, copy, {}) catch {
+            testing.allocator.free(copy);
+            return error.OutOfMemory;
+        };
+    }
+
+    fn stateDir(ptr: *anyopaque, _: Io, buffer: []u8) workspace.FsError![]u8 {
+        const self = cast(ptr);
+        if (self.state_dir.len > buffer.len) return error.TooLarge;
+        @memcpy(buffer[0..self.state_dir.len], self.state_dir);
+        return buffer[0..self.state_dir.len];
+    }
+
+    /// `/bin/sh -c …` is Claude Code's config lookup; `rm -rf -- <path>`
+    /// removes every file and directory under `path`. Both are logged.
+    fn run(ptr: *anyopaque, allocator: Allocator, io: Io, request: workspace.RunRequest) workspace.RunError!workspace.RunResult {
+        const self = cast(ptr);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const joined = std.mem.join(testing.allocator, " ", request.argv) catch return error.OutOfMemory;
+        self.commands.append(testing.allocator, joined) catch {
+            testing.allocator.free(joined);
+            return error.OutOfMemory;
+        };
+        var stdout: []const u8 = "";
+        if (std.mem.eql(u8, request.argv[0], "/bin/sh")) stdout = "/home/remote/.claude";
+        if (std.mem.eql(u8, request.argv[0], "rm") and request.argv.len == 4) {
+            const target = request.argv[3];
+            var index: usize = 0;
+            while (index < self.files.count()) {
+                const key = self.files.keys()[index];
+                if (std.mem.startsWith(u8, key, target)) {
+                    const value = self.files.values()[index];
+                    self.files.swapRemoveAt(index);
+                    testing.allocator.free(value.bytes);
+                    testing.allocator.free(key);
+                    continue;
+                }
+                index += 1;
+            }
+            index = 0;
+            while (index < self.dirs.count()) {
+                const key = self.dirs.keys()[index];
+                if (std.mem.startsWith(u8, key, target)) {
+                    self.dirs.swapRemoveAt(index);
+                    testing.allocator.free(key);
+                    continue;
+                }
+                index += 1;
+            }
+        }
+        const out = allocator.dupe(u8, stdout) catch return error.OutOfMemory;
+        const err_out = allocator.alloc(u8, 0) catch {
+            allocator.free(out);
+            return error.OutOfMemory;
+        };
+        return .{ .exit_code = 0, .stdout = out, .stderr = err_out };
+    }
+
+    fn hasFilesUnder(self: *ScriptedRemote, prefix: []const u8) bool {
+        self.mutex.lockUncancelable(testing.io);
+        defer self.mutex.unlock(testing.io);
+        for (self.files.keys()) |key| if (std.mem.startsWith(u8, key, prefix)) return true;
+        for (self.dirs.keys()) |key| if (std.mem.startsWith(u8, key, prefix)) return true;
+        return false;
+    }
+
+    fn ranCommand(self: *ScriptedRemote, prefix: []const u8) bool {
+        self.mutex.lockUncancelable(testing.io);
+        defer self.mutex.unlock(testing.io);
+        for (self.commands.items) |logged| if (std.mem.startsWith(u8, logged, prefix)) return true;
+        return false;
+    }
+};
+
+/// Join every running detection, as `poll` would once each is done.
+fn joinDetections(runtime: *Runtime) void {
+    for (runtime.detections.items) |detection| {
+        if (detection.thread) |thread| thread.join();
+        detection.thread = null;
+    }
+}
+
+/// Join every queued remote cleanup.
+fn joinCleanups(runtime: *Runtime) void {
+    for (runtime.cleanups.items) |job| {
+        if (job.thread) |thread| thread.join();
+        job.thread = null;
+    }
+}
+
+test "remote sink roots and removable paths refuse anything but a plain sink" {
+    var buffer: [128]u8 = undefined;
+    try testing.expectEqualStrings("/h/.local/state/conduit/agents/r-1", try remoteSinkRoot(&buffer, "/h/.local/state/", "r-1"));
+    try testing.expectError(error.Unsafe, remoteSinkRoot(&buffer, "relative/state", "r"));
+    try testing.expectError(error.Unsafe, remoteSinkRoot(&buffer, "/h/../etc", "r"));
+    try testing.expectError(error.Unsafe, remoteSinkRoot(&buffer, "/h/st\x1bate", "r"));
+    try testing.expectError(error.Unsafe, remoteSinkRoot(&buffer, "/h", "a/b"));
+    try testing.expectError(error.Unsafe, remoteSinkRoot(&buffer, "/h", ""));
+    var small: [8]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, remoteSinkRoot(&small, "/h", "r"));
+
+    try testing.expect(removableSinkPath("/h/.local/state/conduit/agents/r-1"));
+    try testing.expect(removableSinkPath("/h/.local/state/conduit/agents/r-1/0123456789abcdef"));
+    try testing.expect(!removableSinkPath("/h/.local/state/conduit/agents/"));
+    try testing.expect(!removableSinkPath("/"));
+    try testing.expect(!removableSinkPath("/h/conduit/agents/../../etc"));
+    try testing.expect(!removableSinkPath("h/conduit/agents/r"));
+
+    try testing.expect(insideSink("/s/x", "/s/x/ext/conduit.js"));
+    try testing.expect(!insideSink("/s/x", "/s/x/../y"));
+    try testing.expect(!insideSink("/s/x", "/s/xy/file"));
+    try testing.expect(!insideSink("/s/x", "/s/x/"));
+    try testing.expect(safeFileName("fake-1") and !safeFileName("../x") and !safeFileName(".hidden") and !safeFileName("a/b"));
+}
+
+test "a remote fake agent's sink, launch files, steps and decisions go through the context, and cleanups remove them" {
+    var remote: ScriptedRemote = .{};
+    defer remote.deinit();
+    var runtime = try Runtime.init(testing.allocator, testing.io, .{ .sink_root = "/local/state/conduit/agents/run-7", .fake_enabled = true });
+    defer runtime.deinit();
+    try testing.expectEqualStrings("run-7", runtime.runName());
+    const key = WorkspaceKey.fromOrdinal(0);
+    const session_id = SessionId.fromOrdinal(1);
+    const request: LaunchRequest = .{ .choice = .fake, .workspace = key, .session = session_id, .context_kind = .ssh, .context = remote.ref(), .cwd = "/home/remote/project" };
+
+    // Until the detection has resolved the remote root there is nowhere to
+    // put a sink, and nothing is made on this machine instead.
+    try testing.expectError(error.NoSinkRoot, runtime.createRunner(request));
+    runtime.ensureDetection(key, remote.ref(), &.{}, false);
+    joinDetections(&runtime);
+    const root = runtime.remoteSinkRootFor(key).?;
+    try testing.expectEqualStrings("/home/remote/.local/state/conduit/agents/run-7", root);
+    // Checks that offer only the fake never probe harnesses.
+    try testing.expectEqual(@as(usize, 1), runtime.launchChoices(key).len);
+
+    const runner = try runtime.createRunner(request);
+    try testing.expect(runner.sink.isRemote());
+    try testing.expect(std.mem.startsWith(u8, runner.sink_dir, "/home/remote/.local/state/conduit/agents/run-7/"));
+    const prepared = try runner.prepare(&.{ "TERM=xterm-256color", "CONDUIT_AGENT_SINK=stale" });
+    try testing.expectEqualStrings("/bin/sh", prepared.argv[0]);
+    var script_path_buffer: [256]u8 = undefined;
+    const script_path = try std.fmt.bufPrint(&script_path_buffer, "{s}/{s}", .{ runner.sink_dir, fake_remote_script_name });
+    try testing.expectEqualStrings(script_path, prepared.argv[1]);
+    try testing.expect(remote.dirs.contains(runner.sink_dir));
+    const staged = remote.files.get(script_path).?;
+    try testing.expectEqualStrings(fake_remote_script, staged.bytes);
+    try testing.expectEqual(@as(u32, 0o700), staged.mode);
+    var sink_env: ?[]const u8 = null;
+    for (prepared.env) |entry| {
+        if (std.mem.startsWith(u8, entry, agent.pi.sink_env_name ++ "=")) sink_env = entry[agent.pi.sink_env_name.len + 1 ..];
+    }
+    try testing.expectEqualStrings(runner.sink_dir, sink_env.?);
+
+    // A step the remote script appended releases events; an answer becomes
+    // a decision file on the remote host.
+    const id = try runtime.register(runner, .{ .workspace = key, .session = session_id, .session_kind = .agent_terminal, .scratchpad = .first });
+    runner.sink.idle_read_interval_ms = 0;
+    var steps_buffer: [256]u8 = undefined;
+    try remote.put(try std.fmt.bufPrint(&steps_buffer, "{s}/steps", .{runner.sink_dir}), "xx", 0o600);
+    runner.pollOnce();
+    _ = runtime.poll(0);
+    try testing.expectEqual(State.waiting_permission, runtime.registry.get(id).?.state);
+    try runner.answerPermission("fake-1", "allow");
+    runner.pollOnce();
+    var decision_buffer: [256]u8 = undefined;
+    const decision = remote.files.get(try std.fmt.bufPrint(&decision_buffer, "{s}/decisions/fake-1", .{runner.sink_dir})).?;
+    try testing.expectEqualStrings("allow", decision.bytes);
+    try testing.expectEqual(agent.sink_io.private_file_mode, decision.mode);
+
+    // The control endpoint never reaches a remote sink.
+    const token = runner.token.text()[0..agent.CorrelationToken.text_len];
+    try testing.expectError(error.Unavailable, runtime.ingestControlEvent(key, token, "{}"));
+
+    // Closing the agent's session removes its remote sink on a worker.
+    var sink_copy_buffer: [256]u8 = undefined;
+    const sink_copy = try std.fmt.bufPrint(&sink_copy_buffer, "{s}", .{runner.sink_dir});
+    runtime.sessionClosed(key, session_id);
+    joinCleanups(&runtime);
+    _ = runtime.poll(0);
+    try testing.expectEqual(@as(usize, 0), runtime.cleanups.items.len);
+    var rm_buffer: [300]u8 = undefined;
+    try testing.expect(remote.ranCommand(try std.fmt.bufPrint(&rm_buffer, "rm -rf -- {s}", .{sink_copy})));
+    try testing.expect(!remote.hasFilesUnder(sink_copy));
+
+    // A second agent, then the workspace closes: the whole run root goes.
+    const second = try runtime.createRunner(.{ .choice = .fake, .workspace = key, .session = SessionId.fromOrdinal(2), .context_kind = .ssh, .context = remote.ref(), .cwd = "/" });
+    _ = try second.prepare(&.{});
+    const remote_root = "/home/remote/.local/state/conduit/agents/run-7";
+    try testing.expect(remote.hasFilesUnder(remote_root));
+    runtime.removeWorkspace(key);
+    try testing.expect(remote.ranCommand("rm -rf -- " ++ remote_root));
+    try testing.expect(!remote.hasFilesUnder(remote_root));
+}
+
+test "remote Claude Code and Pi agents stage their sinks on the remote host with its config directory" {
+    var remote: ScriptedRemote = .{};
+    defer remote.deinit();
+    var runtime = try Runtime.init(testing.allocator, testing.io, .{ .sink_root = "/local/agents/run-9" });
+    defer runtime.deinit();
+    runtime.control_helper = "/opt/conduit/bin/conduit";
+    const key = WorkspaceKey.fromOrdinal(3);
+    runtime.ensureDetection(key, remote.ref(), &.{}, false);
+    joinDetections(&runtime);
+    try testing.expect(remote.ranCommand("/bin/sh -c "));
+
+    const claude = try runtime.createRunner(.{ .choice = .{ .harness = .claude_code }, .workspace = key, .session = SessionId.fromOrdinal(1), .context_kind = .ssh, .context = remote.ref(), .cwd = "/p", .home = "/local/home" });
+    try testing.expectEqualStrings("/home/remote/.claude", claude.backend.claude.config_dir.?);
+    try testing.expect(claude.backend.claude.sink.isRemote());
+    // No local `conduit control` helper for hooks on another machine.
+    try testing.expectEqual(@as(?[]const u8, null), claude.backend.claude.control_helper);
+    const spec = try claude.prepare(&.{});
+    try testing.expectEqualStrings("claude", spec.argv[0]);
+    var path_buffer: [256]u8 = undefined;
+    try testing.expect(remote.files.get(try std.fmt.bufPrint(&path_buffer, "{s}/settings.json", .{claude.sink_dir})) != null);
+    try testing.expect(remote.files.get(try std.fmt.bufPrint(&path_buffer, "{s}/hook.sh", .{claude.sink_dir})) != null);
+
+    const pi = try runtime.createRunner(.{ .choice = .{ .harness = .pi }, .workspace = key, .session = SessionId.fromOrdinal(2), .context_kind = .ssh, .context = remote.ref(), .cwd = "/p" });
+    _ = try pi.prepare(&.{});
+    const extension = remote.files.get(try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ pi.sink_dir, agent.pi.extension_file_name })).?;
+    try testing.expectEqualStrings(agent.pi.extension_source, extension.bytes);
+    try testing.expect(pi.backend.pi.sink.sink.isRemote());
+
+    // Codex and OpenCode keep the PTY baseline remotely and need no sink.
+    const codex = try runtime.createRunner(.{ .choice = .{ .harness = .codex }, .workspace = key, .session = SessionId.fromOrdinal(4), .context_kind = .ssh, .context = remote.ref(), .cwd = "/p" });
+    try testing.expectEqual(@as(usize, 0), codex.sink_dir.len);
+    try testing.expect(!codex.polling);
 }
