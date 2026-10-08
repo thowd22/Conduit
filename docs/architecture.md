@@ -1010,7 +1010,9 @@ nothing else is a legal dependency.
   drains a non-blocking inotify descriptor on Linux at `pollChanges`; elsewhere, and while the
   watched directory does not exist yet, it compares a bounded fingerprint of the entries' names,
   kinds, sizes and mtimes at most once a second (the `config.Watcher` design without its
-  thread). It only reports that something may have changed; the owner re-reads through the
+  thread). The interval belongs to the Local context: `ExecutionContext.localWithWatchInterval`
+  picks another, and zero scans on every poll, which tests use so the polling backend meets
+  inotify's next-poll claims on macOS and Windows (TASK-5). It only reports that something may have changed; the owner re-reads through the
   context, so no file content crosses threads. `spawn`, `readFile`, `listDir`, `statPath` and
   `run` keep no mutable context state and may run on any thread holding a `Ref`; they block on
   IO, so for a remote context they stay off the render thread, and `run` waits for its child
@@ -1510,6 +1512,12 @@ nothing else is a legal dependency.
     and Pi tests drive the real relay and sink over the sshd container (`ssh.TestRemote`);
     Pi's `conduit.js` needs Node.js, which the container lacks, so that test appends the
     extension's lines by hand.
+  - `poll.zig` (TASK-5): `wait(handle, .read | .write, timeout_ms)`, the one place the agent
+    layer asks whether a descriptor is ready, so no adapter names `std.posix.pollfd` (which
+    does not compile for Windows in Zig 0.16). POSIX is `poll(2)`; on Windows a pipe's read
+    readiness is `PeekNamedPipe` in one-millisecond slices up to the timeout (a broken pipe is
+    a hangup), a write wait reports writable at once because a pipe has no write readiness, and
+    sockets are not served.
 
 ### `backlog`
 
