@@ -232,24 +232,20 @@ jobs:
         run: |
           bash .github/scripts/windows-builtin-checks.sh ./zig-out/bin/conduit.exe "$ARTIFACT_ROOT/builtin" \
             --self-test --grid-test --ui-test --driver-test --scroll-test --mouse-test --sidebar-test \
-            --scratchpad-test --menu-test --theme-test --font-test --tabs-test --palette-test --workspaces-test
+            --scratchpad-test --menu-test --theme-test --font-test --tabs-test --palette-test --workspaces-test \
+            --panes-test --search-test
 
       # Reported, not gating (docs/release.md says why each fails):
       # --clipboard-test pins SDL's offscreen driver, which needs EGL on Windows;
       # --ime-test's MSYS child cannot put a ConPTY console into raw mode;
       # --links-test opens `vi`, which the runner does not have as vi.exe;
-      # --panes-test and --search-test stop with "conduit stopped: Closed":
-      # their MSYS `sh` read loop ends on the SIGWINCH a pseudoconsole resize
-      # raises (bash in POSIX mode returns 128 from `read`), so the pane's
-      # child exits and owed input meets a closed terminal; the fixtures in
-      # src/main.zig need `trap '' WINCH`.
       - name: Built-in checks (survey)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 30
         run: |
           bash .github/scripts/windows-builtin-checks.sh ./zig-out/bin/conduit.exe "$ARTIFACT_ROOT/survey" \
-            --clipboard-test --ime-test --links-test --panes-test --search-test
+            --clipboard-test --ime-test --links-test
 
       - name: Unit tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}

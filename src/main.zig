@@ -25081,7 +25081,7 @@ fn tabsTest(self: *App, io: Io, out: *Writer) !u8 {
 /// ExecutionContext spawn and PTY round trip. Mouse reporting is enabled by
 /// terminal bytes from the program itself.
 const panes_test_script =
-    "stty -echo; " ++
+    "trap '' WINCH; stty -echo; " ++
     "printf '\\033]7;file://localhost/tmp\\007\\033]133;A\\007pane$ \\033]133;B\\007PANE-PWD:%s\\r\\n\\033[?1006;1000h' \"$PWD\"; " ++
     "while IFS= read -r line; do printf '\\033]133;C\\007PANE-ECHO:%s\\r\\n' \"$line\"; done";
 
@@ -26572,7 +26572,7 @@ fn linksTest(self: *App, io: Io, out: *Writer) !u8 {
 /// older than the viewport, and a child that remains attached while search is
 /// driven through SDL.
 const search_test_script =
-    "stty -echo; " ++
+    "trap '' WINCH; stty -echo; " ++
     "i=0; while [ \"$i\" -lt 140 ]; do printf 'pagehit-%03d\\r\\n' \"$i\"; i=$((i+1)); done; " ++
     "printf 'Needle OLD\\r\\n'; " ++
     "i=0; while [ \"$i\" -lt 48 ]; do printf 'fill-%02d\\r\\n' \"$i\"; i=$((i+1)); done; " ++
