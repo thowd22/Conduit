@@ -3,9 +3,10 @@
 There are two separate topics here:
 
 1. **Running a coding agent inside Conduit**: Claude Code, Codex, Pi or OpenCode in a Conduit tab.
-   This works today with no setup, because they are ordinary terminal programs. Conduit-specific
-   agent features (status, notifications, permission prompts, agent views) are planned, not
-   built.
+   This works with no setup, because they are ordinary terminal programs. Launched with **Agent:
+   launch**, Conduit also follows the agent: sidebar status, notifications, permission prompts,
+   the agent view, the agent manager and the prompts view, locally and in SSH workspaces (see the
+   [user guide](user-guide.md#agent-view)).
 2. **Letting an agent drive Conduit**: the `conduit-test` CLI and MCP server, which an agent uses
    to launch an isolated Conduit, operate it through real input and take screenshots. This is the
    development and test loop for Conduit itself.
@@ -52,15 +53,17 @@ Current limits:
 - **No clipboard writes from the program (OSC 52).** Conduit's OSC 52 policy is "ask" and the
   prompt does not exist yet, so a harness's own copy command (for example one that copies the last
   answer) is refused and logged. Select the text and use Ctrl+Shift+C (Cmd+C) instead.
-- **No agent awareness.** Conduit does not know a pane is running an agent: no status in the
-  sidebar, no "needs attention" notifications beyond a bell (`! ` on a background tab) and output
-  activity (`* `), no structured transcript, no answering permission prompts from Conduit.
-- **Local only.** SSH and WSL workspaces are not built, so agents run on the local machine.
+- **Hand-started agents are followed only partly.** A harness you start yourself in a terminal
+  is a terminal program to Conduit until it is noticed (Claude Code through its session
+  registry); agents launched with **Agent: launch** get the full integration below.
+- **WSL is not built.** Agents run locally or, in an SSH workspace, on the remote host
+  ([user guide](user-guide.md#agents-in-ssh-workspaces)); there Codex and OpenCode keep the
+  terminal-level status only.
 
-### Planned agent integration
+### Agent integration
 
 The adapter strategy is decided in `backlog/decisions/decision-7` and the evidence per harness is
-in `backlog/docs/doc-3`. In short, and none of it exists yet:
+in `backlog/docs/doc-3`. In short:
 
 - Every agent keeps its own TUI in a Conduit pane. A harness-neutral baseline reads the PTY
   (process, window title, bell and OSC 9/777 notifications, output activity, prompt marks, exit)
@@ -71,11 +74,19 @@ in `backlog/docs/doc-3`. In short, and none of it exists yet:
   with `-e`; OpenCode's HTTP/SSE server.
 - Permission prompts can be answered from Conduit only with an explicit user gesture, and the
   harness's own dialog keeps working.
-- Backlog.md tasks will be linkable to agent sessions.
+- Backlog.md tasks are linkable to agent sessions (an agent started from a task shows on its
+  card).
+- In an SSH workspace the agent runs on the remote host, and its hooks, extension and transcript
+  are read and answered through the workspace's connection (TASK-61).
+- The prompts view lists an agent's instruction files, prompts and subagent definitions with what
+  may be edited, opens editable files in `vi`, and for Claude Code restarts the agent to apply an
+  edit (TASK-59).
 
 The work is tracked as TASK-52 (adapter interface), TASK-53 to TASK-55 (Claude Code, Codex and Pi
 adapters), TASK-56 (notifications), TASK-57 (agent view), TASK-58 (agent manager), TASK-59 (prompt viewer and editor), TASK-60
 (control API), TASK-61 (agents over SSH), TASK-62 to TASK-64 (Backlog.md) and TASK-78 (OpenCode).
+Live authenticated harness runs (a real Claude Code permission answered from the view, a real
+remote Claude Code) have not been checked; the deterministic checks use a scripted fake agent.
 
 ## Letting an agent drive Conduit
 

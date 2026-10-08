@@ -248,6 +248,45 @@ back. The view keeps the agent's most recent 4,096 events (4 MiB of text); older
 with a note at the top. Transcript text is display only: nothing in it can open a file or answer a
 request without your click or key.
 
+Every view leads with a **▤ prompts and instructions** row: click it, or Tab to it and press
+Enter, to open the [prompts view](#prompts-and-instructions) for that agent.
+
+## Prompts and instructions
+
+**Agent: prompts and instructions** in the palette, or the **▤ prompts and instructions** row at
+the top of an agent view, opens a list of what the agent's instructions are made of. From the
+palette it shows the agent in the presented pane (else the last one shown). Each row reads
+`<name>  <size>  editable` or `<name>  <size>  read-only · <why>`:
+
+- **Instruction files** the agent's harness reads for its directory, found through the
+  workspace (so in an SSH workspace they are the remote host's files). Claude Code: `CLAUDE.md`,
+  `.claude/CLAUDE.md` and `CLAUDE.local.md` in the agent's directory and every directory above
+  it, `~/.claude/CLAUDE.md`, subagent definitions in `.claude/agents/*.md` and
+  `~/.claude/agents/*.md` (`◆`), and its settings files (`⚙`). Codex: `AGENTS.md` and
+  `AGENTS.override.md` up the tree, `~/.codex/AGENTS.md`, `~/.codex/config.toml`. Pi: `AGENTS.md`
+  and `CLAUDE.md` up the tree, `~/.pi/agent/AGENTS.md`. OpenCode: `AGENTS.md` up the tree,
+  `~/.config/opencode/AGENTS.md`, `.opencode/agent/*.md`, `opencode.json`. The harness's main file
+  in the agent's own directory is listed even when it does not exist yet (`new`), so you can create
+  it. Only files that exist are listed otherwise.
+- **The system prompt**, which no harness lets Conduit read: `read-only · not exposed by this
+  harness`.
+- **The initial prompt** the agent was launched with (`launch ›`) and **the prompts you sent** in
+  this session (`you ›`), from the agent's structured events: `read-only · sent`. The highlighted
+  prompt's text is shown under the list.
+
+Enter or a click on an editable file opens it in `vi` in a new tab of the agent's workspace (an
+SSH workspace edits it on the remote host). A settings file the harness owns opens read-only
+(`vi -R`, `read-only · harness-owned`). When the editor exits the list is read again, so the
+row's size follows your edit. A file the workspace cannot read says `read-only on this host`.
+
+Claude Code reads its instruction files when a session starts, so the view offers **restart with
+updated instructions** (`a`, or click it): a running agent Conduit started is stopped and started
+again in the same tab with the same harness, directory, initial prompt and task, as a new agent
+(the [agent manager](#agent-manager)'s restart). For the other harnesses the row says edits take
+effect on the next session. `r` or `refresh` reads the list again; Up/Down, Tab and Home/End move;
+Escape or a click outside closes it. Keys and text over the view never reach the terminal beneath,
+and nothing in a file or prompt runs: an editor opens only from your click or key.
+
 ## Agent manager
 
 Ctrl+Shift+G (Cmd+Shift+G), or **Agents** in the palette, opens one list of every agent in every
@@ -270,6 +309,28 @@ the list is open. The task column names the backlog task an agent was started on
 A message goes to the harness's structured channel without leaving the list. A harness that has
 none (Claude Code today) says `message unsupported` in the status line; type into its tab instead.
 Keys and text over the list never reach the terminal beneath it.
+
+## Agents in SSH workspaces
+
+**Agent: launch** in an [SSH workspace](#workspaces) starts the agent on the remote host, over the
+workspace's connection, in the directory of the pane you launched from. What Conduit needs to
+follow it (Claude Code's hook relay and settings, Conduit's Pi extension) is written into a
+private directory under the remote user's state directory
+(`$XDG_STATE_HOME/conduit/agents/<run>`, else `~/.local/state/conduit/agents/<run>`), and Conduit
+reads the agent's events and transcript, and writes your permission answers, there through the
+same connection. Sidebar glyphs, notifications, the agent view, the agent manager and the prompts
+view therefore work as they do locally.
+
+- **Claude Code and Pi** report structured status, permission requests and transcripts.
+- **Codex and OpenCode** run as plain terminal programs with the terminal-level status (activity,
+  title, bell, OSC 9/777, exit) only; the launch list says `(terminal only here)`. Their
+  structured channels (Codex's daemon socket, OpenCode's local port) are on the remote host and
+  are not forwarded.
+- The harness must be installed on the remote host; the launch list shows the ones found there.
+- A remote agent's sink is removed when its tab closes, and the run's whole remote directory when
+  the workspace closes or Conduit exits.
+- Conduit's local control endpoint is not reachable from the remote host, so `conduit control`
+  does not work in remote terminals.
 
 ## Backlog view
 
@@ -551,6 +612,7 @@ These belong to the surface that has focus and are not rebindable yet. All platf
 | Scratchpad (shown) | Escape hides it |
 | Agent view | Up/Down, PageUp/PageDown, Home/End scroll; Tab/Shift+Tab move between references and choices; Left/Right between a request's choices; Enter opens or answers; Shift+arrows select; Escape clears |
 | Agent manager | Up/Down, Tab/Shift+Tab, Home/End move; Enter focuses; s stop; r restart; m message; n new; Escape closes or goes back |
+| Prompts view | Up/Down, Tab/Shift+Tab, Home/End move; Enter opens the file in vi (read-only for harness-owned files); a restart with updated instructions (Claude Code); r refresh; Escape closes |
 | Backlog view | arrows, Home/End, PageUp/PageDown move; l list; b board; Enter opens a task; Escape closes |
 | Backlog task detail | Up/Down, Tab, Home/End, PageUp/PageDown move; Enter or Space toggles; s status; a start agent; v open in vi; Escape closes (or leaves the harness choice) |
 | Any text field | Left/Right/Home/End (Shift extends the selection), Backspace, Delete; Ctrl+A / Ctrl+C / Ctrl+V (Cmd on macOS) select all, copy, paste |

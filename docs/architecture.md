@@ -345,13 +345,27 @@ nothing else is a legal dependency.
   the spawn `Load`, whose worker runs `Runner.prepare` (the adapter's `launch`, every
   `LaunchSpec.files` entry written 0600/0700 inside the run's private sink, the env overlay merged
   over the integration-free agent environment) before spawning through the workspace
-  ExecutionContext; the poll worker starts once the child is attached. Sinks live under
-  `$XDG_STATE_HOME/conduit/agents/<run>/<token>` (or `~/.local/state/...`), created 0700 and
-  deleted with the agent and the run. Per harness the runner builds: Claude Code with its sink
-  and config dir; Pi with an owner `PiSink` transport and its `conduit.js` extension file; Codex
-  with a lazily connected daemon WebSocket (seeded from `io.random`) and retried `attach`;
-  OpenCode with a loopback port found by bind-0-then-release. Sink-based harnesses and the fake
-  launch in Local workspaces only (TASK-61). Every session's terminal events feed the agent's
+  ExecutionContext; the poll worker starts once the child is attached. Sinks live in the agent's
+  own context and every access goes through the runner's `agent.SinkIo`: in a Local workspace
+  under `$XDG_STATE_HOME/conduit/agents/<run>/<token prefix>` (or `~/.local/state/...`), in an
+  SSH workspace (TASK-61) under `<remote state dir>/conduit/agents/<run>/<token prefix>` on the
+  remote host. The remote root and Claude Code's remote config directory are resolved by the
+  workspace's detection worker (`ExecutionContext.stateDir`, `claude_code.resolveConfigDir`),
+  never on the owner thread; `createRunner` refuses a remote sink harness with `NoSinkRoot` until
+  then (checks offering only the fake resolve it without probing harnesses). Sinks are created
+  0700 and deleted with the agent: a Local one directly, a remote one by a `Cleanup` worker
+  running `rm -rf -- <sink>` through the context (only paths `removableSinkPath` accepts), and a
+  remote run root at the workspace's close or the runtime's `deinit`, a bounded wait (5 s). Per
+  harness the runner builds: Claude Code with its sink, `sink_io` and config dir (no `conduit
+  control` helper for a remote sink: its hooks keep the relay); Pi with `pi.SinkTransport` over
+  the same `SinkIo` and its `conduit.js` extension file; Codex with a lazily connected daemon
+  WebSocket (seeded from `io.random`) and retried `attach`; OpenCode with a loopback port found by
+  bind-0-then-release. Codex and OpenCode in a remote workspace keep the PTY baseline (their
+  channels are remote and not forwarded) and the chooser labels them `(terminal only here)`. In a
+  remote workspace the fake stages its script as a launch file in the remote sink, counts steps
+  from the remote `steps` file and writes each answer to `<sink>/decisions/<id>`, so `--ssh-test`
+  proves the remote path end to end. `ingestControlEvent` refuses a remote agent (`Unavailable`).
+  Every session's terminal events feed the agent's
   heuristics when the session has one (output, title, BEL, OSC 9/777, OSC 133 command and prompt
   marks, the human's key presses, child exit); otherwise OSC 9/777, and a bell from a tab that is
   not shown, become `terminal` notifications. `App.pollAgents` drains every queue into the
@@ -431,7 +445,29 @@ nothing else is a legal dependency.
   status when the record lacks the `send_input` capability). New is an in-manager chooser:
   `agents.new.harness.<n>` (from `launchChoices`), `agents.new.workspace.<n>` (sidebar order) and
   a prompt `Input` with `agents.new.launch`, which activates the workspace and runs
-  `launchAgent`, `agent.launch`'s own path. The task column is `Runner.taskId` (TASK-64).
+  `launchAgent`, `agent.launch`'s own path. The task column is `Runner.taskId` (TASK-64). The
+  restart is `App.relaunchAgent`, shared with the prompts view.
+- **Prompts view (TASK-59).** `src/agent_prompts.zig` (a file of `app`, no semantic-tree code) is
+  the model: `discover` lists the files of an `agent.InstructionProfile` (each adapter's
+  `instruction_profile`, mapped by `agent.instructionProfile(harness)`, so no harness knowledge
+  lives in `app`: project files up the tree from the agent's cwd, nearest first, at most 32
+  levels; user files under the context's home; `<dir>/*.md` listings for subagents, bounded and
+  with untrusted names checked; settings as `harness_owned`) through the workspace's
+  `ExecutionContext` (`statPath`, `listDir`; a remote home from one `run`), and `addPrompts`
+  appends the system prompt row (`not_exposed`), the runner's launch prompt and the human's
+  messages from its event log (`sent`). `formatRow` lays out `<prefix><name>  <size>  editable` or
+  `read-only · <reason>` in a fixed width. A `Job` runs `discover` on its own thread; the owner
+  polls it in `App.pollPrompts`. In `main.zig`, `agent.prompts` (palette "Agent: prompts and
+  instructions", and the `InteractiveText` `agent.view.<a>.prompts` row that now leads every
+  agent view, whose event rows start one row lower) opens a modal `Surface` `agent.prompts.<a>`
+  with `agent.prompts.<a>.item.<n>` rows, `.refresh`, three `.preview.<n>` rows, `.apply`,
+  `.status` and `.hint`, all dispatching `agent.prompts.activate`; it is modal like the manager.
+  A file item opens `vi -- <path>` (or `vi -R -- <path>` for a harness-owned file) through
+  `openEditorTab` in the agent's workspace; `prompts_editor` remembers that tab and its child's
+  exit re-runs the discovery. `.apply` exists when the profile's `apply` is `restart` (Claude
+  Code): a running owned agent is hung up and `pollPrompts` restarts it through `relaunchAgent`
+  once it is restartable; otherwise the row says edits take effect on the next session. Labels,
+  headings and previews the tree borrows live in `App` storage, never on the stack.
 - **Backlog view (TASK-63, TASK-64).** `src/backlog_view.zig` (a file of `app`, no semantic-tree
   code) is the view's model: `build` turns a `backlog.Project` into a `Board` (a `Column` per
   configured status, then one per unconfigured status a task carries, up to 16; active tasks only,
@@ -1322,6 +1358,12 @@ nothing else is a legal dependency.
     agent's private sink before the spawn) that the workspace spawns through its ExecutionContext into
     an `agent_terminal` session; `CorrelationToken` is the `CONDUIT_AGENT_TOKEN` value hooks and
     extensions report back. Methods other than `harness`/`capabilities` run on IO workers only.
+    `InstructionSource`/`InstructionProfile` (TASK-59) describe where a harness reads its
+    instructions (`project_tree`, `project` or `home` relative paths, `<dir>/*.md` listings,
+    `instructions`/`subagent`/`settings` kinds, settings never editable) and whether a restart
+    applies an edit; each adapter publishes its `instruction_profile` (Claude Code: restart;
+    Codex, Pi, OpenCode: next session) and `agent.instructionProfile(harness)` maps a harness to
+    it, so the prompts view lists files without knowing a harness.
   - `registry.zig`: `Registry` of `Agent` records under monotonic, never-reused `AgentId`s, each
     bound to one `WorkspaceKey` and `SessionId`, iterated per workspace. An *owned* agent needs
     an `agent_terminal` session; an *observed* one (started by hand) lives in a `human_terminal`
@@ -2087,7 +2129,8 @@ inside the same event loop, so the main thread is that render/UI thread.
 | Settings file watch | `config.Watcher`, own thread | the thread only sets an atomic `changed` flag and posts an SDL wake; `app` reads, validates and applies the file on the main thread in `poll` |
 | Font discovery and file loading | `font`, off-thread | discovered faces handed to the main thread **(d)** |
 | Agent harness IO | `agent` adapters, one IO worker per launched agent (`app_agents.Runner`) | the worker alone calls its adapter's `attach`/`poll`/`respondPermission`/`sendInput` (the last two from a mutex-guarded request ring the owner fills) and pushes into that agent's `EventQueue`; the spawn worker runs `Runner.prepare` before the poll worker exists; `App.pollAgents` drains on the main thread and wakes the loop through the driver wake |
-| Harness detection, OS notifications | `app_agents`, short-lived workers | detection borrows the workspace context (joined before the workspace goes) and publishes versions behind an atomic `done`; an OS notification worker owns copies of its text and only runs `platform.notify` |
+| Harness detection, remote sink cleanup, OS notifications | `app_agents`, short-lived workers | detection borrows the workspace context (joined before the workspace goes) and publishes versions behind an atomic `done` and a remote workspace's sink root and Claude Code config directory behind an atomic `remote_ready`; a `Cleanup` worker owns a copy of one remote sink path and only runs `rm -rf` through the borrowed context (joined in `poll`, and before its workspace goes); an OS notification worker owns copies of its text and only runs `platform.notify` |
+| Prompts discovery | `agent_prompts.Job`, short-lived worker | borrows the agent's workspace context (destroyed before any workspace closes) and fills its own `List`, which the main thread takes whole once `done` is set |
 | SSH transport | `workspace`'s ExecutionContext, off-thread | decision-8: the system OpenSSH client in Conduit-owned PTYs and pipes, one ControlMaster per SSH workspace on Linux/macOS; the master PTY and `connect`/`poll`/`hangUp`/`reconnect` stay on the main thread, sessions spawn on the presentation's spawn workers, the one-shot `HostProbe` worker borrows the context's `run` and publishes the remote host name behind an atomic flag, and a worker that finds the master gone sets the context's flag and posts an SDL wake |
 | Backlog file reads | `backlog`, off-thread when remote | results handed to `ui` as data **(d)**; a context `WatchHandle` has no thread and is polled by the `Project` owner |
 | Backlog CLI writes | `backlog.Cli`, worker thread | `ExecutionContext.run` waits for the bounded child; the CLI's file edits return through `Project.poll` |
@@ -2223,15 +2266,16 @@ Which level proves what, by concern:
 
 Rules that apply to all levels:
 
-- The thirty verified Linux headless app checks are `--grid-test`, `--self-test`,
+- The thirty-one verified Linux headless app checks are `--grid-test`, `--self-test`,
   `--scroll-test`, `--mouse-test`, `--clipboard-test`, `--ui-test`, `--ime-test`,
   `--sidebar-test`, `--tabs-test`, `--panes-test`, `--palette-test`, `--scratchpad-test`,
   `--workspaces-test`, `--links-test`, `--search-test`, `--menu-test`, `--config-test`,
   `--theme-test`, `--font-test`, `--settings-test`, `--git-test`, `--agent-test`,
-  `--agent-view-test`, `--agent-manager-test`, `--backlog-test`, `--ssh-test`, `--control-test`,
-  `--restore-test`, `--a11y-test` and `--driver-test`; the scripted `zig build e2e` runner has nineteen scenarios, the latest being
-  `font-coverage`, `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch`,
-  `agent-notifications`, `agent-view`, `agent-manager`, `backlog-board` and `control-api`. Real-window checks use
+  `--agent-view-test`, `--agent-manager-test`, `--agent-prompts-test`, `--backlog-test`,
+  `--ssh-test`, `--control-test`, `--restore-test`, `--a11y-test` and `--driver-test`; the
+  scripted `zig build e2e` runner has twenty scenarios, the latest being `font-coverage`,
+  `theme-picker`, `font-picker`, `settings-view`, `sidebar-branch`, `agent-notifications`,
+  `agent-view`, `agent-manager`, `backlog-board`, `control-api` and `agent-prompts`. Real-window checks use
   Xvfb locally; `--clipboard-test` deliberately uses SDL's offscreen driver.
   TASK-28's `--sidebar-test` uses the production sidebar and real SDL events to switch provisioned
   tabs by click and through an independently entered keyboard focus path, hide and reveal the
