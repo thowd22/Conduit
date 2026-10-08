@@ -266,9 +266,12 @@ step is the real proof), `--ime-test` (its fixed child is an MSYS `sh` script
 that cannot put a ConPTY console into raw mode; the smoke's Unicode text input
 through cmd.exe is the Windows proof of committed text), `--links-test` (it
 opens `vi`, which the runner has only as an MSYS script, not `vi.exe`), and
-`--panes-test` and `--search-test` (a write that reaches a ConPTY whose child
-has just exited fails with `ERROR_NO_DATA`, which `pty.zig` reports as
-`SystemError` rather than `Closed`, and the check stops).
+`--panes-test` and `--search-test` (a write to a live pane's pseudoconsole
+fails with `ERROR_NO_DATA`, now reported as `Closed`, right after that pane's
+shell draws its prompt, which stops the app; the cause is still open in
+`pty.zig`). The WSL step `windows-wsl-check.sh` (TASK-47) gates: it drives
+Remote: connect, a first tab, a split pane, the scratchpad and a Windows file
+reference inside the runner's WSL2 Ubuntu through `conduit-test`.
 
 `publish-windows` uploads the zip and its `.sha256` to the release with
 `--clobber`. Like `publish-macos` it needs `publish` and nothing needs it.

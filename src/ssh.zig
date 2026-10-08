@@ -458,7 +458,7 @@ pub fn discardScript(allocator: Allocator, tmp: []const u8) QuoteError![]u8 {
 pub fn makePrivateDirScript(allocator: Allocator, path: []const u8) QuoteError![]u8 {
     var body_buffer: [512]u8 = undefined;
     const body = std.fmt.bufPrint(&body_buffer,
-        \\umask 077; [ -L "$p" ] && exit {d}; mkdir -p -- "$p" 2>/dev/null; [ -d "$p" ] || {{ [ -e "$p" ] && exit {d}; exit {d}; }}; chmod 700 -- "$p" || exit {d}
+        \\umask 077; [ -L "$p" ] && exit {d}; mkdir -p -- "$p" 2>/dev/null; [ -d "$p" ] || {{ [ -e "$p" ] && exit {d}; exit {d}; }}; chmod -- 700 "$p" || exit {d}
     , .{ helper_failed, helper_not_dir, helper_access_denied, helper_access_denied }) catch unreachable; // A fixed template and four integers fit 512 bytes.
     return pathScript(allocator, path, body);
 }

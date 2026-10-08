@@ -978,8 +978,8 @@ Option setting are still to do.
 
 TASK-49 is complete on the hosted Windows runner. `conduit.exe` embeds `assets/windows/conduit.manifest`
 (per-monitor-v2 DPI awareness, UTF-8 code page, Windows 10/11 supportedOS, asInvoker) and the
-icon from `conduit.rc`. `Window.create` sets a dark DWM title bar (`setTitleBarDark` is not yet
-called on theme changes), logs the DPI awareness, and frees a console Windows created only for
+icon from `conduit.rc`. `Window.create` sets a dark DWM title bar, and `setTitleBarDark` follows the
+theme's background at startup and in `applyPalette`, logs the DPI awareness, and frees a console Windows created only for
 this process. `font.discoverCatalog` lists fonts through DirectWrite and catalogues each file with
 FreeType; without DirectWrite it walks `%WINDIR%\Fonts` and the per-user font directory. Every
 Windows argument is copied out of the iterator's buffer, which `deinit` frees (before that fix
@@ -990,22 +990,34 @@ and drawn at scale 1 and 1.5; Unicode text input; Ctrl+Shift+V/C through the Win
 Consolas, Cascadia Mono and a per-user DejaVu Sans Mono; a live display-scale change from 100%
 to 125% re-rendering at 800x450; and 14 gating built-in checks. `--clipboard-test` (needs EGL),
 `--ime-test` (an MSYS child cannot enter raw mode), `--links-test` (no `vi.exe`) and
-`--panes-test`/`--search-test` (`ERROR_NO_DATA` from a ConPTY whose child exited is not yet
-mapped to `Closed`) are reported but do not gate. Local process runs use `create_no_window`, and
+`--panes-test`/`--search-test` (a write to a live pane's pseudoconsole fails with
+`ERROR_NO_DATA`, now reported as `Closed`, right after that pane's shell draws its prompt; the
+cause is still open in `pty.zig`) are reported but do not gate. The smoke opens cmd.exe through
+New tab with profile because pwsh is the default shell since TASK-46. Local process runs use `create_no_window`, and
 `build.zig` translates the C header seams as Debug on Windows because MinGW's `_FORTIFY_SOURCE`
 breaks translate-c at ReleaseSafe. A real GPU driver, a second monitor and real IME composition
 are unverified.
 
-TASK-47 is implemented at the context level. `workspace.wsl.WslContext` runs every process
+TASK-47 is complete on the hosted Windows runner. `workspace.wsl.WslContext` runs every process
 through `wsl.exe -d <distro> --cd ~ -e /bin/sh -c <script>`: sessions under ConPTY, and files,
-run, stateDir and watch over pipes with the SSH helper scripts. Distributions come from HKCU
-`Lxss` or `wsl --list --quiet` (UTF-16LE decoded). `link.WslPaths` translates drive and
-`\\wsl.localhost` paths using the mount root learned from `wslpath`, and `remote.zig` has the
-`wsl:<name>` choice helpers. On windows-latest the workflow installs Ubuntu under WSL2, and the
-context test passes against it: commands, files, watch, three concurrent sessions inside the
-distribution, and translation that agrees with `wslpath -w`. A stand-in launcher covers Linux.
-The palette entry, the WSL workspace presentation and file-reference translation in `main.zig`
-are being wired next.
+run, stateDir and watch over pipes with the SSH helper scripts; distributions come from HKCU
+`Lxss` or `wsl --list --quiet` (UTF-16LE decoded), and `link.WslPaths` translates drive and
+`\\wsl.localhost` paths using the mount root learned from `wslpath`. On Windows, Remote: connect
+lists each registered distribution as `<name>  WSL`, read from the registry so no process runs
+on the UI thread. Choosing one opens a workspace named after the distribution, backed by
+`WslContext`, with no connection phase: its first tab, every pane and its scratchpad run the
+distribution's login shell with the remote overlay (SSH and WSL share `processFor`'s remote
+path), starting in its home directory, and the first spawn worker learns the drive mount root
+from `wslpath`. A ctrl-clicked Windows file reference (`C:\x:12`, `\\wsl.localhost\<distro>\x`)
+opens `vi +12 -- /mnt/c/x` inside the distribution. A driven run can name a `wsl.exe` stand-in
+with `CONDUIT_TEST_WSL_LAUNCHER`, which is ignored without `--test-driver` and never inherited by
+children; the stand-in test runs on Linux and Windows. windows.yml installs Ubuntu under WSL2 and
+gates on `windows-wsl-check.sh`, which drives Remote: connect, the first tab, a split pane, the
+scratchpad and the file reference through `conduit-test`; run 37737271998 passed it and its
+screenshots were inspected. Still open: WSL workspaces are not saved or restored
+(`createRestoredPresentation` refuses `.wsl`); OSC 7 from a WSL shell is accepted only as
+`localhost`, so cwd inheritance for splits depends on the shell; a non-root default user and
+distributions other than Ubuntu have not been tried.
 
 TASK-69 (Windows): `zig build portable` and `windows-package.sh` produce
 `conduit-<v>-windows-x86_64.zip` plus `.sha256`, verified on the runner (checksum, fresh unpack,
