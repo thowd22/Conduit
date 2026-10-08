@@ -4256,3 +4256,71 @@ test "starting and destroying a Windows terminal releases every handle it took" 
     }
     try testing.expectEqual(before, try win.processHandleCount());
 }
+
+// PROBE (temporary, TASK-49): which input or resize makes a live pseudoconsole stop reading.
+const probe_esc = "\x1b";
+
+fn probeLine(gpa: Allocator, pty: Pty, name: []const u8, step: []const u8, line: []const u8, marker: []const u8) !bool {
+    writeAll(pty, line) catch |err| {
+        std.debug.print("PROBE {s}: {s}: write failed: {s}, state {any}\n", .{ name, step, @errorName(err), pty.state() });
+        return false;
+    };
+    const out = try readUntil(gpa, pty, marker);
+    defer gpa.free(out);
+    const ok = std.mem.indexOf(u8, out, marker) != null;
+    std.debug.print("PROBE {s}: {s}: {s} (state {any}, {d} bytes)\n", .{ name, step, if (ok) "ok" else "NO ECHO", pty.state(), out.len });
+    return ok;
+}
+
+fn probeScenario(gpa: Allocator, name: []const u8, argv: []const []const u8, env: []const []const u8, ready: []const u8, echo_prefix: []const u8, mouse: bool, resizes: []const WindowSize) !void {
+    const pty = spawnConPty(gpa, .{ .argv = argv, .env = env, .cwd = windows_test_cwd, .size = WindowSize.init(18, 56) }) catch |err| {
+        std.debug.print("PROBE {s}: SKIP spawn {s}\n", .{ name, @errorName(err) });
+        return;
+    };
+    defer pty.destroy();
+    const first = try readUntil(gpa, pty, ready);
+    defer gpa.free(first);
+    std.debug.print("PROBE {s}: ready={any} first bytes: {f}\n", .{ name, std.mem.indexOf(u8, first, ready) != null, std.ascii.hexEscape(first, .lower) });
+    var marker_buf: [64]u8 = undefined;
+    if (!try probeLine(gpa, pty, name, "baseline", "one\r", try std.fmt.bufPrint(&marker_buf, "{s}one", .{echo_prefix}))) return;
+    if (mouse) {
+        writeAll(pty, probe_esc ++ "[<0;5;5M") catch |err| std.debug.print("PROBE {s}: mouse press write: {s}\n", .{ name, @errorName(err) });
+        writeAll(pty, probe_esc ++ "[<0;5;5m") catch |err| std.debug.print("PROBE {s}: mouse release write: {s}\n", .{ name, @errorName(err) });
+        if (!try probeLine(gpa, pty, name, "after mouse", "two\r", try std.fmt.bufPrint(&marker_buf, "{s}two", .{echo_prefix}))) return;
+    }
+    for (resizes, 0..) |size, index| {
+        pty.resize(size) catch |err| std.debug.print("PROBE {s}: resize {d}x{d}: {s}\n", .{ name, size.rows, size.cols, @errorName(err) });
+        var step_buf: [32]u8 = undefined;
+        var line_buf: [16]u8 = undefined;
+        const step = try std.fmt.bufPrint(&step_buf, "after {d}x{d}", .{ size.rows, size.cols });
+        const line = try std.fmt.bufPrint(&line_buf, "r{d}\r", .{index});
+        if (!try probeLine(gpa, pty, name, step, line, try std.fmt.bufPrint(&marker_buf, "{s}r{d}", .{ echo_prefix, index }))) return;
+    }
+    std.debug.print("PROBE {s}: SURVIVED\n", .{name});
+}
+
+const probe_ps_mouse = "[Console]::Out.Write([char]27 + '[?1006;1000h'); [Console]::Out.WriteLine('ps-ready'); while ($null -ne ($l = [Console]::In.ReadLine())) { [Console]::Out.WriteLine('echo:' + $l) }";
+const probe_ps_plain = "[Console]::Out.WriteLine('ps-ready'); while ($null -ne ($l = [Console]::In.ReadLine())) { [Console]::Out.WriteLine('echo:' + $l) }";
+const probe_sh_script = "stty -echo; printf 'sh-ready\\r\\n\\033[?1006;1000h'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
+const probe_sh_plain = "stty -echo; printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
+const probe_sh_env = [_][]const u8{
+    "PATH=C:\\bin;C:\\Windows\\System32;C:\\Windows",
+    "PATHEXT=.COM;.EXE;.BAT;.CMD",
+    "SYSTEMROOT=C:\\Windows",
+    "TEMP=C:\\Windows\\Temp",
+    "TERM=xterm-256color",
+};
+
+test "PROBE conpty input and resize" {
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const tiny = [_]WindowSize{ WindowSize.init(9, 28), WindowSize.init(3, 20), WindowSize.init(1, 1), WindowSize.init(2, 5), WindowSize.init(1, 18), WindowSize.init(18, 80) };
+    const ps = "powershell.exe";
+    try probeScenario(gpa, "ps-mouse", &.{ ps, "-NoProfile", "-NonInteractive", "-Command", probe_ps_mouse }, &windows_test_env, "ps-ready", "echo:", true, &.{});
+    try probeScenario(gpa, "ps-plain-mouse", &.{ ps, "-NoProfile", "-NonInteractive", "-Command", probe_ps_plain }, &windows_test_env, "ps-ready", "echo:", true, &.{});
+    try probeScenario(gpa, "ps-resize", &.{ ps, "-NoProfile", "-NonInteractive", "-Command", probe_ps_plain }, &windows_test_env, "ps-ready", "echo:", false, &tiny);
+    try probeScenario(gpa, "sh-mouse", &.{ "C:\\bin\\sh", "-c", probe_sh_script }, &probe_sh_env, "sh-ready", "echo:", true, &.{});
+    try probeScenario(gpa, "sh-plain-mouse", &.{ "C:\\bin\\sh", "-c", probe_sh_plain }, &probe_sh_env, "sh-ready", "echo:", true, &.{});
+    try probeScenario(gpa, "sh-resize", &.{ "C:\\bin\\sh", "-c", probe_sh_plain }, &probe_sh_env, "sh-ready", "echo:", false, &tiny);
+    try probeScenario(gpa, "sh-resize-one", &.{ "C:\\bin\\sh", "-c", probe_sh_plain }, &probe_sh_env, "sh-ready", "echo:", false, &.{ WindowSize.init(9, 28), WindowSize.init(18, 28) });
+}

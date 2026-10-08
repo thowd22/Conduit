@@ -30,7 +30,7 @@ name: Windows
 
 on:
   push:
-    branches: ["task-49-windows", "task-49-windows-release", "task-47-wsl*"]
+    branches: ["task-49-windows", "task-49-windows-release", "task-49-conpty", "task-47-wsl*"]
   workflow_dispatch:
     inputs:
       version:
@@ -59,6 +59,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  conpty-probe:
+    name: ConPTY probe (temporary)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "ZIG_VERSION=$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_ENV"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+      - run: bash .github/scripts/windows-sh-standin.sh
+      - run: zig test src/pty.zig --test-filter PROBE 2>&1 | tee probe.txt
+      - run: powershell.exe -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber | Format-List"
+
   windows:
     name: Windows x86_64 platform checks and zip
     runs-on: windows-latest
