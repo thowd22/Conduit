@@ -28532,7 +28532,7 @@ fn backlogTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try Dir.cwd().createDirPathStatus(io, bin, .default_dir);
     var program_buffer: [path_capacity]u8 = undefined;
     const program = try std.fmt.bufPrint(&program_buffer, "{s}/backlog", .{bin});
-    try Dir.cwd().writeFile(io, .{ .sub_path = program, .data = backlog_fake_cli, .flags = .{ .permissions = .fromMode(0o700) } });
+    try Dir.cwd().writeFile(io, .{ .sub_path = program, .data = backlog_fake_cli, .flags = .{ .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o700) } });
     var fail_buffer: [path_capacity]u8 = undefined;
     const fail_path = try std.fmt.bufPrint(&fail_buffer, "{s}/fail", .{bin});
     self.backlog_program = program;
