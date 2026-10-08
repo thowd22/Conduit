@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-03 21:39'
-updated_date: '2026-10-08 00:09'
+updated_date: '2026-10-08 00:32'
 labels:
   - agents
   - ssh
@@ -38,3 +38,9 @@ Part 1 (context and adapters): 1. ExecutionContext.writeFile (bounded, mode) for
 3. Integration test against the sshd container: launch the fake-shaped hook relay remotely and tail its sink through the SshContext.
 Part 2 (app): Runtime uses the context for sink IO per workspace kind; --ssh-test launches a fake agent in the SSH workspace and proves status, notifications and the agent view.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Part one landed (020d922, 981032c, d1ca1e5 rebased onto main as fe7f9b8): ExecutionContext readFileAt/writeFile (atomic, 1 MiB, exact mode)/makePrivateDir/stateDir with Local and SSH (chunked stdin exec scripts) implementations, localWithStateDir and localFiles helpers, ssh.TestRemote harness; agent/sink_io.zig SinkIo (local or context-backed with 500 ms idle read throttling); Claude and Pi adapters route sinks, decisions, transcripts and the config dir through SinkIo; Codex/OpenCode remain PTY baseline remotely. Docker SSH tests ran the Claude relay remotely through run and through a PTY session over the master. Part two (app_agents/main): Runner.prepare writes files through the workspace context, remote sink root from stateDir resolved on the detection worker, Pi SinkTransport replaces PiSink, remote cleanup via rm -rf on a worker, --ssh-test launching a fake-shaped agent remotely. decision-8's remote-writes sentence needs updating.
+<!-- SECTION:NOTES:END -->

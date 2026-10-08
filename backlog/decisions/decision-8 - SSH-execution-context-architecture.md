@@ -228,7 +228,7 @@ the default. **This trade-off is the open point for the user** before the decisi
   output that is file content is never logged.
 - Conduit persists nothing SSH-related except non-secret profile data (TASK-44); `known_hosts`
   changes are OpenSSH's, made only after the user typed `yes`.
-- Remote writes are limited to the content-addressed integration/helper directory, disabled by
+- Remote writes are limited to the content-addressed integration/helper directory, disabled by *Amended by TASK-61 (2026-10-08): per-agent sink directories under the remote state directory (`$XDG_STATE_HOME/conduit/agents/<run>/<agent>`, 0700) are also written through `writeFile`/`makePrivateDir`, so harness hooks and extensions running remotely can report into a sink Conduit tails over the connection.*
   `ssh.shell_integration = off`, and documented.
 - The control API and test driver cannot address the connection session, consistent with the
   scratchpad rule; TASK-60 must not expose `ssh -O` operations.
