@@ -527,6 +527,24 @@ pub const Catalog = struct {
         return self;
     }
 
+    /// Record every font file in `paths` (absolute, as DirectWrite names them on Windows). A file
+    /// FreeType refuses is skipped, as in `scan`; only running out of memory is returned.
+    /// `paths` is not owned.
+    pub fn scanFiles(gpa: Allocator, paths: []const [:0]const u8) !Catalog {
+        var self: Catalog = .{ .gpa = gpa };
+        errdefer self.deinit();
+        var library = try Library.init();
+        defer library.deinit();
+        for (paths) |path| {
+            if (!hasFontExtension(path)) continue;
+            self.addFile(library.handle, path) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+        }
+        return self;
+    }
+
     /// The most faces read from one collection. Real collections hold a handful (Menlo has four,
     /// the largest CJK collections a few dozen); a file claiming more is bounded rather than
     /// believed.
@@ -703,6 +721,199 @@ fn canonicalStyleName(style: FaceStyle) []const u8 {
     };
 }
 
+/// Build the catalog of installed fonts the way this OS lists them.
+///
+/// Linux and macOS walk `systemFontDirectories`. Windows asks DirectWrite (TASK-49): its system
+/// font collection is the list Windows itself shows, which covers fonts installed for all users in
+/// `%WINDIR%\Fonts`, fonts installed for one user (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`,
+/// registered under HKCU) and fonts registered from any other directory. DirectWrite only names
+/// the files; FreeType still reads them, so a face is described the same way on every OS. When
+/// DirectWrite is unavailable or lists nothing, the two font directories are walked instead.
+pub fn discoverCatalog(io: Io, gpa: Allocator, home_dir: ?[]const u8) !Catalog {
+    if (builtin.os.tag == .windows) {
+        if (windows_fonts.listFiles(gpa)) |files| {
+            defer {
+                for (files) |file| gpa.free(file);
+                gpa.free(files);
+            }
+            if (files.len != 0) {
+                var catalog = try Catalog.scanFiles(gpa, files);
+                errdefer catalog.deinit();
+                log.info("font discovery: DirectWrite listed {d} font files, {d} faces catalogued", .{ files.len, catalog.files.items.len });
+                return catalog;
+            }
+            log.info("font discovery: DirectWrite listed no font files; walking the font directories", .{});
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => log.info("font discovery: DirectWrite unavailable ({s}); walking the font directories", .{@errorName(err)}),
+        }
+    }
+    const directories = try systemFontDirectories(gpa, home_dir);
+    defer freeAll(gpa, directories);
+    return Catalog.scan(io, gpa, directories);
+}
+
+/// DirectWrite's system font collection as a list of font file paths (Windows only).
+///
+/// Plain COM through each interface's vtable: `DWriteCreateFactory` is looked up in `dwrite.dll` at
+/// run time, every family's every font is turned into a font face, and each face's files are
+/// asked for their local path through `IDWriteLocalFontFileLoader`. A font that is not a local
+/// file (a remote or in-memory font) has no path and is skipped. Each path is returned once, in
+/// UTF-8, NUL-terminated for FreeType; the caller owns the list (`freeAll`).
+const windows_fonts = if (builtin.os.tag == .windows) struct {
+    const windows = std.os.windows;
+    const HRESULT = i32;
+    const GUID = windows.GUID;
+
+    const iid_factory = GUID.parse("{b859ee5a-d838-4b5b-a2e8-1adc7d93db48}");
+    const iid_local_loader = GUID.parse("{b2d9f3ec-c9fe-4a11-a2ec-d86208f7c0a2}");
+
+    /// Any COM object: a pointer to its vtable of function pointers, in declaration order.
+    const Object = extern struct { vtable: [*]const *const anyopaque };
+
+    fn method(comptime T: type, object: *Object, index: usize) T {
+        return @ptrCast(object.vtable[index]);
+    }
+
+    fn release(object: *Object) void {
+        _ = method(*const fn (*Object) callconv(.winapi) u32, object, 2)(object);
+    }
+
+    // Vtable slots, counted from IUnknown's three.
+    const factory_get_system_font_collection = 3;
+    const collection_get_family_count = 3;
+    const collection_get_family = 4;
+    const list_get_font_count = 4;
+    const list_get_font = 5;
+    const font_create_face = 13;
+    const face_get_files = 4;
+    const file_get_reference_key = 3;
+    const file_get_loader = 4;
+    const unknown_query_interface = 0;
+    const local_loader_get_path_length = 4;
+    const local_loader_get_path = 5;
+
+    extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+
+    const CreateFactory = *const fn (u32, *const GUID, *?*Object) callconv(.winapi) HRESULT;
+
+    const ListError = Allocator.Error || error{ DirectWriteMissing, DirectWriteFailed };
+
+    /// The most font files kept. A Windows install has about a thousand; the bound only stops a
+    /// broken collection from growing the list forever.
+    const max_files: usize = 16 * 1024;
+
+    fn listFiles(gpa: Allocator) ListError![]const [:0]const u8 {
+        const module = LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("dwrite.dll")) orelse return error.DirectWriteMissing;
+        const create: CreateFactory = @ptrCast(GetProcAddress(module, "DWriteCreateFactory") orelse return error.DirectWriteMissing);
+        var factory_ptr: ?*Object = null;
+        // DWRITE_FACTORY_TYPE_SHARED (0): the process-wide factory, whose system collection is
+        // cached by the font service rather than rebuilt.
+        if (create(0, &iid_factory, &factory_ptr) < 0) return error.DirectWriteFailed;
+        const factory = factory_ptr orelse return error.DirectWriteFailed;
+        defer release(factory);
+
+        var collection_ptr: ?*Object = null;
+        const get_collection = method(*const fn (*Object, *?*Object, windows.BOOL) callconv(.winapi) HRESULT, factory, factory_get_system_font_collection);
+        if (get_collection(factory, &collection_ptr, .FALSE) < 0) return error.DirectWriteFailed;
+        const collection = collection_ptr orelse return error.DirectWriteFailed;
+        defer release(collection);
+
+        var paths: std.ArrayList([:0]const u8) = .empty;
+        errdefer {
+            for (paths.items) |path| gpa.free(path);
+            paths.deinit(gpa);
+        }
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(gpa);
+
+        const family_count = method(*const fn (*Object) callconv(.winapi) u32, collection, collection_get_family_count)(collection);
+        var family_index: u32 = 0;
+        while (family_index < family_count) : (family_index += 1) {
+            var family_ptr: ?*Object = null;
+            if (method(*const fn (*Object, u32, *?*Object) callconv(.winapi) HRESULT, collection, collection_get_family)(collection, family_index, &family_ptr) < 0) continue;
+            const family = family_ptr orelse continue;
+            defer release(family);
+            const font_count = method(*const fn (*Object) callconv(.winapi) u32, family, list_get_font_count)(family);
+            var font_index: u32 = 0;
+            while (font_index < font_count) : (font_index += 1) {
+                if (paths.items.len == max_files) return paths.toOwnedSlice(gpa);
+                var font_ptr: ?*Object = null;
+                if (method(*const fn (*Object, u32, *?*Object) callconv(.winapi) HRESULT, family, list_get_font)(family, font_index, &font_ptr) < 0) continue;
+                const font = font_ptr orelse continue;
+                defer release(font);
+                try collectFaceFiles(gpa, font, &paths, &seen);
+            }
+        }
+        return paths.toOwnedSlice(gpa);
+    }
+
+    fn collectFaceFiles(
+        gpa: Allocator,
+        font: *Object,
+        paths: *std.ArrayList([:0]const u8),
+        seen: *std.StringHashMapUnmanaged(void),
+    ) Allocator.Error!void {
+        var face_ptr: ?*Object = null;
+        if (method(*const fn (*Object, *?*Object) callconv(.winapi) HRESULT, font, font_create_face)(font, &face_ptr) < 0) return;
+        const face = face_ptr orelse return;
+        defer release(face);
+        const get_files = method(*const fn (*Object, *u32, ?[*]?*Object) callconv(.winapi) HRESULT, face, face_get_files);
+        var file_count: u32 = 0;
+        if (get_files(face, &file_count, null) < 0 or file_count == 0) return;
+        var files: [4]?*Object = @splat(null);
+        // A face spans one file in practice; more are not looked at rather than allocated for.
+        file_count = @min(file_count, files.len);
+        if (get_files(face, &file_count, &files) < 0) return;
+        for (files[0..file_count]) |maybe_file| {
+            const file = maybe_file orelse continue;
+            defer release(file);
+            const path = (try localPath(gpa, file)) orelse continue;
+            if (seen.contains(path)) {
+                gpa.free(path);
+                continue;
+            }
+            paths.append(gpa, path) catch |err| {
+                gpa.free(path);
+                return err;
+            };
+            try seen.put(gpa, path, {});
+        }
+    }
+
+    /// The file's path when its loader is the local one, as owned UTF-8; null otherwise.
+    fn localPath(gpa: Allocator, file: *Object) Allocator.Error!?[:0]u8 {
+        var key: ?*const anyopaque = null;
+        var key_size: u32 = 0;
+        if (method(*const fn (*Object, *?*const anyopaque, *u32) callconv(.winapi) HRESULT, file, file_get_reference_key)(file, &key, &key_size) < 0) return null;
+        var loader_ptr: ?*Object = null;
+        if (method(*const fn (*Object, *?*Object) callconv(.winapi) HRESULT, file, file_get_loader)(file, &loader_ptr) < 0) return null;
+        const loader = loader_ptr orelse return null;
+        defer release(loader);
+        var local_ptr: ?*Object = null;
+        if (method(*const fn (*Object, *const GUID, *?*Object) callconv(.winapi) HRESULT, loader, unknown_query_interface)(loader, &iid_local_loader, &local_ptr) < 0) return null;
+        const local = local_ptr orelse return null;
+        defer release(local);
+        var length: u32 = 0;
+        if (method(*const fn (*Object, ?*const anyopaque, u32, *u32) callconv(.winapi) HRESULT, local, local_loader_get_path_length)(local, key, key_size, &length) < 0) return null;
+        if (length == 0 or length > 32 * 1024) return null;
+        const wide = try gpa.alloc(u16, length + 1);
+        defer gpa.free(wide);
+        if (method(*const fn (*Object, ?*const anyopaque, u32, [*]u16, u32) callconv(.winapi) HRESULT, local, local_loader_get_path)(local, key, key_size, wide.ptr, length + 1) < 0) return null;
+        const text = std.mem.sliceTo(wide, 0);
+        const utf8 = std.unicode.wtf16LeToWtf8Alloc(gpa, text) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer gpa.free(utf8);
+        return try gpa.dupeZ(u8, utf8);
+    }
+} else struct {
+    fn listFiles(_: Allocator) error{ OutOfMemory, Unsupported }![]const [:0]const u8 {
+        return error.Unsupported;
+    }
+};
+
 /// The directories system fonts are searched in, most specific first. The caller owns the result
 /// and frees it with the allocator it passed.
 ///
@@ -714,9 +925,11 @@ fn canonicalStyleName(style: FaceStyle) []const u8 {
 /// Linux and macOS search the same shapes of directory, because on both the system, distribution
 /// and per-user font directories have the same names and the same tree layout. Windows is the odd
 /// one out — its per-user fonts live under `%LOCALAPPDATA%` rather than in the home directory, and
-/// a registered font may exist in no directory at all — so TASK-49 replaces this list with GDI or
-/// DirectWrite enumeration rather than extending it.
+/// a registered font may exist in no directory at all — so `discoverCatalog` asks DirectWrite
+/// there, and this list (the Windows directory's `Fonts` and the per-user font directory, read
+/// from the process environment) is only its fallback.
 pub fn systemFontDirectories(gpa: Allocator, home_dir: ?[]const u8) ![]const []const u8 {
+    if (builtin.os.tag == .windows) return windowsFontDirectories(gpa);
     var list: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (list.items) |owned| gpa.free(owned);
@@ -724,7 +937,7 @@ pub fn systemFontDirectories(gpa: Allocator, home_dir: ?[]const u8) ![]const []c
     }
 
     const roots: []const []const u8 = switch (builtin.os.tag) {
-        .windows => &.{"C:\\Windows\\Fonts"},
+        .windows => unreachable, // returned above
         .macos => &.{
             "/System/Library/Fonts",
             "/System/Library/Fonts/Supplemental",
@@ -748,6 +961,42 @@ pub fn systemFontDirectories(gpa: Allocator, home_dir: ?[]const u8) ![]const []c
     }
     return list.toOwnedSlice(gpa);
 }
+
+/// `%WINDIR%\Fonts` (else `C:\Windows\Fonts`) and, when `%LOCALAPPDATA%` is set, the per-user
+/// `%LOCALAPPDATA%\Microsoft\Windows\Fonts` that Settings installs a font into for one user.
+fn windowsFontDirectories(gpa: Allocator) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |owned| gpa.free(owned);
+        list.deinit(gpa);
+    }
+    const windir = try windowsEnvironment(gpa, "WINDIR");
+    defer if (windir) |value| gpa.free(value);
+    try list.append(gpa, try std.fmt.allocPrint(gpa, "{s}\\Fonts", .{windir orelse "C:\\Windows"}));
+    if (try windowsEnvironment(gpa, "LOCALAPPDATA")) |local| {
+        defer gpa.free(local);
+        try list.append(gpa, try std.fmt.allocPrint(gpa, "{s}\\Microsoft\\Windows\\Fonts", .{local}));
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+/// One variable of this process's environment as owned UTF-8, or null when unset or empty.
+/// Windows only: Zig 0.16 hands the environment to `main` rather than through a global, and the
+/// font manager is not given it, so the Win32 call is the one place to ask.
+fn windowsEnvironment(gpa: Allocator, comptime name: []const u8) Allocator.Error!?[]u8 {
+    if (builtin.os.tag != .windows) return null;
+    const wide_name = std.unicode.utf8ToUtf16LeStringLiteral(name);
+    var buffer: [1024]u16 = undefined;
+    const length = windows_kernel.GetEnvironmentVariableW(wide_name, &buffer, buffer.len);
+    if (length == 0 or length >= buffer.len) return null;
+    return std.unicode.wtf16LeToWtf8Alloc(gpa, buffer[0..length]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+const windows_kernel = struct {
+    extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buffer: ?[*]u16, size: u32) callconv(.winapi) u32;
+};
 
 /// Identifies a rasterised glyph: the glyph, in the face it came from.
 pub const Key = struct {
@@ -1341,10 +1590,7 @@ pub const Manager = struct {
         var library = try Library.init();
         errdefer library.deinit();
 
-        const directories = try systemFontDirectories(gpa, request.home_dir);
-        defer freeAll(gpa, directories);
-
-        var catalog = try Catalog.scan(io, gpa, directories);
+        var catalog = try discoverCatalog(io, gpa, request.home_dir);
         errdefer catalog.deinit();
 
         var resolution = try resolveFaces(gpa, library.handle, &catalog, request, size_px);
@@ -2883,6 +3129,31 @@ test "shaping a run reports one glyph per character, in pixels" {
     try manager.shape("hi", &run);
     try testing.expectEqual(@as(usize, 2), run.items.len);
     try testing.expectEqual(capacity, run.capacity);
+}
+
+test "on Windows, DirectWrite lists the installed fonts and Consolas resolves from them" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const files = try windows_fonts.listFiles(testing.allocator);
+    defer {
+        for (files) |file| testing.allocator.free(file);
+        testing.allocator.free(files);
+    }
+    try testing.expect(files.len > 0);
+    var consolas_file = false;
+    for (files) |file| {
+        if (std.ascii.endsWithIgnoreCase(file, "\\consola.ttf")) consolas_file = true;
+    }
+    try testing.expect(consolas_file);
+
+    var catalog = try discoverCatalog(testing.io, testing.allocator, null);
+    defer catalog.deinit();
+    const consolas = catalog.findFamily("Consolas") orelse return error.ConsolasNotCatalogued;
+    try testing.expect(consolas.fixed_width);
+
+    // The fallback list names the Windows font directory from the environment.
+    const directories = try systemFontDirectories(testing.allocator, null);
+    defer freeAll(testing.allocator, directories);
+    try testing.expect(std.ascii.endsWithIgnoreCase(directories[0], "\\Fonts"));
 }
 
 test "an installed family resolves from the system, and says so" {
