@@ -4,7 +4,7 @@ title: Embedded VSCodium editor pane exposed to harnesses as a tool
 status: Done
 assignee: []
 created_date: '2026-10-08 03:39'
-updated_date: '2026-10-08 07:19'
+updated_date: '2026-10-08 14:26'
 labels:
   - editor
   - agents
@@ -42,6 +42,8 @@ Design notes a future agent cannot recover from the code: (1) VSCodium is an Ele
 Phase one merged to main (94847f5): decision-12, src/editor.zig model, editor.* control methods and faults, conduit-test/MCP editor tools, docs, and the X11 foreign-window hosting seam in platform (dlopen'ed Xlib, tested under Xvfb with xlogo). The app answers Unavailable until phase two wires main.zig and the workspace pane leaf.
 
 Phase two merged to main (7864057, rebased cleanly). Evidence: --editor-test (29+ checks through real SDL events and a real tab shell typing conduit control editor.*), the twenty-second e2e scenario editor-pane, 22/22 scenarios locally, X root captures of a visible run showing the stand-in's xlogo window hosted beside the terminal pane under the 'editor ─ notes.txt:2  × close' header; not-installed path proven (no palette row, control fault with the vscodium.com hint). Known limits: restore saves the editor pane as a terminal pane; quitting leaves a hosted window on the desktop; closing a last tab's only editor pane quits. Unverified: real VSCodium (never installed on this box), typing into a reparented Electron window, the Wayland separate-window fallback, macOS and Windows hosting (decision-12 records them as later work).
+
+Coordinator 2026-10-08, with the user's approval: real VSCodium 1.135.06055 (private tarball under .zig-cache/vscodium, checksum verified) driven through Conduit under Xvfb with a visible window: editor.open hosted the real window over pane 2 within 1.6 s, the real file showed, editor.goto moved the cursor and header to notes.txt:4:1, XTest typing inserted at the cursor, editor.close ended the process; root captures inspected. Findings: the tarball needs a wrapper with --no-sandbox on this AppArmor-restricted kernel (package installs set the setuid helper); relative paths from a shell without OSC 7 resolve against the workspace dir; VSCodium shows Restricted Mode in the fresh user-data-dir.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

@@ -250,9 +250,20 @@ On X11 the VSCodium window is hosted inside the pane and follows it as it moves,
 or is hidden by another tab, workspace, the scratchpad or a dialog. On Wayland, macOS and Windows
 VSCodium stays in its own window and the pane says so. Conduit runs its own VSCodium instance per
 workspace with a separate `--user-data-dir` under Conduit's state directory, so your usual
-VSCodium windows and settings are untouched (your extensions are shared). In SSH workspaces
-`Editor: open file…` opens the file in `vi` in a new tab instead and says why. Quitting Conduit
-leaves a hosted editor window running on the desktop, so unsaved work is never lost.
+VSCodium windows and settings are untouched (your extensions are shared), which is why VSCodium
+shows its Restricted Mode banner the first time; trust the folder there if you want extensions
+to run. In SSH workspaces `Editor: open file…` opens the file in `vi` in a new tab instead and
+says why. Quitting Conduit leaves a hosted editor window running on the desktop, so unsaved work
+is never lost.
+
+Two things to know about the VSCodium install itself. A tarball install does not set up
+VSCodium's `chrome-sandbox` helper, and on kernels that restrict unprivileged user namespaces
+(Ubuntu 24.04 and later by default) a plain `codium` then exits at once with "The SUID sandbox
+helper binary was found, but is not configured correctly"; either install VSCodium from its
+package repository, which sets the helper up, or point `editor.command` at a wrapper script
+that runs `codium --no-sandbox "$@"`. And a relative path is resolved against the directory the
+terminal reported through shell integration; from a shell without it, the path is taken relative
+to the workspace directory, where VSCodium opens a missing file as a new empty one.
 
 ## Search
 

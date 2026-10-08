@@ -1075,11 +1075,21 @@ window found mid-frame recomposes that frame. The settings view has an Editor gr
 maps a real `xlogo` window; they cover the not-installed path (no palette row, `conduit control
 editor.open` exits non-zero with the vscodium.com hint), palette by keyboard, context menu by
 mouse, every control method typed into a real tab shell, reuse, resize, zoom, Escape and click
-close; X root captures of a visible run show the xlogo hosted beside the terminal pane. Known
+close; X root captures of a visible run show the xlogo hosted beside the terminal pane. Real
+VSCodium 1.135.06055 was then verified by hand under Xvfb (the user approved a private tarball
+install under `.zig-cache/vscodium`, no system change): a `conduit-test launch --visible` run,
+`conduit control editor.open` from a tab shell, the window found by its title marker and hosted
+over the pane 1.6 s after the launch, the real five-line file shown, `editor.goto` moving the
+cursor to line 4 and the header to `notes.txt:4:1`, XTest typing inserted at that cursor, and
+`editor.close` ending the process; root captures were inspected. Two findings: the tarball's
+`chrome-sandbox` is not setuid and this kernel restricts unprivileged user namespaces, so a plain
+`codium` dies with the SUID sandbox error and needs either a package-manager install or an
+`editor.command` wrapper adding `--no-sandbox`; and a relative path from a shell without OSC 7
+resolves against the workspace directory, where VSCodium opens a new empty file while `goto`
+answers NotFound. VSCodium shows its Restricted Mode banner in the fresh user-data-dir. Known
 limits: session restore saves the editor pane as a terminal pane; quitting leaves a hosted editor
-window on the desktop; closing the last tab's only editor pane quits. Real VSCodium (never
-installed here), typing into a reparented Electron window, the Wayland fallback and macOS/Windows
-hosting are unverified.
+window on the desktop; closing the last tab's only editor pane quits. The Wayland fallback and
+macOS/Windows hosting are unverified.
 
 TASK-49 ConPTY follow-up: `--panes-test` and `--search-test` stopped on Windows with `conduit
 stopped: Closed` because their fixed child, a `while IFS= read -r line` loop under Git for
