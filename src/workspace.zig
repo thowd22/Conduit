@@ -1647,6 +1647,24 @@ fn initializeTab(
     tab_record.semantic_len = @intCast(semantic_id.len);
 }
 
+/// The plan's tab and leaf numbering mapped to live ids while
+/// `Workspace.applyRestoreStep` replays one workspace (TASK-65). Leaves are
+/// those of the tab created last, which is the only one later steps name.
+pub const RestoreCursor = struct {
+    tabs: [persistence.max_tabs]?TabId = @splat(null),
+    leaves: [persistence.max_panes]?PaneId = @splat(null),
+
+    fn tabFor(self: *const RestoreCursor, index: usize) ?TabId {
+        if (index >= self.tabs.len) return null;
+        return self.tabs[index];
+    }
+};
+
+fn hashBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    hasher.update(std.mem.asBytes(&bytes.len));
+    hasher.update(bytes);
+}
+
 /// The non-visual owner of one workspace and all its sessions.
 ///
 /// Session and tab records have stable heap addresses and monotonic ids. A
@@ -2387,6 +2405,143 @@ pub const Workspace = struct {
         };
     }
 
+    /// One session `applyRestoreStep` created: its pane and the directory
+    /// the plan says its shell starts in (borrowed from the plan).
+    pub const RestoredSession = struct {
+        session_id: session.SessionId,
+        pane_id: PaneId,
+        cwd: []const u8,
+    };
+
+    pub const RestoreStepError = CreateTabError || CreatePaneSessionError || RenameTabError ||
+        error{UnknownTab};
+
+    /// Replay one tab-level step of a `persistence.RestorePlan` on this
+    /// workspace (TASK-65): `create_tab`, `split_pane`, `focus_pane`,
+    /// `zoom_pane` and `select_tab`. Workspace-level steps are the caller's
+    /// and return null. `cursor` maps the plan's tab and leaf numbering to
+    /// the ids created so far; the caller keeps one cursor per workspace.
+    ///
+    /// A tab gets the user's name when the plan has one (and is then
+    /// `userNamed`), otherwise `derived_name`. A split that no longer fits
+    /// `bounds` is skipped, as is every later step that names a leaf it
+    /// would have created, so a smaller window still restores what fits.
+    /// Returns the session a create or split made, whose child the caller
+    /// starts in `RestoredSession.cwd` through this workspace's context.
+    pub fn applyRestoreStep(
+        self: *Workspace,
+        cursor: *RestoreCursor,
+        step: persistence.Step,
+        derived_name: []const u8,
+        size: term.GridSize,
+        bounds: CellRect,
+    ) RestoreStepError!?RestoredSession {
+        switch (step) {
+            .create_workspace, .select_workspace => return null,
+            .create_tab => |value| {
+                if (value.tab >= persistence.max_tabs) return null;
+                const created = try self.createTab(derived_name, size);
+                if (value.name) |user_name| try self.renameTab(created.tab_id, user_name);
+                cursor.tabs[value.tab] = created.tab_id;
+                cursor.leaves = @splat(null);
+                const root = self.focusedPaneId(created.tab_id) orelse return error.UnknownTab;
+                cursor.leaves[0] = root;
+                return .{ .session_id = created.session_id, .pane_id = root, .cwd = value.cwd };
+            },
+            .split_pane => |value| {
+                const tab_id = cursor.tabFor(value.tab) orelse return null;
+                if (value.leaf >= persistence.max_panes or value.new_leaf >= persistence.max_panes) return null;
+                const pane_id = cursor.leaves[value.leaf] orelse return null;
+                const split: PaneSplit = switch (value.direction) {
+                    .right => .right,
+                    .down => .down,
+                };
+                const created = self.createPaneSession(tab_id, pane_id, .human_terminal, size, split, bounds) catch |err| switch (err) {
+                    error.InvalidGeometry => {
+                        log.info("a restored split no longer fits the window; skipped", .{});
+                        return null;
+                    },
+                    else => return err,
+                };
+                // The new pane's parent is the divider just made, and the plan
+                // validated the ratio, so this cannot be refused; a refusal
+                // would only leave the default even split.
+                self.setPaneSplitRatio(tab_id, created.pane_id, value.ratio) catch |err| {
+                    log.debug("a restored split ratio was not applied: {s}", .{@errorName(err)});
+                };
+                cursor.leaves[value.new_leaf] = created.pane_id;
+                return .{ .session_id = created.session_id, .pane_id = created.pane_id, .cwd = value.cwd };
+            },
+            .focus_pane => |value| {
+                const tab_id = cursor.tabFor(value.tab) orelse return null;
+                if (value.leaf >= persistence.max_panes) return null;
+                const pane_id = cursor.leaves[value.leaf] orelse return null;
+                self.focusPane(tab_id, pane_id) catch |err| switch (err) {
+                    error.UnknownPane => return null,
+                    error.UnknownTab => return error.UnknownTab,
+                };
+                return null;
+            },
+            .zoom_pane => |value| {
+                const tab_id = cursor.tabFor(value.tab) orelse return null;
+                const tab_record = self.tab(tab_id) orelse return error.UnknownTab;
+                if (tab_record.zoomedPaneId() == null) _ = try self.togglePaneZoom(tab_id);
+                return null;
+            },
+            .select_tab => |value| {
+                const tab_id = cursor.tabFor(value.tab) orelse return null;
+                try self.activateTab(tab_id);
+                return null;
+            },
+        }
+    }
+
+    /// Fold everything a restore would rebuild into `hasher`: name, cwd,
+    /// tab order, names, pane trees with their weights, focus, zoom, the
+    /// active tab and each leaf's tracked cwd. Allocation free and never
+    /// reads terminal contents; `WorkspaceRegistry.layoutFingerprint`
+    /// compares the result between loop iterations (TASK-65).
+    pub fn hashLayout(self: *const Workspace, hasher: *std.hash.Wyhash) void {
+        hashBytes(hasher, self.name_bytes);
+        hashBytes(hasher, self.cwd_bytes);
+        const active: u32 = if (self.active_tab_id) |id| @intFromEnum(id) +% 1 else 0;
+        hasher.update(std.mem.asBytes(&active));
+        for (self.tabs.items) |tab_record| {
+            const id: u32 = @intFromEnum(tab_record.id_value);
+            hasher.update(std.mem.asBytes(&id));
+            hasher.update(&.{@intFromBool(tab_record.user_named)});
+            if (tab_record.user_named) hashBytes(hasher, tab_record.name());
+            const focused: u32 = @intFromEnum(tab_record.focused_pane_id);
+            hasher.update(std.mem.asBytes(&focused));
+            const zoomed: u32 = if (tab_record.zoomed_pane_id) |pane| @intFromEnum(pane) +% 1 else 0;
+            hasher.update(std.mem.asBytes(&zoomed));
+            self.hashPanes(hasher, tab_record.root);
+        }
+    }
+
+    fn hashPanes(self: *const Workspace, hasher: *std.hash.Wyhash, node: *const PaneNode) void {
+        switch (node.*) {
+            .leaf => |leaf| {
+                const id: u32 = @intFromEnum(leaf.id);
+                hasher.update(&.{0});
+                hasher.update(std.mem.asBytes(&id));
+                const record = self.recordByIdConst(leaf.session_id);
+                const tracked: []const u8 = if (record) |value|
+                    if (value.live) |*live| live.workingDirectory() orelse "" else ""
+                else
+                    "";
+                hashBytes(hasher, tracked);
+            },
+            .branch => |branch| {
+                hasher.update(&.{ 1, @intFromEnum(branch.split) });
+                hasher.update(std.mem.asBytes(&branch.first_weight));
+                hasher.update(std.mem.asBytes(&branch.total_weight));
+                self.hashPanes(hasher, branch.first);
+                self.hashPanes(hasher, branch.second);
+            },
+        }
+    }
+
     const CaptureWalk = struct {
         focused: PaneId,
         next_leaf: usize = 0,
@@ -3111,6 +3266,19 @@ pub const WorkspaceRegistry = struct {
         owned.snapshot.workspaces = workspaces;
         if (self.active_key) |key| owned.snapshot.active_workspace = self.indexOfKey(key);
         return owned;
+    }
+
+    /// A fingerprint of everything `snapshot` captures, in presentation
+    /// order with the active selection (TASK-65). Equal fingerprints mean an
+    /// unchanged layout, so the app saves only after a change. Allocation
+    /// free and cheap enough for every loop iteration.
+    pub fn layoutFingerprint(self: *const WorkspaceRegistry) u64 {
+        var hasher = std.hash.Wyhash.init(0x6c61796f7574);
+        hasher.update(std.mem.asBytes(&self.records.items.len));
+        for (self.records.items) |record| record.workspace.hashLayout(&hasher);
+        const active_ordinal: u64 = if (self.active_key) |key| @intFromEnum(key) else 0;
+        hasher.update(std.mem.asBytes(&active_ordinal));
+        return hasher.final();
     }
 
     /// Remove and fully deinitialize a workspace.
@@ -5686,37 +5854,88 @@ fn applyTestRestorePlan(
 ) !void {
     const testing = std.testing;
     var keys: [4]WorkspaceKey = undefined;
-    var tab_ids: [4][4]TabId = undefined;
-    var leaf_panes: [8]PaneId = undefined;
+    var cursors: [4]RestoreCursor = @splat(.{});
     for (plan.steps) |step| switch (step) {
         .create_workspace => |s| {
             keys[s.workspace] = try insertFakeWorkspace(registry, testing.io, testing.allocator, audit, s.name, s.cwd, size);
         },
-        .create_tab => |s| {
-            const workspace = registry.byKey(keys[s.workspace]).?;
-            const created = try workspace.createTab(s.name orelse "Terminal", size);
-            if (s.name) |name| try workspace.renameTab(created.tab_id, name);
-            tab_ids[s.workspace][s.tab] = created.tab_id;
-            leaf_panes[0] = workspace.focusedPaneId(created.tab_id).?;
-            try reportTestCwd(workspace, created.session_id, s.cwd);
-        },
-        .split_pane => |s| {
-            const workspace = registry.byKey(keys[s.workspace]).?;
-            const tab_id = tab_ids[s.workspace][s.tab];
-            const split: PaneSplit = switch (s.direction) {
-                .right => .right,
-                .down => .down,
-            };
-            const created = try workspace.createPaneSession(tab_id, leaf_panes[s.leaf], .human_terminal, size, split, bounds);
-            try workspace.setPaneSplitRatio(tab_id, created.pane_id, s.ratio);
-            leaf_panes[s.new_leaf] = created.pane_id;
-            try reportTestCwd(workspace, created.session_id, s.cwd);
-        },
-        .focus_pane => |s| try registry.byKey(keys[s.workspace]).?.focusPane(tab_ids[s.workspace][s.tab], leaf_panes[s.leaf]),
-        .zoom_pane => |s| _ = try registry.byKey(keys[s.workspace]).?.togglePaneZoom(tab_ids[s.workspace][s.tab]),
-        .select_tab => |s| try registry.byKey(keys[s.workspace]).?.activateTab(tab_ids[s.workspace][s.tab]),
         .select_workspace => |s| try registry.activate(keys[s.workspace]),
+        inline else => |s| {
+            const workspace = registry.byKey(keys[s.workspace]).?;
+            if (try workspace.applyRestoreStep(&cursors[s.workspace], step, "Terminal", size, bounds)) |created| {
+                try reportTestCwd(workspace, created.session_id, created.cwd);
+            }
+        },
     };
+}
+
+test "restore steps skip splits that no longer fit and every step naming their leaves" {
+    const testing = std.testing;
+    const size = try term.GridSize.init(40, 16);
+    var audit: FakeAudit = .{};
+    const context = try FakeContext.create(testing.allocator, &audit, .local);
+    var workspace = try Workspace.init(testing.io, testing.allocator, "small", "/tmp", context, size);
+    defer workspace.deinit() catch |err| std.debug.panic("workspace cleanup failed: {s}", .{@errorName(err)});
+
+    // right(a, right(b, c)) in a window two panes wide.
+    const leaf: persistence.PaneNode = .{ .leaf = .{} };
+    const inner: persistence.PaneNode = .{ .split = .{ .direction = .right, .ratio = 0.5, .first = &leaf, .second = &leaf } };
+    const tabs = [_]persistence.TabState{
+        .{ .name = "kept", .panes = .{ .split = .{ .direction = .right, .ratio = 0.3, .first = &leaf, .second = &inner } }, .focused_leaf = 2, .zoomed = true },
+    };
+    const workspaces = [_]persistence.WorkspaceState{.{ .name = "small", .cwd = "/tmp", .active_tab = 0, .tabs = &tabs }};
+    const snapshot: persistence.Snapshot = .{ .active_workspace = 0, .workspaces = &workspaces };
+    var plan = try persistence.planRestore(testing.allocator, &snapshot);
+    defer plan.deinit(testing.allocator);
+
+    const narrow = try CellRect.init(0, 0, 5, 10);
+    var cursor: RestoreCursor = .{};
+    var created: usize = 0;
+    for (plan.steps) |step| {
+        if (try workspace.applyRestoreStep(&cursor, step, "Terminal 1", size, narrow)) |_| created += 1;
+    }
+    // The tab and the outer split fit; the inner split did not, so focus on
+    // its leaf was skipped and the zoom applies to the pane that has focus.
+    try testing.expectEqual(@as(usize, 2), created);
+    const tab_id = workspace.tabAt(0).?.id();
+    try testing.expectEqual(@as(usize, 2), workspace.tabAt(0).?.paneCount());
+    try testing.expectEqualStrings("kept", workspace.tabAt(0).?.name());
+    try testing.expect(workspace.tabAt(0).?.userNamed());
+    try testing.expectEqual(workspace.focusedPaneId(tab_id).?, workspace.tabAt(0).?.zoomedPaneId().?);
+    try testing.expectEqual(tab_id, workspace.activeTabId().?);
+}
+
+test "the layout fingerprint changes with layout and tracked cwd, not with output" {
+    const testing = std.testing;
+    const size = try term.GridSize.init(40, 16);
+    const bounds = try CellRect.init(0, 0, 31, 17);
+    var audit: FakeAudit = .{};
+    var registry = WorkspaceRegistry.init(testing.allocator);
+    defer registry.deinit() catch |err| std.debug.panic("registry cleanup failed: {s}", .{@errorName(err)});
+    try buildPersistenceFixture(&registry, &audit, size, bounds);
+
+    const base = registry.layoutFingerprint();
+    try testing.expectEqual(base, registry.layoutFingerprint());
+    const side = registry.active().?;
+    const tab_id = side.activeTabId().?;
+    const session_id = side.focusedPaneSessionId(tab_id).?;
+    // Ordinary output is content, not layout.
+    side.sessionById(session_id).?.terminal().feed("hello\r\n");
+    try testing.expectEqual(base, registry.layoutFingerprint());
+
+    try reportTestCwd(side, session_id, "/srv/www/elsewhere");
+    const moved = registry.layoutFingerprint();
+    try testing.expect(moved != base);
+    try side.renameTab(tab_id, "renamed");
+    const renamed = registry.layoutFingerprint();
+    try testing.expect(renamed != moved);
+    try registry.activate(registry.keyAt(0).?);
+    try testing.expect(registry.layoutFingerprint() != renamed);
+    const main = registry.active().?;
+    _ = try main.togglePaneZoom(main.activeTabId().?);
+    const unzoomed = registry.layoutFingerprint();
+    _ = try main.togglePaneZoom(main.activeTabId().?);
+    try testing.expect(registry.layoutFingerprint() != unzoomed);
 }
 
 test "a registry snapshot captures workspaces, tabs, pane trees, cwd, focus, zoom and selection" {
