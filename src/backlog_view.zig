@@ -1303,7 +1303,8 @@ test "a panel runs a write on a worker, reports it and reloads what it changed" 
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = "cli",
         .data = "#!/bin/sh\n[ \"$4\" = --status=Fail ] && { echo 'Error: nope' >&2; exit 3; }\n" ++
-            "sed -i \"s/^status: .*/status: ${4#--status=}/\" \"backlog/tasks/task-1 - A.md\"\n",
+            // `-i.bak` is the in-place spelling GNU and BSD sed share.
+            "sed -i.bak \"s/^status: .*/status: ${4#--status=}/\" \"backlog/tasks/task-1 - A.md\" && rm -f \"backlog/tasks/task-1 - A.md.bak\"\n",
         .flags = .{ .permissions = .fromMode(0o700) },
     });
     var program_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1311,7 +1312,9 @@ test "a panel runs a write on a worker, reports it and reloads what it changed" 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try std.fmt.bufPrint(&root_buffer, "{s}/backlog", .{base});
 
-    var context = try workspace.ExecutionContext.local(testing.allocator);
+    // Off Linux the watch polls; scanning on every poll lets `settle` see
+    // the CLI's edit at once, as inotify does.
+    var context = try workspace.ExecutionContext.localWithWatchInterval(testing.allocator, 0);
     defer context.deinit();
     var panel = Panel.init(testing.allocator, testing.io, .{});
     defer panel.deinit();
