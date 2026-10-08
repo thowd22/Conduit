@@ -4268,7 +4268,7 @@ fn probeLine(gpa: Allocator, pty: Pty, name: []const u8, step: []const u8, line:
     const out = try readUntil(gpa, pty, marker);
     defer gpa.free(out);
     const ok = std.mem.indexOf(u8, out, marker) != null;
-    std.debug.print("PROBE {s}: {s}: {s} (state {any}, {d} bytes)\n", .{ name, step, if (ok) "ok" else "NO ECHO", pty.state(), out.len });
+    std.debug.print("PROBE {s}: {s}: {s} (state {any}): {f}\n", .{ name, step, if (ok) "ok" else "NO ECHO", pty.state(), std.ascii.hexEscape(out, .lower) });
     return ok;
 }
 
@@ -4311,16 +4311,28 @@ const probe_sh_env = [_][]const u8{
     "TERM=xterm-256color",
 };
 
+const probe_sh_rc = "/bin/stty -echo; printf 'sh-ready\\r\\n'; n=0; while [ $n -lt 30 ]; do n=$((n+1)); IFS= read -r line; rc=$?; printf 'echo:%s rc=%s\\r\\n' \"$line\" \"$rc\"; done";
+const probe_sh_trap_ignore = "trap '' WINCH; /bin/stty -echo; printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
+const probe_sh_trap_noop = "trap : WINCH; /bin/stty -echo; printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
+const probe_sh_stty = "/bin/stty -echo; printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
+const probe_sh_nostty = "printf 'sh-ready\\r\\n'; while IFS= read -r line; do printf 'echo:%s\\r\\n' \"$line\"; done";
+
 test "PROBE conpty input and resize" {
     if (!has_conpty_backend) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const tiny = [_]WindowSize{ WindowSize.init(9, 28), WindowSize.init(3, 20), WindowSize.init(1, 1), WindowSize.init(2, 5), WindowSize.init(1, 18), WindowSize.init(18, 80) };
-    const ps = "powershell.exe";
-    try probeScenario(gpa, "ps-mouse", &.{ ps, "-NoProfile", "-NonInteractive", "-Command", probe_ps_mouse }, &windows_test_env, "ps-ready", "echo:", true, &.{});
-    try probeScenario(gpa, "ps-plain-mouse", &.{ ps, "-NoProfile", "-NonInteractive", "-Command", probe_ps_plain }, &windows_test_env, "ps-ready", "echo:", true, &.{});
-    try probeScenario(gpa, "ps-resize", &.{ ps, "-NoProfile", "-NonInteractive", "-Command", probe_ps_plain }, &windows_test_env, "ps-ready", "echo:", false, &tiny);
-    try probeScenario(gpa, "sh-mouse", &.{ "C:\\bin\\sh", "-c", probe_sh_script }, &probe_sh_env, "sh-ready", "echo:", true, &.{});
-    try probeScenario(gpa, "sh-plain-mouse", &.{ "C:\\bin\\sh", "-c", probe_sh_plain }, &probe_sh_env, "sh-ready", "echo:", true, &.{});
-    try probeScenario(gpa, "sh-resize", &.{ "C:\\bin\\sh", "-c", probe_sh_plain }, &probe_sh_env, "sh-ready", "echo:", false, &tiny);
-    try probeScenario(gpa, "sh-resize-one", &.{ "C:\\bin\\sh", "-c", probe_sh_plain }, &probe_sh_env, "sh-ready", "echo:", false, &.{ WindowSize.init(9, 28), WindowSize.init(18, 28) });
+    const sizes = [_]WindowSize{ WindowSize.init(9, 28), WindowSize.init(18, 28), WindowSize.init(18, 56) };
+    const sh = "C:\\bin\\sh";
+    try probeScenario(gpa, "sh-rc", &.{ sh, "-c", probe_sh_rc }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
+    try probeScenario(gpa, "sh-trap-ignore", &.{ sh, "-c", probe_sh_trap_ignore }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
+    try probeScenario(gpa, "sh-trap-noop", &.{ sh, "-c", probe_sh_trap_noop }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
+    try probeScenario(gpa, "sh-stty", &.{ sh, "-c", probe_sh_stty }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
+    try probeScenario(gpa, "sh-nostty", &.{ sh, "-c", probe_sh_nostty }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
+    try probeScenario(gpa, "bash-nostty", &.{ "C:\\bin\\bash.exe", "-c", probe_sh_nostty }, &probe_sh_env, "sh-ready", "echo:", false, &sizes);
+
+    // Resize after the child ended.
+    const pty = try spawnConPty(gpa, windowsRequest(&.{ "cmd.exe", "/Q", "/C", "exit 0" }));
+    defer pty.destroy();
+    _ = try waitForExit(pty);
+    pty.resize(WindowSize.init(10, 10)) catch |err| std.debug.print("PROBE resize-after-end: {s}\n", .{@errorName(err)});
+    std.debug.print("PROBE resize-after-end: done\n", .{});
 }
