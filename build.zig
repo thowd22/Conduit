@@ -395,6 +395,19 @@ fn addMacosBundle(
     }
 }
 
+/// The optimize mode a C header seam is translated in.
+///
+/// For a Windows target in an optimized mode, MinGW's headers turn on
+/// `_FORTIFY_SOURCE`, and translate-c renders the fortified inline string
+/// functions (`wcscat`, `wcscpy`, ...) with an unused local declaration that
+/// Zig rejects, so a ReleaseSafe Windows build failed in the SDL and font
+/// seams (TASK-49). The seams are declarations only, so translating them as
+/// for Debug changes nothing Conduit calls; the code itself is still compiled
+/// at `optimize`. Other targets translate in the build's own mode.
+fn translateOptimize(target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
+    return if (target.result.os.tag == .windows) .Debug else optimize;
+}
+
 /// TASK-49: what a Windows `conduit.exe` carries inside it. The application
 /// manifest (`assets/windows/conduit.manifest`) declares per-monitor-v2 DPI
 /// awareness, UTF-8 as the process code page and Windows 10/11 support; the
@@ -646,7 +659,7 @@ fn sdlSeam(
     const seam = std.Build.Step.TranslateC.create(b, .{
         .root_source_file = b.addWriteFiles().add("sdl3.h", sdl_c_header),
         .target = target,
-        .optimize = optimize,
+        .optimize = translateOptimize(target, optimize),
     });
     seam.addIncludePath(sdl_lib.getEmittedIncludeTree());
     return seam.createModule();
@@ -806,7 +819,7 @@ fn onigurumaSeam(
     const seam = std.Build.Step.TranslateC.create(b, .{
         .root_source_file = b.addWriteFiles().add("conduit_oniguruma.h", oniguruma_c_header),
         .target = target,
-        .optimize = optimize,
+        .optimize = translateOptimize(target, optimize),
     });
     seam.addIncludePath(b.dependency("oniguruma", .{}).path("src"));
     return seam.createModule();
@@ -1155,7 +1168,7 @@ fn fontSeam(
     const seam = std.Build.Step.TranslateC.create(b, .{
         .root_source_file = b.addWriteFiles().add("font.h", font_c_header),
         .target = target,
-        .optimize = optimize,
+        .optimize = translateOptimize(target, optimize),
     });
     seam.addIncludePath(
         b.dependency("freetype", .{ .target = target, .optimize = optimize }).path("include"),
