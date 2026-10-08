@@ -613,6 +613,19 @@ nothing else is a legal dependency.
   Every new window gets Conduit's icon through `SDL_SetWindowIcon` from an embedded 64x64 RGBA8
   fixture (`assets/linux/io.github.thowd22.Conduit-64.rgba`), which X11 task switchers read as
   `_NET_WM_ICON`; a refusal is logged at warn and never fails window creation.
+  TASK-48 (macOS): `Window.setOptionAsAlt` takes the `macos.option_as_alt` choice
+  (`OptionAsAlt`: none/left/right/both), sets `SDL_HINT_MAC_OPTION_AS_ALT` so SDL's text for an
+  Alt-side Option is the plain character, and marks each key event `option_composes` when Option
+  is held on a composing side with a character key and neither Command nor Control; `input`
+  then sends that key nothing and the composed character (or dead-key preedit) arrives as text.
+  Alt-side presses keep `alt` and the app sets the terminal encoder's macOS Option-as-Alt mode,
+  so they are ESC-prefixed. `Window.create` also takes Command+W off SDL's default Cocoa Window ▸
+  Close item (`macos_menu.releaseCommandW`, Objective-C runtime calls, `libobjc` linked on
+  macOS only), because AppKit runs menu key equivalents after SDL has delivered the key and
+  Command+W would otherwise close the window as well as the tab. Quit (Cmd+Q), Hide (Cmd+H),
+  Minimize (Cmd+M) and Toggle Full Screen (Ctrl+Cmd+F) stay SDL's. `Window.setFullscreen` /
+  `isFullscreen` wrap SDL's fullscreen for a future `window.fullscreen` action. The bundle is
+  staged by `zig build bundle`; macOS desktop notifications are still `error.Unsupported`.
 - **Never** contain product logic, layout or workspace behaviour; let an SDL handle escape above
   the seam; place an OS conditional in a shared module (P12, invariant 10 — the only permitted
   OS conditionals are *selecting* a backend).
@@ -766,6 +779,13 @@ nothing else is a legal dependency.
   TASK-67: `Atlas.find` and slot reuse read a key-to-slot hash index rather than scanning every
   slot, and the free-rectangle allocator cuts along the shorter leftover so columns keep their
   width under varying glyph sizes (`docs/performance.md`).
+  TASK-48: discovery on macOS walks `/System/Library/Fonts`, its `Supplemental`,
+  `/Library/Fonts` and `~/Library/Fonts`. A collection (`.ttc`/`.otc`, as most macOS system
+  faces are) is one `FontFile` per face with its `face_index` (at most 64 per file), and both
+  FreeType and the HarfBuzz face are opened at that index, so Menlo's bold and italic are real
+  faces. The macOS workflow proves a per-user (`~/Library/Fonts`, DejaVu from Homebrew) and a
+  system (Menlo) family load. CoreText-only fonts (downloadable assets under
+  `/System/Library/AssetsV2`) are not searched.
 - **Never** know about sessions, workspaces, agents or UI (`AGENTS.md`). Never draw anything
   itself. Never let a missing glyph turn a terminal into boxes (CONDUIT.md §8).
 - **May depend on** no other Conduit module, plus the external FreeType and HarfBuzz seam.

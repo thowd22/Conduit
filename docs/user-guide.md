@@ -1,8 +1,9 @@
 # Conduit user guide
 
 This guide covers what Conduit does today. Everything here is implemented and tested on Linux
-(X11 and Wayland). The macOS chords are the shipped macOS defaults, but no macOS or Windows build
-has been released or verified yet. The settings file grammar and every setting are in
+(X11 and Wayland). macOS (Apple silicon) is built as `Conduit.app` and checked on GitHub's macOS
+runners — see [macOS](#macos) for what has and has not been verified there. No Windows build has
+been released or verified yet. The settings file grammar and every setting are in
 [`config.md`](config.md); this guide links there rather than repeating it.
 
 Chords are written for Linux and Windows first, macOS second: "Ctrl+Shift+P (Cmd+Shift+P)". The
@@ -430,12 +431,42 @@ families and previews each as you move over it.
 - **Ligatures** (`=>`, `!=`, `->`) form when the font has them and `font.ligatures` is `true`
   (the default); Font: Toggle Ligatures switches them.
 
+## macOS
+
+Conduit for macOS is an app bundle, `Conduit.app`, shipped in a disk image
+(`conduit-<version>-macos-arm64.dmg`, Apple silicon) beside the Linux packages. Drag it to
+Applications. The image is not signed with an Apple Developer ID or notarized yet, so the first
+launch of a downloaded copy is refused; Control-click the app and choose **Open** once (or run
+`xattr -dr com.apple.quarantine /Applications/Conduit.app`).
+
+- **Keys** follow macOS: Command takes the place of Ctrl+Shift (Cmd+C / Cmd+V, Cmd+T, Cmd+W,
+  Cmd+D, Cmd+F, Cmd+Shift+P; the [macOS table](#macos-1) lists them all). Control+letter always
+  goes to the terminal, so Ctrl+C is SIGINT.
+- **The menu bar** has the standard Quit (Cmd+Q), Hide (Cmd+H), Minimize (Cmd+M) and Toggle Full
+  Screen (Ctrl+Cmd+F, also the green window button). Window ▸ Close closes the window but has no
+  key: Cmd+W closes the tab.
+- **Option** types accented and special characters, as in every Mac app. To use it as Alt (Meta)
+  for Emacs, readline or tmux, set `macos.option_as_alt` to `true`, `left` or `right`
+  ([config.md](config.md#macos-option-key)).
+- **Retina**: the window draws at the display's pixel density; text is rendered at 2x on a 2x
+  display.
+- **Fonts**: `font.family` finds families in `/System/Library/Fonts`, `/Library/Fonts` and
+  `~/Library/Fonts`, including the faces inside `.ttc` collections such as Menlo.
+- **Settings file**: `~/Library/Application Support/conduit/config`.
+
+Verified on a GitHub macOS 14 arm64 runner: the bundle and its icon, Launch Services start, a 2x
+frame, Cmd+V and Cmd+C through the system pasteboard, per-user and system font discovery, and the
+built-in checks listed in `docs/release.md`. Not verified: a physical keyboard (the runner only
+injects SDL events, so the Option key's composition and dead keys have unit tests but no live
+proof), a real Retina display (the runner's display reports 1x; 2x was proved with a fixed scale),
+desktop notifications (not implemented on macOS) and the menu items themselves.
+
 ## Configuration file
 
 | Platform | Path |
 |---|---|
 | Linux and other Unix | `$XDG_CONFIG_HOME/conduit/config`, else `~/.config/conduit/config` |
-| macOS (unverified) | `~/Library/Application Support/conduit/config` |
+| macOS | `~/Library/Application Support/conduit/config` |
 | Windows (unverified) | `%APPDATA%\conduit\config` |
 
 The file is optional. Saving it applies the change at once: on Linux a watcher sees the save
@@ -547,7 +578,9 @@ command except the fixed ones at the end can be rebound or unbound with `keybind
 
 ### macOS
 
-macOS chords are the shipped defaults for macOS builds; they have not been run on a Mac yet.
+macOS chords are the shipped defaults for macOS builds. A unit test in `src/input.zig` holds this
+table to the shipped one, row for row, and checks that every Linux/Windows Ctrl chord is a Command
+chord here.
 
 | Command | Name | Chord |
 |---|---|---|

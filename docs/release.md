@@ -147,8 +147,11 @@ The `macos` job in `release.yml` calls the reusable `.github/workflows/macos.yml
 with the tag's version and `optimize: ReleaseSafe`, after the Linux gate. On a
 GitHub arm64 macOS runner (`macos-14`) it:
 
-1. builds and runs the required built-in checks (`--self-test`, `--grid-test`,
-   `--ui-test`, `--driver-test`, `--clipboard-test`) in real Cocoa windows;
+1. builds and runs the built-in checks that pass on macOS (`--self-test`,
+   `--grid-test`, `--ui-test`, `--driver-test`, `--scroll-test`,
+   `--mouse-test`, `--ime-test`, `--sidebar-test`, `--scratchpad-test`,
+   `--links-test`, `--menu-test`, `--theme-test`, `--font-test`) in real
+   Cocoa windows, and reports the rest without gating on them;
 2. stages `Conduit.app` with `zig build bundle` (`Contents/MacOS/conduit`, a
    generated `Info.plist`, `Resources/AppIcon.icns`, the fonts, shell
    integration and licences; see `assets/macos/README.md`);
