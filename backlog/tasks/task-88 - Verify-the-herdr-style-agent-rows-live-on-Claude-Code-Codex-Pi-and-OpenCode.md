@@ -1,10 +1,10 @@
 ---
 id: TASK-88
 title: 'Verify the herdr-style agent rows live on Claude Code, Codex, Pi and OpenCode'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-09 04:53'
-updated_date: '2026-10-09 06:05'
+updated_date: '2026-10-09 06:21'
 labels:
   - agents
   - verification
@@ -25,11 +25,11 @@ TASK-85, TASK-86 and TASK-87 are proven with the scripted fake and fixtures; the
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Claude Code 2.1.292, hand-started and launched: icons, row title, click shows the TUI, view shows reasoning and tool results; evidence (driver inspect output and inspected screenshots) in the notes
-- [ ] #2 Codex 0.160.1, hand-started with the mock provider: icons, row detail, click shows the TUI, view shows reasoning and command output; evidence in the notes
-- [ ] #3 Pi 0.73.1, hand-started with the loopback mock model: icons, row detail, click shows the TUI, view shows thinking and tool results; evidence in the notes
-- [ ] #4 OpenCode 1.18.35 in the check container: icons, row detail, click shows the TUI, view shows reasoning and tool output; evidence in the notes
-- [ ] #5 The three-OS matrix, the Linux gate and a windows.yml dispatch with --agent-test are green on the final commit; omp and macOS/Windows real-harness screens are listed as unverified in AGENTS.md
+- [x] #1 Claude Code 2.1.292, hand-started and launched: icons, row title, click shows the TUI, view shows reasoning and tool results; evidence (driver inspect output and inspected screenshots) in the notes
+- [x] #2 Codex 0.160.1, hand-started with the mock provider: icons, row detail, click shows the TUI, view shows reasoning and command output; evidence in the notes
+- [x] #3 Pi 0.73.1, hand-started with the loopback mock model: icons, row detail, click shows the TUI, view shows thinking and tool results; evidence in the notes
+- [x] #4 OpenCode 1.18.35 in the check container: icons, row detail, click shows the TUI, view shows reasoning and tool output; evidence in the notes
+- [x] #5 The three-OS matrix, the Linux gate and a windows.yml dispatch with --agent-test are green on the final commit; omp and macOS/Windows real-harness screens are listed as unverified in AGENTS.md
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -43,3 +43,9 @@ Claude Code 2.1.292 (Linux, driven Conduit, Messages API stand-in with a 3 s del
 
 Codex 0.160.1 (Linux, driven Conduit, Responses API stand-in returning a reasoning summary per response with a 2 s delay, isolated CODEX_HOME with approval_policy=on-request, no account). Hand-started: '● codex input: proj' (Codex titles its window with the cwd basename) → '● codex working: proj' (once '⠧ | proj') → '● codex permission: [ ! ] Action Required | proj' (the approval title blinks [ ! ]/[ . ]) → after Accept from the view '● codex done: proj'; /exit or two Ctrl+C end at '● codex done'. From tab 2 a click showed the TUI (0 agent.view elements), a second opened agent.view.1 (21 elements), a third closed it. The observed view fills from the shared daemon thread: reasoning.1..4 ('∴ …'), result.1 '↳ probe line one …', result.2 '↳ exit 2: ls: cannot access …' red, perm.0.accept/acceptWithExecpolicyAmendment/cancel, '✓ Accept: allowed' then result.3 '↳ commandExecution: done'; Decline gives '× Decline and stop the turn: rejected', '↳ commandExecution: declined' and '○ codex idle: proj'. Launched through Agent: launch (mouse and keyboard): before the fix it attached to another TUI's thread in the same cwd (its row showed that thread's permission); the adapter now takes the earliest loaded thread created since its launch (retrying until it exists), test failed first; after the fix the launched row went '● codex working: proj' → '● codex permission: [ . ] Action Required | proj', its own view held reasoning.1..3, result.1..2 and perm.1.*, Tab+Enter accepted ('✓ Accept: allowed'), result.3, reasoning.4, 'codex › …', '● codex done: proj', while the hand-started tab kept its own pending request. Codex's managed daemon self-updates to the latest release (0.162.0 on 2026-10-09) whatever the CLI version, which showed Codex's own 'incompatible feature settings' dialog and, under the old gate, heuristics-only views; all 251 names of protocol-0.160.1.txt occur in 0.162.0's schema output, tested_end is now 0.163.0, and a private 0.162.0 copy was verified observed and launched with reasoning, results and an accepted approval. Icon pixels: waits #CC5555, working #D6B055, done #56B6C2, idle green ring. Incident: the driven keys hit Codex's 'Update now' dialog, which ran npm install -g @openai/codex (0.162.0); the agent restored 0.160.1 from the npm cache at once and the isolated homes set check_for_update_on_startup = false. App-level findings: the '[ ! ] Action Required | proj' and '⠧ | proj' titles are not stripped (fixed by the coordinator below); a launched agent's exit in a --command run ended the app (status 2 after 40 ms; fine from a plain launch); a Kitty Ctrl+C release report typed into the shell after Codex exited mid-release; conduit-test 'key CTRL+C' means Ctrl+Shift+C, use 'CTRL+c'. Unverified: a 'you ›' row for prompts sent before attach (resume uses excludeTurns), live file-change results, real accounts, omp, macOS, Windows.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Each harness was verified live inside a driven Conduit on Linux against a local model stand-in (Claude Code 2.1.292, Codex 0.160.1 and a private 0.162.0, Pi 0.73.1, OpenCode 1.18.35 in its container): coloured icons through working, blocked and done, the harness title in the row, the TUI on a first row click and the view on a second, and reasoning and tool-result rows wherever a structured channel exists. Fixes: Claude Code registry permission waits and failed results without a hook, Codex launched-thread attach and the 0.162 daemon gate, observed agents ignoring harness OSC 133 marks and dropping the shell's title once ended, bracket-badge title stripping, the Windows agent check tolerating console titles and the observe script expecting the icons. Verified by the per-harness evidence in the notes, the full local gate, matrix run 37891940240, Linux gate run 37891940298 and Windows run 37891939898.
+<!-- SECTION:FINAL_SUMMARY:END -->

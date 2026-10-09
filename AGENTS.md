@@ -1327,8 +1327,9 @@ release report can reach the shell when Codex exits mid-release; `conduit-test k
 Ctrl+Shift+C, lowercase `CTRL+c` is SIGINT. Incident: a driven keystroke hit Codex's "Update
 now" dialog and upgraded the global npm `@openai/codex` to 0.162.0; it was restored to 0.160.1
 from the npm cache at once. omp, real accounts, macOS and Windows harness screens stay
-unverified; the three-OS matrix and a windows.yml `--agent-test` run are recorded on the final
-commit below.
+unverified. On the final commit the three-OS matrix (run 37891940240), the Linux gate (run
+37891940298) and a windows.yml dispatch with `--agent-test` and the Claude observe step (run
+37891939898) are green.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
