@@ -1216,7 +1216,11 @@ approval, an error and a spinner burst, and the checks follow its row through `?
 `· fake idle` that arrives no sooner than the debounce allows. A real Claude Code 2.1.292 started
 by hand in a driven Conduit, against a local Messages API stand-in with no account, showed
 `? claude input`, `! claude permission` at its Bash approval, `? claude input` after it and
-`✓ claude done` after `/exit`, all from the screen. omp and macOS/Windows screens are
+`✓ claude done` after `/exit`, all from the screen. The screen fixtures sit under the LF rule in
+`.gitattributes` and a `\r`-only row counts as blank, because the Windows matrix leg's CRLF checkout
+had pushed the Codex and OpenCode errored screens out of their bottom-rows window (run
+37868542783); the three-OS matrix passed afterwards and `--agent-test` with the screen layer
+gates on windows.yml (run 37874621552). omp and macOS/Windows harness screens are
 uncaptured.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
