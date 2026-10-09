@@ -56,6 +56,45 @@ pub const ToolUse = struct {
     truncated: bool = false,
 };
 
+/// What the model thought before it acted, as the harness records it: Claude
+/// Code's thinking blocks, Codex's reasoning summaries, Pi's thinking content
+/// and OpenCode's reasoning parts (TASK-87). Display text only, like a
+/// message; it is never acted on and never logged.
+pub const Reasoning = struct {
+    text: []const u8,
+    /// Set when the adapter or storage cut `text` short.
+    truncated: bool = false,
+};
+
+/// The result of a tool the agent used: the tool's own name (empty when the
+/// harness's record does not say), one display line of its output or
+/// outcome, and whether the harness reported it as failed (a non-zero exit,
+/// an error result, a refused edit).
+pub const ToolResult = struct {
+    name: []const u8,
+    summary: []const u8,
+    failed: bool = false,
+    /// Set when `summary` is not the whole output: more lines followed or it
+    /// was cut.
+    truncated: bool = false,
+};
+
+/// The first non-blank line of a tool's output, trimmed and bounded to
+/// `limit` bytes at a UTF-8 boundary, for `ToolResult.summary`. `truncated`
+/// says whether anything was left out. Adapters share it so every harness's
+/// result line reads the same way; the text is display data only.
+pub fn summaryLine(output: []const u8, limit: usize) struct { line: []const u8, truncated: bool } {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const kept = truncateUtf8(line, limit);
+        const rest = std.mem.trim(u8, output[lines.index orelse output.len ..], " \t\r\n");
+        return .{ .line = kept, .truncated = kept.len != line.len or rest.len != 0 };
+    }
+    return .{ .line = "", .truncated = false };
+}
+
 /// A file the agent read, wrote or mentioned. `path` is the harness's claim,
 /// relative to the agent's cwd or absolute, in the workspace's
 /// ExecutionContext; it is never resolved or opened here.
@@ -137,6 +176,8 @@ pub const ExitStatus = union(enum) {
 pub const Event = union(enum) {
     message: Message,
     tool_use: ToolUse,
+    tool_result: ToolResult,
+    reasoning: Reasoning,
     file_reference: FileReference,
     permission_request: PermissionRequest,
     permission_resolved: PermissionResolved,
@@ -181,6 +222,15 @@ pub const StoredEvent = struct {
                 const name = try copier.identifier(t.name, max_identifier_bytes);
                 const summary = copier.freeText(t.summary);
                 break :blk .{ .tool_use = .{ .name = name, .summary = summary, .truncated = t.truncated or copier.truncated } };
+            },
+            .tool_result => |t| blk: {
+                const name = try copier.identifier(t.name, max_identifier_bytes);
+                const summary = copier.freeText(t.summary);
+                break :blk .{ .tool_result = .{ .name = name, .summary = summary, .failed = t.failed, .truncated = t.truncated or copier.truncated } };
+            },
+            .reasoning => |r| blk: {
+                const text = copier.freeText(r.text);
+                break :blk .{ .reasoning = .{ .text = text, .truncated = r.truncated or copier.truncated } };
             },
             .file_reference => |f| .{ .file_reference = .{
                 .path = try copier.identifier(f.path, max_path_bytes),
@@ -347,6 +397,8 @@ test "every event kind survives a deep copy and stops borrowing its source" {
     const events = [_]Event{
         .{ .message = .{ .role = .assistant, .text = &source_text } },
         .{ .tool_use = .{ .name = "Bash", .summary = &source_text } },
+        .{ .tool_result = .{ .name = "Bash", .summary = &source_text, .failed = true } },
+        .{ .reasoning = .{ .text = &source_text } },
         .{ .file_reference = .{ .path = "src/main.zig", .line = 12, .column = 4 } },
         .{ .permission_request = .{ .id = "req-1", .title = &source_text, .decisions = &decisions } },
         .{ .permission_resolved = .{ .id = "req-1", .outcome = .resolved_elsewhere } },
@@ -365,7 +417,7 @@ test "every event kind survives a deep copy and stops borrowing its source" {
         try testing.expectEqual(std.meta.activeTag(event), std.meta.activeTag(slot.event));
     }
 
-    try slot.store(events[3]);
+    try slot.store(events[5]);
     const request = slot.event.permission_request;
     @memset(&source_text, 'x');
     try testing.expectEqualStrings("Bash: ls -la", request.title);
@@ -373,6 +425,37 @@ test "every event kind survives a deep copy and stops borrowing its source" {
     try testing.expectEqualStrings("always", request.decisions[1].id);
     try testing.expectEqualStrings("Reject", request.decisions[2].label);
     try testing.expectEqual(DecisionKind.reject, request.decisions[2].kind);
+
+    // Reasoning and tool results are copied too, flags and all.
+    var reasoning_text = "weigh the options".*;
+    try slot.store(.{ .reasoning = .{ .text = &reasoning_text } });
+    @memset(&reasoning_text, 'x');
+    try testing.expectEqualStrings("weigh the options", slot.event.reasoning.text);
+    try testing.expect(!slot.event.reasoning.truncated);
+    var result_text = "exit 2: not found".*;
+    try slot.store(.{ .tool_result = .{ .name = "Bash", .summary = &result_text, .failed = true, .truncated = true } });
+    @memset(&result_text, 'x');
+    const result = slot.event.tool_result;
+    try testing.expectEqualStrings("Bash", result.name);
+    try testing.expectEqualStrings("exit 2: not found", result.summary);
+    try testing.expect(result.failed and result.truncated);
+}
+
+test "a tool result's summary is the first non-blank line, bounded" {
+    const testing = std.testing;
+    const one = summaryLine("\n  hello world  \n", 64);
+    try testing.expectEqualStrings("hello world", one.line);
+    try testing.expect(!one.truncated);
+    const more = summaryLine("first\nsecond\n", 64);
+    try testing.expectEqualStrings("first", more.line);
+    try testing.expect(more.truncated);
+    const cut = summaryLine("abcdef", 3);
+    try testing.expectEqualStrings("abc", cut.line);
+    try testing.expect(cut.truncated);
+    const empty = summaryLine(" \r\n\t\n", 64);
+    try testing.expectEqualStrings("", empty.line);
+    try testing.expect(!empty.truncated);
+    try testing.expectEqualStrings("a", summaryLine("a\xc3\xa9", 2).line);
 }
 
 test "free text truncates at a UTF-8 boundary, identifiers are refused instead" {
@@ -387,6 +470,13 @@ test "free text truncates at a UTF-8 boundary, identifiers are refused instead" 
     try testing.expect(message.truncated);
     try testing.expect(message.text.len <= stored_text_capacity);
     try testing.expect(std.unicode.utf8ValidateSlice(message.text));
+
+    // Reasoning is free text and is cut the same way.
+    try slot.store(.{ .reasoning = .{ .text = long } });
+    try testing.expect(slot.event.reasoning.truncated);
+    try testing.expect(std.unicode.utf8ValidateSlice(slot.event.reasoning.text));
+    // A tool result's name is an identifier: refused, not cut.
+    try testing.expectError(error.EventTooLarge, slot.store(.{ .tool_result = .{ .name = "n" ** (max_identifier_bytes + 1), .summary = "" } }));
 
     try slot.store(.{ .message = .{ .role = .user, .text = "short" } });
     try testing.expect(!slot.event.message.truncated);

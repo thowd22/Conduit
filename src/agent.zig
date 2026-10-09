@@ -53,6 +53,8 @@ pub const Event = event.Event;
 pub const Role = event.Role;
 pub const Message = event.Message;
 pub const ToolUse = event.ToolUse;
+pub const ToolResult = event.ToolResult;
+pub const Reasoning = event.Reasoning;
 pub const FileReference = event.FileReference;
 pub const Decision = event.Decision;
 pub const DecisionKind = event.DecisionKind;
@@ -66,6 +68,7 @@ pub const ExitStatus = event.ExitStatus;
 pub const StoredEvent = event.StoredEvent;
 pub const EventQueue = event.EventQueue;
 pub const truncateUtf8 = event.truncateUtf8;
+pub const summaryLine = event.summaryLine;
 
 pub const Adapter = adapter.Adapter;
 pub const AdapterError = adapter.Error;

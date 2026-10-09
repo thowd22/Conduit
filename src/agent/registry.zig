@@ -380,6 +380,9 @@ pub const Registry = struct {
                 agent.structured = true;
                 agent.setSummary(tool.name);
             },
+            // Reasoning and tool output are for the view; the summary a
+            // notification quotes stays the agent's last message or tool.
+            .reasoning, .tool_result => agent.structured = true,
             .file_reference => |reference| {
                 agent.structured = true;
                 agent.setSummary(reference.path);

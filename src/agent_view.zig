@@ -164,6 +164,8 @@ fn eventBytes(ev: agent.Event) usize {
     return switch (ev) {
         .message => |m| m.text.len,
         .tool_use => |t| t.name.len + t.summary.len,
+        .tool_result => |t| t.name.len + t.summary.len,
+        .reasoning => |r| r.text.len,
         .file_reference => |f| f.path.len,
         .permission_request => |p| blk: {
             var total = p.id.len + p.title.len;
@@ -190,6 +192,8 @@ fn copyEvent(ev: agent.Event, bytes: []u8, decisions: *[max_decisions]agent.Deci
     return switch (ev) {
         .message => |m| .{ .message = .{ .role = m.role, .text = take(bytes, &used, m.text), .truncated = m.truncated } },
         .tool_use => |t| .{ .tool_use = .{ .name = take(bytes, &used, t.name), .summary = take(bytes, &used, t.summary), .truncated = t.truncated } },
+        .tool_result => |t| .{ .tool_result = .{ .name = take(bytes, &used, t.name), .summary = take(bytes, &used, t.summary), .failed = t.failed, .truncated = t.truncated } },
+        .reasoning => |r| .{ .reasoning = .{ .text = take(bytes, &used, r.text), .truncated = r.truncated } },
         .file_reference => |f| .{ .file_reference = .{ .path = take(bytes, &used, f.path), .line = f.line, .column = f.column } },
         .permission_request => |p| blk: {
             const n = @min(p.decisions.len, max_decisions);
@@ -220,7 +224,11 @@ pub const Kind = enum {
     truncated,
     blank,
     message,
+    /// The model's reasoning: dim rows under a `∴ ` prefix (TASK-87).
+    reasoning,
     tool,
+    /// A tool's result: one row under the tool use (TASK-87).
+    tool_result,
     /// A file reference: clickable, opens the file at its line.
     reference,
     permission_title,
@@ -326,6 +334,9 @@ const Builder = struct {
     allocator: Allocator,
     width: u32,
     rows: std.ArrayList(Row) = .empty,
+    /// The tool the latest rows belong to, so its result row need not name
+    /// it again; cleared by anything that is not part of that tool's block.
+    last_tool: ?[]const u8 = null,
 
     fn push(self: *Builder, row: Row) Allocator.Error!void {
         try self.rows.append(self.allocator, row);
@@ -378,6 +389,10 @@ const Builder = struct {
     fn entry(self: *Builder, logged: *const Entry, speaker: []const u8) Allocator.Error!void {
         const seq = logged.seq;
         switch (logged.event) {
+            .tool_use, .tool_result, .file_reference => {},
+            else => self.last_tool = null,
+        }
+        switch (logged.event) {
             .message => |m| {
                 try self.blankBefore(seq);
                 var prefix_buffer: [64]u8 = undefined;
@@ -399,7 +414,14 @@ const Builder = struct {
                 const name = try sanitize(self.allocator, t.name);
                 const head = try std.mem.concat(self.allocator, u8, &.{ "⚙ ", name, " " });
                 try self.wrapped(.tool, seq, head, .tool, t.summary, .dim);
+                self.last_tool = name;
             },
+            .reasoning => |r| {
+                try self.blankBefore(seq);
+                const body = if (r.truncated) try std.mem.concat(self.allocator, u8, &.{ r.text, " …" }) else r.text;
+                try self.wrapped(.reasoning, seq, "∴ ", .dim, body, .dim);
+            },
+            .tool_result => |t| try self.toolResultRow(seq, t),
             .file_reference => |f| {
                 const path = try sanitize(self.allocator, f.path);
                 const spelled = if (f.line) |line|
@@ -465,6 +487,32 @@ const Builder = struct {
                 try self.push(.{ .kind = .exited, .seq = seq, .text = text, .tone = if (e.succeeded()) .dim else .danger });
             },
         }
+    }
+
+    /// One row under the tool use: `  ↳ <summary>`, naming the tool only
+    /// when the rows above are not its own. A summary is one line; one too
+    /// wide for the pane is cut with `…` rather than wrapped, so the result
+    /// stays a single row under its tool.
+    fn toolResultRow(self: *Builder, seq: u64, result: agent.ToolResult) Allocator.Error!void {
+        const name = try sanitize(self.allocator, result.name);
+        const same_tool = if (self.last_tool) |last| name.len == 0 or std.mem.eql(u8, last, name) else false;
+        const clean = try sanitize(self.allocator, result.summary);
+        // `sanitize` keeps line breaks; a result row shows the first line.
+        const first_line = clean[0 .. std.mem.indexOfScalar(u8, clean, '\n') orelse clean.len];
+        const more = result.truncated or first_line.len != clean.len;
+        const summary: []const u8 = if (first_line.len != 0) first_line else if (result.failed) "failed" else "done";
+        const label = if (same_tool or name.len == 0)
+            summary
+        else
+            try std.mem.concat(self.allocator, u8, &.{ name, ": ", summary });
+        const lead = "  ↳ ";
+        const room = self.width -| displayCells(lead);
+        const body = if (displayCells(label) + @as(u32, if (more) 2 else 0) <= room)
+            (if (more) try std.mem.concat(self.allocator, u8, &.{ label, " …" }) else label)
+        else
+            try std.mem.concat(self.allocator, u8, &.{ std.mem.trimEnd(u8, label[0..byteAtCell(label, room -| 1)], " "), "…" });
+        const text = try std.mem.concat(self.allocator, u8, &.{ lead, body });
+        try self.push(.{ .kind = .tool_result, .seq = seq, .text = text, .tone = if (result.failed) .danger else .dim });
     }
 
     /// Lay the decisions out left to right, two cells apart, starting a new
@@ -1068,4 +1116,74 @@ test "search finds literal matches per row, by case, and bounds its output" {
     const bounded = findMatches(rows.items, "build", false, out[0..2]);
     try testing.expect(bounded.truncated);
     try testing.expectEqual(@as(usize, 0), findMatches(rows.items, "", false, &out).count);
+}
+
+test "reasoning is dim wrapped rows and a tool result is one row under its tool" {
+    var log = try EventLog.init(testing.allocator, 64, 64 * 1024);
+    defer log.deinit();
+    try log.append(.{ .reasoning = .{ .text = "check the build file first" } });
+    try log.append(.{ .tool_use = .{ .name = "Bash", .summary = "zig build" } });
+    try log.append(.{ .tool_result = .{ .name = "Bash", .summary = "Build Summary: 3/3 steps succeeded", .truncated = true } });
+    try log.append(.{ .tool_use = .{ .name = "Read", .summary = "a.zig" } });
+    try log.append(.{ .file_reference = .{ .path = "a.zig" } });
+    try log.append(.{ .tool_result = .{ .name = "", .summary = "" } });
+    try log.append(.{ .message = .{ .role = .assistant, .text = "ok" } });
+    // A result whose tool is not the one above names it, and a failure is red.
+    try log.append(.{ .tool_result = .{ .name = "Edit", .summary = "\x1b[31mno match\nmore", .failed = true } });
+    try log.append(.{ .tool_result = .{ .name = "Bash", .summary = "", .failed = true } });
+    try log.append(.{ .reasoning = .{ .text = "cut short", .truncated = true } });
+
+    var rows = Rows.init(testing.allocator);
+    defer rows.deinit();
+    try rows.build(&log, 24, "claude");
+    var storage: [64][]const u8 = undefined;
+    const texts = rowTexts(rows.items, &storage);
+    const expected = [_][]const u8{
+        "∴ check the build file",
+        "  first",
+        "⚙ Bash zig build",
+        "  ↳ Build Summary: 3/3…",
+        "⚙ Read a.zig",
+        "  ↳ a.zig",
+        "  ↳ done",
+        "",
+        "claude › ok",
+        "  ↳ Edit:  [31mno match…",
+        "  ↳ Bash: failed",
+        "",
+        "∴ cut short …",
+    };
+    try testing.expectEqual(expected.len, texts.len);
+    for (expected, texts) |want, got| try testing.expectEqualStrings(want, got);
+    for (rows.items) |row| try testing.expect(row.cells() <= 24);
+
+    try testing.expectEqual(Kind.reasoning, rows.items[0].kind);
+    try testing.expectEqual(Tone.dim, rows.items[0].tone);
+    try testing.expectEqual(Tone.dim, rows.items[0].prefix_tone);
+    try testing.expectEqual(@as(usize, "∴ ".len), rows.items[0].prefix_len);
+    try testing.expectEqual(Kind.reasoning, rows.items[1].kind);
+    try testing.expectEqual(Kind.tool_result, rows.items[3].kind);
+    try testing.expectEqual(Tone.dim, rows.items[3].tone);
+    try testing.expectEqual(Kind.reference, rows.items[5].kind);
+    try testing.expectEqual(Tone.danger, rows.items[9].tone);
+    try testing.expectEqual(Tone.danger, rows.items[10].tone);
+
+    // At a wider pane the whole summary fits, with its "more follows" mark.
+    try rows.build(&log, 60, "claude");
+    try testing.expectEqualStrings("  ↳ Build Summary: 3/3 steps succeeded …", rows.items[2].text);
+
+    // Search sees their rows.
+    var out: [4]Match = undefined;
+    try testing.expectEqual(@as(usize, 1), findMatches(rows.items, "Build Summary", true, &out).count);
+    try testing.expectEqual(@as(usize, 1), findMatches(rows.items, "check the", true, &out).count);
+
+    // Both kinds count against the byte budget like any other entry.
+    var small = try EventLog.init(testing.allocator, 8, 64);
+    defer small.deinit();
+    try small.append(.{ .reasoning = .{ .text = "r" ** 40 } });
+    try small.append(.{ .tool_result = .{ .name = "Bash", .summary = "s" ** 40 } });
+    try testing.expectEqual(@as(usize, 1), small.count());
+    try testing.expect(small.bytes_used <= 64);
+    try small.append(.{ .reasoning = .{ .text = "r" ** 100 } });
+    try testing.expectEqual(@as(usize, 1), small.count());
 }
