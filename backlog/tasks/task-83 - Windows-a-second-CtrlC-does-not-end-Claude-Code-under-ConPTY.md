@@ -1,9 +1,11 @@
 ---
 id: TASK-83
 title: 'Windows: a second Ctrl+C does not end Claude Code under ConPTY'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@coordinator'
 created_date: '2026-10-08 22:04'
+updated_date: '2026-10-09 00:25'
 labels:
   - windows
   - input
