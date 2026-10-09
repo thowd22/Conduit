@@ -217,7 +217,9 @@ release run 37817941435) carries TASK-80's sidebar agent rows; its eight assets 
 checksum-verified locally. `v0.1.12` (https://github.com/thowd22/Conduit/releases/tag/v0.1.12,
 release run 37853094245) carries TASK-81 and TASK-82 (Windows agents: process-tree observation,
 named-pipe control transport, /bin/sh-free Claude Code hooks); its eight assets were
-checksum-verified locally. `v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
+checksum-verified locally. `v0.1.13` (https://github.com/thowd22/Conduit/releases/tag/v0.1.13,
+release run 37877650800) carries TASK-83 (ConPTY Kitty Ctrl+C) and TASK-84 (screen-pattern agent
+state); its eight assets were checksum-verified locally. `v0.1.5` and `v0.1.6` were tagged but never published because their release gates hit, in turn,
 the `less` wheel test ordering and the IBus bridge race that the following commits fixed. `zig build
 -Dversion=<semver>` validates SemVer 2.0.0 at configure time and stamps a `build_options` module
 re-exported by `src/version.zig`; `conduit --version` (or `-V`) prints `conduit <version>` before
