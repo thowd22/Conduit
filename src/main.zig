@@ -16986,7 +16986,10 @@ const App = struct {
                             // The detail is the agent terminal's own title,
                             // untrusted text that is sanitised and only
                             // shown, else the backlog task it works on.
-                            const title = if (model.sessionById(record.session)) |live| live.terminal().title() else null;
+                            const title = if (app_agents.titleApplies(record.ownership, record.state))
+                                (if (model.sessionById(record.session)) |live| live.terminal().title() else null)
+                            else
+                                null;
                             const task_id = if (self.agents.runnerForAgent(record.id)) |runner| runner.taskId() else null;
                             const detail = app_agents.rowDetail(&self.agent_row_titles[slot], title, task_id);
                             const agent_row = app_agents.formatAgentRow(&self.agent_row_labels[slot], &self.agent_row_painted[slot], icon_style, self.agents.rowName(record), record.state, detail, content_width - 2);
@@ -30249,8 +30252,15 @@ fn sidebarIconPainted(self: *App, id: []const u8, icon: theme.Role, text: ?theme
     return icon_ok and text_ok;
 }
 
+/// Whether agent row `id` reads `label` (`<icon> <harness> <state>`), on its
+/// own or followed by a `: <detail>` title. The detail is the terminal's
+/// title, which a console sets on its own (cmd and PowerShell name the
+/// running program, `/bin/sh` under the Windows runner), so the checks that
+/// prove a state do not depend on it; the title step proves the detail.
 fn agentRowLabelIs(self: *const App, id: []const u8, label: []const u8) bool {
-    return std.mem.eql(u8, agentRowLabel(self, id), label);
+    const actual = agentRowLabel(self, id);
+    if (std.mem.eql(u8, actual, label)) return true;
+    return actual.len > label.len + 2 and std.mem.startsWith(u8, actual, label) and std.mem.startsWith(u8, actual[label.len..], ": ");
 }
 
 /// Whether `row_id` is an agent row nested under `tab_id` (TASK-80): its
@@ -30668,7 +30678,7 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-BACK" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.1.agent.done" }) and
         !self.agents.hasAgent(first_key, first_session), "it ended when the script exited: the tab shows done and the session has no live agent", .{});
-    agentCheck(out, &failures, agentRowLabelIs(self, observed_row, "✓ fake done: Fixing the tests"), "the observed agent's row shows `{s}` once the program left the foreground", .{agentRowLabel(self, observed_row)});
+    agentCheck(out, &failures, std.mem.eql(u8, agentRowLabel(self, observed_row), "✓ fake done"), "the observed agent's row shows `{s}` once the program left the foreground, the shell's title no longer its own", .{agentRowLabel(self, observed_row)});
 
     const rows_screenshot = try agentRowChecks(self, io, out, &os_trace, &failures, .{
         .key = first_key,

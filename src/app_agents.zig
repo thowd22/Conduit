@@ -153,6 +153,21 @@ pub const agent_row_name_bytes = 16;
 /// name, the longest state word and `: <detail>`.
 pub const agent_row_bytes = 3 + 1 + agent_row_name_bytes + 1 + "permission".len + 2 + agent_row_detail_bytes;
 
+/// Whether a terminal title still describes the agent: an observed agent
+/// that has ended (done or errored means its program left the foreground)
+/// shares its terminal with the shell again, whose title (PowerShell names
+/// its own window, cmd names the last command) says nothing about the agent.
+/// An owned agent's terminal is its own, so its title always applies.
+pub fn titleApplies(ownership: agent.Ownership, state: State) bool {
+    return switch (ownership) {
+        .owned => true,
+        .observed => switch (state) {
+            .done, .errored => false,
+            .idle, .working, .waiting_input, .waiting_permission => true,
+        },
+    };
+}
+
 /// What a sidebar agent row shows after its harness (TASK-86): the
 /// terminal title the harness set, stripped of its activity glyph, else the
 /// backlog task the agent was started from (TASK-64), else nothing, which
@@ -2259,14 +2274,26 @@ pub const Runtime = struct {
         }
         const agent_id = self.registry.findBySession(key, id) orelse return;
         const track_record = self.trackFor(agent_id) orelse return;
-        switch (observation) {
+        // A hand-started harness draws inside the human's shell session, and
+        // some (Pi 0.73.1) wrap each message they draw in OSC 133 prompt and
+        // command marks of their own. Those are not the shell's prompt: the
+        // shell only returns once the program leaves the foreground, which
+        // already ends the observed agent. So for an observed agent a
+        // command mark is plain output and a prompt mark says nothing.
+        const record = self.registry.get(agent_id) orelse return;
+        const effective: Observation = if (record.ownership == .observed) switch (observation) {
+            .shell_prompt => return,
+            .command_started => |o| .{ .output = .{ .now_ns = o.now_ns } },
+            else => observation,
+        } else observation;
+        switch (effective) {
             // Ticks keep their pace through output (TASK-84): the screen is
             // looked at while a turn runs, for a permission prompt drawn
             // over a spinner that never stops.
             .output, .title, .command_started => track_record.last_activity_ns = now_ns,
             else => {},
         }
-        const batch = track_record.heuristics.observe(observation);
+        const batch = track_record.heuristics.observe(effective);
         for (batch.events()) |ev| self.applyAndAnnounce(agent_id, ev, null);
     }
 
@@ -2820,6 +2847,13 @@ test "a row's detail is the stripped title, else the task id, else nothing" {
     try testing.expectEqualStrings("Fix  ]bug", rowDetail(&buffer, "✳ Fix \x1b]bug", null).?);
     // A title that is only a glyph, or blank, falls through to the task.
     try testing.expectEqualStrings("TASK-9", rowDetail(&buffer, "✳", "TASK-9").?);
+    // An observed agent that has ended shares its terminal with the shell
+    // again, so the shell's title no longer describes it.
+    try testing.expect(titleApplies(.owned, .done));
+    try testing.expect(titleApplies(.observed, .working));
+    try testing.expect(titleApplies(.observed, .waiting_input));
+    try testing.expect(!titleApplies(.observed, .done));
+    try testing.expect(!titleApplies(.observed, .errored));
     try testing.expectEqualStrings("TASK-9", rowDetail(&buffer, "\x07 ", "TASK-9").?);
     try testing.expectEqualStrings("TASK-9", rowDetail(&buffer, null, "TASK-9").?);
     try testing.expectEqual(@as(?[]const u8, null), rowDetail(&buffer, null, null));
@@ -3064,6 +3098,12 @@ test "a harness started by hand in a human terminal is observed, rate-limited, a
     try testing.expectEqual(@as(?u32, 4242), runtime.runnerForAgent(first_id).?.observed_pid);
     // Its PTY baseline runs like any agent's: output means working.
     runtime.observe(key, human, .{ .output = .{ .now_ns = @intCast(23 * s) } }, 23 * s);
+    try testing.expectEqual(State.working, runtime.agentForSession(key, human).?.state);
+    // The harness's own OSC 133 marks (Pi draws each message between a
+    // prompt and a command mark) neither end the turn nor restart it.
+    runtime.observe(key, human, .shell_prompt, 23 * s + 1);
+    try testing.expectEqual(State.working, runtime.agentForSession(key, human).?.state);
+    runtime.observe(key, human, .{ .command_started = .{ .now_ns = @intCast(23 * s + 2) } }, 23 * s + 2);
     try testing.expectEqual(State.working, runtime.agentForSession(key, human).?.state);
     // Still in front: the next look keeps it.
     _ = runtime.poll(25 * s);

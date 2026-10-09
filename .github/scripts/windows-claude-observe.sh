@@ -12,10 +12,12 @@
 #   1. launch a run whose first tab is the default shell (PowerShell);
 #   2. type `claude` and Enter;
 #   3. wait for the tab's observed-agent glyph and check the agent's own row,
-#      `workspace.1.tab.1.agent-row.<id>`, reads `· claude idle`;
+#      `workspace.1.tab.1.agent-row.<id>`, reads `○ claude idle` (TASK-85 icons; the
+#      console's own title may follow as `: claude`);
 #   4. Ctrl+C until Claude Code exits (or, reported with a warning when it
 #      does not leave, end it with taskkill), then wait for `done` and
-#      check the row reads `✓ claude done`.
+#      check the row reads `● claude done` (TASK-86 drops the shell's title once the
+#      observed program has left).
 #
 # Screenshots of both states, the semantic tree, the terminal text and the
 # app log are kept in <artifact-dir>.
@@ -97,8 +99,8 @@ grep -B2 -A3 -iE "claude|pwsh" "$out/processes.txt" | sed 's/^/INFO /' | head -n
 row="$(agent_row)"
 echo "INFO agent row: ${row:-<none>}"
 case "$row" in
-  "· claude idle") pass "the agent row reads '· claude idle'" ;;
-  *) fail "the agent row is '${row:-<none>}', expected '· claude idle'" ;;
+  "○ claude idle"|"○ claude idle: "*) pass "the agent row reads '○ claude idle' (the console's own title may follow it)" ;;
+  *) fail "the agent row is '${row:-<none>}', expected '○ claude idle'" ;;
 esac
 keep_screenshot claude-idle
 ct terminal-text > "$out/claude-terminal.txt" 2>&1 || true
@@ -138,8 +140,8 @@ fi
 row="$(agent_row)"
 echo "INFO agent row: ${row:-<none>}"
 case "$row" in
-  "✓ claude done") pass "the agent row reads '✓ claude done'" ;;
-  *) fail "the agent row is '${row:-<none>}', expected '✓ claude done'" ;;
+  "● claude done") pass "the agent row reads '● claude done' with no title once the program has left" ;;
+  *) fail "the agent row is '${row:-<none>}', expected '● claude done'" ;;
 esac
 keep_screenshot claude-done
 

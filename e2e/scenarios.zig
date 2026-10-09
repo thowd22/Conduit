@@ -615,7 +615,8 @@ const agent_notifications_steps = [_]Step{
     .{ .wait_element = .{ .id = observed_glyph ++ "waiting_input", .state = "exists", .equals = true } },
     // TASK-86: the fake titles its window behind a braille spinner frame;
     // its row paints the title without the frame (the screenshot), and the
-    // retained semantic tree's label reads `... done: Fixing the tests`.
+    // retained semantic tree's label reads `... input: Fixing the tests`
+    // while it runs (once it has left, the title is the shell's again).
     .{ .type_text = "title" },
     .{ .key = "ENTER" },
     .{ .wait_terminal_text = .{ .contains = "OBS-TITLED" } },
