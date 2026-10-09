@@ -655,9 +655,14 @@ const fake_decisions = [_]agent.Decision{
 /// The fake's script: idle → working → waiting for permission → (resolved)
 /// done → working → errored → working → waiting for permission again →
 /// (resolved) waiting for input,
-/// released in the step groups below.
+/// released in the step groups below. Before the first request it reasons
+/// and runs a tool, so the agent view shows both (TASK-87); neither moves
+/// the state.
 pub const fake_script = [_]agent.Event{
     .{ .status_change = .{ .state = .working, .source = .structured } },
+    .{ .reasoning = .{ .text = "Build first, then ask before running the tests." } },
+    .{ .tool_use = .{ .name = "Bash", .summary = "make" } },
+    .{ .tool_result = .{ .name = "Bash", .summary = "build finished: 0 errors" } },
     .{ .permission_request = .{ .id = "fake-1", .title = "Run: make test", .decisions = &fake_decisions } },
     .{ .permission_resolved = .{ .id = "fake-1", .outcome = .allowed } },
     .{ .status_change = .{ .state = .done, .source = .structured } },
@@ -670,7 +675,7 @@ pub const fake_script = [_]agent.Event{
 };
 
 /// Events released after 1, 2, 3, 4, 5 and 6 steps.
-pub const fake_step_ends = [_]usize{ 1, 2, 4, 6, 8, 10 };
+pub const fake_step_ends = [_]usize{ 1, 5, 7, 9, 11, 13 };
 
 /// How many script events `steps` typed lines release.
 pub fn fakeReleased(steps: u64) usize {
@@ -702,8 +707,10 @@ pub fn fakeViewScript(allocator: Allocator, sample_path: []const u8) Allocator.E
     const script = [_]agent.Event{
         .{ .status_change = .{ .state = .working, .source = .structured } },
         .{ .message = .{ .role = .user, .text = "Run the tests and fix whatever fails." } },
+        .{ .reasoning = .{ .text = "The suite is the quickest way to find what fails; then read only the failing file." } },
         .{ .message = .{ .role = .assistant, .text = "I will run the test suite first, then read the failing file and fix the smallest thing that makes it pass. The build compiles every module and runs the unit tests in each file." } },
         .{ .tool_use = .{ .name = "Bash", .summary = "zig build test" } },
+        .{ .tool_result = .{ .name = "Bash", .summary = "exit 1: 1 test failed in the sample file", .failed = true, .truncated = true } },
         .{ .message = .{ .role = .assistant, .text = "One test fails in the sample file; the reference below opens it at the failing line." } },
         .{ .file_reference = .{ .path = sample_path, .line = fake_view_sample_line } },
         .{ .permission_request = .{ .id = "view-1", .title = "Run: zig build test --summary all", .decisions = &fake_view_decisions } },
@@ -720,7 +727,7 @@ pub fn fakeViewScript(allocator: Allocator, sample_path: []const u8) Allocator.E
 
 /// The view script's steps: everything up to the second request, then the
 /// end of the turn.
-pub const fake_view_step_ends = [_]usize{ 12, 14 };
+pub const fake_view_step_ends = [_]usize{ 14, 16 };
 
 /// The message `--agent-prompts-test`'s fake reports the human sent.
 pub const fake_prompts_message = "Keep the project rules short and current.";
@@ -2873,12 +2880,12 @@ test "the environment overlay replaces names and keeps the rest" {
 test "the fake's steps release its script in groups" {
     try testing.expectEqual(@as(usize, 0), fakeReleased(0));
     try testing.expectEqual(@as(usize, 1), fakeReleased(1));
-    try testing.expectEqual(@as(usize, 2), fakeReleased(2));
-    try testing.expectEqual(@as(usize, 4), fakeReleased(3));
-    try testing.expectEqual(@as(usize, 6), fakeReleased(4));
-    try testing.expectEqual(@as(usize, 8), fakeReleased(5));
-    try testing.expectEqual(@as(usize, 10), fakeReleased(6));
-    try testing.expectEqual(@as(usize, 10), fakeReleased(99));
+    try testing.expectEqual(@as(usize, 5), fakeReleased(2));
+    try testing.expectEqual(@as(usize, 7), fakeReleased(3));
+    try testing.expectEqual(@as(usize, 9), fakeReleased(4));
+    try testing.expectEqual(@as(usize, 11), fakeReleased(5));
+    try testing.expectEqual(@as(usize, 13), fakeReleased(6));
+    try testing.expectEqual(@as(usize, 13), fakeReleased(99));
 }
 
 const TestNotifier = struct {
@@ -3281,7 +3288,7 @@ test "the view log fills from drained events and an answer reaches the adapter t
     const id = try runtime.register(runner, .{ .workspace = key, .session = session_id, .session_kind = .agent_terminal, .scratchpad = .first });
     try testing.expect(runtime.runnerForAgent(id) == runner);
     // The view script names the sample beside the sink root.
-    const reference = runner.backend.fake.script[5].file_reference;
+    const reference = runner.backend.fake.script[7].file_reference;
     try testing.expect(std.mem.endsWith(u8, reference.path, "/" ++ fake_view_sample_name));
     try testing.expectEqual(@as(?u32, fake_view_sample_line), reference.line);
 
@@ -3293,11 +3300,13 @@ test "the view log fills from drained events and an answer reaches the adapter t
         runner.pollOnce();
         _ = runtime.poll(0);
     }
-    // Twelve events, the status change among them, all logged in order.
+    // Fourteen events, the status change among them, all logged in order.
     const log_view = &runner.view.log;
-    try testing.expectEqual(@as(usize, 12), log_view.count());
+    try testing.expectEqual(@as(usize, 14), log_view.count());
     try testing.expectEqual(agent.Event.Kind.status_change, std.meta.activeTag(log_view.at(0).event));
-    const request = log_view.at(6);
+    try testing.expectEqual(agent.Event.Kind.reasoning, std.meta.activeTag(log_view.at(2).event));
+    try testing.expectEqual(agent.Event.Kind.tool_result, std.meta.activeTag(log_view.at(5).event));
+    const request = log_view.at(8);
     try testing.expectEqualStrings("view-1", request.event.permission_request.id);
 
     try runner.answerPermission("view-1", "deny");
@@ -3309,7 +3318,7 @@ test "the view log fills from drained events and an answer reaches the adapter t
     try testing.expectEqualStrings("deny", answer.decision);
     try testing.expectEqual(@as(?agent.PermissionOutcome, .rejected), request.outcome);
     // The resolution settled the request rather than adding a row.
-    try testing.expectEqual(@as(usize, 12), log_view.count());
+    try testing.expectEqual(@as(usize, 14), log_view.count());
 
     // The queue is bounded and refuses ids no stored event can carry.
     var index: usize = 0;

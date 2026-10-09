@@ -1260,6 +1260,43 @@ were inspected in both styles. herdr's done-until-seen rule was deliberately not
 stays until the record is forgotten (TASK-80). macOS and Windows rendering, other themes and the
 `◐` sprite above scale 1 are unverified.
 
+TASK-86 is complete on Linux. A sidebar agent row reads `<icon> <harness>  <detail>`: the agent
+terminal's OSC 0/2 title with one leading activity glyph stripped as herdr does (a braille frame
+U+2800..U+28FF or one of `· ✢ ✳ ✶ ✻ ✽ ◐ ◓ ◑ ◒` followed by whitespace or alone;
+`app_agents.strippedTitle`), else the backlog task id of a task-launched agent, else the state
+word. The title is sanitised (`sanitizeTitle`: controls become spaces, malformed UTF-8 is dropped,
+at most 192 bytes), cut with `…` at the row, painted muted after the harness name and never logged
+or acted on. The semantic label is `<icon> <harness> <state>` plus `: <detail>` when there is one,
+so labels without a title are unchanged; `ui.InteractiveText` gained paint-only `painted` text and
+a `tail_foreground`/`tail_from` dim tail for this. Activating a row shows the agent's workspace,
+tab and pane with its terminal, closing a view that covered it; only an activation while that
+terminal is already presented toggles the agent view (Ctrl+Shift+A, the palette, the manager and
+the backlog detail are unchanged). The agent manager rows, the Agent: stop/focus choices, the
+prompts heading and the backlog badges use `statusIcon` in the configured style, and `stateGlyph`
+is gone. `--agent-test` and the agent-notifications scenario cover the title (the hand-started fake
+sets `⠋ Fixing the tests` through OSC 2), terminal-first activation and the second-activation
+toggle by mouse and keys; a real hand-started Claude Code 2.1.292 against a local Messages API
+stand-in showed `● claude input: Fix login bug` and a click on its row showed its TUI. The e2e
+driver has no label wait, so the scenario's title evidence is its screenshot and retained semantic
+tree. macOS and Windows are unverified.
+
+TASK-87 is complete on Linux. `agent.Event` gained `reasoning` (text, truncated) and `tool_result`
+(name, one-line summary, failed, truncated), copied through `EventQueue` and the view's `EventLog`
+under the existing bounds. The agent view draws reasoning as dim rows wrapped under a `∴` prefix
+and a tool result as one `↳ <first line>` row under its tool, in the danger colour when it failed;
+the first row of each reasoning block and each result row register as
+`agent.view.<a>.reasoning.<n>` and `agent.view.<a>.result.<n>`. Claude Code reports transcript
+thinking blocks and PostToolUse/PostToolUseFailure results (transcript `tool_result` blocks when no
+hooks run); Codex reports completed reasoning summaries and commandExecution/fileChange results,
+and its rollout reader maps both; Pi's extension forwards thinking and tool output, and its sink,
+RPC and session readers map them; OpenCode reports ended reasoning parts and completed or errored
+tool parts, where a bash that exits non-zero stays `completed` with `metadata.exit`. Each is proven
+by fixtures recorded from the pinned version (Claude Code 2.1.292, Codex 0.160.1, Pi 0.73.1,
+OpenCode 1.18.35 in its container) against local model stand-ins; the fake's scripts carry both
+kinds, and `--agent-view-test` and the agent-view scenario check them. Reasoning only appears when
+the model returns it; real accounts were not used, the Pi extension change was exercised through
+RPC mode only, and omp, macOS and Windows were not tried.
+
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
 attributes in any order, and `shell = <name>` for the default (32 profiles, 32 arguments and 32

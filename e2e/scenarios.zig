@@ -703,6 +703,9 @@ const agent_view_steps = [_]Step{
     .{ .key = "CTRL+SHIFT+a" },
     .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = true } },
     .{ .wait_element = .{ .id = agent_view_allow_id, .state = "exists", .equals = true } },
+    // TASK-87: the fake reasoned and ran a tool before it asked.
+    .{ .wait_element = .{ .id = agent_view_id ++ ".reasoning.1", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = agent_view_id ++ ".result.1", .state = "exists", .equals = true } },
     .screenshot,
     .{ .click = agent_view_allow_id },
     .{ .wait_element = .{ .id = agent_view_outcome_id, .state = "exists", .equals = true } },

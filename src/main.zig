@@ -12600,6 +12600,25 @@ const App = struct {
                         });
                     }
                 },
+                .reasoning, .tool_result => {
+                    // TASK-87: the first row of a reasoning block and every
+                    // tool result get ids by ordinal, stable as the view
+                    // scrolls; a reasoning block's other rows are plain rows.
+                    const id_text = (if (row.ordinal == 0)
+                        self.nextAgentViewId("agent.view.{d}.row.{d}", .{ number, row_index }, null)
+                    else if (row.kind == .reasoning)
+                        self.nextAgentViewId("agent.view.{d}.reasoning.{d}", .{ number, row.ordinal }, null)
+                    else
+                        self.nextAgentViewId("agent.view.{d}.result.{d}", .{ number, row.ordinal }, null)) orelse return;
+                    var runs: [4]ui.Run = undefined;
+                    try self.ui_tree.addText(.{
+                        .id = .{ .value = id_text },
+                        .parent = surface_id,
+                        .role = if (row.kind == .reasoning and row.ordinal != 0) "agent_reasoning" else if (row.kind == .tool_result) "agent_result" else "agent_row",
+                        .label = row.text,
+                        .bounds = bounds,
+                    }, .{ .runs = agentViewRuns(row, view.selection, row_index, &runs) });
+                },
                 else => {
                     const id_text = self.nextAgentViewId("agent.view.{d}.row.{d}", .{ number, row_index }, null) orelse return;
                     var runs: [4]ui.Run = undefined;
@@ -32620,12 +32639,17 @@ fn agentViewTest(self: *App, io: Io, out: *Writer) !u8 {
         .{ .prefix = "agent.view.1.row.", .text = "▪ Claude: Claude needs your permission", .what = "notification" },
     };
     for (kinds) |kind| viewCheck(out, &failures, viewElement(self, kind.prefix, kind.text) != null, "a {s} row: '{s}'", .{ kind.what, kind.text });
+    // TASK-87: the failed tool result is one danger-toned row under its tool.
+    const result_row = viewElement(self, "agent.view.1.result.", "↳ exit 1: 1 test failed");
+    viewCheck(out, &failures, result_row != null, "a failed tool result row under its tool: '↳ exit 1: 1 test failed …'", .{});
 
     // Scrolling by keys: Home shows the first rows, End returns to the newest.
     _ = try postNamedKey(self, io, out, .home, .{});
     try self.drawFrame();
     viewCheck(out, &failures, viewElement(self, "agent.view.1.row.0", "· working") != null and
         viewElement(self, "agent.view.1.row.", "you › Run the tests") != null, "Home scrolled to the first rows (status, then the human's message)", .{});
+    // TASK-87: the reasoning is dim wrapped rows after the human's message.
+    viewCheck(out, &failures, viewElement(self, "agent.view.1.reasoning.1", "∴ The suite is the quickest") != null, "a reasoning row: '∴ The suite is the quickest …'", .{});
     _ = try postNamedKey(self, io, out, .page_down, .{});
     _ = try postNamedKey(self, io, out, .up, .{});
     _ = try postNamedKey(self, io, out, .end, .{});
