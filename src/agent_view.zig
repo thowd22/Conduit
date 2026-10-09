@@ -268,6 +268,10 @@ pub const Row = struct {
     tone: Tone = .normal,
     choices: [max_decisions]Choice = undefined,
     choice_count: u8 = 0,
+    /// For the first row of a reasoning block and for a tool result row:
+    /// which one of its kind it is in the whole list, from 1, so the app can
+    /// give it a stable semantic id however the view scrolls. 0 otherwise.
+    ordinal: u32 = 0,
 
     /// The row's width in cells.
     pub fn cells(self: *const Row) u32 {
@@ -337,6 +341,8 @@ const Builder = struct {
     /// The tool the latest rows belong to, so its result row need not name
     /// it again; cleared by anything that is not part of that tool's block.
     last_tool: ?[]const u8 = null,
+    reasoning_count: u32 = 0,
+    result_count: u32 = 0,
 
     fn push(self: *Builder, row: Row) Allocator.Error!void {
         try self.rows.append(self.allocator, row);
@@ -419,7 +425,10 @@ const Builder = struct {
             .reasoning => |r| {
                 try self.blankBefore(seq);
                 const body = if (r.truncated) try std.mem.concat(self.allocator, u8, &.{ r.text, " …" }) else r.text;
+                const first = self.rows.items.len;
                 try self.wrapped(.reasoning, seq, "∴ ", .dim, body, .dim);
+                self.reasoning_count += 1;
+                self.rows.items[first].ordinal = self.reasoning_count;
             },
             .tool_result => |t| try self.toolResultRow(seq, t),
             .file_reference => |f| {
@@ -512,7 +521,8 @@ const Builder = struct {
         else
             try std.mem.concat(self.allocator, u8, &.{ std.mem.trimEnd(u8, label[0..byteAtCell(label, room -| 1)], " "), "…" });
         const text = try std.mem.concat(self.allocator, u8, &.{ lead, body });
-        try self.push(.{ .kind = .tool_result, .seq = seq, .text = text, .tone = if (result.failed) .danger else .dim });
+        self.result_count += 1;
+        try self.push(.{ .kind = .tool_result, .seq = seq, .text = text, .tone = if (result.failed) .danger else .dim, .ordinal = self.result_count });
     }
 
     /// Lay the decisions out left to right, two cells apart, starting a new
@@ -1163,6 +1173,14 @@ test "reasoning is dim wrapped rows and a tool result is one row under its tool"
     try testing.expectEqual(@as(usize, "∴ ".len), rows.items[0].prefix_len);
     try testing.expectEqual(Kind.reasoning, rows.items[1].kind);
     try testing.expectEqual(Kind.tool_result, rows.items[3].kind);
+    // Ordinals count each kind from 1; continuation rows have none.
+    try testing.expectEqual(@as(u32, 1), rows.items[0].ordinal);
+    try testing.expectEqual(@as(u32, 0), rows.items[1].ordinal);
+    try testing.expectEqual(@as(u32, 1), rows.items[3].ordinal);
+    try testing.expectEqual(@as(u32, 2), rows.items[6].ordinal);
+    try testing.expectEqual(@as(u32, 4), rows.items[10].ordinal);
+    try testing.expectEqual(@as(u32, 2), rows.items[12].ordinal);
+    try testing.expectEqual(@as(u32, 0), rows.items[2].ordinal);
     try testing.expectEqual(Tone.dim, rows.items[3].tone);
     try testing.expectEqual(Kind.reference, rows.items[5].kind);
     try testing.expectEqual(Tone.danger, rows.items[9].tone);
