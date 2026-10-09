@@ -6310,6 +6310,9 @@ const App = struct {
     /// ids) and painted labels, one slot per row registered this frame.
     agent_row_ids: [2][sidebar_element_capacity][workspace_semantic_capacity]u8 = undefined,
     agent_row_labels: [sidebar_element_capacity][app_agents.agent_row_bytes]u8 = undefined,
+    /// What each agent row paints and its sanitised title (TASK-86).
+    agent_row_painted: [sidebar_element_capacity][app_agents.agent_row_bytes]u8 = undefined,
+    agent_row_titles: [sidebar_element_capacity][app_agents.agent_row_detail_bytes]u8 = undefined,
     agent_row_id_generation: usize = 0,
     palette_row_ids: [palette_action_capacity][palette_semantic_capacity]u8 = undefined,
     palette_row_labels: [palette_action_capacity][palette_label_capacity]u8 = undefined,
@@ -11872,7 +11875,7 @@ const App = struct {
             const value = std.fmt.bufPrint(&self.agent_choice_values[count], "{d}", .{@intFromEnum(record.id)}) catch continue;
             const workspace_name = if (self.workspace_registry.byKey(record.workspace)) |model| model.name() else "?";
             const label = std.fmt.bufPrint(&self.agent_choice_labels[count], "{s} {s} #{d}  {s} › {s}", .{
-                app_agents.stateGlyph(record.state),
+                app_agents.statusIcon(self.config_current.settings.sidebar_status_icons, record.state),
                 self.agents.displayName(record),
                 @intFromEnum(record.id),
                 workspace_name,
@@ -12126,9 +12129,11 @@ const App = struct {
         self.agents.selected_agent = id;
     }
 
-    /// A click on, or Enter over, a sidebar agent row (TASK-80): show the
-    /// agent's workspace, tab and pane and open its view. A second activation
-    /// while that view is already showing closes it again.
+    /// A click on, or Enter over, a sidebar agent row (TASK-86): show the
+    /// agent's workspace, tab and pane with its terminal, the harness's own
+    /// live screen, closing an agent view that covered it. Only an
+    /// activation while that terminal is already presented opens the view,
+    /// and one while the view shows closes it again.
     fn agentRowAction(context: *anyopaque, invocation: inputmod.Invocation) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));
         const origin = invocation.origin orelse return;
@@ -12137,7 +12142,8 @@ const App = struct {
         const key = record.workspace;
         const session_id = record.session;
         const runner = self.agents.runnerForAgent(id);
-        const showing = if (runner) |r| self.presentedAgentView() == r else false;
+        const terminal_shown = self.workspace_registry.activeKey() == key and
+            self.presentedSessionId() == session_id and self.presentedAgentView() == null;
         try self.focusSession(key, session_id);
         // Focus is deferred while terminal input is still owed; the row
         // then does nothing rather than open a view in another pane.
@@ -12149,7 +12155,9 @@ const App = struct {
             return;
         };
         if (self.presentedAgentRunner() != shown) return;
-        shown.view.active = !showing;
+        // A view left open while its pane was hidden closes too: the
+        // terminal comes first.
+        shown.view.active = !shown.view.active and terminal_shown;
         shown.view.follow = true;
         shown.view.selection = null;
         self.agent_view_pointer = null;
@@ -12239,7 +12247,11 @@ const App = struct {
         const now = Io.Clock.awake.now(self.io).nanoseconds;
         const has_agent = self.agents.hasAgent(key, id);
         switch (event) {
-            .title => if (has_agent) self.agents.observe(key, id, .{ .title = .{ .now_ns = monotonicNs(now) } }, now),
+            .title => if (has_agent) {
+                self.agents.observe(key, id, .{ .title = .{ .now_ns = monotonicNs(now) } }, now);
+                // The agent's sidebar row shows the title (TASK-86).
+                self.invalidateUi();
+            },
             .bell => if (has_agent) {
                 self.agents.observe(key, id, .bell, now);
             } else if (!self.sessionVisible(key, id)) {
@@ -13528,7 +13540,7 @@ const App = struct {
             const workspace_name = if (self.workspace_registry.byKey(record.workspace)) |model| model.name() else "?";
             var age_buffer: [16]u8 = undefined;
             const label = app_agents.formatManagerRow(&self.manager_labels[slot], .{
-                .glyph = app_agents.stateGlyph(record.state),
+                .glyph = app_agents.statusIcon(self.config_current.settings.sidebar_status_icons, record.state),
                 .harness = self.agents.displayName(record),
                 .workspace = workspace_name,
                 .tab = self.sessionTabName(record.workspace, record.session) orelse "(closed)",
@@ -14342,7 +14354,7 @@ const App = struct {
         const heading = if (record) |found| blk: {
             const cwd = self.promptsCwd(found) orelse "?";
             var writer: std.Io.Writer = .fixed(&self.prompts_heading);
-            writer.print("{s} {s} #{d}  {s}", .{ app_agents.stateGlyph(found.state), self.agents.displayName(found), number, cwd }) catch {};
+            writer.print("{s} {s} #{d}  {s}", .{ app_agents.statusIcon(self.config_current.settings.sidebar_status_icons, found.state), self.agents.displayName(found), number, cwd }) catch {};
             var len = writer.end;
             while (len != 0 and !std.unicode.utf8ValidateSlice(self.prompts_heading[0..len])) len -= 1;
             break :blk self.prompts_heading[0..len];
@@ -14935,7 +14947,7 @@ const App = struct {
         const record = best orelse return null;
         return .{
             .badge = .{
-                .glyph = app_agents.stateGlyph(record.state),
+                .glyph = app_agents.statusIcon(self.config_current.settings.sidebar_status_icons, record.state),
                 .harness = self.agents.displayName(record),
                 .state = app_agents.managerStateWord(record),
             },
@@ -16938,10 +16950,10 @@ const App = struct {
 
                         // One row per agent in the tab's panes (TASK-80),
                         // after the branch row, in the normal face one level
-                        // in: `<glyph> <harness> <state>`, rebuilt from the
-                        // registry every frame so it follows each state
-                        // event. A finished agent keeps its row until its
-                        // record is forgotten.
+                        // in: `<icon> <harness>  <detail>` (TASK-86), rebuilt
+                        // from the registry every frame so it follows each
+                        // state event and title. A finished agent keeps its
+                        // row until its record is forgotten.
                         if (!self.config_current.settings.sidebar_agents) continue;
                         for (self.agents.registry.all()) |*record| {
                             if (record.workspace != key) continue;
@@ -16952,7 +16964,14 @@ const App = struct {
                             const slot = agent_row_slot;
                             agent_row_slot += 1;
                             const row_semantic = try agentRowSemanticId(&self.agent_row_ids[self.agent_row_id_generation][slot], key, tab.id(), record.id);
-                            const row_label = app_agents.formatAgentRow(&self.agent_row_labels[slot], icon_style, self.agents.rowName(record), record.state);
+                            // The detail is the agent terminal's own title,
+                            // untrusted text that is sanitised and only
+                            // shown, else the backlog task it works on.
+                            const title = if (model.sessionById(record.session)) |live| live.terminal().title() else null;
+                            const task_id = if (self.agents.runnerForAgent(record.id)) |runner| runner.taskId() else null;
+                            const detail = app_agents.rowDetail(&self.agent_row_titles[slot], title, task_id);
+                            const agent_row = app_agents.formatAgentRow(&self.agent_row_labels[slot], &self.agent_row_painted[slot], icon_style, self.agents.rowName(record), record.state, detail, content_width - 2);
+                            const row_label = agent_row.label;
                             const row_id: ui.Id = .{ .value = row_semantic };
                             try self.ui_tree.addInteractiveText(.{
                                 .id = row_id,
@@ -16970,7 +16989,10 @@ const App = struct {
                                 .hovered = .{ .foreground = .strong, .underline = .accent },
                                 .focused = .{ .foreground = .strong, .background = .selection },
                                 .lead_foreground = app_agents.statusRole(record.state),
-                                .lead_bytes = app_agents.statusIcon(icon_style, record.state).len,
+                                .lead_bytes = agent_row.icon_bytes,
+                                .painted = agent_row.painted,
+                                .tail_foreground = .muted,
+                                .tail_from = agent_row.detail_from,
                             });
                         }
                     }
@@ -18274,6 +18296,8 @@ const App = struct {
             log.warn("the reloaded settings could not be fully applied: {s}", .{@errorName(err)});
         };
         self.refreshConfigError();
+        // The stop and focus choices lead with the configured status icon.
+        self.rebuildAgentChoices();
         self.refreshActiveUi() catch |err| log.warn("the UI could not be rebuilt after a config reload: {s}", .{@errorName(err)});
         log.info("config reloaded ({d} problem(s))", .{self.config_current.diagnostics.items.len + self.config_current.dropped_diagnostics});
     }
@@ -28603,7 +28627,9 @@ const agent_test_script =
 /// (`agent.fake_screen_manifest`, TASK-84) knows, one typed line at a time:
 /// its `fake› ` prompt, `ask` an approval answered by the next line, `fail`
 /// an error line, `spin` six spinner frames 0.4 s apart and then plain
-/// lines (held until the next line), and `bye` leaves.
+/// lines (held until the next line), `title` sets the window title through
+/// OSC 2 behind a braille spinner frame, as Claude Code does (TASK-86), and
+/// `bye` leaves.
 const observed_fake_script =
     \\printf 'OBSERVED-FAKE-READY\r\n'
     \\p() { printf 'fake\342\200\272 '; }
@@ -28612,6 +28638,7 @@ const observed_fake_script =
     \\  case "$line" in
     \\    ask) printf 'fake asks: run make test? [y/n]\r\n'; IFS= read -r a; printf 'FAKE-ANSWER-%s\r\n' "$a"; p ;;
     \\    fail) printf 'fake error: the build failed\r\n'; p ;;
+    \\    title) printf '\033]2;\342\240\213 Fixing the tests\007'; p ;;
     \\    spin) for i in 1 2 3 4 5 6; do printf '\342\240\213 fake working %s\r\n' "$i"; sleep 0.4; done
     \\      printf 'FAKE-SPIN-%s\r\nsettled\r\nquiet\r\nnow\r\n' DONE; IFS= read -r a; p ;;
     \\    bye) break ;;
@@ -30054,6 +30081,56 @@ fn agentScreenChecks(self: *App, io: Io, out: *Writer, trace: *const AgentOsTrac
     agentCheck(out, failures, settled and settled_ms >= 1200, "plain lines after it settle to idle only after the debounce ({d} ms)", .{settled_ms});
     _ = try agentTypeLine(self, io, out, "next");
     agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "× fake input" } }), "its prompt again shows input", .{});
+
+    // TASK-86: a title set through OSC 2 behind a spinner frame becomes the
+    // row's detail, stripped of the frame, painted muted after the name and
+    // cut with `…` at the 20-cell row of this 640-pixel window; the label
+    // keeps the whole title and the state word for the driver and
+    // accessibility.
+    _ = try agentTypeLine(self, io, out, "title");
+    var painted_buffer: [256]u8 = undefined;
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "× fake input: Fixing the tests" } }) and
+        std.mem.eql(u8, sidebarRowPainted(self, &painted_buffer, row), "× fake  Fixing the …") and
+        sidebarRowCellRole(self, row, 8, .muted) and sidebarRowCellRole(self, row, 2, .foreground), "the title shows stripped in the row: label `{s}`, painted `{s}`", .{ agentRowLabel(self, row), sidebarRowPainted(self, &painted_buffer, row) });
+}
+
+/// The text sidebar row `id` painted in the last frame, one character per
+/// cell, read back from the overlay (TASK-86), trailing blanks dropped.
+fn sidebarRowPainted(self: *App, buffer: []u8, id: []const u8) []const u8 {
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return "";
+    const cell = self.fonts.metrics().cell;
+    const col: u32 = @intCast(@divTrunc(element.bounds.x, @as(i32, @intCast(cell.width_px))));
+    const row: u32 = @intCast(@divTrunc(element.bounds.y, @as(i32, @intCast(cell.height_px))));
+    const width: u32 = @intCast(@divTrunc(@as(i32, @intCast(element.bounds.width)), @as(i32, @intCast(cell.width_px))));
+    const view = self.overlayView();
+    var len: usize = 0;
+    var kept: usize = 0;
+    for (col..col + width) |at| {
+        var text: []const u8 = " ";
+        for (view.cells) |overlay_cell| {
+            if (overlay_cell.position.row == row and overlay_cell.position.col == at and overlay_cell.text.len != 0) text = overlay_cell.text;
+        }
+        if (len + text.len > buffer.len) break;
+        @memcpy(buffer[len .. len + text.len], text);
+        len += text.len;
+        if (!std.mem.eql(u8, text, " ")) kept = len;
+    }
+    return buffer[0..kept];
+}
+
+/// Whether sidebar row `id` painted its cell `offset` columns in from its
+/// start in `role`'s colour in the last frame.
+fn sidebarRowCellRole(self: *App, id: []const u8, offset: u32, role: theme.Role) bool {
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return false;
+    const cell = self.fonts.metrics().cell;
+    const col: u32 = @intCast(@divTrunc(element.bounds.x, @as(i32, @intCast(cell.width_px))));
+    const row: u32 = @intCast(@divTrunc(element.bounds.y, @as(i32, @intCast(cell.height_px))));
+    for (self.overlayView().cells) |overlay_cell| {
+        if (overlay_cell.position.row == row and overlay_cell.position.col == col + offset) {
+            return sameColor(overlay_cell.foreground, ui.resolveRole(&self.palette, role));
+        }
+    }
+    return false;
 }
 
 const RowWatch = struct { reached: bool, left_working: bool, samples: usize };
@@ -30217,20 +30294,32 @@ fn agentRowChecks(self: *App, io: Io, out: *Writer, os_trace: *const AgentOsTrac
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element = "workspace.1.tab.2.agent.waiting_input" }) and
         agentRowLabelIs(self, f.agent_row, "× fake input"), "waiting for input: the agent row reads `× fake input` with no other gesture", .{});
 
-    // A click on the row from another tab shows the agent and its view.
+    // TASK-86: a click on the row from another tab shows the agent's tab
+    // with its terminal; a second click, with that terminal presented,
+    // opens the view over it.
+    const agent_session = model.focusedPaneSessionId(f.agent_tab) orelse return null;
     _ = try clickTabsElement(self, io, out, first_tab);
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .active_tab = f.first_tab }), "the first tab is active before the row click", .{});
     _ = try clickTabsElement(self, io, out, f.agent_row);
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .active_tab = f.agent_tab }) and
-        try waitForAgent(self, io, out, os_trace, .{ .element = view_id }) and
-        self.agents.selected_agent == f.launched, "a click on the agent row focused its tab and pane and opened its agent view", .{});
+        self.presentedSessionId() == agent_session and self.ui_tree.byId(.{ .value = view_id }) == null and
+        self.agents.selected_agent == f.launched, "a click on the agent row showed its tab and pane with the terminal, no view", .{});
+    _ = try clickTabsElement(self, io, out, f.agent_row);
+    agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element = view_id }), "a second click with the terminal presented opened the agent view", .{});
     try self.drawFrame();
     const pixels = try self.allocator.dupe(u8, try self.capture());
     errdefer self.allocator.free(pixels);
 
+    // A view left open while another tab showed gives way to the terminal.
+    _ = try clickTabsElement(self, io, out, first_tab);
+    _ = try waitForAgent(self, io, out, os_trace, .{ .active_tab = f.first_tab });
+    _ = try clickTabsElement(self, io, out, f.agent_row);
+    agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .active_tab = f.agent_tab }) and
+        try waitForAgent(self, io, out, os_trace, .{ .element_absent = view_id }), "a click from another tab closed the view that had covered the terminal", .{});
+
     // The sidebar keys reach the rows: the focus chord, Tab onto the first
     // tab, then Down over tab, observed row, tab and agent row; Enter on the
-    // row whose view is showing closes it.
+    // row whose terminal shows opens the view, and once more closes it.
     _ = try sidebarFocusChord(self, io, out);
     _ = try postNamedKey(self, io, out, .tab, .{});
     const on_first = std.mem.eql(u8, focusedMenuRow(self), first_tab);
@@ -30246,10 +30335,17 @@ fn agentRowChecks(self: *App, io: Io, out: *Writer, os_trace: *const AgentOsTrac
     agentCheck(out, failures, on_first and on_observed and on_agent_tab and on_row and back_up and
         std.mem.eql(u8, focusedMenuRow(self), f.agent_row), "Tab and Up/Down moved sidebar focus over tab, agent row, tab and agent row", .{});
     _ = try postNamedKey(self, io, out, .enter, .{});
-    agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element_absent = view_id }) and
+    agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element = view_id }) and
+        model.activeTabId() == f.agent_tab, "Enter on the row while its terminal showed opened the view", .{});
+    _ = try sidebarFocusChord(self, io, out);
+    _ = try postNamedKey(self, io, out, .tab, .{});
+    for (0..3) |_| _ = try postNamedKey(self, io, out, .down, .{});
+    const keyed_again = std.mem.eql(u8, focusedMenuRow(self), f.agent_row);
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    agentCheck(out, failures, keyed_again and try waitForAgent(self, io, out, os_trace, .{ .element_absent = view_id }) and
         model.activeTabId() == f.agent_tab, "Enter on the row of the view already showing closed the view", .{});
 
-    // From another tab, Down to the row and Enter open it again.
+    // From another tab, Down to the row and Enter show the terminal.
     _ = try clickTabsElement(self, io, out, first_tab);
     _ = try waitForAgent(self, io, out, os_trace, .{ .active_tab = f.first_tab });
     _ = try postNamedKey(self, io, out, .down, .{});
@@ -30258,12 +30354,15 @@ fn agentRowChecks(self: *App, io: Io, out: *Writer, os_trace: *const AgentOsTrac
     const keyed = std.mem.eql(u8, focusedMenuRow(self), f.agent_row);
     _ = try postNamedKey(self, io, out, .enter, .{});
     agentCheck(out, failures, keyed and try waitForAgent(self, io, out, os_trace, .{ .active_tab = f.agent_tab }) and
-        try waitForAgent(self, io, out, os_trace, .{ .element = view_id }), "Down to the agent row and Enter from the first tab showed the agent's tab and view", .{});
+        self.presentedSessionId() == agent_session and self.ui_tree.byId(.{ .value = view_id }) == null, "Down to the agent row and Enter from the first tab showed the agent's tab with its terminal", .{});
 
-    // The observed agent's row opens its own view on the human tab.
+    // The observed agent's row shows the human tab's terminal first, then
+    // its own view.
     _ = try clickTabsElement(self, io, out, f.observed_row);
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .active_tab = f.first_tab }) and
-        try waitForAgent(self, io, out, os_trace, .{ .element = observed_view }), "a click on the observed agent's row showed the human tab and that agent's view", .{});
+        self.ui_tree.byId(.{ .value = observed_view }) == null, "a click on the observed agent's row showed the human tab's terminal", .{});
+    _ = try clickTabsElement(self, io, out, f.observed_row);
+    agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element = observed_view }), "a second click showed that agent's view", .{});
 
     // The list limit keeps every row above the footer.
     const hint_y = rowY(self, "sidebar.palette") orelse 0;
@@ -30550,7 +30649,7 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-BACK" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.1.agent.done" }) and
         !self.agents.hasAgent(first_key, first_session), "it ended when the script exited: the tab shows done and the session has no live agent", .{});
-    agentCheck(out, &failures, agentRowLabelIs(self, observed_row, "✓ fake done"), "the observed agent's row shows `✓ fake done` once the program left the foreground", .{});
+    agentCheck(out, &failures, agentRowLabelIs(self, observed_row, "✓ fake done: Fixing the tests"), "the observed agent's row shows `{s}` once the program left the foreground", .{agentRowLabel(self, observed_row)});
 
     const rows_screenshot = try agentRowChecks(self, io, out, &os_trace, &failures, .{
         .key = first_key,
@@ -30671,6 +30770,8 @@ fn agentManagerTest(self: *App, io: Io, out: *Writer) !u8 {
     const first_row = managerRowId(&row_buffer, first_agent, null);
     managerCheck(out, &failures, opened and try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = first_row, .text = "Fake agent" } }) and
         try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = first_row, .text = "working" } }), "the chord opened the manager with agent one working", .{});
+    // TASK-86: the row leads with the sidebar's status icon for its state.
+    managerCheck(out, &failures, std.mem.startsWith(u8, agentRowLabel(self, first_row), "● Fake agent"), "agent one's row leads with the working status icon `●`", .{});
     var first_label_buffer: [tab_name_capacity + 8]u8 = undefined;
     const first_location = std.fmt.bufPrint(&first_label_buffer, "{s} › ", .{first_model.name()}) catch "";
     managerCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = first_row, .text = first_location } }) and
@@ -30908,6 +31009,10 @@ fn agentPromptsTest(self: *App, io: Io, out: *Writer) !u8 {
     const dialog_id = try std.fmt.bufPrint(&dialog_buffer, "agent.prompts.{d}", .{@intFromEnum(first_agent)});
     promptsCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = dialog_id }) and
         try waitForAgent(self, io, out, &os_trace, .{ .role_label = .{ .prefix = "agent.prompts.", .text = "CLAUDE.md" } }), "Agent: prompts and instructions opened {s} from the palette", .{dialog_id});
+    // TASK-86: the heading leads with the done agent's status icon.
+    var heading_buffer: [prompts_id_capacity]u8 = undefined;
+    const heading_id = try std.fmt.bufPrint(&heading_buffer, "agent.prompts.{d}.heading", .{@intFromEnum(first_agent)});
+    promptsCheck(out, &failures, std.mem.startsWith(u8, agentRowLabel(self, heading_id), "● Fake agent #"), "the heading '{s}' leads with the done status icon", .{agentRowLabel(self, heading_id)});
     const expected_rows = [_]struct { name: []const u8, tail: []const u8 }{
         .{ .name = "▤ CLAUDE.md", .tail = "  editable" },
         .{ .name = "▤ ~/.claude/CLAUDE.md", .tail = "  editable" },
@@ -31356,8 +31461,8 @@ fn backlogTest(self: *App, io: Io, out: *Writer) !u8 {
         std.mem.indexOf(u8, runner.?.prompt.?, "Acceptance criteria:\n- [ ] #1 Tasks are parsed\n- [x] #2") != null, "the agent's initial prompt is the task's id, title, description and criteria", .{});
     backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .terminal_text = "FAKE-AGENT-READY" }), "the fake agent's real process is running in its own tab", .{});
     backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.task.TASK-1.agent.idle" }) and
-        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1.meta", .text = "· Fake agent idle" } }) and
-        try waitForBacklog(self, io, out, .{ .prefix_label = .{ .prefix = "backlog.detail.TASK-1.row.", .text = "Agent      · Fake agent idle" } }), "the card and the detail show the agent and its state", .{});
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1.meta", .text = "○ Fake agent idle" } }) and
+        try waitForBacklog(self, io, out, .{ .prefix_label = .{ .prefix = "backlog.detail.TASK-1.row.", .text = "Agent      ○ Fake agent idle" } }), "the card and the detail show the agent and its state", .{});
     try backlogScreenshot(self, io, out, "detail");
 
     // The card follows the agent's state live.
@@ -31369,7 +31474,7 @@ fn backlogTest(self: *App, io: Io, out: *Writer) !u8 {
         try Dir.cwd().writeFile(io, .{ .sub_path = steps_path, .data = "x" });
     }
     backlogCheck(out, &failures, try waitForBacklog(self, io, out, .{ .element = "backlog.task.TASK-1.agent.working" }) and
-        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1.meta", .text = "▸ Fake agent working" } }), "the card's agent badge changed to working live", .{});
+        try waitForBacklog(self, io, out, .{ .label = .{ .id = "backlog.task.TASK-1.meta", .text = "● Fake agent working" } }), "the card's agent badge changed to working live", .{});
     try backlogScreenshot(self, io, out, "board");
 
     // The agent manager names the task.

@@ -38,6 +38,8 @@ pub const max_id_bytes: usize = 64;
 /// What a card, a list row and the detail show about the agent working on
 /// the task (TASK-64). Borrowed display text from the agent runtime.
 pub const AgentBadge = struct {
+    /// The configured status icon (`app_agents.statusIcon`, TASK-86), the
+    /// same one the sidebar row shows for the state.
     glyph: []const u8,
     harness: []const u8,
     /// The state word the manager shows (`working`, `exited`, ...).
@@ -1197,7 +1199,7 @@ test "the detail wraps the task and marks its controls" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const task = project.findTask("TASK-1").?;
-    const rows = try detailRows(arena_state.allocator(), task, "M1 - First", 24, .{ .glyph = "▸", .harness = "Fake agent", .state = "working" });
+    const rows = try detailRows(arena_state.allocator(), task, "M1 - First", 24, .{ .glyph = "●", .harness = "Fake agent", .state = "working" });
 
     try testing.expectEqualStrings("TASK-1 First task: parse", rows[0].text);
     try testing.expectEqualStrings("the model", rows[1].text);
@@ -1215,7 +1217,7 @@ test "the detail wraps the task and marks its controls" {
             },
             .none => {},
         }
-        if (std.mem.startsWith(u8, row.text, "Agent") and std.mem.indexOf(u8, row.text, "▸ Fake agent") != null) saw_agent_field = true;
+        if (std.mem.startsWith(u8, row.text, "Agent") and std.mem.indexOf(u8, row.text, "● Fake agent") != null) saw_agent_field = true;
     }
     try testing.expectEqual(@as(usize, 1), status_rows);
     try testing.expectEqual(@as(usize, 3), criterion_count);
@@ -1245,12 +1247,12 @@ test "status cycles through the configured order" {
 
 test "a card's second row ends with the agent working on it" {
     var buffer: [64]u8 = undefined;
-    try testing.expectEqualStrings("▸ Fake agent working  #ui", metaWithBadge(&buffer, "#ui", .{ .glyph = "▸", .harness = "Fake agent", .state = "working" }));
-    try testing.expectEqualStrings("? Pi waiting", metaWithBadge(&buffer, "", .{ .glyph = "?", .harness = "Pi", .state = "waiting" }));
+    try testing.expectEqualStrings("● Fake agent working  #ui", metaWithBadge(&buffer, "#ui", .{ .glyph = "●", .harness = "Fake agent", .state = "working" }));
+    try testing.expectEqualStrings("● Pi waiting", metaWithBadge(&buffer, "", .{ .glyph = "●", .harness = "Pi", .state = "waiting" }));
     try testing.expectEqualStrings("#ui", metaWithBadge(&buffer, "#ui", null));
     var small: [7]u8 = undefined;
     // Cut on a character boundary: `…` is three bytes.
-    try testing.expectEqualStrings("? x y", metaWithBadge(&small, "#ui", .{ .glyph = "?", .harness = "x", .state = "y…" }));
+    try testing.expectEqualStrings("● x y", metaWithBadge(&small, "#ui", .{ .glyph = "●", .harness = "x", .state = "y…" }));
 }
 
 test "element ids parse back to their targets and reject smuggled suffixes" {

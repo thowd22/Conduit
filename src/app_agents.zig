@@ -64,20 +64,6 @@ const AgentId = agent.AgentId;
 
 // Glyphs ------------------------------------------------------------------------
 
-/// The sidebar glyph for an agent state (TASK-56). Box-drawing-adjacent
-/// symbols from the bundled face, never emoji: `·` idle, `▸` working,
-/// `?` waiting for input, `!` waiting for permission, `✓` done, `×` errored.
-pub fn stateGlyph(state: State) []const u8 {
-    return switch (state) {
-        .idle => "·",
-        .working => "▸",
-        .waiting_input => "?",
-        .waiting_permission => "!",
-        .done => "✓",
-        .errored => "×",
-    };
-}
-
 /// The sidebar status icon for an agent state in the configured style
 /// (TASK-85), herdr's two tables. Conduit's two waits are both herdr's
 /// "blocked", and `errored` is Conduit's own `×` in both styles. Every icon
@@ -157,19 +143,145 @@ pub fn rowHarnessName(harness: Harness) []const u8 {
     return tag[0..end];
 }
 
-/// The longest row `formatAgentRow` writes: a three-byte glyph, a name of
-/// at most `agent_row_name_bytes` and the longest state words.
+/// At most this many bytes of a terminal title are kept for a row's detail
+/// (TASK-86): far more than a sidebar row shows, so the ellipsis is the
+/// row's, while a hostile title cannot grow the row buffers.
+pub const agent_row_detail_bytes = 192;
+/// The longest harness name a row keeps.
 pub const agent_row_name_bytes = 16;
-pub const agent_row_bytes = 3 + 1 + agent_row_name_bytes + 1 + "permission".len;
+/// The longest semantic label `formatAgentRow` writes: a three-byte icon, a
+/// name, the longest state word and `: <detail>`.
+pub const agent_row_bytes = 3 + 1 + agent_row_name_bytes + 1 + "permission".len + 2 + agent_row_detail_bytes;
 
-/// `<icon> <name> <state>` into `buffer`, the icon in `style`; a name
-/// longer than `agent_row_name_bytes` is cut so the row always fits
-/// `agent_row_bytes`. The icon is the row's first `statusIcon(...).len`
-/// bytes, which the sidebar paints in `statusRole`.
-pub fn formatAgentRow(buffer: *[agent_row_bytes]u8, style: config.StatusIcons, name: []const u8, state: State) []const u8 {
+/// What a sidebar agent row shows after its harness (TASK-86): the
+/// terminal title the harness set, stripped of its activity glyph, else the
+/// backlog task the agent was started from (TASK-64), else nothing, which
+/// the row spells with its state word. `title_buffer` holds the sanitised
+/// title; the result borrows it or `task_id`.
+pub fn rowDetail(title_buffer: *[agent_row_detail_bytes]u8, title: ?[]const u8, task_id: ?[]const u8) ?[]const u8 {
+    if (title) |raw| {
+        if (strippedTitle(sanitizeTitle(title_buffer, raw))) |shown| return shown;
+    }
+    if (task_id) |task| if (task.len != 0) return task;
+    return null;
+}
+
+/// `raw` as display text in `buffer`: every C0 and C1 control and DEL
+/// becomes a space, malformed UTF-8 is dropped, and the copy ends at the
+/// last whole character that fits. A terminal title is untrusted text that
+/// is only ever shown (CONDUIT.md section 11).
+pub fn sanitizeTitle(buffer: []u8, raw: []const u8) []const u8 {
+    var in: usize = 0;
+    var out: usize = 0;
+    while (in < raw.len) {
+        const length = std.unicode.utf8ByteSequenceLength(raw[in]) catch {
+            in += 1;
+            continue;
+        };
+        if (in + length > raw.len) break;
+        const sequence = raw[in .. in + length];
+        const codepoint = std.unicode.utf8Decode(sequence) catch {
+            in += 1;
+            continue;
+        };
+        in += length;
+        const control = codepoint < 0x20 or codepoint == 0x7f or (codepoint >= 0x80 and codepoint < 0xa0);
+        const kept: []const u8 = if (control) " " else sequence;
+        if (out + kept.len > buffer.len) break;
+        @memcpy(buffer[out .. out + kept.len], kept);
+        out += kept.len;
+    }
+    return buffer[0..out];
+}
+
+/// The glyphs harnesses lead a title with to show activity, after herdr's
+/// `stripped_terminal_title`: Claude Code's spinner set. Braille frames
+/// (U+2800..U+28FF) count too.
+const title_activity_glyphs = [_]u21{ 0x00b7, 0x2722, 0x2733, 0x2736, 0x273b, 0x273d, 0x25d0, 0x25d3, 0x25d1, 0x25d2 };
+
+/// `title` trimmed, without one leading activity glyph when that glyph is
+/// followed by whitespace or is all there is, or null when nothing is left.
+/// Only one glyph goes: `⠋ ⠙ task` reads `⠙ task`, and a glyph glued to a
+/// word is part of the title.
+pub fn strippedTitle(title: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, title, " \t");
+    if (trimmed.len == 0) return null;
+    const length = std.unicode.utf8ByteSequenceLength(trimmed[0]) catch return trimmed;
+    if (length > trimmed.len) return trimmed;
+    const first = std.unicode.utf8Decode(trimmed[0..length]) catch return trimmed;
+    const recognised = (first >= 0x2800 and first <= 0x28ff) or
+        std.mem.indexOfScalar(u21, &title_activity_glyphs, first) != null;
+    const rest = trimmed[length..];
+    if (!recognised or (rest.len != 0 and rest[0] != ' ' and rest[0] != '\t')) return trimmed;
+    const left = std.mem.trim(u8, rest, " \t");
+    return if (left.len == 0) null else left;
+}
+
+/// One sidebar agent row (TASK-86). `label` is the semantic label the
+/// driver and accessibility read, `<icon> <harness> <state>` and, when
+/// there is a detail, `: <detail>`; `painted` is what the row draws,
+/// `<icon> <harness>  <detail or state word>`, cut to the row with `…`. Its
+/// first `icon_bytes` take the status colour and everything from
+/// `detail_from` the muted role.
+pub const AgentRow = struct {
+    label: []const u8,
+    painted: []const u8,
+    icon_bytes: usize,
+    detail_from: usize,
+};
+
+/// Build one row into the two buffers, the painted text cut to `cells`.
+/// `detail` comes from `rowDetail`; a name longer than
+/// `agent_row_name_bytes` and a detail longer than `agent_row_detail_bytes`
+/// are cut, so both always fit.
+pub fn formatAgentRow(
+    label_buffer: *[agent_row_bytes]u8,
+    painted_buffer: *[agent_row_bytes]u8,
+    style: config.StatusIcons,
+    name: []const u8,
+    state: State,
+    detail: ?[]const u8,
+    cells: u32,
+) AgentRow {
     const kept = agent.truncateUtf8(name, agent_row_name_bytes);
     const icon = statusIcon(style, state);
-    return std.fmt.bufPrint(buffer, "{s} {s} {s}", .{ icon, kept, rowStateWord(state) }) catch icon;
+    const word = rowStateWord(state);
+    const shown_detail = if (detail) |text| agent.truncateUtf8(text, agent_row_detail_bytes) else null;
+    const label = if (shown_detail) |text|
+        std.fmt.bufPrint(label_buffer, "{s} {s} {s}: {s}", .{ icon, kept, word, text }) catch icon
+    else
+        std.fmt.bufPrint(label_buffer, "{s} {s} {s}", .{ icon, kept, word }) catch icon;
+    const full = std.fmt.bufPrint(painted_buffer, "{s} {s}  {s}", .{ icon, kept, shown_detail orelse word }) catch icon;
+    const painted = ellipsizeInPlace(painted_buffer, full.len, cells);
+    return .{
+        .label = label,
+        .painted = painted,
+        .icon_bytes = icon.len,
+        .detail_from = @min(icon.len + 1 + kept.len, painted.len),
+    };
+}
+
+/// The first `len` bytes of `buffer` cut to at most `cells` codepoints, the
+/// last kept one replaced by `…` when anything was cut. A wider character
+/// still counts one; the row clips it safely.
+fn ellipsizeInPlace(buffer: []u8, len: usize, cells: u32) []const u8 {
+    if (cells == 0) return buffer[0..0];
+    const text = buffer[0..len];
+    var view = (std.unicode.Utf8View.init(text) catch return text).iterator();
+    var count: u32 = 0;
+    var keep_end: usize = 0;
+    while (view.nextCodepointSlice()) |_| {
+        count += 1;
+        if (count < cells) keep_end = view.i;
+        if (count > cells) {
+            // At least one more character follows `keep_end`, so `…` fits
+            // whenever that character and the one it replaces are three bytes.
+            if (keep_end + 3 > buffer.len) return buffer[0..keep_end];
+            @memcpy(buffer[keep_end .. keep_end + 3], "…");
+            return buffer[0 .. keep_end + 3];
+        }
+    }
+    return text;
 }
 
 // The agent manager (TASK-58) ------------------------------------------------------
@@ -2597,12 +2709,7 @@ fn clampNs(value: i96) u64 {
 
 const testing = std.testing;
 
-test "every state has one glyph, and urgency orders the waits first" {
-    const glyphs = [_][]const u8{ "·", "▸", "?", "!", "✓", "×" };
-    for (std.enums.values(State), glyphs) |state, glyph| {
-        try testing.expectEqualStrings(glyph, stateGlyph(state));
-        try testing.expect(std.unicode.utf8CountCodepoints(glyph) catch 0 == 1);
-    }
+test "urgency orders the waits first" {
     try testing.expectEqual(State.waiting_permission, mostUrgent(&.{ .done, .waiting_permission, .waiting_input, .working }).?);
     try testing.expectEqual(State.errored, mostUrgent(&.{ .done, .errored, .idle }).?);
     try testing.expectEqual(@as(?State, null), mostUrgent(&.{}));
@@ -2628,16 +2735,88 @@ test "status icon colours come from the theme roles herdr uses" {
     for (std.enums.values(State), roles) |state, role| try testing.expectEqual(role, statusRole(state));
 }
 
+fn testRow(label: *[agent_row_bytes]u8, painted: *[agent_row_bytes]u8, style: config.StatusIcons, name: []const u8, state: State) AgentRow {
+    return formatAgentRow(label, painted, style, name, state, null, 40);
+}
+
 test "sidebar agent rows read icon, harness and state words" {
-    var buffer: [agent_row_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings("● claude working", formatAgentRow(&buffer, .dots, rowHarnessName(.claude_code), .working));
-    try std.testing.expectEqualStrings("◐ claude working", formatAgentRow(&buffer, .symbols, rowHarnessName(.claude_code), .working));
-    try std.testing.expectEqualStrings("● codex permission", formatAgentRow(&buffer, .dots, rowHarnessName(.codex), .waiting_permission));
-    try std.testing.expectEqualStrings("× codex permission", formatAgentRow(&buffer, .symbols, rowHarnessName(.codex), .waiting_permission));
-    try std.testing.expectEqualStrings("✓ pi done", formatAgentRow(&buffer, .symbols, rowHarnessName(.pi), .done));
-    try std.testing.expectEqualStrings("● opencode input", formatAgentRow(&buffer, .dots, rowHarnessName(.opencode), .waiting_input));
-    try std.testing.expectEqualStrings("× fake errored", formatAgentRow(&buffer, .dots, "fake", .errored));
-    try std.testing.expectEqualStrings("○ aaaaaaaaaaaaaaaa idle", formatAgentRow(&buffer, .symbols, "a" ** 40, .idle));
+    var label: [agent_row_bytes]u8 = undefined;
+    var painted: [agent_row_bytes]u8 = undefined;
+    try testing.expectEqualStrings("● claude working", testRow(&label, &painted, .dots, rowHarnessName(.claude_code), .working).label);
+    try testing.expectEqualStrings("◐ claude working", testRow(&label, &painted, .symbols, rowHarnessName(.claude_code), .working).label);
+    try testing.expectEqualStrings("● codex permission", testRow(&label, &painted, .dots, rowHarnessName(.codex), .waiting_permission).label);
+    try testing.expectEqualStrings("× codex permission", testRow(&label, &painted, .symbols, rowHarnessName(.codex), .waiting_permission).label);
+    try testing.expectEqualStrings("✓ pi done", testRow(&label, &painted, .symbols, rowHarnessName(.pi), .done).label);
+    try testing.expectEqualStrings("● opencode input", testRow(&label, &painted, .dots, rowHarnessName(.opencode), .waiting_input).label);
+    try testing.expectEqualStrings("× fake errored", testRow(&label, &painted, .dots, "fake", .errored).label);
+    try testing.expectEqualStrings("○ aaaaaaaaaaaaaaaa idle", testRow(&label, &painted, .symbols, "a" ** 40, .idle).label);
+    // Without a detail the row paints the state word after two spaces.
+    const plain = testRow(&label, &painted, .dots, "claude", .working);
+    try testing.expectEqualStrings("● claude  working", plain.painted);
+    try testing.expectEqual("●".len, plain.icon_bytes);
+    try testing.expectEqualStrings("  working", plain.painted[plain.detail_from..]);
+}
+
+test "a row with a detail paints it muted after two spaces and labels harness, state and detail" {
+    var label: [agent_row_bytes]u8 = undefined;
+    var painted: [agent_row_bytes]u8 = undefined;
+    const row = formatAgentRow(&label, &painted, .dots, "claude", .working, "Fix login bug", 40);
+    try testing.expectEqualStrings("● claude working: Fix login bug", row.label);
+    try testing.expectEqualStrings("● claude  Fix login bug", row.painted);
+    try testing.expectEqualStrings("● claude", row.painted[0..row.detail_from]);
+    // Cut to the row: the last kept cell becomes `…`.
+    const cut = formatAgentRow(&label, &painted, .symbols, "fake", .idle, "Fixing the tests", 12);
+    try testing.expectEqualStrings("○ fake  Fix…", cut.painted);
+    try testing.expectEqualStrings("○ fake idle: Fixing the tests", cut.label);
+    try testing.expectEqual(@as(usize, 12), try std.unicode.utf8CountCodepoints(cut.painted));
+    // A hostile title is capped, and both texts stay valid UTF-8.
+    const long = "é" ** 400;
+    const capped = formatAgentRow(&label, &painted, .dots, "x" ** 40, .waiting_permission, long, 1000);
+    try testing.expect(std.unicode.utf8ValidateSlice(capped.label));
+    try testing.expect(std.unicode.utf8ValidateSlice(capped.painted));
+    try testing.expect(std.mem.endsWith(u8, capped.label, "é"));
+    const tiny = formatAgentRow(&label, &painted, .dots, "claude", .working, "title", 0);
+    try testing.expectEqualStrings("", tiny.painted);
+    try testing.expect(tiny.detail_from <= tiny.painted.len);
+}
+
+test "titles lose one leading activity glyph the way herdr strips them" {
+    // Braille spinner frames and every Claude glyph, with spacing.
+    for ([_][]const u8{ "⠋ task", "⠿ task", "⣿ task", "⠀ task", "  ⠙   task  ", "· task", "✢ task", "✳ task", "✶ task", "✻ task", "✽ task", "◐ task", "◓ task", "◑ task", "◒ task", "✳\ttask" }) |title| {
+        try testing.expectEqualStrings("task", strippedTitle(title).?);
+    }
+    try testing.expectEqualStrings("⠙ task", strippedTitle("⠋ ⠙ task").?);
+    // Unknown symbols, a glyph glued to a word, and one mid-title stay.
+    for ([_][]const u8{ "★task", "★ production", "✨ task", "@ task", "task ⠋ detail", "[prod] task", "⠋task", "✳Claude Code" }) |title| {
+        try testing.expectEqualStrings(title, strippedTitle(title).?);
+    }
+    try testing.expectEqualStrings("修复🙂标题", strippedTitle(" ⠋ 修复🙂标题 ").?);
+    // Only whitespace, or only a glyph, is no title.
+    for ([_][]const u8{ "", "  ", "⠋", "⠋   ", " ✳ ", "·" }) |title| try testing.expectEqual(@as(?[]const u8, null), strippedTitle(title));
+}
+
+test "titles are sanitised: controls become spaces, malformed UTF-8 goes, the copy is bounded" {
+    var buffer: [agent_row_detail_bytes]u8 = undefined;
+    try testing.expectEqualStrings("a b c d", sanitizeTitle(&buffer, "a\x1bb\x07c\u{9b}d"));
+    try testing.expectEqualStrings("okay", sanitizeTitle(&buffer, "ok\xffay"));
+    try testing.expectEqualStrings("x", sanitizeTitle(&buffer, "x\xe2\x82"));
+    var small: [5]u8 = undefined;
+    // `é` is two bytes: the third does not fit and is not split.
+    try testing.expectEqualStrings("éé", sanitizeTitle(&small, "ééé"));
+    const long = sanitizeTitle(&buffer, "y" ** 1000);
+    try testing.expectEqual(@as(usize, agent_row_detail_bytes), long.len);
+}
+
+test "a row's detail is the stripped title, else the task id, else nothing" {
+    var buffer: [agent_row_detail_bytes]u8 = undefined;
+    try testing.expectEqualStrings("Fixing the tests", rowDetail(&buffer, "⠋ Fixing the tests", "TASK-9").?);
+    try testing.expectEqualStrings("Fix  ]bug", rowDetail(&buffer, "✳ Fix \x1b]bug", null).?);
+    // A title that is only a glyph, or blank, falls through to the task.
+    try testing.expectEqualStrings("TASK-9", rowDetail(&buffer, "✳", "TASK-9").?);
+    try testing.expectEqualStrings("TASK-9", rowDetail(&buffer, "\x07 ", "TASK-9").?);
+    try testing.expectEqualStrings("TASK-9", rowDetail(&buffer, null, "TASK-9").?);
+    try testing.expectEqual(@as(?[]const u8, null), rowDetail(&buffer, null, null));
+    try testing.expectEqual(@as(?[]const u8, null), rowDetail(&buffer, "⠋ ", ""));
 }
 
 test "the notification list is bounded, newest first, and forgets a workspace" {
@@ -3139,17 +3318,17 @@ test "the view log fills from drained events and an answer reaches the adapter t
     try testing.expectError(error.IdTooLong, runner.answerPermission("r" ** (Runner.max_answer_id_bytes + 1), "d"));
 }
 
-test "manager rows show glyph, names, an empty task slot, the state and the age" {
+test "manager rows show icon, names, an empty task slot, the state and the age" {
     var buffer: [128]u8 = undefined;
     const row = formatManagerRow(&buffer, .{
-        .glyph = stateGlyph(.working),
+        .glyph = statusIcon(.dots, .working),
         .harness = "Codex",
         .workspace = "work",
         .tab = "Codex",
         .state = State.working.label(),
         .age = "12s",
     });
-    try testing.expectEqualStrings("▸ Codex  work › Codex  –  working  12s", row);
+    try testing.expectEqualStrings("● Codex  work › Codex  –  working  12s", row);
     const tasked = formatManagerRow(&buffer, .{ .glyph = "·", .harness = "Pi", .workspace = "w", .tab = "t", .task = "TASK-7", .state = "idle", .age = "3m" });
     try testing.expectEqualStrings("· Pi  w › t  TASK-7  idle  3m", tasked);
     // A narrow buffer never splits the separator or the glyph.

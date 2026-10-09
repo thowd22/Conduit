@@ -836,6 +836,19 @@ pub const InteractiveText = struct {
     /// label in one style.
     lead_foreground: ?theme.Role = null,
     lead_bytes: usize = 0,
+    /// Borrowed text painted in place of the label when the row draws a
+    /// shorter form of what its semantic label says, the way a `Text`'s
+    /// runs may cut what its label names (TASK-86: an agent row paints
+    /// `● claude  Fix login bug` for the label
+    /// `● claude working: Fix login bug`). The label stays the one semantic
+    /// representation; this is paint only. Null paints the label.
+    painted: ?[]const u8 = null,
+    /// The painted text from byte `tail_from` on takes `tail_foreground`
+    /// while idle or hovered, so a row's secondary part reads dimmer than
+    /// its name; a focused row keeps one style. Null, or an offset that is
+    /// not a character boundary of the painted text, paints no tail.
+    tail_foreground: ?theme.Role = null,
+    tail_from: usize = 0,
 
     /// Paint the label in the style selected by `state`.
     pub fn draw(
@@ -851,22 +864,38 @@ pub const InteractiveText = struct {
         };
         switch (self.paint) {
             .label => {
+                const text = self.painted orelse self.label;
+                var runs: [3]Run = undefined;
+                var count: usize = 0;
+                var start: usize = 0;
                 if (self.lead_foreground) |lead| {
-                    if (self.lead_bytes != 0 and self.lead_bytes <= self.label.len and
-                        std.unicode.utf8ValidateSlice(self.label[0..self.lead_bytes]))
+                    if (self.lead_bytes != 0 and self.lead_bytes <= text.len and
+                        std.unicode.utf8ValidateSlice(text[0..self.lead_bytes]))
                     {
                         var lead_style = style;
                         lead_style.foreground = lead;
-                        const runs = [_]Run{
-                            .{ .text = self.label[0..self.lead_bytes], .style = lead_style },
-                            .{ .text = self.label[self.lead_bytes..], .style = style },
-                        };
-                        try (Text{ .runs = &runs }).draw(canvas, bounds);
-                        return;
+                        runs[count] = .{ .text = text[0..self.lead_bytes], .style = lead_style };
+                        count += 1;
+                        start = self.lead_bytes;
                     }
                 }
-                const runs = [_]Run{.{ .text = self.label, .style = style }};
-                try (Text{ .runs = &runs }).draw(canvas, bounds);
+                var end = text.len;
+                var tail_style = style;
+                if (self.tail_foreground) |tail| {
+                    if (state != .focused and self.tail_from >= start and self.tail_from < text.len and
+                        std.unicode.utf8ValidateSlice(text[start..self.tail_from]))
+                    {
+                        tail_style.foreground = tail;
+                        end = self.tail_from;
+                    }
+                }
+                runs[count] = .{ .text = text[start..end], .style = style };
+                count += 1;
+                if (end != text.len) {
+                    runs[count] = .{ .text = text[end..], .style = tail_style };
+                    count += 1;
+                }
+                try (Text{ .runs = runs[0..count] }).draw(canvas, bounds);
             },
             .decorations_only => {
                 var row = bounds.y;
@@ -1829,6 +1858,9 @@ pub const Tree = struct {
         if (!self.building) return error.FrameNotBegun;
         const action = registration.action orelse return error.ActionRequired;
         if (action.len == 0) return error.ActionRequired;
+        if (interactive.painted) |text| {
+            if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+        }
         const prepared = try self.prepare(registration, .interactive_text);
         var retained = interactive;
         retained.id = prepared.element.id;
@@ -3353,6 +3385,71 @@ test "interactive text paints a coloured lead over every state's style" {
     try unsplit.draw(&canvas, canvas.bounds(), .normal);
     view = canvas.view(&palette);
     try testing.expectEqual(resolveRole(&palette, .foreground), view.cells[0].foreground);
+}
+
+test "interactive text paints a shorter form of its label with a dim tail" {
+    const testing = std.testing;
+    var canvas = try Canvas.init(testing.allocator, 16, 1);
+    defer canvas.deinit();
+    const palette = testPalette();
+    const painted = "● fake  task";
+    const item = InteractiveText{
+        .id = try Id.parse("item.agent"),
+        .label = "● fake idle: task",
+        .action = "agent.row",
+        .normal = .{ .foreground = .foreground },
+        .focused = .{ .foreground = .strong, .background = .selection },
+        .lead_foreground = .green,
+        .lead_bytes = "●".len,
+        .painted = painted,
+        .tail_foreground = .muted,
+        .tail_from = "● fake".len,
+    };
+
+    try item.draw(&canvas, canvas.bounds(), .normal);
+    var view = canvas.view(&palette);
+    try testing.expectEqual(resolveRole(&palette, .green), view.cells[0].foreground);
+    try testing.expectEqual(resolveRole(&palette, .foreground), view.cells[2].foreground);
+    try testing.expectEqualStrings("t", view.cells[8].text);
+    try testing.expectEqual(resolveRole(&palette, .muted), view.cells[8].foreground);
+    try testing.expectEqual(@as(usize, 0), countText(view, "i"));
+
+    // Focused, the row is one style past its icon.
+    canvas.clear();
+    try item.draw(&canvas, canvas.bounds(), .focused);
+    view = canvas.view(&palette);
+    try testing.expectEqual(resolveRole(&palette, .green), view.cells[0].foreground);
+    try testing.expectEqual(resolveRole(&palette, .strong), view.cells[8].foreground);
+
+    // A tail inside a character paints none.
+    var torn = item;
+    torn.tail_from = 1;
+    canvas.clear();
+    try torn.draw(&canvas, canvas.bounds(), .normal);
+    view = canvas.view(&palette);
+    try testing.expectEqual(resolveRole(&palette, .foreground), view.cells[8].foreground);
+
+    // The tree refuses painted text that is not UTF-8.
+    var tree = try Tree.init(testing.allocator, 1, 0);
+    defer tree.deinit();
+    try tree.beginFrame(testGeometryFor(16, 1));
+    var bad = item;
+    bad.painted = "\xff";
+    try testing.expectError(error.InvalidUtf8, tree.addInteractiveText(.{
+        .id = try Id.parse("item.agent"),
+        .role = "agent_row",
+        .label = "x",
+        .action = "agent.row",
+        .bounds = .{ .x = 0, .y = 0, .width = 16, .height = 1 },
+    }, bad));
+}
+
+fn countText(view: render.OverlayView, text: []const u8) usize {
+    var count: usize = 0;
+    for (view.cells) |cell| {
+        if (std.mem.eql(u8, cell.text, text)) count += 1;
+    }
+    return count;
 }
 
 test "decoration-only interactive text preserves underlying glyph ownership" {
