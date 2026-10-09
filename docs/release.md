@@ -267,8 +267,9 @@ foreground lookup, TASK-81). A further gating step,
 `npm i -g @anthropic-ai/claude-code`, starts it unauthenticated as `claude` in
 a PowerShell tab through `conduit-test`, and requires its observed-agent row
 to read `· claude idle` and, once Claude Code has left, `✓ claude done`
-(it is sent Ctrl+C twice; when that does not end it under ConPTY, as on the
-runner so far, the step warns and ends it with `taskkill`). Five
+(it is sent Ctrl+C twice; Claude Code 2.1.295 starts its exit and never
+finishes it on the runner, in or out of Conduit, so the step warns and ends it
+with `taskkill`; TASK-83). Five
 are run and reported without gating:
 `--clipboard-test` (it pins SDL's offscreen driver, which needs an EGL library
 on Windows; the Windows clipboard step is the real proof), `--ime-test` (its

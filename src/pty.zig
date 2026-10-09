@@ -4889,7 +4889,7 @@ test "a Git for Windows sh read loop that ignores WINCH survives a ConPTY resize
 
 // --- Ctrl+C through a pseudoconsole (TASK-83) ---------------------------------------------------
 
-const probe_log = std.log.scoped(.pty_probe);
+const ctrl_c_log = std.log.scoped(.pty_ctrl_c_test);
 
 /// Start a Windows PowerShell script under a pseudoconsole. The script travels base64-encoded as
 /// UTF-16LE (`-EncodedCommand`), so no command-line quoting rule can change a byte of it.
@@ -4903,15 +4903,6 @@ fn spawnPowerShellScript(gpa: Allocator, script: []const u8) !Pty {
     return spawnConPty(gpa, windowsRequest(&.{
         "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded,
     }));
-}
-
-/// Write `bytes`, then a sentinel key the script names, and return what the terminal said up to
-/// the script's answer to that sentinel. Everything sent before the sentinel has been read by
-/// then, so counting in the result needs no timing.
-fn sendThenSentinel(gpa: Allocator, pty: Pty, bytes: []const u8, sentinel: []const u8, answer: []const u8) ![]u8 {
-    try writeAll(pty, bytes);
-    try writeAll(pty, sentinel);
-    return readUntil(gpa, pty, answer);
 }
 
 /// A console program that reads key events the way a .NET console program does, with Ctrl+C as
@@ -4953,138 +4944,11 @@ test "two Ctrl+C presses reach a Windows console program as two key events, lega
         try writeAll(pty, pair.sentinel);
         const seen = try readUntil(gpa, pty, pair.answer);
         defer gpa.free(seen);
-        errdefer probe_log.warn("seen: {f}", .{std.ascii.hexEscape(seen, .lower)});
+        errdefer ctrl_c_log.warn("seen: {f}", .{std.ascii.hexEscape(seen, .lower)});
         try testing.expect(std.mem.indexOf(u8, seen, pair.answer) != null);
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, seen, "key:3:C:Control"));
     }
     try writeAll(pty, "q");
-}
-
-/// A console program that reads bytes with virtual-terminal input on and processed input off,
-/// which is how a raw-mode Node or Bun program reads its terminal.
-const read_vt_script =
-    \\$k = Add-Type -PassThru -Name K -Namespace P -MemberDefinition '[DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int n); [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr h, out uint m); [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(System.IntPtr h, uint m);'
-    \\$h = $k::GetStdHandle(-10)
-    \\$m = 0
-    \\[void]$k::GetConsoleMode($h, [ref]$m)
-    \\'mode:' + $m
-    \\'set:' + $k::SetConsoleMode($h, 0x200)
-    \\$s = [Console]::OpenStandardInput()
-    \\$b = New-Object byte[] 256
-    \\'probe-' + 'ready'
-    \\while (($n = $s.Read($b, 0, 256)) -gt 0) {
-    \\  $got = $b[0..($n - 1)]
-    \\  'bytes:' + ($got -join ',')
-    \\  if ($got -contains 122) { 'seen-' + 'z' }
-    \\  if ($got -contains 121) { 'seen-' + 'y' }
-    \\  if ($got -contains 120) { 'seen-' + 'x' }
-    \\  if ($got -contains 113) { break }
-    \\}
-;
-
-test "TASK-83 probe: Ctrl+C bytes through ConPTY to a VT-input reader" {
-    if (!has_conpty_backend) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    const pty = try spawnPowerShellScript(gpa, read_vt_script);
-    defer pty.destroy();
-    const ready = try readUntil(gpa, pty, "probe-ready");
-    defer gpa.free(ready);
-    probe_log.warn("vt ready: {f}", .{std.ascii.hexEscape(ready, .lower)});
-
-    const legacy = try sendThenSentinel(gpa, pty, "\x03", "", "bytes:3");
-    defer gpa.free(legacy);
-    probe_log.warn("vt first ctrl-c: {f}", .{std.ascii.hexEscape(legacy, .lower)});
-    const again = try sendThenSentinel(gpa, pty, "\x03", "z", "seen-z");
-    defer gpa.free(again);
-    probe_log.warn("vt second ctrl-c: {f}", .{std.ascii.hexEscape(again, .lower)});
-    const kitty = try sendThenSentinel(gpa, pty, "\x1b[99;5u\x1b[99;5u", "y", "seen-y");
-    defer gpa.free(kitty);
-    probe_log.warn("vt kitty: {f}", .{std.ascii.hexEscape(kitty, .lower)});
-    const win32 = try sendThenSentinel(gpa, pty, "\x1b[67;46;3;1;8;1_\x1b[67;46;3;0;8;1_", "x", "seen-x");
-    defer gpa.free(win32);
-    probe_log.warn("vt win32-input-mode: {f}", .{std.ascii.hexEscape(win32, .lower)});
-    try writeAll(pty, "q");
-}
-
-test "TASK-83 probe: what a program's keyboard-mode requests look like after ConPTY" {
-    if (!has_conpty_backend) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    const pty = try spawnPowerShellScript(gpa,
-        \\[Console]::Out.Write([string][char]27 + '[>1u')
-        \\'after-' + 'push'
-        \\[Console]::Out.Write([string][char]27 + '[?u')
-        \\'after-' + 'query'
-        \\[Console]::Out.Write([string][char]27 + '[>4;2m')
-        \\'probe-' + 'done'
-    );
-    defer pty.destroy();
-    const seen = try readUntil(gpa, pty, "probe-done");
-    defer gpa.free(seen);
-    probe_log.warn("output passthrough: push {}, query {}, modifyOtherKeys {}: {f}", .{
-        std.mem.indexOf(u8, seen, "\x1b[>1u") != null,
-        std.mem.indexOf(u8, seen, "\x1b[?u") != null,
-        std.mem.indexOf(u8, seen, "\x1b[>4;2m") != null,
-        std.ascii.hexEscape(seen, .lower),
-    });
-}
-
-test "TASK-83 probe: Claude Code under a bare pseudoconsole, two Ctrl+C presses" {
-    if (!has_conpty_backend) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    const claude_exe = "C:\\npm\\prefix\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
-    const pty = spawnConPty(gpa, .{
-        .argv = &.{claude_exe},
-        .env = &.{
-            "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\Git\\bin",
-            "SYSTEMROOT=C:\\Windows",
-            "TEMP=C:\\Windows\\Temp",
-            "TMP=C:\\Windows\\Temp",
-            "USERPROFILE=C:\\Windows\\Temp",
-            "HOME=C:\\Windows\\Temp",
-            "APPDATA=C:\\Windows\\Temp",
-            "LOCALAPPDATA=C:\\Windows\\Temp",
-            "CLAUDE_CODE_GIT_BASH_PATH=C:\\Program Files\\Git\\bin\\bash.exe",
-        },
-        .cwd = windows_test_cwd,
-        .size = WindowSize.init(30, 100),
-    }) catch |err| {
-        probe_log.warn("bare claude: cannot start: {s}", .{@errorName(err)});
-        return error.SkipZigTest;
-    };
-    defer pty.destroy();
-    const first = try readUntil(gpa, pty, "text style");
-    defer gpa.free(first);
-    probe_log.warn("bare claude: first screen seen: {}", .{std.mem.indexOf(u8, first, "text style") != null});
-    const hint = try sendThenSentinel(gpa, pty, "\x03", "", "again to exit");
-    defer gpa.free(hint);
-    probe_log.warn("bare claude: hint after one press: {}", .{std.mem.indexOf(u8, hint, "again to exit") != null});
-    const steps = [_]struct { name: []const u8, bytes: []const u8 }{
-        .{ .name = "second Ctrl+C", .bytes = "\x03" },
-        .{ .name = "Enter", .bytes = "\r" },
-        .{ .name = "third Ctrl+C", .bytes = "\x03" },
-    };
-    for (steps) |step| {
-        writeAll(pty, step.bytes) catch |err| {
-            probe_log.warn("bare claude: {s}: write {s}", .{ step.name, @errorName(err) });
-            return;
-        };
-        var seen: std.ArrayList(u8) = .empty;
-        defer seen.deinit(gpa);
-        var scratch: [4096]u8 = undefined;
-        const deadline = monotonicMillis() + 10_000;
-        while (pty.state() == .running and monotonicMillis() < deadline) {
-            _ = pty.waitReadable(100);
-            while (true) {
-                const n = pty.takeBytes(&scratch);
-                if (n == 0) break;
-                try seen.appendSlice(gpa, scratch[0..n]);
-            }
-        }
-        const tail = seen.items[seen.items.len -| 600..];
-        probe_log.warn("bare claude: after {s}: {s}; output tail: {f}", .{ step.name, @tagName(pty.state()), std.ascii.hexEscape(tail, .lower) });
-        if (pty.state() != .running) return;
-    }
-    pty.kill(.kill) catch {};
 }
 
 test "a Kitty Ctrl+C report is found for the pseudoconsole, and nothing else is" {

@@ -267,10 +267,10 @@ jobs:
         continue-on-error: true
         run: zig build test -Doptimize="$OPTIMIZE" -Dversion="$CONDUIT_VERSION" --summary all
 
-      # The build runner reports only counts; run the font and workspace test
-      # binaries directly so every DirectWrite and WSL test names its outcome
-      # (OK, SKIP or FAIL) in the log and the evidence.
-      - name: Font and WSL tests, one line per test (TASK-49 AC2, TASK-47)
+      # The build runner reports only counts; run the font, workspace and pty
+      # test binaries directly so every DirectWrite, WSL and ConPTY test names
+      # its outcome (OK, SKIP or FAIL) in the log and the evidence.
+      - name: Font, WSL and ConPTY tests, one line per test (TASK-49 AC2, TASK-47, TASK-83)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 10
         run: |
@@ -293,7 +293,7 @@ jobs:
             done
             echo "== $name-test (${ran:-no runnable binary})"
             [ -n "$ran" ] || status=1
-            grep -iE "wsl|directwrite|windows|passed|failed|skipped|pty_probe|TASK-83" "$ARTIFACT_ROOT/$name-test.txt" | head -n 120 || true
+            grep -iE "wsl|directwrite|windows|passed|failed|skipped|ctrl\+c" "$ARTIFACT_ROOT/$name-test.txt" | head -n 80 || true
           done
           exit $status
 

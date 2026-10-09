@@ -170,8 +170,11 @@ started by hand there is not observed. On Windows it is proved on the hosted run
 `--agent-test` (a scripted fake started by hand through `cmd /c` in a tab) and by an npm-installed, unauthenticated
 Claude Code started as `claude` in a PowerShell tab, observed as `· claude idle` and marked
 `✓ claude done` once it leaves (`windows-claude-observe.sh`). On the runner Claude Code answers
-the first Ctrl+C with "Press Ctrl-C again to exit" but has not yet exited on the second one under
-ConPTY, so the check ends it with `taskkill` and reports that with a warning.
+the first Ctrl+C with "Press Ctrl-C again to exit" and starts to exit on the second, but its exit
+never finishes, in Conduit and equally under a bare pseudoconsole or in a classic console window, so
+the check ends it with `taskkill` and reports that with a warning (TASK-83). A Ctrl+C that Conduit
+would encode in the Kitty keyboard protocol is written to a Windows pseudoconsole as `0x03`, because
+the pseudoconsole drops Kitty reports; every other key is written as encoded.
 
 ### Screen states (TASK-84)
 

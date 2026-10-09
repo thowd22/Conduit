@@ -1185,8 +1185,8 @@ windows.yml; on Windows its fake is started through `cmd /c`, because Git for Wi
 MSYS programs by ending its own process, which leaves them without a Windows parent.
 `windows-claude-observe.sh` gates too (run 37849549953): an npm-installed, unauthenticated Claude
 Code started as `claude` in a PowerShell tab is observed as `· claude idle` and shows `✓ claude
-done` once it leaves. Two Ctrl+C presses have not yet ended Claude Code under ConPTY (it shows
-"Press Ctrl-C again to exit"), so that step ends it with taskkill and warns; TASK-83 tracks it.
+done` once it leaves. Two Ctrl+C presses still do not end Claude Code there, so that step ends it
+with taskkill and warns; TASK-83 below found that this is Claude Code's own exit, not Conduit's input.
 macOS still reports no foreground process.
 
 TASK-84 is complete on Linux. The PTY baseline reads the screen, following herdr's design
@@ -1222,6 +1222,22 @@ had pushed the Codex and OpenCode errored screens out of their bottom-rows windo
 37868542783); the three-OS matrix passed afterwards and `--agent-test` with the screen layer
 gates on windows.yml (run 37874621552). omp and macOS/Windows harness screens are
 uncaptured.
+
+TASK-83 (open: its first criterion cannot be met from Conduit). A pseudoconsole parses the terminal's
+input back into console key events and drops Kitty `CSI 99;5u` reports, while it passes a program's
+`CSI > 1 u` through to the terminal, so a Kitty-encoded Ctrl+C never reached a console program (a
+`[Console]::ReadKey` reader got none, run 37865506186). The ConPTY backend now writes a Kitty Ctrl+C
+press or repeat as `0x03` and its release as nothing (`pty.conPtyInput`); every other key is written as
+encoded. The ConPTY test "two Ctrl+C presses reach a Windows console program as two key events,
+legacy and Kitty" passes on windows-latest (runs 37867442891, 37869071981), and a term test proves
+every Ctrl+C report the encoder can emit, under all 32 Kitty flag sets, is recognised. Claude Code
+itself is a different matter: 2.1.295 gets no reply to its `CSI ? u` probe through ConPTY, stays on
+legacy encoding, and receives both presses (the first shows and then clears its hint; the second
+starts its exit and it writes its terminal-mode resets), but its exit never finishes: inside Conduit,
+under a bare pseudoconsole with no terminal behind it, and in a classic console window fed key events
+with `WriteConsoleInputW`, with Enter or a third Ctrl+C changing nothing (run 37869071981). Raw-mode
+Node 22 and Bun 1.4.2 programs typed into Conduit exit on the second press. The observe step therefore
+keeps its taskkill fallback and warning.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
