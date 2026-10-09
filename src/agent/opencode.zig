@@ -59,6 +59,11 @@
 //!     `tool {tool, callID, state:{status, input, title?}}`, `file {source?}`).
 //! The other fixtures there (`turn-*.sse`, `edge-cases.sse`, `messages.json`)
 //! are hand-written from those shapes; the `recorded-*` ones are live.
+//! `recorded-reasoning-*` (TASK-87, 2026-10-09, the same container) adds
+//! `reasoning` parts (`{text, time:{start, end?}}`, reported once ended) and
+//! tool parts that end `completed` (`output`, with `metadata.exit` for bash,
+//! which stays `completed` when it exits non-zero) or `error` (`error`);
+//! each ended tool part becomes a `tool_result` with its first output line.
 //!
 //! Gaps (also in docs/architecture.md):
 //!   - `detect` runs `opencode --version` through the workspace's
@@ -136,6 +141,10 @@ const backlog_capacity = 64;
 /// cancelling every pending permission, then `done`).
 const backlog_reserve = max_pending_permissions + 4;
 const seen_capacity = 512;
+/// Seeds the seen-set key of a tool part's result, apart from its use.
+const result_seen_seed = 0x726573756c74;
+/// The longest tool result summary kept, matching the other adapters.
+const max_result_bytes = 512;
 const role_capacity = 64;
 
 /// The server's basic-auth user name. `OPENCODE_SERVER_USERNAME` defaults to
@@ -883,7 +892,7 @@ const Mapper = struct {
             .@"message.part.updated" => {
                 const part = field(props, "part") orelse return;
                 if (self.claim(string(field(part, "sessionID"))) != .bound) return;
-                try self.mapPart(sink, part, null);
+                try self.mapPart(arena, sink, part, null);
             },
         }
     }
@@ -936,8 +945,10 @@ const Mapper = struct {
     }
 
     /// Map one message part. `role` is known for history; live parts look it
-    /// up from `message.updated`.
-    fn mapPart(self: *Mapper, sink: *Backlog, part: json.Value, role: ?event.Role) Backlog.Error!void {
+    /// up from `message.updated`. Text and reasoning parts are reported once
+    /// they end; a tool part's use once it runs and its result once it is
+    /// `completed` or `error`.
+    fn mapPart(self: *Mapper, arena: Allocator, sink: *Backlog, part: json.Value, role: ?event.Role) (Backlog.Error || Allocator.Error)!void {
         const id = string(field(part, "id")) orelse return;
         const kind = string(field(part, "type")) orelse return;
         if (std.mem.eql(u8, kind, "text")) {
@@ -953,16 +964,44 @@ const Mapper = struct {
                 (if (time == null) event.Role.user else event.Role.assistant);
             return sink.push(.{ .message = .{ .role = message_role, .text = text } });
         }
+        if (std.mem.eql(u8, kind, "reasoning")) {
+            // Like an assistant text part: reported once, when it ends.
+            const text = string(field(part, "text")) orelse return;
+            if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
+            const time = field(part, "time");
+            if (time != null and field(time, "end") == null) return;
+            if (!self.markSeen(id)) return;
+            const kept = event.truncateUtf8(text, event.stored_text_capacity);
+            return sink.push(.{ .reasoning = .{ .text = kept, .truncated = kept.len != text.len } });
+        }
         if (std.mem.eql(u8, kind, "tool")) {
             const tool_state = field(part, "state");
             const status_text = string(field(tool_state, "status")) orelse return;
             if (std.mem.eql(u8, status_text, "pending")) return;
-            if (!self.markSeen(id)) return;
             const name = string(field(part, "tool")) orelse "tool";
-            const input = field(tool_state, "input");
-            try sink.push(.{ .tool_use = .{ .name = name, .summary = toolSummary(tool_state, input) } });
-            if (string(field(input, "filePath"))) |path| try sink.push(.{ .file_reference = .{ .path = path } });
-            return;
+            if (self.markSeen(id)) {
+                const input = field(tool_state, "input");
+                try sink.push(.{ .tool_use = .{ .name = name, .summary = toolSummary(tool_state, input) } });
+                if (string(field(input, "filePath"))) |path| try sink.push(.{ .file_reference = .{ .path = path } });
+            }
+            // The same part later reaches `completed` or `error`: its result
+            // is reported once too, under a key of its own.
+            // A bash that exits non-zero still `completed`; its metadata
+            // carries the exit status.
+            const errored = std.mem.eql(u8, status_text, "error");
+            if (!errored and !std.mem.eql(u8, status_text, "completed")) return;
+            if (!self.markSeenAs(result_seen_seed, id)) return;
+            const exit_code: ?i64 = if (field(field(tool_state, "metadata"), "exit")) |code| (if (code == .integer) code.integer else null) else null;
+            const nonzero = exit_code != null and exit_code.? != 0;
+            const output = string(field(tool_state, if (errored) "error" else "output")) orelse "";
+            const summary = event.summaryLine(output, max_result_bytes);
+            const line = if (!nonzero)
+                summary.line
+            else if (summary.line.len == 0)
+                try std.fmt.allocPrint(arena, "exit {d}", .{exit_code.?})
+            else
+                try std.fmt.allocPrint(arena, "exit {d}: {s}", .{ exit_code.?, summary.line });
+            return sink.push(.{ .tool_result = .{ .name = name, .summary = line, .failed = errored or nonzero, .truncated = summary.truncated } });
         }
         if (std.mem.eql(u8, kind, "file")) {
             const path = string(field(field(part, "source"), "path")) orelse return;
@@ -972,7 +1011,11 @@ const Mapper = struct {
     }
 
     fn markSeen(self: *Mapper, id: []const u8) bool {
-        const hash = std.hash.Wyhash.hash(0x6f70656e636f6465, id);
+        return self.markSeenAs(0x6f70656e636f6465, id);
+    }
+
+    fn markSeenAs(self: *Mapper, seed: u64, id: []const u8) bool {
+        const hash = std.hash.Wyhash.hash(seed, id);
         for (self.seen[0..self.seen_len]) |h| if (h == hash) return false;
         self.seen[self.seen_next] = hash;
         self.seen_next = (self.seen_next + 1) % seen_capacity;
@@ -1743,7 +1786,7 @@ pub const OpenCodeAdapter = struct {
                     log.debug("history cut short by the backlog", .{});
                     return;
                 }
-                self.mapper.mapPart(&self.backlog, part, role) catch return;
+                self.mapper.mapPart(arena, &self.backlog, part, role) catch return;
             }
         }
     }
@@ -2098,7 +2141,7 @@ test "a recorded-shape turn maps onto agent events through the common interface"
     var kinds_buffer: [64]event.Event.Kind = undefined;
     const K = event.Event.Kind;
     try testing.expectEqualSlices(K, &.{
-        .message,            .status_change,       .message,  .tool_use,      .file_reference, .subagent,      .subagent,
+        .message,            .status_change,       .message,  .tool_use,      .file_reference, .tool_result,   .subagent,      .subagent,
         .permission_request, .permission_resolved, .tool_use, .status_change, .notification,   .status_change, .status_change,
     }, collected.kinds(&kinds_buffer));
 
@@ -2112,11 +2155,13 @@ test "a recorded-shape turn maps onto agent events through the common interface"
     try testing.expectEqualStrings("read", collected.at(3).tool_use.name);
     try testing.expectEqualStrings("build.zig", collected.at(3).tool_use.summary);
     try testing.expectEqualStrings("/work/build.zig", collected.at(4).file_reference.path);
-    try testing.expectEqualStrings("ses_child", collected.at(5).subagent.id);
-    try testing.expectEqualStrings("explore the tests", collected.at(5).subagent.name);
-    try testing.expectEqual(event.Subagent.Phase.start, collected.at(5).subagent.phase);
-    try testing.expectEqual(event.Subagent.Phase.stop, collected.at(6).subagent.phase);
-    const request = collected.at(7).permission_request;
+    try testing.expectEqualStrings("read", collected.at(5).tool_result.name);
+    try testing.expect(!collected.at(5).tool_result.failed);
+    try testing.expectEqualStrings("ses_child", collected.at(6).subagent.id);
+    try testing.expectEqualStrings("explore the tests", collected.at(6).subagent.name);
+    try testing.expectEqual(event.Subagent.Phase.start, collected.at(6).subagent.phase);
+    try testing.expectEqual(event.Subagent.Phase.stop, collected.at(7).subagent.phase);
+    const request = collected.at(8).permission_request;
     try testing.expectEqualStrings("per_1", request.id);
     try testing.expectEqualStrings("bash: zig build", request.title);
     try testing.expectEqual(@as(usize, 3), request.decisions.len);
@@ -2124,12 +2169,12 @@ test "a recorded-shape turn maps onto agent events through the common interface"
     try testing.expectEqual(event.DecisionKind.allow_always, request.decisions[1].kind);
     try testing.expectEqual(event.DecisionKind.reject, request.decisions[2].kind);
     // Nobody answered through Conduit: the TUI did.
-    try testing.expectEqual(event.PermissionOutcome.resolved_elsewhere, collected.at(8).permission_resolved.outcome);
-    try testing.expectEqualStrings("zig build", collected.at(9).tool_use.summary);
-    try testing.expectEqual(State.waiting_input, collected.at(10).status_change.state);
-    try testing.expectEqualStrings("Which target should I build?", collected.at(11).notification.body);
-    try testing.expectEqual(State.working, collected.at(12).status_change.state);
-    try testing.expectEqual(State.done, collected.at(13).status_change.state);
+    try testing.expectEqual(event.PermissionOutcome.resolved_elsewhere, collected.at(9).permission_resolved.outcome);
+    try testing.expectEqualStrings("zig build", collected.at(10).tool_use.summary);
+    try testing.expectEqual(State.waiting_input, collected.at(11).status_change.state);
+    try testing.expectEqualStrings("Which target should I build?", collected.at(12).notification.body);
+    try testing.expectEqual(State.working, collected.at(13).status_change.state);
+    try testing.expectEqual(State.done, collected.at(14).status_change.state);
 
     // The same events drive the registry without an OpenCode case anywhere.
     const registry_mod = @import("registry.zig");
@@ -2145,9 +2190,9 @@ test "a recorded-shape turn maps onto agent events through the common interface"
     });
     var states: [64]State = undefined;
     for (collected.slots[0..collected.len], 0..) |*stored, i| states[i] = (try reg.apply(id, stored.event)).current;
-    try testing.expectEqual(State.waiting_permission, states[7]);
-    try testing.expectEqual(State.working, states[8]);
-    try testing.expectEqual(State.waiting_input, states[10]);
+    try testing.expectEqual(State.waiting_permission, states[8]);
+    try testing.expectEqual(State.working, states[9]);
+    try testing.expectEqual(State.waiting_input, states[11]);
     try testing.expectEqual(State.done, reg.get(id).?.state);
     try testing.expect(reg.get(id).?.structured);
 }
@@ -2183,7 +2228,7 @@ test "a turn recorded from opencode 1.18.35 maps onto agent events through the c
     var kinds_buffer: [64]event.Event.Kind = undefined;
     const K = event.Event.Kind;
     try testing.expectEqualSlices(K, &.{
-        .message, .status_change, .tool_use, .permission_request, .permission_resolved, .message, .status_change,
+        .message, .status_change, .tool_use, .permission_request, .permission_resolved, .tool_result, .message, .status_change,
     }, collected.kinds(&kinds_buffer));
     try testing.expectEqualStrings("run the marker", collected.at(0).message.text);
     try testing.expectEqual(State.working, collected.at(1).status_change.state);
@@ -2193,9 +2238,12 @@ test "a turn recorded from opencode 1.18.35 maps onto agent events through the c
     try testing.expectEqualStrings("per_1195b1fc1001hVuStfUdg47luK", request.id);
     try testing.expectEqualStrings("bash: echo conduit-live", request.title);
     try testing.expectEqual(event.PermissionOutcome.resolved_elsewhere, collected.at(4).permission_resolved.outcome);
-    try testing.expectEqual(event.Role.assistant, collected.at(5).message.role);
-    try testing.expectEqualStrings("All done.", collected.at(5).message.text);
-    try testing.expectEqual(State.done, collected.at(6).status_change.state);
+    try testing.expectEqualStrings("bash", collected.at(5).tool_result.name);
+    try testing.expectEqualStrings("conduit-live", collected.at(5).tool_result.summary);
+    try testing.expect(!collected.at(5).tool_result.failed);
+    try testing.expectEqual(event.Role.assistant, collected.at(6).message.role);
+    try testing.expectEqualStrings("All done.", collected.at(6).message.text);
+    try testing.expectEqual(State.done, collected.at(7).status_change.state);
     try testing.expectEqualStrings("ses_ee6a4e41affeQFeE4NibVv28Gd", oc.mapper.session.slice());
 
     // The recorded history replays the same turn as transcript events.
@@ -2212,9 +2260,79 @@ test "a turn recorded from opencode 1.18.35 maps onto agent events through the c
     var replayed = try Collected.init();
     defer replayed.deinit();
     replayed.drain(&queue);
-    try testing.expectEqualSlices(K, &.{ .message, .tool_use, .message }, replayed.kinds(&kinds_buffer));
+    try testing.expectEqualSlices(K, &.{ .message, .tool_use, .tool_result, .message }, replayed.kinds(&kinds_buffer));
     try testing.expectEqualStrings("run the marker", replayed.at(0).message.text);
-    try testing.expectEqualStrings("All done.", replayed.at(2).message.text);
+    try testing.expectEqualStrings("conduit-live", replayed.at(2).tool_result.summary);
+    try testing.expectEqualStrings("All done.", replayed.at(3).message.text);
+}
+
+test "a turn with reasoning and tool output recorded from opencode 1.18.35" {
+    // TASK-87: the stand-in streams `reasoning_content` before every reply;
+    // the turn runs a bash printing two lines, a bash exiting 2 (which
+    // OpenCode reports as `completed` with `metadata.exit`) and a read of a
+    // missing file (an `error` tool part).
+    const recorded = try readFixture("recorded-reasoning-turn.sse");
+    defer testing.allocator.free(recorded);
+    const response = try sseResponse(testing.allocator, recorded);
+    defer testing.allocator.free(response);
+    var scripted: ScriptedTransport = .{ .script = response };
+    defer scripted.written.deinit(testing.allocator);
+    var oc = try OpenCodeAdapter.init(testing.allocator, testing.io, .{ .port = 4096, .transport = scripted.transport(), .directory = "/tmp/proj" });
+    const a = oc.adapter();
+    defer a.destroy();
+    var queue = try event.EventQueue.init(testing.allocator, testing.io, 64);
+    defer queue.deinit(testing.allocator);
+    var collected = try Collected.init();
+    defer collected.deinit();
+    while (scripted.at < scripted.script.len) {
+        _ = try a.poll(&queue);
+        collected.drain(&queue);
+    }
+    _ = try a.poll(&queue);
+    collected.drain(&queue);
+
+    const K = event.Event.Kind;
+    const turn = [_]K{
+        .reasoning, .tool_use, .tool_result, // printf
+        .reasoning, .tool_use, .tool_result, // ls of a missing directory
+        .reasoning, .tool_use, .file_reference, .tool_result, // read of a missing file
+        .reasoning, .message, // the answer
+    };
+    var kinds_buffer: [64]K = undefined;
+    try testing.expectEqualSlices(K, &(.{ .message, .status_change } ++ turn ++ .{.status_change}), collected.kinds(&kinds_buffer));
+    try testing.expectEqualStrings("run the probe", collected.at(0).message.text);
+    try testing.expectEqualStrings("Run the probe first to see what it prints.", collected.at(2).reasoning.text);
+    const printed = collected.at(4).tool_result;
+    try testing.expectEqualStrings("bash", printed.name);
+    try testing.expectEqualStrings("probe line one", printed.summary);
+    try testing.expect(printed.truncated and !printed.failed);
+    const missing = collected.at(7).tool_result;
+    try testing.expectEqualStrings("exit 2: ls: cannot access '/nonexistent-conduit-probe': No such file or directory", missing.summary);
+    try testing.expect(missing.failed);
+    const unread = collected.at(11).tool_result;
+    try testing.expectEqualStrings("read", unread.name);
+    try testing.expectEqualStrings("File not found: /tmp/proj/missing-notes.txt", unread.summary);
+    try testing.expect(unread.failed);
+    try testing.expectEqualStrings("Everything I need is here; summarise.", collected.at(12).reasoning.text);
+    try testing.expectEqual(State.done, collected.at(14).status_change.state);
+
+    // The message replay gives the same turn.
+    const body = try readFixture("recorded-reasoning-messages.json");
+    defer testing.allocator.free(body);
+    var history: ScriptedTransport = .{ .script = "" };
+    defer history.written.deinit(testing.allocator);
+    var replay = try OpenCodeAdapter.init(testing.allocator, testing.io, .{ .port = 4096, .transport = history.transport(), .directory = "/tmp/proj" });
+    defer replay.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try replay.mapHistory(arena_state.allocator(), body);
+    _ = replay.flush(&queue);
+    var replayed = try Collected.init();
+    defer replayed.deinit();
+    replayed.drain(&queue);
+    try testing.expectEqualSlices(K, &(.{.message} ++ turn), replayed.kinds(&kinds_buffer));
+    try testing.expectEqualStrings("exit 2: ls: cannot access '/nonexistent-conduit-probe': No such file or directory", replayed.at(6).tool_result.summary);
+    try testing.expect(replayed.at(10).tool_result.failed);
 }
 
 test "older shapes, other sessions, errors, aborts and junk degrade gracefully" {
@@ -2395,13 +2513,15 @@ test "history replays a session's messages as transcript events once" {
 
     var kinds_buffer: [64]event.Event.Kind = undefined;
     try testing.expectEqualSlices(event.Event.Kind, &.{
-        .message, .file_reference, .message, .tool_use, .file_reference, .tool_use,
+        .message, .file_reference, .reasoning, .message, .tool_use, .file_reference, .tool_result, .tool_use, .tool_result,
     }, collected.kinds(&kinds_buffer));
     try testing.expectEqual(event.Role.user, collected.at(0).message.role);
     try testing.expectEqualStrings("build.zig", collected.at(1).file_reference.path);
-    try testing.expectEqual(event.Role.assistant, collected.at(2).message.role);
-    try testing.expectEqualStrings("edit", collected.at(3).tool_use.name);
-    try testing.expectEqualStrings("zig build test", collected.at(5).tool_use.summary);
+    try testing.expectEqualStrings("thinking", collected.at(2).reasoning.text);
+    try testing.expectEqual(event.Role.assistant, collected.at(3).message.role);
+    try testing.expectEqualStrings("edit", collected.at(4).tool_use.name);
+    try testing.expectEqualStrings("ok", collected.at(6).tool_result.summary);
+    try testing.expectEqualStrings("zig build test", collected.at(7).tool_use.summary);
 
     // The same parts arriving live are not emitted twice.
     try oc.mapHistory(arena_state.allocator(), body);
@@ -2633,7 +2753,7 @@ test "end to end against a fake OpenCode server over real TCP" {
 
     const deadline = Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
     var answered = false;
-    while (collected.len < 14 and Io.Clock.awake.now(io).nanoseconds < deadline) {
+    while (collected.len < 15 and Io.Clock.awake.now(io).nanoseconds < deadline) {
         _ = try a.poll(&queue);
         const seen = collected.len;
         collected.drain(&queue);
@@ -2649,7 +2769,7 @@ test "end to end against a fake OpenCode server over real TCP" {
     joined = true;
     if (fake.failure) |err| return err;
     try testing.expect(answered);
-    try testing.expectEqual(@as(usize, 14), collected.len);
+    try testing.expectEqual(@as(usize, 15), collected.len);
 
     const sse_request = fake.sse_request[0..fake.sse_request_len];
     try testing.expect(std.mem.startsWith(u8, sse_request, "GET /event?directory=%2Fwork HTTP/1.1\r\n"));
@@ -2662,8 +2782,8 @@ test "end to end against a fake OpenCode server over real TCP" {
         "Content-Type: application/json\r\nContent-Length: 16\r\n\r\n{{\"reply\":\"once\"}}", .{fake.port()});
     try testing.expectEqualStrings(expected, fake.post[0..fake.post_len]);
     // Conduit answered, so the resolution is `allowed`, not elsewhere.
-    try testing.expectEqual(event.PermissionOutcome.allowed, collected.at(8).permission_resolved.outcome);
-    try testing.expectEqual(State.done, collected.at(13).status_change.state);
+    try testing.expectEqual(event.PermissionOutcome.allowed, collected.at(9).permission_resolved.outcome);
+    try testing.expectEqual(State.done, collected.at(14).status_change.state);
 }
 
 test "live: a real opencode serve, when installed" {

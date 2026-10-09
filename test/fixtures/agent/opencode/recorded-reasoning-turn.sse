@@ -1,0 +1,171 @@
+: RECORDED from a real opencode 1.18.35 (npm opencode-ai@1.18.35) on 2026-10-09
+: for TASK-87: 'opencode serve' in the conduit-opencode-check:1.18.35 container
+: with a mock OpenAI-compatible provider that streams reasoning_content before
+: every reply, and permission bash/read = allow. One turn: prompt_async 'run
+: the probe', a bash printing two lines, a bash exiting 2, a read of a missing
+: file (a tool error), then text. Only the startup plugin/catalog/reference/
+: integration announcements were removed; every other event is byte for byte
+: as served.
+
+data: {"id":"evt_11f16059a001fsVyYQPpDtpXWI","type":"server.connected","properties":{}}
+
+data: {"id":"evt_11f160981001FWyrZd4iP5d2fV","type":"session.created","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","version":"1.18.35","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"New session - 2026-10-09T05:15:00.353Z","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522900353}}}}
+
+data: {"id":"evt_11f1609a4001DI289MmmnH7Hmi","type":"session.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"New session - 2026-10-09T05:15:00.353Z","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522900387}}}}
+
+data: {"id":"evt_11f1609a9001wbyGWO58ebBriT","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"user","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","time":{"created":1791522900387},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"}}}}
+
+data: {"id":"evt_11f160b56001emgaa9I0zMrb7G","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"text","text":"run the probe","messageID":"msg_11f1609a2001u8e5ClKV2wWJq5","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","id":"prt_11f1609a8001d4Tc895HlpL5JK"},"time":1791522900821}}
+
+data: {"id":"evt_11f160b590016cTLvPz7RkFu6e","type":"session.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"New session - 2026-10-09T05:15:00.353Z","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522900824}}}}
+
+data: {"id":"evt_11f160b5d001XpcZEtc9ZFDsei","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160b600012Bu7zF68uG06Lb","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160b600019ux30aGZIEm1KS","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522900832},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}}
+
+data: {"id":"evt_11f160b7f001NTgD8Qwi0CMTuR","type":"session.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"New session - 2026-10-09T05:15:00.353Z","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522900862}}}}
+
+data: {"id":"evt_11f160b81001qYjfqGolWE3s08","type":"session.diff","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","diff":[]}}
+
+data: {"id":"evt_11f160b82001Jc5AFIobQqCHI3","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"role":"user","time":{"created":1791522900387},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"},"id":"msg_11f1609a2001u8e5ClKV2wWJq5","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","summary":{"diffs":[]}}}}
+
+data: {"id":"evt_11f160bb0001aw9SBKWjHFl5j1","type":"session.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"Probe run","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522900862}}}}
+
+data: {"id":"evt_11f160d26001rYfjub9RWpnqNA","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160d2e001gsQUW5cp8cJO91","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160d2e001IDXEOq35SGT6r7","messageID":"msg_11f160b600019ux30aGZIEm1KS","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"step-start"},"time":1791522901294}}
+
+data: {"id":"evt_11f160d31001Kj6lLWvL5uVKYd","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160d31001FzKLFV8Yh556w7","messageID":"msg_11f160b600019ux30aGZIEm1KS","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"reasoning","text":"","time":{"start":1791522901297}},"time":1791522901297}}
+
+data: {"id":"evt_11f160d34001q1onsjgiswqREn","type":"message.part.delta","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160b600019ux30aGZIEm1KS","partID":"prt_11f160d31001FzKLFV8Yh556w7","field":"text","delta":"Run the probe first to see what it prints."}}
+
+data: {"id":"evt_11f160d350016pMDDJsafzGvfy","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160d31001FzKLFV8Yh556w7","messageID":"msg_11f160b600019ux30aGZIEm1KS","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"reasoning","text":"Run the probe first to see what it prints.","time":{"start":1791522901297,"end":1791522901301}},"time":1791522901301}}
+
+data: {"id":"evt_11f160d3700115xgLtaPEk3iZj","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160d37001COloqC1I9lalE6","messageID":"msg_11f160b600019ux30aGZIEm1KS","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"tool","tool":"bash","callID":"call_0","state":{"status":"pending","input":{},"raw":""}},"time":1791522901303}}
+
+data: {"id":"evt_11f160d3f0011VB4F5qBhFfY74","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"bash","callID":"call_0","state":{"status":"running","input":{"command":"printf 'probe line one\\nprobe line two\\n'","description":"Print two probe lines"},"time":{"start":1791522901311}},"id":"prt_11f160d37001COloqC1I9lalE6","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160b600019ux30aGZIEm1KS"},"time":1791522901311}}
+
+data: {"id":"evt_11f160d70001I4Rn53DPPhV80a","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"bash","callID":"call_0","state":{"metadata":{"output":""},"status":"running","input":{"command":"printf 'probe line one\\nprobe line two\\n'","description":"Print two probe lines"},"time":{"start":1791522901311}},"id":"prt_11f160d37001COloqC1I9lalE6","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160b600019ux30aGZIEm1KS"},"time":1791522901359}}
+
+data: {"id":"evt_11f160d7f001Pf63dzUCS4TqLc","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"bash","callID":"call_0","state":{"metadata":{"output":"probe line one\nprobe line two\n"},"status":"running","input":{"command":"printf 'probe line one\\nprobe line two\\n'","description":"Print two probe lines"},"time":{"start":1791522901311}},"id":"prt_11f160d37001COloqC1I9lalE6","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160b600019ux30aGZIEm1KS"},"time":1791522901375}}
+
+data: {"id":"evt_11f160d83001fn0Fa8GtmA0LPe","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"bash","callID":"call_0","state":{"status":"completed","input":{"command":"printf 'probe line one\\nprobe line two\\n'","description":"Print two probe lines"},"output":"probe line one\nprobe line two\n","metadata":{"output":"probe line one\nprobe line two\n","exit":0,"truncated":false},"title":"printf 'probe line one\\nprobe line two\\n'","time":{"start":1791522901311,"end":1791522901379}},"id":"prt_11f160d37001COloqC1I9lalE6","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160b600019ux30aGZIEm1KS"},"time":1791522901379}}
+
+data: {"id":"evt_11f160d86001ONA3N0tDV6Ezq4","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160d86001FN4Oa8IB3ylzBp","reason":"tool-calls","messageID":"msg_11f160b600019ux30aGZIEm1KS","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"step-finish","tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0},"time":1791522901382}}
+
+data: {"id":"evt_11f160d88001ZHWsbkT48F3rSj","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160b600019ux30aGZIEm1KS","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522900832,"completed":1791522901387},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","finish":"tool-calls"}}}
+
+data: {"id":"evt_11f160d8b0010S1mPufvhtUXWw","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160b600019ux30aGZIEm1KS","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522900832,"completed":1791522901387},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","finish":"tool-calls"}}}
+
+data: {"id":"evt_11f160d8c001ZVSfkHEEEW7yz3","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160d8e001xIE8R5T5u3TZF3","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160d8e001EpHg36jvR0WmZX","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901390},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}}
+
+data: {"id":"evt_11f160d9a001HbhLLAqw0yz4Fb","type":"session.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"Probe run","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522901401}}}}
+
+data: {"id":"evt_11f160d9b001Mg7wFAY5OQS6tl","type":"session.diff","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","diff":[]}}
+
+data: {"id":"evt_11f160d9c001b0L2IZGWZ8GjF1","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"role":"user","time":{"created":1791522900387},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"},"summary":{"diffs":[]},"id":"msg_11f1609a2001u8e5ClKV2wWJq5","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}}
+
+data: {"id":"evt_11f160d9f001w01T9SGd6799zJ","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160dad001uVxxOtUxqXQDea","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160dad0018cdHIaW4YZA9eG","messageID":"msg_11f160d8e001EpHg36jvR0WmZX","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"step-start"},"time":1791522901421}}
+
+data: {"id":"evt_11f160daf001bwx5MkTB1nRV7v","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160daf001qVuJzcKEfPPDu1","messageID":"msg_11f160d8e001EpHg36jvR0WmZX","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"reasoning","text":"","time":{"start":1791522901423}},"time":1791522901423}}
+
+data: {"id":"evt_11f160db100113BZ3AWbbWDdb4","type":"message.part.delta","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160d8e001EpHg36jvR0WmZX","partID":"prt_11f160daf001qVuJzcKEfPPDu1","field":"text","delta":"Both lines printed. Check that the missing directory really is missing."}}
+
+data: {"id":"evt_11f160db1002Rlgj5d6HxlwZDq","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160daf001qVuJzcKEfPPDu1","messageID":"msg_11f160d8e001EpHg36jvR0WmZX","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"reasoning","text":"Both lines printed. Check that the missing directory really is missing.","time":{"start":1791522901423,"end":1791522901425}},"time":1791522901425}}
+
+data: {"id":"evt_11f160db2001sdGD6K9W8htgNZ","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160db2001HsuobYD1jJTVgO","messageID":"msg_11f160d8e001EpHg36jvR0WmZX","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"tool","tool":"bash","callID":"call_1","state":{"status":"pending","input":{},"raw":""}},"time":1791522901426}}
+
+data: {"id":"evt_11f160db6001n6Hn8QtvED3DuE","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"bash","callID":"call_1","state":{"metadata":{"output":""},"status":"running","input":{"command":"ls /nonexistent-conduit-probe","description":"List a missing directory"},"time":{"start":1791522901430}},"id":"prt_11f160db2001HsuobYD1jJTVgO","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160d8e001EpHg36jvR0WmZX"},"time":1791522901430}}
+
+data: {"id":"evt_11f160db8001XxxRfexyu150Kq","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"bash","callID":"call_1","state":{"metadata":{"output":""},"status":"running","input":{"command":"ls /nonexistent-conduit-probe","description":"List a missing directory"},"time":{"start":1791522901430}},"id":"prt_11f160db2001HsuobYD1jJTVgO","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160d8e001EpHg36jvR0WmZX"},"time":1791522901432}}
+
+data: {"id":"evt_11f160dc2001Ny5Wzwy6ssxalG","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"bash","callID":"call_1","state":{"metadata":{"output":"ls: cannot access '/nonexistent-conduit-probe': No such file or directory\n"},"status":"running","input":{"command":"ls /nonexistent-conduit-probe","description":"List a missing directory"},"time":{"start":1791522901430}},"id":"prt_11f160db2001HsuobYD1jJTVgO","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160d8e001EpHg36jvR0WmZX"},"time":1791522901442}}
+
+data: {"id":"evt_11f160dc5001GnXWvjRcaRrAWl","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"bash","callID":"call_1","state":{"status":"completed","input":{"command":"ls /nonexistent-conduit-probe","description":"List a missing directory"},"output":"ls: cannot access '/nonexistent-conduit-probe': No such file or directory\n","metadata":{"output":"ls: cannot access '/nonexistent-conduit-probe': No such file or directory\n","exit":2,"truncated":false},"title":"ls /nonexistent-conduit-probe","time":{"start":1791522901430,"end":1791522901445}},"id":"prt_11f160db2001HsuobYD1jJTVgO","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160d8e001EpHg36jvR0WmZX"},"time":1791522901445}}
+
+data: {"id":"evt_11f160dc7001PeWRMHQgAe50DG","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160dc7001Q5wsHfo0ZCtroh","reason":"tool-calls","messageID":"msg_11f160d8e001EpHg36jvR0WmZX","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"step-finish","tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0},"time":1791522901447}}
+
+data: {"id":"evt_11f160dc9001sQPEAxLD5Xv5b4","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160d8e001EpHg36jvR0WmZX","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901390,"completed":1791522901450},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","finish":"tool-calls"}}}
+
+data: {"id":"evt_11f160dca0017hjBmUlE6sKY5J","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160d8e001EpHg36jvR0WmZX","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901390,"completed":1791522901450},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","finish":"tool-calls"}}}
+
+data: {"id":"evt_11f160dcb001vMALeafuuc4aRZ","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160dcc001Zg6soP8MU9eNDA","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160dcc001oulEToMxzBSwts","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901452},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}}
+
+data: {"id":"evt_11f160dd0001SNaDIJVXGtidgu","type":"session.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"Probe run","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":2,"output":2,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522901455}}}}
+
+data: {"id":"evt_11f160dd1001HoZu82JMvbGdRV","type":"session.diff","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","diff":[]}}
+
+data: {"id":"evt_11f160dd2001VXgSW0iYpjB9lg","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"role":"user","time":{"created":1791522900387},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"},"summary":{"diffs":[]},"id":"msg_11f1609a2001u8e5ClKV2wWJq5","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}}
+
+data: {"id":"evt_11f160df40010yv4eeLZNz7NU6","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160e000011NnYTjTIk1802F","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e00001PSNC3AOSnCR5iP","messageID":"msg_11f160dcc001oulEToMxzBSwts","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"step-start"},"time":1791522901504}}
+
+data: {"id":"evt_11f160e03001fZBLolMwhlUyry","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e03001IpeiivexNVAumx","messageID":"msg_11f160dcc001oulEToMxzBSwts","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"reasoning","text":"","time":{"start":1791522901507}},"time":1791522901507}}
+
+data: {"id":"evt_11f160e04001M98Nqf1PtNmNkM","type":"message.part.delta","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160dcc001oulEToMxzBSwts","partID":"prt_11f160e03001IpeiivexNVAumx","field":"text","delta":"The listing failed as expected. Try reading a missing file."}}
+
+data: {"id":"evt_11f160e05001HgD1cESsNyUozv","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e03001IpeiivexNVAumx","messageID":"msg_11f160dcc001oulEToMxzBSwts","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"reasoning","text":"The listing failed as expected. Try reading a missing file.","time":{"start":1791522901507,"end":1791522901508}},"time":1791522901508}}
+
+data: {"id":"evt_11f160e06001ogLfl84A3PSsVi","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e060010Ijri0j519vTcZ","messageID":"msg_11f160dcc001oulEToMxzBSwts","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"tool","tool":"read","callID":"call_2","state":{"status":"pending","input":{},"raw":""}},"time":1791522901510}}
+
+data: {"id":"evt_11f160e0a001udG6GpblzAW1iF","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"read","callID":"call_2","state":{"status":"running","input":{"filePath":"/tmp/proj/missing-notes.txt"},"time":{"start":1791522901514}},"id":"prt_11f160e060010Ijri0j519vTcZ","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160dcc001oulEToMxzBSwts"},"time":1791522901514}}
+
+data: {"id":"evt_11f160e10001mmiTqBp30GPkeR","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"type":"tool","tool":"read","callID":"call_2","state":{"status":"error","input":{"filePath":"/tmp/proj/missing-notes.txt"},"error":"File not found: /tmp/proj/missing-notes.txt","time":{"start":1791522901514,"end":1791522901519}},"id":"prt_11f160e060010Ijri0j519vTcZ","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160dcc001oulEToMxzBSwts"},"time":1791522901520}}
+
+data: {"id":"evt_11f160e12001A09FO2CLoX2AM2","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e11001Z4v0NY81i8GTw5","reason":"tool-calls","messageID":"msg_11f160dcc001oulEToMxzBSwts","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"step-finish","tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0},"time":1791522901522}}
+
+data: {"id":"evt_11f160e13001auNZv5biZKT7DV","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160dcc001oulEToMxzBSwts","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901452,"completed":1791522901525},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","finish":"tool-calls"}}}
+
+data: {"id":"evt_11f160e15001aajUYzE4xWK2PM","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160dcc001oulEToMxzBSwts","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901452,"completed":1791522901525},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","finish":"tool-calls"}}}
+
+data: {"id":"evt_11f160e16001ZUINR6SfRHWb0g","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160e17001w6koI1n8Gdmft6","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160e17001COajXZjsOd162y","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901527},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}}
+
+data: {"id":"evt_11f160e1b001GCaJ13iwi4saDN","type":"session.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"Probe run","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":3,"output":3,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522901531}}}}
+
+data: {"id":"evt_11f160e1d001VUmWvcapom8iUK","type":"session.diff","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","diff":[]}}
+
+data: {"id":"evt_11f160e1e001sS0zVxzv8wDl5b","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"role":"user","time":{"created":1791522900387},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"},"summary":{"diffs":[]},"id":"msg_11f1609a2001u8e5ClKV2wWJq5","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}}
+
+data: {"id":"evt_11f160e29001pXMIMHzhXs98QO","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160e2f001uQWu2sAmSsn51V","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e2f0011IxGoYiovKv1li","messageID":"msg_11f160e17001COajXZjsOd162y","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"step-start"},"time":1791522901551}}
+
+data: {"id":"evt_11f160e31001iELnWJ32Th3KlS","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e300018jsD4TE84QDQM9","messageID":"msg_11f160e17001COajXZjsOd162y","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"reasoning","text":"","time":{"start":1791522901553}},"time":1791522901553}}
+
+data: {"id":"evt_11f160e32001W5pdG31RXEO9aF","type":"message.part.delta","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160e17001COajXZjsOd162y","partID":"prt_11f160e300018jsD4TE84QDQM9","field":"text","delta":"Everything I need is here; summarise."}}
+
+data: {"id":"evt_11f160e320020avDhpBbKAk2U8","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e300018jsD4TE84QDQM9","messageID":"msg_11f160e17001COajXZjsOd162y","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"reasoning","text":"Everything I need is here; summarise.","time":{"start":1791522901553,"end":1791522901554}},"time":1791522901554}}
+
+data: {"id":"evt_11f160e34001ii3ZIFr3UpwjZf","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e33001KRL1C5dT3JGQAS","messageID":"msg_11f160e17001COajXZjsOd162y","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"text","text":"","time":{"start":1791522901555}},"time":1791522901556}}
+
+data: {"id":"evt_11f160e35001ey6FxjCTcI2oDT","type":"message.part.delta","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","messageID":"msg_11f160e17001COajXZjsOd162y","partID":"prt_11f160e33001KRL1C5dT3JGQAS","field":"text","delta":"The probe printed two lines; the directory and the file are missing."}}
+
+data: {"id":"evt_11f160e35002kyuvDnUv9qFdcG","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e33001KRL1C5dT3JGQAS","messageID":"msg_11f160e17001COajXZjsOd162y","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"text","text":"The probe printed two lines; the directory and the file are missing.","time":{"start":1791522901555,"end":1791522901557}},"time":1791522901557}}
+
+data: {"id":"evt_11f160e36001abKl0jcf0Ko2ra","type":"message.part.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","part":{"id":"prt_11f160e36001z4XkZK9TQo1By6","reason":"stop","messageID":"msg_11f160e17001COajXZjsOd162y","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","type":"step-finish","tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0},"time":1791522901558}}
+
+data: {"id":"evt_11f160e37001owaJHvgPOUnAbc","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160e17001COajXZjsOd162y","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901527,"completed":1791522901561},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","finish":"stop"}}}
+
+data: {"id":"evt_11f160e39001F503Fj8WflhOzx","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"msg_11f160e17001COajXZjsOd162y","parentID":"msg_11f1609a2001u8e5ClKV2wWJq5","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/proj","root":"/"},"cost":0,"tokens":{"total":2,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":0}},"modelID":"conduit-mock","providerID":"conduit","time":{"created":1791522901527,"completed":1791522901561},"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","finish":"stop"}}}
+
+data: {"id":"evt_11f160e3a001U3da6RUYS2nUEA","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"busy"}}}
+
+data: {"id":"evt_11f160e3c001LKBGgD2f8Unl5M","type":"session.status","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","status":{"type":"idle"}}}
+
+data: {"id":"evt_11f160e3c002b04SBm9eWAioBf","type":"session.idle","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}
+
+data: {"id":"evt_11f160e3d0011jlx47ohDdhbeY","type":"session.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"id":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","slug":"gentle-pixel","projectID":"global","directory":"/tmp/proj","path":"tmp/proj","title":"Probe run","agent":"build","model":{"id":"conduit-mock","providerID":"conduit","variant":"default"},"version":"1.18.35","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":4,"output":4,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1791522900353,"updated":1791522901564}}}}
+
+data: {"id":"evt_11f160e3e001OgS3VYxWDHIY5C","type":"session.diff","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","diff":[]}}
+
+data: {"id":"evt_11f160e3e002cPdtNETV5tUcbH","type":"message.updated","properties":{"sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy","info":{"role":"user","time":{"created":1791522900387},"agent":"build","model":{"providerID":"conduit","modelID":"conduit-mock"},"summary":{"diffs":[]},"id":"msg_11f1609a2001u8e5ClKV2wWJq5","sessionID":"ses_ee0e9f67fffe7bLN1gYE0qrSXy"}}}
+
