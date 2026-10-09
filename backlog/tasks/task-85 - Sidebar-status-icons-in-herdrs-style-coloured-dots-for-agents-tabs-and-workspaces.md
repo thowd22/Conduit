@@ -3,9 +3,11 @@ id: TASK-85
 title: >-
   Sidebar status icons in herdr's style: coloured dots for agents, tabs and
   workspaces
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@opus-5.5'
 created_date: '2026-10-09 04:52'
+updated_date: '2026-10-09 05:09'
 labels:
   - agents
   - ui
@@ -32,3 +34,28 @@ The user compared Conduit with herdr (picture: herdr.png in the repo root, untra
 - [ ] #5 The deterministic --agent-test and the agent-notifications scenario pass with the new icons in both styles (the style switched through the settings file during the check), and a 640x360 screenshot showing working, blocked, done, errored and idle icons in colour was inspected
 - [ ] #6 docs/user-guide.md and docs/agents.md describe the icons, the colours and the setting; AGENTS.md records the change
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. config: sidebar.status_icons = dots|symbols (config.StatusIcons, default dots), parse/checkValue/copy/defaults document, unit test.
+2. app_agents: statusIcon(style, state) with herdr's two tables (errored × in both) and statusRole(state) -> theme.Role (yellow/red/cyan/green/danger); formatAgentRow takes the style; unit tests pin both tables and the colours.
+3. ui: InteractiveText lead_foreground/lead_bytes so only the leading icon takes the state colour over every state style; unit test.
+4. font_sprite: draw U+25D0 (◐) procedurally because the bundled JetBrains Mono lacks it (○ ● × ✓ are in the face).
+5. main: sidebar workspace/tab/agent rows lead with statusIcon in statusRole; agent row text back to .foreground (agentRowRole removed); settings view Agents group cycling row; semantic ids unchanged.
+6. --agent-test: new icons, overlay colour checks per state, symbols by settings file, bad value, symbols through the screen-state checks, settings-view row by keyboard. agent-notifications scenario: settings row clicked to symbols plus screenshot.
+7. Docs: config.md, user-guide.md, agents.md. Verify with zig build test, --agent-test, --settings-test, --config-test, a five-state 640x360 screenshot in both styles, and zig build e2e.
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented on branch worktree-agent-a7855d3c9c23f3826 (commits 18465ce, eca4209, f1b6b9c).
+- config.StatusIcons (dots|symbols, built-in dots), key sidebar.status_icons: parse, checkValue (`expected \`dots\` or \`symbols\``), copy, defaults document, unit test incl. bad value keeping the previous one.
+- app_agents.statusIcon(style,state) and statusRole(state); unit tests pin both icon tables and the colour table. formatAgentRow takes the style.
+- ui.InteractiveText.lead_foreground/lead_bytes: the leading icon keeps its colour over normal/hovered/focused styles; unit test. Touched src/ui.zig (not in the owned list; additive only).
+- font_sprite draws U+25D0 ◐ (JetBrains Mono has ○ ● × ✓ but not ◐; fc-query charset checked); unit test. Touched src/font_sprite.zig.
+- main.zig: workspace/tab/agent rows lead with the icon in its role; agentRowRole removed (agent row text is .foreground); settings Agents group gets a cycling sidebar.status_icons row; ids unchanged.
+- Unchanged on purpose (out of scope): stateGlyph still feeds the agent manager rows, Agent: stop/focus choices, the prompts heading and the backlog card badge, so those still show · ▸ ? ! ✓ ×.
+Evidence: zig fmt --check clean; zig build ok; zig build test 1043/1067 passed, 22 skipped, 2 failed: platform driver-transport tests fail with EndpointTooLong because testing.tmpDir under this worktree's .zig-cache makes a 111-byte Unix socket path (environmental, platform.zig untouched). xvfb --agent-test exit 0 (67 ok, 0 FAIL) incl. per-state overlay colour checks in dots, symbols by settings file, bad value as config.error, the screen-state checks in symbols, and the settings-view row by keyboard. --settings-test (40 ok) and --config-test (25 ok) exit 0. zig build e2e (artifact dir /tmp/claude-1000/c85e2e, short path for the socket limit): 22 passed, 0 failed; agent-notifications now clicks the settings row to symbols and its last frame shows cyan ✓ icons. 640x360 conduit-test screenshots with five fake agents (errored, done, permission, working, idle) inspected in both styles: dots red/cyan/red/yellow ●, green ○, red ×; symbols ×, ✓, ×, ◐, ○ in the same colours, row text uncoloured.
+<!-- SECTION:NOTES:END -->
