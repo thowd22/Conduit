@@ -1,0 +1,30 @@
+
+     All done.
+
+     ▣  Build · Conduit mock · 16.1s
+
+  ┃
+  ┃  please fail
+  ┃
+
+  ┃
+  ┃  mock refused this request
+  ┃
+
+  ┃
+  ┃  try again
+  ┃
+
+  ┃
+  ┃  Cannot connect to API: Unable to connect. Is the computer able to access the url?
+  ┃
+
+     ▣  Build · Conduit mock
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Conduit mock Conduit mock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /tmp/proj                                                                    2  ctrl+p commands
+

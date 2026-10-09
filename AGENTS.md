@@ -1197,9 +1197,10 @@ a region of the last N (≤ 32) non-blank rows; manifests are compile-time data 
 `validate`, matching allocates nothing, and `classify` ranks permission > working > errored >
 input. Each adapter publishes `screen_manifest` (`agent.screenManifest(harness)`; the fake has
 `agent.fake_screen_manifest`): Claude Code 2.1.292, Codex 0.160.1 and Pi 0.73.1 were captured at
-100x30 against local API stand-ins and are pinned by scrubbed fixtures
-(`src/agent/{claude_code/fixtures,codex/fixtures,pi/testdata}/screen-*.txt`); OpenCode's strings
-come from herdr's manifest, are unverified, and it has no error or input patterns. `Heuristics`
+100x30 against local API stand-ins, OpenCode 1.18.35 inside the `conduit-opencode-check`
+container against its fixed model, and all are pinned by scrubbed fixtures
+(`src/agent/{claude_code/fixtures,codex/fixtures,opencode/fixtures,pi/testdata}/screen-*.txt`);
+an OpenCode provider error is only a red block and reads as input. `Heuristics`
 ticks carry an optional screen (`wantsScreen`, only with a manifest and while working or after a
 redraw): after 1 s of quiet the screen names input or errored, a permission prompt wins at once
 even during output (Pi's spinner keeps running behind its confirm), a state the screen named
@@ -1215,7 +1216,7 @@ approval, an error and a spinner burst, and the checks follow its row through `?
 `· fake idle` that arrives no sooner than the debounce allows. A real Claude Code 2.1.292 started
 by hand in a driven Conduit, against a local Messages API stand-in with no account, showed
 `? claude input`, `! claude permission` at its Bash approval, `? claude input` after it and
-`✓ claude done` after `/exit`, all from the screen. omp, OpenCode and macOS/Windows screens are
+`✓ claude done` after `/exit`, all from the screen. omp and macOS/Windows screens are
 uncaptured.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`

@@ -189,13 +189,14 @@ working, then error, then input:
 | Claude Code | 2.1.292 | `Do you want to proceed?` or `Do you want to … 1. Yes` with `Esc to cancel` | `esc to interrupt` footer | `● API Error:` row | `❯` prompt row |
 | Codex | 0.160.1 | `Press enter to confirm or esc to cancel`, `Would you like to run the following command?` | `esc to interrupt` | `■` row | `›` composer row |
 | Pi | 0.73.1 | an extension's confirm (`→ Yes`/`→ No` over `enter select`) | `Working...`, `Retrying (` | `Error:` row | the editor rule over the `%/` context footer |
-| OpenCode | not captured | `△ Permission required`, `enter confirm` + `esc dismiss` | `esc interrupt` | none | none |
+| OpenCode | 1.18.35 | `△ Permission required`; `Allow once` + `enter confirm` | `esc interrupt`, `[retrying` | `Cannot connect to API:` | `ctrl+p commands` footer |
 
 The Claude Code, Codex and Pi screens were captured on Linux at 100x30 against local stand-ins
-for their model APIs (no account) and are checked in as scrubbed fixtures beside each adapter.
-OpenCode is not installed where this was written: its strings are the ones herdr's manifest
-relies on and are unverified, and it has no error or input patterns, so those fall back to the
-baseline.
+for their model APIs (no account), OpenCode's inside the `conduit-opencode-check` container
+against its fixed local model, and all are checked in as scrubbed fixtures beside each adapter.
+An error OpenCode's provider returns (an HTTP 400, say) is drawn only as its message in a red
+block, which text alone cannot tell apart, so that screen reads as input; only a request that
+cannot reach the model at all reads as errored.
 
 The rules, borrowed from herdr's design: output is the authority for working, and the screen
 names the quiet states once the terminal has been silent for 1 s (`? input`, `× errored`). A
@@ -217,7 +218,7 @@ no session registry to attach to, so every state came from the screen.
 
 Limits: patterns are literals, so a harness release that rewords its TUI needs a manifest update;
 a harness's own output that happens to contain a pattern (an error line quoted in a reply) can
-misclassify a quiet screen until the next redraw; and omp, OpenCode and Windows/macOS terminals
+misclassify a quiet screen until the next redraw; and omp and Windows/macOS terminals
 have not been captured.
 
 The work is tracked as TASK-52 (adapter interface), TASK-53 to TASK-55 (Claude Code, Codex and Pi

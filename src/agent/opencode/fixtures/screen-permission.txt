@@ -1,0 +1,30 @@
+
+  ┃
+  ┃  run the probe
+  ┃
+
+     $ echo conduit-live
+
+     ▣  Build · Conduit mock
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃  △ Permission required
+  ┃    # Shell command
+  ┃
+  ┃  $ echo conduit-live
+  ┃
+  ┃
+  ┃   Allow once   Allow always   Reject             ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃
+

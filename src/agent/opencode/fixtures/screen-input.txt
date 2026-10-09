@@ -1,0 +1,30 @@
+
+  ┃
+  ┃  run the probe
+  ┃
+
+  ┃
+  ┃  $ echo conduit-live
+  ┃
+  ┃  conduit-live
+  ┃
+
+     All done.
+
+     ▣  Build · Conduit mock · 16.1s
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Conduit mock Conduit mock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /tmp/proj                                                                    2  ctrl+p commands
+

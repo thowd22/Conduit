@@ -2775,24 +2775,34 @@ test "live: a real opencode serve, when installed" {
 // Screen manifest (TASK-84) ----------------------------------------------------
 
 /// What OpenCode's TUI shows, for a hand-started `opencode` whose server
-/// Conduit cannot reach and for remote OpenCode agents. Not captured:
-/// OpenCode is not installed on the machine this was written on, so these
-/// are the TUI strings herdr's OpenCode manifest (2026.06.10) relies on, for
-/// OpenCode 1.x: the `△ Permission required` dialog with its `enter
-/// confirm`/`esc dismiss` hints, and the `esc interrupt` hint while a turn
-/// runs. Its idle prompt and error rendering are not documented anywhere
-/// this could check, so those classes stay empty and OpenCode falls back to
-/// the PTY baseline (quiet is idle) for them.
+/// Conduit cannot reach and for remote OpenCode agents. Captured from
+/// OpenCode 1.18.35 at 100x30 inside the `conduit-opencode-check` container
+/// (`scripts/opencode-container-check.sh`) against its fixed local model
+/// with `permission.bash = "ask"` (`src/agent/opencode/fixtures/screen-*.txt`).
+/// A running turn keeps `esc interrupt` in the footer under the prompt box
+/// (and `[retrying attempt #n]` while it retries); a tool approval is the
+/// `△ Permission required` panel over `Allow once   Allow always   Reject`
+/// and `enter confirm`; the idle footer ends in `ctrl+p commands`; and a
+/// request that cannot reach the model ends as `Cannot connect to API: …`.
+/// An error the provider itself returns (an HTTP 400) is drawn only as its
+/// message in a red block, which no literal can tell from text, so that
+/// screen reads as the idle prompt (`screen-errored-provider.txt`).
 pub const screen_manifest: agent_screen.ScreenManifest = blk: {
     const m: agent_screen.ScreenManifest = .{
-        .captured_from = "OpenCode 1.x strings via herdr (unverified)",
+        .captured_from = "OpenCode 1.18.35",
         .permission = &.{
-            .{ .all = &.{"\u{25b3} permission required"}, .rows = 20 },
-            .{ .all = &.{ "esc dismiss", "enter confirm" }, .rows = 12 },
+            .{ .all = &.{"\u{25b3} permission required"}, .rows = 12 },
+            .{ .all = &.{ "allow once", "enter confirm" }, .rows = 4 },
         },
         .working = &.{
-            .{ .all = &.{"esc interrupt"}, .rows = 8 },
-            .{ .all = &.{"esc to interrupt"}, .rows = 8 },
+            .{ .all = &.{"esc interrupt"}, .rows = 3 },
+            .{ .all = &.{"[retrying"}, .rows = 3 },
+        },
+        .errored = &.{
+            .{ .all = &.{"cannot connect to api:"}, .rows = 12 },
+        },
+        .input = &.{
+            .{ .all = &.{"ctrl+p commands"}, .rows = 2 },
         },
     };
     m.validate();
@@ -2801,9 +2811,15 @@ pub const screen_manifest: agent_screen.ScreenManifest = blk: {
 
 const agent_screen = @import("screen.zig");
 
-test "the screen manifest classifies OpenCode's documented strings" {
+test "the screen manifest classifies screens recorded from OpenCode 1.18.35" {
     const m = &screen_manifest;
-    try testing.expectEqual(agent_screen.Class.permission, m.classify("  \u{25b3} Permission required\n  bash: make clean\n  Allow once   Allow always   Reject\n  enter confirm  esc dismiss"));
-    try testing.expectEqual(agent_screen.Class.working, m.classify("\u{2503} fix the tests\n\n  \u{25a0}\u{25a0}\u{25a0}\u{2b1d}  esc interrupt"));
-    try testing.expectEqual(agent_screen.Class.none, m.classify("\u{2503} fix the tests\n  tab agents  ctrl+p commands"));
+    try testing.expectEqual(agent_screen.Class.input, m.classify(@embedFile("opencode/fixtures/screen-input-home.txt")));
+    try testing.expectEqual(agent_screen.Class.input, m.classify(@embedFile("opencode/fixtures/screen-input.txt")));
+    try testing.expectEqual(agent_screen.Class.working, m.classify(@embedFile("opencode/fixtures/screen-working.txt")));
+    try testing.expectEqual(agent_screen.Class.permission, m.classify(@embedFile("opencode/fixtures/screen-permission.txt")));
+    try testing.expectEqual(agent_screen.Class.errored, m.classify(@embedFile("opencode/fixtures/screen-errored.txt")));
+    // The known gap: a provider's own error is only a coloured block.
+    try testing.expectEqual(agent_screen.Class.input, m.classify(@embedFile("opencode/fixtures/screen-errored-provider.txt")));
+    // While it retries, the connection error in the footer is still work.
+    try testing.expectEqual(agent_screen.Class.working, m.classify("  \u{2503}  try again\n\n   \u{2b1d}\u{2b1d}\u{2b1d}Cannot connect to API: Unable to connect. [retrying\n        attempt #3]"));
 }
