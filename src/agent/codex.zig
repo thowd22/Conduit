@@ -159,9 +159,15 @@ pub const Version = struct {
 /// and a recorded round trip).
 pub const tested_min: Version = .{ .major = 0, .minor = 160, .patch = 0 };
 /// The first version not accepted. 0.161.x is admitted because the user's
-/// daemon runs 0.161.0 and every name used here is in the stable surface, but
-/// its shapes were not re-recorded; anything newer is refused until verified.
-pub const tested_end: Version = .{ .major = 0, .minor = 162, .patch = 0 };
+/// daemon ran 0.161.0 and every name used here is in the stable surface, but
+/// its shapes were not re-recorded. 0.162.x is admitted because Codex's
+/// managed daemon updates itself to the latest release whatever the CLI's
+/// version (TASK-88 saw a 0.160.1 CLI's daemon become 0.162.0), every name in
+/// `protocol-0.160.1.txt` is still in 0.162.0's generated schema, and a
+/// hand-started 0.162.0 TUI's turn (reasoning, command results, an approval
+/// answered from the agent view) was followed live. Anything newer is refused
+/// until verified.
+pub const tested_end: Version = .{ .major = 0, .minor = 163, .patch = 0 };
 
 /// Bounds on the `codex --version` probe.
 const detect_max_output: usize = 4096;
@@ -2565,7 +2571,10 @@ test "versions are found in probe output and gated to the tested range" {
     try testing.expect(versionSupported(.{ .major = 0, .minor = 160, .patch = 1 }));
     try testing.expect(versionSupported(.{ .major = 0, .minor = 161, .patch = 9 }));
     try testing.expect(!versionSupported(.{ .major = 0, .minor = 159, .patch = 99 }));
-    try testing.expect(!versionSupported(.{ .major = 0, .minor = 162, .patch = 0 }));
+    // TASK-88: Codex's managed daemon updates itself to the latest release
+    // (0.162.0 on 2026-10-09), whatever the CLI's version.
+    try testing.expect(versionSupported(.{ .major = 0, .minor = 162, .patch = 0 }));
+    try testing.expect(!versionSupported(.{ .major = 0, .minor = 163, .patch = 0 }));
     try testing.expect(!versionSupported(.{ .major = 1, .minor = 0, .patch = 0 }));
 
     var stream: MemoryStream = .{ .allocator = testing.allocator };
