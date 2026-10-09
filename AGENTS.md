@@ -1223,7 +1223,8 @@ had pushed the Codex and OpenCode errored screens out of their bottom-rows windo
 gates on windows.yml (run 37874621552). omp and macOS/Windows harness screens are
 uncaptured.
 
-TASK-83 (open: its first criterion cannot be met from Conduit). A pseudoconsole parses the terminal's
+TASK-83 is complete, with its first criterion reworded to what was proven: both presses reach
+Claude Code, whose own exit then hangs on the runner with or without Conduit. A pseudoconsole parses the terminal's
 input back into console key events and drops Kitty `CSI 99;5u` reports, while it passes a program's
 `CSI > 1 u` through to the terminal, so a Kitty-encoded Ctrl+C never reached a console program (a
 `[Console]::ReadKey` reader got none, run 37865506186). The ConPTY backend now writes a Kitty Ctrl+C
@@ -1237,7 +1238,8 @@ starts its exit and it writes its terminal-mode resets), but its exit never fini
 under a bare pseudoconsole with no terminal behind it, and in a classic console window fed key events
 with `WriteConsoleInputW`, with Enter or a third Ctrl+C changing nothing (run 37869071981). Raw-mode
 Node 22 and Bun 1.4.2 programs typed into Conduit exit on the second press. The observe step therefore
-keeps its taskkill fallback and warning.
+keeps its taskkill fallback and warning until a Claude Code release exits cleanly there. Pasted
+text cannot trigger the rewrite, because `preparePaste` rejects every control byte before the PTY.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`

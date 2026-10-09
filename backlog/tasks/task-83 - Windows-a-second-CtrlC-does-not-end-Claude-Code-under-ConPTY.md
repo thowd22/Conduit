@@ -1,11 +1,11 @@
 ---
 id: TASK-83
 title: 'Windows: a second Ctrl+C does not end Claude Code under ConPTY'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-08 22:04'
-updated_date: '2026-10-09 01:45'
+updated_date: '2026-10-09 02:49'
 labels:
   - windows
   - input
@@ -25,7 +25,7 @@ On the hosted Windows runner (TASK-81's windows-claude-observe.sh), Claude Code 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 On the hosted Windows runner the windows-claude-observe.sh step ends Claude Code with two Ctrl+C presses through the driver, with no taskkill fallback and no warning
+- [x] #1 On the hosted Windows runner both Ctrl+C presses sent through the driver reach Claude Code (the first shows its 'Press Ctrl-C again to exit' hint, the second starts its exit), proven by the windows-claude-observe.sh step; its taskkill fallback and warning stay because Claude Code 2.1.295's own shutdown hangs on that image with or without Conduit
 - [x] #2 A ConPTY unit test proves two consecutive Ctrl+C presses reach a console program as two events, in both the legacy and kitty keyboard encodings Conduit can emit
 <!-- AC:END -->
 
@@ -48,6 +48,8 @@ Run 37867442891: the new ConPTY test 'two Ctrl+C presses reach a Windows console
 Run 37869071981 (third and last diagnostic iteration): Claude Code 2.1.295 under a bare pseudoconsole (no terminal) writes its terminal-mode resets (CSI > 4m, ?2031l, ?2004l, mouse off, cursor show) after the second Ctrl+C and then never exits; Enter and a third Ctrl+C change nothing. In a classic console window (Start-Process, no ConPTY) two Ctrl+C key events written with WriteConsoleInputW also leave it running 15 s later. Inside Conduit: hint shown and cleared after one press, double press leaves it with flat CPU and an Executive-wait thread; Enter and a third press do nothing. Conclusion: both presses reach Claude Code; its own shutdown hangs on this Windows runner independent of Conduit and of ConPTY. Per the stop rule the taskkill fallback and warning stay in windows-claude-observe.sh (comment and warning text now say why). AC2 is met: the ConPTY test 'two Ctrl+C presses reach a Windows console program as two key events, legacy and Kitty' passed on windows-latest in runs 37867442891 and 37869071981; Linux: 'every Ctrl+C the encoder can produce reaches a pseudoconsole as Ctrl+C' (term) and 'a Kitty Ctrl+C report is found for the pseudoconsole, and nothing else is' (pty) pass. AC1 is not met and cannot be met from Conduit; it needs a Claude Code fix or a decision to drop or reword it.
 
 Cleaned branch, run 37870374778 (success): both new pty tests OK on windows-latest; the observe step still gates idle/done and ends Claude Code with taskkill plus the reworded warning.
+
+2026-10-09 (coordinator): the user chose to reword criterion 1 rather than wait for an upstream Claude Code fix. The original wording (the observe step ends Claude Code with two Ctrl+C presses, no taskkill, no warning) cannot be met from Conduit: runs 37867442891 and 37869071981 show both presses arriving and Claude Code 2.1.295 hanging in its own exit under a bare pseudoconsole and in a classic console with no Conduit involved. Criterion 1 now records what was proven; the taskkill fallback stays until Claude Code exits cleanly on Windows. Pasted text cannot trigger the Kitty rewrite: term.preparePaste rejects every control byte, including ESC, before the PTY sees it.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -59,3 +61,9 @@ created: 2026-10-09 01:33
 AC1 blocked: Claude Code's exit hangs after the second Ctrl+C on the Windows runner even outside Conduit (bare ConPTY, classic console). Needs a decision: wait for an upstream fix, reword AC1, or close.
 ---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+ConPTY drops Kitty-encoded key reports, so a Kitty Ctrl+C never reached a console program; the ConPTY backend now writes a Kitty Ctrl+C press or repeat as 0x03 (pty.conPtyInput) and every other key as encoded. Verified by the Windows ConPTY test (two presses, legacy and Kitty, runs 37867442891, 37869071981, 37870374778), a term test over all 32 Kitty flag sets, and the gated observe step. Both presses reach Claude Code on the runner; its exit hang is upstream (reproduced without Conduit), so the observe step keeps taskkill with a warning.
+<!-- SECTION:FINAL_SUMMARY:END -->
