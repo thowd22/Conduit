@@ -1012,9 +1012,11 @@ const max_calls = 8;
 const max_approvals = 8;
 const max_loaded_threads = 64;
 /// The most events one received message converts into (a file change with
-/// many paths is cut to this many references).
+/// many paths is cut to `max_file_references`, leaving room for its result).
 const max_events_per_message = 10;
-const max_file_references = max_events_per_message - 1;
+const max_file_references = max_events_per_message - 2;
+/// The longest tool result summary kept, matching the other adapters.
+const max_result_bytes = 512;
 
 const ApprovalKind = enum { command, file_change, permissions, legacy_exec, legacy_patch };
 
@@ -1708,12 +1710,25 @@ pub const CodexAdapter = struct {
                     const text = try joinTextParts(arena, array(field(item, "content")), "text");
                     self.emit(.{ .message = .{ .role = .user, .text = text } });
                 } else if (eq(u8, kind, "fileChange")) {
+                    const changes = array(field(item, "changes"));
                     var count: usize = 0;
-                    for (array(field(item, "changes"))) |change| {
+                    for (changes) |change| {
                         if (count == max_file_references) break;
                         const path = string(field(change, "path")) orelse continue;
                         self.emit(.{ .file_reference = .{ .path = path } });
                         count += 1;
+                    }
+                    self.emit(.{ .tool_result = try fileChangeResult(arena, item, changes) });
+                } else if (eq(u8, kind, "commandExecution")) {
+                    self.emit(.{ .tool_result = try commandResult(arena, item) });
+                } else if (eq(u8, kind, "reasoning")) {
+                    // The summary Codex shows; raw reasoning text only when
+                    // the model sent no summary.
+                    var text = try joinStrings(arena, array(field(item, "summary")));
+                    if (text.len == 0) text = try joinStrings(arena, array(field(item, "content")));
+                    if (text.len != 0) {
+                        const kept = event.truncateUtf8(text, event.stored_text_capacity);
+                        self.emit(.{ .reasoning = .{ .text = kept, .truncated = kept.len != text.len } });
                     }
                 } else if (eq(u8, kind, "imageView")) {
                     if (string(field(item, "path"))) |path| self.emit(.{ .file_reference = .{ .path = path } });
@@ -1728,8 +1743,8 @@ pub const CodexAdapter = struct {
                     const id = string(field(item, "agentThreadId")) orelse return;
                     self.emit(.{ .subagent = .{ .id = id, .name = string(field(item, "agentPath")) orelse "", .phase = phase_ } });
                 }
-                // Reasoning, plans and command results are not transcript
-                // events; the rollout keeps them.
+                // Plans and other item kinds are not transcript events; the
+                // rollout keeps them.
             },
         }
     }
@@ -2086,6 +2101,78 @@ fn array(value: ?Value) []const Value {
     };
 }
 
+/// Join an array of strings with newlines, skipping anything else.
+fn joinStrings(allocator: Allocator, values: []const Value) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (values) |value| {
+        const text = string(value) orelse continue;
+        if (text.len == 0) continue;
+        if (out.items.len != 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, text);
+    }
+    return out.items;
+}
+
+/// A completed `commandExecution` item's result: the first line of its
+/// output, after `exit N:` when the exit status is not zero. A `failed` or
+/// `declined` status, or a non-zero exit, marks it failed.
+fn commandResult(arena: Allocator, item: Value) Allocator.Error!event.ToolResult {
+    const status = string(field(item, "status")) orelse "";
+    const exit_code: ?i64 = switch (field(item, "exitCode") orelse Value.null) {
+        .integer => |code| code,
+        else => null,
+    };
+    const declined = std.mem.eql(u8, status, "declined");
+    const failed = declined or std.mem.eql(u8, status, "failed") or (exit_code != null and exit_code.? != 0);
+    const output = event.summaryLine(string(field(item, "aggregatedOutput")) orelse "", max_result_bytes);
+    var summary = output.line;
+    if (declined) {
+        summary = "declined";
+    } else if (exit_code != null and exit_code.? != 0) {
+        summary = if (output.line.len == 0)
+            try std.fmt.allocPrint(arena, "exit {d}", .{exit_code.?})
+        else
+            try std.fmt.allocPrint(arena, "exit {d}: {s}", .{ exit_code.?, output.line });
+    }
+    return .{ .name = "commandExecution", .summary = summary, .failed = failed, .truncated = output.truncated };
+}
+
+/// A completed `fileChange` item's result: what changed, by Codex's own
+/// change kind and path, and whether the patch applied.
+fn fileChangeResult(arena: Allocator, item: Value, changes: []const Value) Allocator.Error!event.ToolResult {
+    const status = string(field(item, "status")) orelse "";
+    const failed = !std.mem.eql(u8, status, "completed");
+    if (changes.len == 0) return .{ .name = "fileChange", .summary = status, .failed = failed };
+    const kind = string(field(field(changes[0], "kind") orelse Value.null, "type")) orelse "change";
+    const path = string(field(changes[0], "path")) orelse "";
+    const summary = if (changes.len > 1)
+        try std.fmt.allocPrint(arena, "{s}{s} {s} {s} (+{d} more)", .{ if (failed) status else "", if (failed) ":" else "", kind, path, changes.len - 1 })
+    else
+        try std.fmt.allocPrint(arena, "{s}{s} {s} {s}", .{ if (failed) status else "", if (failed) ":" else "", kind, path });
+    return .{ .name = "fileChange", .summary = std.mem.trimStart(u8, summary, " "), .failed = failed };
+}
+
+/// A rollout tool output's result. Codex writes the shell's report as text:
+/// `Process exited with code N` (or `Exit code: N`) and the output after the
+/// last `Output:` line.
+fn rolloutOutputResult(text: []const u8) event.ToolResult {
+    var failed = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r");
+        for ([_][]const u8{ "Process exited with code ", "Exit code: " }) |prefix| {
+            if (std.mem.startsWith(u8, trimmed, prefix)) {
+                const code = std.fmt.parseInt(i64, trimmed[prefix.len..], 10) catch continue;
+                if (code != 0) failed = true;
+            }
+        }
+    }
+    const marker = "Output:\n";
+    const output = if (std.mem.lastIndexOf(u8, text, marker)) |at| text[at + marker.len ..] else text;
+    const summary = event.summaryLine(output, max_result_bytes);
+    return .{ .name = "", .summary = summary.line, .failed = failed, .truncated = summary.truncated };
+}
+
 fn rawJson(allocator: Allocator, value: Value) Allocator.Error![]const u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
@@ -2117,9 +2204,12 @@ fn joinTextParts(allocator: Allocator, parts: []const Value, part_type: []const 
 /// that is a single `<tag>...</tag>` block such as `<environment_context>` —
 /// and developer/system instructions are skipped); `function_call`,
 /// `custom_tool_call`, `local_shell_call` and `web_search_call` → `tool_use`;
+/// `function_call_output` and `custom_tool_call_output` → `tool_result`
+/// (TASK-87; the exit status and output are read from the text Codex
+/// writes); `reasoning` → `reasoning` (its summary texts);
 /// `event_msg` `task_started` → working, `task_complete` → done,
-/// `turn_aborted` → idle. Reasoning, tool outputs, token counts, turn context
-/// and compaction records are skipped. Approvals are not persisted in
+/// `turn_aborted` → idle. Token counts, turn context and compaction records
+/// are skipped. Approvals are not persisted in
 /// rollouts (doc-3), so a transcript never yields permission events; the
 /// app-server is their only source.
 ///
@@ -2270,6 +2360,16 @@ pub const RolloutReader = struct {
         if (eq(u8, kind, "web_search_call")) {
             const query = string(field(field(payload, "action") orelse Value.null, "query")) orelse "";
             return .{ .tool_use = .{ .name = "web_search", .summary = query } };
+        }
+        if (eq(u8, kind, "function_call_output") or eq(u8, kind, "custom_tool_call_output")) {
+            const output = string(field(payload, "output")) orelse return null;
+            return .{ .tool_result = rolloutOutputResult(output) };
+        }
+        if (eq(u8, kind, "reasoning")) {
+            const text = joinTextParts(arena, array(field(payload, "summary")), "summary_text") catch return null;
+            if (text.len == 0) return null;
+            const kept = event.truncateUtf8(text, event.stored_text_capacity);
+            return .{ .reasoning = .{ .text = kept, .truncated = kept.len != text.len } };
         }
         return null;
     }
@@ -2859,16 +2959,17 @@ test "every protocol name the adapter uses is in 0.160.1's generated schema" {
         "thread-item fileChange",                         "thread-item mcpToolCall",
         "thread-item dynamicToolCall",                    "thread-item collabAgentToolCall",
         "thread-item webSearch",                          "thread-item imageView",
-        "thread-item subAgentActivity",                   "command-decision accept",
-        "command-decision acceptForSession",              "command-decision acceptWithExecpolicyAmendment",
-        "command-decision applyNetworkPolicyAmendment",   "command-decision decline",
-        "command-decision cancel",                        "file-change-decision accept",
-        "file-change-decision acceptForSession",          "file-change-decision decline",
-        "file-change-decision cancel",                    "permission-grant-scope turn",
-        "permission-grant-scope session",                 "review-decision approved",
-        "review-decision approved_for_session",           "review-decision denied",
-        "review-decision abort",                          "subagent-activity started",
-        "subagent-activity completed",                    "subagent-activity interrupted",
+        "thread-item subAgentActivity",                   "thread-item reasoning",
+        "command-decision accept",                        "command-decision acceptForSession",
+        "command-decision acceptWithExecpolicyAmendment", "command-decision applyNetworkPolicyAmendment",
+        "command-decision decline",                       "command-decision cancel",
+        "file-change-decision accept",                    "file-change-decision acceptForSession",
+        "file-change-decision decline",                   "file-change-decision cancel",
+        "permission-grant-scope turn",                    "permission-grant-scope session",
+        "review-decision approved",                       "review-decision approved_for_session",
+        "review-decision denied",                         "review-decision abort",
+        "subagent-activity started",                      "subagent-activity completed",
+        "subagent-activity interrupted",
     };
     for (used) |name| {
         var lines = std.mem.splitScalar(u8, protocol, '\n');
@@ -2911,6 +3012,68 @@ test "attach runs the handshake and starts a thread for a headless agent" {
     try testing.expectError(error.Protocol, newer.attach(null));
     try testing.expect(!newer.codex.adapter().capabilities().structured_status);
     try testing.expectEqual(@as(usize, 1), newer.server.lines.items.len);
+}
+
+test "a recorded 0.160.1 turn yields reasoning summaries and command and file-change results" {
+    // Recorded from the real 0.160.1 app-server against a local Responses API
+    // stand-in whose every response carries a reasoning summary: a command
+    // printing two lines, a failing `ls`, and an apply_patch adding a file.
+    const allocator = testing.allocator;
+    const fixture = try readFixture(allocator, "app-server-reasoning-0.160.1.jsonl");
+    defer allocator.free(fixture);
+    const thread_result = "{\"thread\":{\"id\":\"01a11f0b-3213-7550-a739-1e5fece995a6\",\"cwd\":\"/work/proj\",\"status\":{\"type\":\"idle\"}}}";
+    const rig = try Rig.create(.stdio, &.{
+        .{ .method = "initialize", .json = default_init_result },
+        .{ .method = "thread/start", .json = thread_result },
+    });
+    defer rig.destroy();
+    try rig.attach(null);
+
+    var lines = std.mem.splitScalar(u8, fixture, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or std.mem.startsWith(u8, line, "{\"id\":") and std.mem.indexOf(u8, line, "\"result\"") != null) continue;
+        rig.feed(line);
+    }
+    const events = try rig.poll();
+    var reg = registry_mod.Registry.init(allocator);
+    defer reg.deinit();
+    const agent_id = try reg.create(.{
+        .binding = .{ .workspace = .first, .session = session.SessionId.fromOrdinal(1), .session_kind = .agent_terminal, .scratchpad = .first },
+        .harness = .codex,
+        .ownership = .owned,
+        .token = .fromBytes(@splat(9)),
+        .capabilities = rig.codex.adapter().capabilities(),
+    });
+    for (events) |*stored| _ = try reg.apply(agent_id, stored.event);
+
+    const Kind = event.Event.Kind;
+    const kinds = [_]Kind{
+        .status_change, .message, // turn started, the prompt
+        .reasoning, .tool_use, .tool_result, // printf
+        .reasoning, .tool_use, .tool_result, // ls of a missing directory
+        .reasoning, .tool_use, .file_reference, .tool_result, // apply_patch
+        .reasoning, .message, .status_change, // the answer, done
+    };
+    try testing.expectEqual(kinds.len, events.len);
+    for (kinds, events) |kind, stored| try testing.expectEqual(kind, std.meta.activeTag(stored.event));
+    try testing.expectEqualStrings("Run the probe first to see what it prints.", events[2].event.reasoning.text);
+    const printed = events[4].event.tool_result;
+    try testing.expectEqualStrings("commandExecution", printed.name);
+    try testing.expectEqualStrings("probe line one", printed.summary);
+    try testing.expect(printed.truncated and !printed.failed);
+    const missing = events[7].event.tool_result;
+    try testing.expectEqualStrings("exit 2: ls: cannot access '/nonexistent-conduit-probe': No such file or directory", missing.summary);
+    try testing.expect(missing.failed and !missing.truncated);
+    try testing.expectEqualStrings("fileChange", events[9].event.tool_use.name);
+    try testing.expectEqualStrings("/work/proj/notes.txt", events[10].event.file_reference.path);
+    const patched = events[11].event.tool_result;
+    try testing.expectEqualStrings("fileChange", patched.name);
+    try testing.expectEqualStrings("add /work/proj/notes.txt", patched.summary);
+    try testing.expect(!patched.failed);
+    try testing.expectEqualStrings("Everything is in place; summarise.", events[12].event.reasoning.text);
+    try expectStatus(events[14], .done);
+    try testing.expectEqual(State.done, reg.get(agent_id).?.state);
+    try testing.expectEqual(@as(u64, 0), rig.codex.malformed_messages);
 }
 
 test "the recorded 0.160.1 approval round trip maps to legal agent events" {
@@ -2984,12 +3147,16 @@ test "the recorded 0.160.1 approval round trip maps to legal agent events" {
     }
     const rest = try rig.poll();
     for (rest) |*stored| _ = try reg.apply(agent_id, stored.event);
-    try testing.expectEqual(@as(usize, 3), rest.len);
+    try testing.expectEqual(@as(usize, 4), rest.len);
     try testing.expectEqualStrings("0", rest[0].event.permission_resolved.id);
     try testing.expectEqual(event.PermissionOutcome.allowed, rest[0].event.permission_resolved.outcome);
-    try testing.expectEqual(event.Role.assistant, rest[1].event.message.role);
-    try testing.expectEqualStrings("MOCK_OK", rest[1].event.message.text);
-    try expectStatus(rest[2], .done);
+    // `touch` printed nothing and exited 0.
+    try testing.expectEqualStrings("commandExecution", rest[1].event.tool_result.name);
+    try testing.expectEqualStrings("", rest[1].event.tool_result.summary);
+    try testing.expect(!rest[1].event.tool_result.failed);
+    try testing.expectEqual(event.Role.assistant, rest[2].event.message.role);
+    try testing.expectEqualStrings("MOCK_OK", rest[2].event.message.text);
+    try expectStatus(rest[3], .done);
     try testing.expectEqual(State.done, reg.get(agent_id).?.state);
     try testing.expect(reg.get(agent_id).?.structured);
     // The resolved request is gone.
@@ -3145,21 +3312,24 @@ test "items, turns and subagents map to events" {
     for (events) |*stored| _ = try reg.apply(agent_id, stored.event);
 
     const Kind = event.Event.Kind;
-    const kinds = [_]Kind{ .status_change, .tool_use, .file_reference, .file_reference, .tool_use, .subagent, .subagent, .notification, .notification, .status_change, .status_change, .status_change, .status_change };
+    const kinds = [_]Kind{ .status_change, .tool_use, .file_reference, .file_reference, .tool_result, .tool_use, .subagent, .reasoning, .subagent, .notification, .notification, .status_change, .status_change, .status_change, .status_change };
     try testing.expectEqual(kinds.len, events.len);
     for (kinds, events) |kind, stored| try testing.expectEqual(kind, std.meta.activeTag(stored.event));
     try expectStatus(events[0], .working);
     try testing.expectEqualStrings("src/a.zig (+1 more)", events[1].event.tool_use.summary);
     try testing.expectEqualStrings("src/b.zig", events[3].event.file_reference.path);
-    try testing.expectEqualStrings("search", events[4].event.tool_use.name);
-    try testing.expectEqualStrings("docs", events[4].event.tool_use.summary);
-    try testing.expectEqual(event.Subagent.Phase.start, events[5].event.subagent.phase);
-    try testing.expectEqualStrings("t-2", events[6].event.subagent.id);
-    try testing.expectEqualStrings("stream lost", events[7].event.notification.body);
-    try expectStatus(events[9], .errored);
-    try expectStatus(events[10], .working);
-    try expectStatus(events[11], .idle);
-    try expectStatus(events[12], .errored);
+    try testing.expectEqualStrings("update src/a.zig (+1 more)", events[4].event.tool_result.summary);
+    try testing.expect(!events[4].event.tool_result.failed);
+    try testing.expectEqualStrings("search", events[5].event.tool_use.name);
+    try testing.expectEqualStrings("docs", events[5].event.tool_use.summary);
+    try testing.expectEqual(event.Subagent.Phase.start, events[6].event.subagent.phase);
+    try testing.expectEqualStrings("private", events[7].event.reasoning.text);
+    try testing.expectEqualStrings("t-2", events[8].event.subagent.id);
+    try testing.expectEqualStrings("stream lost", events[9].event.notification.body);
+    try expectStatus(events[11], .errored);
+    try expectStatus(events[12], .working);
+    try expectStatus(events[13], .idle);
+    try expectStatus(events[14], .errored);
 }
 
 test "input starts or steers turns and stop interrupts the running one" {
@@ -3331,6 +3501,8 @@ test "rollout transcripts parse incrementally into events" {
         .{ .kind = .status_change, .text = "working" },
         .{ .kind = .message, .text = "RUNTOOL" },
         .{ .kind = .tool_use, .text = "touch probe_file" },
+        // `touch` printed nothing and exited 0.
+        .{ .kind = .tool_result, .text = "" },
         .{ .kind = .message, .text = "MOCK_OK" },
         .{ .kind = .status_change, .text = "done" },
     };
@@ -3354,6 +3526,10 @@ test "rollout transcripts parse incrementally into events" {
                         try testing.expectEqualStrings("exec_command", t.name);
                         try testing.expectEqualStrings(expected[got].text, t.summary);
                     },
+                    .tool_result => |t| {
+                        try testing.expectEqualStrings(expected[got].text, t.summary);
+                        try testing.expect(!t.failed);
+                    },
                     else => return error.TestUnexpectedResult,
                 }
             }
@@ -3364,6 +3540,41 @@ test "rollout transcripts parse incrementally into events" {
         try testing.expectEqualStrings("0.160.1", reader.cliVersion().?);
         try testing.expectEqual(@as(u64, 0), reader.skipped_lines);
     }
+
+    // The TASK-87 recording's rollout adds reasoning summaries and tool
+    // outputs, whose exit status is read from the text Codex writes.
+    const reasoning_fixture = try readFixture(allocator, "rollout-reasoning-0.160.1.jsonl");
+    defer allocator.free(reasoning_fixture);
+    var rollout = RolloutReader.init(allocator, RolloutReader.default_max_line_bytes);
+    defer rollout.deinit();
+    try rollout.feed(reasoning_fixture);
+    const Kind = event.Event.Kind;
+    const rollout_kinds = [_]Kind{
+        .status_change, .message,  .reasoning,   .tool_use,  .tool_result, .reasoning,     .tool_use, .tool_result,
+        .reasoning,     .tool_use, .tool_result, .reasoning, .message,     .status_change,
+    };
+    var seen: usize = 0;
+    while (rollout.next()) |ev| : (seen += 1) {
+        try testing.expect(seen < rollout_kinds.len);
+        try testing.expectEqual(rollout_kinds[seen], std.meta.activeTag(ev));
+        switch (seen) {
+            2 => try testing.expectEqualStrings("Run the probe first to see what it prints.", ev.reasoning.text),
+            4 => {
+                try testing.expectEqualStrings("probe line one", ev.tool_result.summary);
+                try testing.expect(!ev.tool_result.failed and ev.tool_result.truncated);
+            },
+            7 => {
+                try testing.expectEqualStrings("ls: cannot access '/nonexistent-conduit-probe': No such file or directory", ev.tool_result.summary);
+                try testing.expect(ev.tool_result.failed);
+            },
+            10 => {
+                try testing.expectEqualStrings("Success. Updated the following files:", ev.tool_result.summary);
+                try testing.expect(!ev.tool_result.failed);
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(rollout_kinds.len, seen);
 
     // Oversized and malformed lines are skipped; the next line still parses.
     var reader = RolloutReader.init(allocator, 64);
