@@ -29,7 +29,12 @@
 //!   thinking blocks as reasoning (TASK-87) and, when no hook channel reports
 //!   them, tool uses, the files they name and their `tool_result` blocks. The format is
 //!   internal to Claude Code and parsed tolerantly; unknown records are
-//!   skipped.
+//!   skipped. With hooks live it still reports failed results, because a
+//!   tool that never runs gets no `PostToolUse(Failure)`: in 2.1.292's auto
+//!   mode (its default permission mode) a call the classifier blocks reaches
+//!   only the transcript, as an `is_error` result (TASK-88).
+//!   `ReportedFailures` keeps a failure to one event whichever channel
+//!   reports it first.
 //! * **Session registry** (`findRunningSession`). Claude Code 2.1.x keeps an
 //!   undocumented `<config>/sessions/<pid>.json` per running interactive
 //!   session with `sessionId`, `cwd`, `status` (`busy`, `waiting`, `idle`)
@@ -617,6 +622,37 @@ fn fileReference(input: ?Value) ?event.FileReference {
     return reference;
 }
 
+/// The failed tool results already reported, by tool use id and channel, so
+/// a failure both `PostToolUseFailure` and the transcript report becomes one
+/// event: the first channel claims the id and the other skips it. A claim by
+/// the channel that holds it succeeds again, because re-mapping a line after
+/// a full queue must yield the same events. A ring: the oldest id goes first.
+pub const ReportedFailures = struct {
+    ids: [capacity]Ident(max_id_bytes) = @splat(.{}),
+    channels: [capacity]Channel = @splat(.hook),
+    len: usize = 0,
+    next: usize = 0,
+
+    pub const Channel = enum { hook, transcript };
+    const capacity = 16;
+    const max_id_bytes = 64;
+
+    /// Whether `channel` reports the failure of `tool_use`. An id that cannot
+    /// be kept is reported by the hook (which names the tool) and never by
+    /// the transcript, so it cannot appear twice.
+    pub fn claim(self: *ReportedFailures, tool_use: []const u8, channel: Channel) bool {
+        if (tool_use.len == 0 or tool_use.len > max_id_bytes) return channel == .hook;
+        for (self.ids[0..self.len], self.channels[0..self.len]) |*id, held| {
+            if (std.mem.eql(u8, id.slice(), tool_use)) return held == channel;
+        }
+        _ = self.ids[self.next].set(tool_use);
+        self.channels[self.next] = channel;
+        self.next = (self.next + 1) % capacity;
+        self.len = @min(self.len + 1, capacity);
+        return true;
+    }
+};
+
 /// The events one record yields, borrowing the record and the arena.
 pub const EventBuf = struct {
     items: [max_events_per_record]Event = undefined,
@@ -673,10 +709,11 @@ pub const EventBuf = struct {
 /// Map one transcript record to events. Messages and thinking blocks
 /// (as reasoning) always; tool uses, the files they name and tool results
 /// only with `include_tools`, which is off when hooks already report them
-/// live. Meta records (local command caveats), sidechain records (a
-/// subagent's own conversation), redacted thinking and every record type
-/// this version does not know are skipped.
-pub fn mapTranscriptRecord(arena: Allocator, line: []const u8, include_tools: bool, out: *EventBuf) void {
+/// live; then a failed result is still reported when `failures` is given and
+/// no hook claimed it first. Meta records (local command caveats), sidechain
+/// records (a subagent's own conversation), redacted thinking and every
+/// record type this version does not know are skipped.
+pub fn mapTranscriptRecord(arena: Allocator, line: []const u8, include_tools: bool, failures: ?*ReportedFailures, out: *EventBuf) void {
     const record = parseLine(arena, line) orelse return;
     const kind = string(record, "type") orelse return;
     if (boolean(record, "isSidechain") or boolean(record, "isMeta")) return;
@@ -697,10 +734,15 @@ pub fn mapTranscriptRecord(arena: Allocator, line: []const u8, include_tools: bo
                 out.reasoning(string(block, "thinking") orelse continue);
             } else if (include_tools and role == .assistant and std.mem.eql(u8, block_type, "tool_use")) {
                 out.toolUse(string(block, "name") orelse continue, field(block, "input"), true);
-            } else if (include_tools and role == .user and std.mem.eql(u8, block_type, "tool_result")) {
+            } else if (role == .user and std.mem.eql(u8, block_type, "tool_result")) {
                 // The record names only the tool use id; the view shows the
                 // result under the tool use it follows.
-                out.toolResult("", toolResultText(field(block, "content")), boolean(block, "is_error"));
+                const failed = boolean(block, "is_error");
+                const reported = include_tools or (failed and if (failures) |set|
+                    set.claim(string(block, "tool_use_id") orelse "", .transcript)
+                else
+                    false);
+                if (reported) out.toolResult("", toolResultText(field(block, "content")), failed);
             }
         },
         else => {},
@@ -826,7 +868,8 @@ pub const TranscriptReader = struct {
 
     /// Push the events of up to `max_lines_per_poll` new records, read
     /// through `sink` (this machine's files or a remote workspace's).
-    pub fn poll(self: *TranscriptReader, sink: *SinkIo, io: Io, arena: *std.heap.ArenaAllocator, queue: *event.EventQueue) LineTail.ReadError!Drained {
+    /// `failures` is the adapter's, when hooks report results too.
+    pub fn poll(self: *TranscriptReader, sink: *SinkIo, io: Io, arena: *std.heap.ArenaAllocator, queue: *event.EventQueue, failures: ?*ReportedFailures) LineTail.ReadError!Drained {
         var drained: Drained = .{};
         self.tail.bytes_this_poll = 0;
         var lines: usize = 0;
@@ -834,7 +877,7 @@ pub const TranscriptReader = struct {
             const line = (try self.tail.peek(sink, io)) orelse break;
             _ = arena.reset(.retain_capacity);
             var out: EventBuf = .{};
-            mapTranscriptRecord(arena.allocator(), line, self.include_tools, &out);
+            mapTranscriptRecord(arena.allocator(), line, self.include_tools, failures, &out);
             if (!pushEvents(queue, out.slice(), &self.tail, &drained)) break;
             self.tail.advance(line.len);
         }
@@ -1019,6 +1062,8 @@ pub const ClaudeCodeAdapter = struct {
     registry_gone: bool = false,
     pending: [max_pending]PendingPermission = undefined,
     pending_len: usize = 0,
+    /// Failed tool results reported by a hook or the transcript (owned).
+    failures: ReportedFailures = .{},
     arena: std.heap.ArenaAllocator,
     /// `Options.observe`, with an owned cwd.
     observe_pid: ?u32 = null,
@@ -1397,7 +1442,7 @@ pub const ClaudeCodeAdapter = struct {
 
         if (self.transcript == null and self.transcript_lookup) try self.locateTranscript();
         if (self.transcript) |*reader| {
-            const drained = try reader.poll(&self.sink, self.io, &self.arena, queue);
+            const drained = try reader.poll(&self.sink, self.io, &self.arena, queue, if (self.hooks != null) &self.failures else null);
             pushed += drained.pushed;
             if (drained.full) return pushed;
         }
@@ -1536,12 +1581,14 @@ pub const ClaudeCodeAdapter = struct {
                 }
                 out.status(.working);
                 const tool = string(payload, "tool_name") orelse "";
+                const tool_use = string(payload, "tool_use_id") orelse "";
                 if (hook == .post_tool_use_failure) {
-                    out.toolResult(tool, string(payload, "error") orelse "", true);
+                    if (self.failures.claim(tool_use, .hook)) out.toolResult(tool, string(payload, "error") orelse "", true);
                 } else {
                     const interrupted = boolean(field(payload, "tool_response"), "interrupted");
                     const text = try hookResponseText(arena, field(payload, "tool_response"));
-                    out.toolResult(tool, if (interrupted and text.len == 0) "interrupted" else text, interrupted);
+                    if (!interrupted or self.failures.claim(tool_use, .hook))
+                        out.toolResult(tool, if (interrupted and text.len == 0) "interrupted" else text, interrupted);
                 }
             },
             .notification => {
@@ -2140,7 +2187,7 @@ test "transcript records become messages, reasoning, tool uses and file referenc
         var arena: std.heap.ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var out: EventBuf = .{};
-        mapTranscriptRecord(arena.allocator(), line, true, &out);
+        mapTranscriptRecord(arena.allocator(), line, true, null, &out);
         for (out.slice()) |ev| try events.append(ev);
     }
     const e = events.items;
@@ -2167,7 +2214,7 @@ test "transcript records become messages, reasoning, tool uses and file referenc
     var messages: usize = 0;
     while (it.next()) |line| {
         out = .{};
-        mapTranscriptRecord(arena.allocator(), line, false, &out);
+        mapTranscriptRecord(arena.allocator(), line, false, null, &out);
         for (out.slice()) |ev| {
             try testing.expect(ev == .message or ev == .reasoning);
             messages += 1;
@@ -2178,7 +2225,7 @@ test "transcript records become messages, reasoning, tool uses and file referenc
     // Long text is cut at a UTF-8 boundary and flagged.
     const long = try std.fmt.allocPrint(arena.allocator(), "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{"é" ** (max_message_bytes / 2 + 1)});
     out = .{};
-    mapTranscriptRecord(arena.allocator(), long, false, &out);
+    mapTranscriptRecord(arena.allocator(), long, false, null, &out);
     try testing.expect(out.slice()[0].message.truncated);
     try testing.expect(out.slice()[0].message.text.len <= max_message_bytes);
     try testing.expect(std.unicode.utf8ValidateSlice(out.slice()[0].message.text));
@@ -2198,7 +2245,7 @@ test "a recorded 2.1.292 turn yields its thinking as reasoning and its tool resu
         var arena: std.heap.ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var out: EventBuf = .{};
-        mapTranscriptRecord(arena.allocator(), line, true, &out);
+        mapTranscriptRecord(arena.allocator(), line, true, null, &out);
         for (out.slice()) |ev| try events.append(ev);
     }
     const e = events.items;
@@ -2257,6 +2304,73 @@ test "a recorded 2.1.292 turn yields its thinking as reasoning and its tool resu
     try testing.expect(!a.transcript.?.include_tools);
 }
 
+test "a launched agent reports a failed tool result once, with or without PostToolUseFailure" {
+    // In the interactive 2.1.292 TUI's auto mode a Bash call the classifier
+    // blocked ran no PostToolUseFailure (TASK-88); only its transcript
+    // carried the failed result. Each case appends hook lines (from the
+    // recorded turn) and then, optionally, the failure hook after the
+    // transcript has been read.
+    const Case = struct { hooks: []const usize, late_failure_hook: bool };
+    const cases = [_]Case{
+        .{ .hooks = &.{ 0, 2 }, .late_failure_hook = false }, // no failure hook, as for a blocked call
+        .{ .hooks = &.{ 0, 1, 2 }, .late_failure_hook = false }, // the hook comes first
+        .{ .hooks = &.{ 0, 2 }, .late_failure_hook = true }, // the transcript comes first
+    };
+    var hook_lines: [3][]const u8 = undefined;
+    var split = std.mem.splitScalar(u8, fixture_hooks_tools, '\n');
+    for (&hook_lines) |*line| line.* = split.next().?;
+
+    for (cases) |case| {
+        var scratch: Scratch = undefined;
+        try scratch.init();
+        defer scratch.deinit();
+        var sink_buffer: [Dir.max_path_bytes]u8 = undefined;
+        const sink = scratch.join(&sink_buffer, "agents/1");
+        var config_buffer: [Dir.max_path_bytes]u8 = undefined;
+        const config = scratch.join(&config_buffer, "config");
+        try scratch.tmp.dir.createDirPath(testing.io, "config/projects/-home-user-work");
+        try scratch.tmp.dir.writeFile(testing.io, .{ .sub_path = "config/projects/-home-user-work/e66334b3-9522-4ebc-8628-2bc12aed3923.jsonl", .data = fixture_transcript_tools });
+
+        var a = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .sink_dir = sink, .config_dir = config });
+        const iface = a.adapter();
+        defer iface.destroy();
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        _ = try iface.launch(arena.allocator(), .{ .context_kind = .local, .cwd = "/home/user/work", .token = fixtureToken() });
+
+        var hooks: std.ArrayList(u8) = .empty;
+        defer hooks.deinit(testing.allocator);
+        for (case.hooks) |i| {
+            const line = try std.mem.replaceOwned(u8, arena.allocator(), hook_lines[i], "/home/user/.claude", config);
+            try hooks.appendSlice(testing.allocator, line);
+            try hooks.append(testing.allocator, '\n');
+        }
+        try scratch.tmp.dir.writeFile(testing.io, .{ .sub_path = "agents/1/events.jsonl", .data = hooks.items });
+
+        var queue = try event.EventQueue.init(testing.allocator, testing.io, 64);
+        defer queue.deinit(testing.allocator);
+        var out: [64]event.StoredEvent = undefined;
+        var failed: usize = 0;
+        var rounds: usize = 0;
+        while (rounds < 2) : (rounds += 1) {
+            while (try iface.poll(&queue) != 0) {}
+            for (out[0..queue.drain(&out)]) |*stored| switch (stored.event) {
+                .tool_result => |result| if (result.failed) {
+                    failed += 1;
+                    try testing.expect(std.mem.startsWith(u8, result.summary, "Exit code 2"));
+                },
+                else => {},
+            };
+            if (!case.late_failure_hook or rounds == 1) break;
+            const line = try std.mem.replaceOwned(u8, arena.allocator(), hook_lines[1], "/home/user/.claude", config);
+            try hooks.appendSlice(testing.allocator, line);
+            try hooks.append(testing.allocator, '\n');
+            try scratch.tmp.dir.writeFile(testing.io, .{ .sub_path = "agents/1/events.jsonl", .data = hooks.items });
+        }
+        try testing.expectEqual(@as(usize, 1), failed);
+    }
+}
+
 test "the transcript reader is incremental, bounded and resumes after a full queue" {
     var scratch: Scratch = undefined;
     try scratch.init();
@@ -2275,12 +2389,12 @@ test "the transcript reader is incremental, bounded and resumes after a full que
     defer testing.allocator.free(out);
 
     // No file yet: nothing, and no error.
-    try testing.expectEqual(@as(usize, 0), (try reader.poll(&sink, testing.io, &arena, &queue)).pushed);
+    try testing.expectEqual(@as(usize, 0), (try reader.poll(&sink, testing.io, &arena, &queue, null)).pushed);
 
     // A complete record and a partial one.
     const first = fixture_transcript[0 .. std.mem.indexOf(u8, fixture_transcript, "I'll read").? + 40];
     try scratch.tmp.dir.writeFile(testing.io, .{ .sub_path = "t.jsonl", .data = first });
-    var drained = try reader.poll(&sink, testing.io, &arena, &queue);
+    var drained = try reader.poll(&sink, testing.io, &arena, &queue, null);
     try testing.expectEqual(@as(usize, 2), drained.pushed);
     try testing.expectEqual(@as(usize, 2), queue.drain(out));
     try testing.expectEqualStrings("read the build", out[0].event.message.text);
@@ -2293,7 +2407,7 @@ test "the transcript reader is incremental, bounded and resumes after a full que
     defer kinds.deinit(testing.allocator);
     var polls: usize = 0;
     while (polls < 10) : (polls += 1) {
-        drained = try reader.poll(&sink, testing.io, &arena, &queue);
+        drained = try reader.poll(&sink, testing.io, &arena, &queue, null);
         const n = queue.drain(out);
         for (out[0..n]) |*stored| try kinds.append(testing.allocator, std.meta.activeTag(stored.event));
         if (!drained.full and n == 0) break;
@@ -2313,7 +2427,7 @@ test "the transcript reader is incremental, bounded and resumes after a full que
     polls = 0;
     var after: ?[]const u8 = null;
     while (polls < 4 and after == null) : (polls += 1) {
-        _ = try reader.poll(&sink, testing.io, &arena, &queue);
+        _ = try reader.poll(&sink, testing.io, &arena, &queue, null);
         const n = queue.drain(out);
         if (n != 0) after = out[0].event.message.text;
     }
