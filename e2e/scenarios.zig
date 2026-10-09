@@ -597,7 +597,28 @@ const agent_notifications_steps = [_]Step{
     .{ .wait_element = .{ .id = "workspace.1.tab.1.agent.done", .state = "exists", .equals = true, .timeout_ms = 10_000 } },
     .{ .wait_element = .{ .id = observed_row_id, .state = "exists", .equals = true } },
     .screenshot,
+    // TASK-85: the settings view's sidebar.status_icons row, reached from
+    // the end of the list by keyboard and clicked, writes `symbols` to the
+    // run's private settings file; the icons redraw under the same ids.
+    .{ .key = "CTRL+SHIFT+p" },
+    .{ .wait_element = .{ .id = "palette.query", .state = "focused", .equals = true } },
+    .{ .type_text = "settings" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = "settings.dialog", .state = "exists", .equals = true } },
+    .{ .key = "END" },
+} ++ [_]Step{.{ .key = "UP" }} ** 16 ++ [_]Step{
+    .{ .wait_element = .{ .id = status_icons_row, .state = "exists", .equals = true } },
+    .{ .click = status_icons_row },
+    .{ .wait_element = .{ .id = "settings.error", .state = "exists", .equals = false } },
+    .{ .key = "ESCAPE" },
+    .{ .wait_element = .{ .id = "settings.dialog", .state = "exists", .equals = false } },
+    .{ .wait_element = .{ .id = "workspace.1.tab.1.agent.done", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = agent_tab_id ++ ".agent.done", .state = "exists", .equals = true } },
+    .{ .wait_element = .{ .id = observed_row_id, .state = "exists", .equals = true } },
+    .screenshot,
 };
+
+const status_icons_row = "settings.row.sidebar.status_icons";
 
 /// The launched fake's sidebar row and view (agent 1, tab 2), and the
 /// observed fake's (agent 2, tab 1).

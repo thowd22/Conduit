@@ -123,6 +123,34 @@ pub const RightClick = enum {
     }
 };
 
+/// How the sidebar draws agent states: the `sidebar.status_icons` setting
+/// (TASK-85). Both styles follow herdr's: `dots` marks every state that is
+/// not idle with a filled dot and lets its colour tell them apart, `symbols`
+/// gives each state its own shape. The values are the file spellings.
+pub const StatusIcons = enum {
+    /// `●` for working, blocked and done, `○` idle.
+    dots,
+    /// `◐` working, `×` blocked, `✓` done, `○` idle.
+    symbols,
+
+    /// The value compiled into Conduit.
+    pub const built_in: StatusIcons = .dots;
+
+    pub const Error = error{InvalidStatusIcons};
+
+    /// Parse the setting's exact spelling; anything else is an error.
+    pub fn parse(raw: []const u8) Error!StatusIcons {
+        if (std.mem.eql(u8, raw, "dots")) return .dots;
+        if (std.mem.eql(u8, raw, "symbols")) return .symbols;
+        return error.InvalidStatusIcons;
+    }
+
+    /// Render the value back to the text it was parsed from.
+    pub fn text(self: StatusIcons) []const u8 {
+        return @tagName(self);
+    }
+};
+
 /// Which macOS Option keys act as Alt: the `macos.option_as_alt` setting (TASK-48).
 ///
 /// `false`, the built-in value, is the macOS convention: Option types the characters the layout
@@ -259,6 +287,7 @@ pub const Key = enum {
     restore_enabled,
     accessibility_enabled,
     sidebar_agents,
+    sidebar_status_icons,
     shell,
     profile,
     editor_command,
@@ -297,6 +326,7 @@ pub const Key = enum {
             .restore_enabled => "restore.enabled",
             .accessibility_enabled => "accessibility.enabled",
             .sidebar_agents => "sidebar.agents",
+            .sidebar_status_icons => "sidebar.status_icons",
             .shell => "shell",
             .profile => "profile",
             .editor_command => "editor.command",
@@ -369,6 +399,9 @@ pub const Settings = struct {
     /// `<glyph> <harness> <state>`, nested under its tab in the sidebar.
     /// False keeps only the glyph in front of the tab's name. Hot-reloaded.
     sidebar_agents: bool = true,
+    /// `sidebar.status_icons` (TASK-85): the icon style for agent states on
+    /// agent, tab and workspace rows. Hot-reloaded.
+    sidebar_status_icons: StatusIcons = StatusIcons.built_in,
     /// `shell` (TASK-46): the name of the profile a new tab or pane runs
     /// when none is chosen. Empty keeps the built-in default (the user's
     /// shell on POSIX, the first of PowerShell 7, Windows PowerShell and cmd
@@ -973,6 +1006,7 @@ pub const Config = struct {
             .restore_enabled => to.restore_enabled = from.restore_enabled,
             .accessibility_enabled => to.accessibility_enabled = from.accessibility_enabled,
             .sidebar_agents => to.sidebar_agents = from.sidebar_agents,
+            .sidebar_status_icons => to.sidebar_status_icons = from.sidebar_status_icons,
             .shell => to.shell = try self.dupe(from.shell),
             .profile => to.shell_profiles = try self.dupeShellProfiles(from.shell_profiles),
             .editor_command => to.editor_command = try self.dupe(from.editor_command),
@@ -1015,6 +1049,7 @@ const ValueError = error{
     OutOfRange,
     NotBool,
     NotRightClick,
+    NotStatusIcons,
     NotOptionAsAlt,
     NotPercent,
     TooManyFallbacks,
@@ -1142,6 +1177,7 @@ fn valueMessage(key: Key, err: ValueError) []const u8 {
         },
         error.NotBool => "expected `true` or `false`",
         error.NotRightClick => "expected `menu` or `paste`",
+        error.NotStatusIcons => "expected `dots` or `symbols`",
         error.NotOptionAsAlt => "expected `true`, `false`, `left` or `right`",
         error.NotPercent => "expected a whole percentage from 10 to 100",
         error.TooManyFallbacks => "expected at most 8 comma-separated families",
@@ -1225,6 +1261,7 @@ fn applyValue(result: *Config, allocator: Allocator, key: Key, value: []const u8
         .restore_enabled => settings.restore_enabled = try parseBool(value),
         .accessibility_enabled => settings.accessibility_enabled = try parseBool(value),
         .sidebar_agents => settings.sidebar_agents = try parseBool(value),
+        .sidebar_status_icons => settings.sidebar_status_icons = StatusIcons.parse(value) catch return error.NotStatusIcons,
         .shell => {
             const name = try parseString(value);
             if (name.len != 0 and !validShellProfileName(name)) return error.ShellProfileName;
@@ -1526,6 +1563,11 @@ pub const defaults_document =
     "# or Enter on it, to open that agent's view. false keeps only the glyph on the tab.\n" ++
     "# sidebar.agents = true\n" ++
     "\n" ++
+    "# The agent state icons on agent, tab and workspace rows. dots: ● working (yellow),\n" ++
+    "# blocked (red) and done (cyan), ○ idle (green). symbols: ◐ working, × blocked, ✓ done,\n" ++
+    "# ○ idle. An errored agent is a × in the danger colour in both.\n" ++
+    "# sidebar.status_icons = dots\n" ++
+    "\n" ++
     "# Remote connections (Remote: connect). Saved profiles hold a destination, never a\n" ++
     "# secret, and repeat one per line: remote.profile = <name> = <user@host[:port]>\n" ++
     "# The last ten destinations connected to, newest first:\n" ++
@@ -1660,6 +1702,10 @@ pub fn checkValue(key: Key, value: []const u8) ?[]const u8 {
             },
             .mouse_right_click => {
                 _ = RightClick.parse(value) catch break :check error.NotRightClick;
+                return null;
+            },
+            .sidebar_status_icons => {
+                _ = StatusIcons.parse(value) catch break :check error.NotStatusIcons;
                 return null;
             },
             .macos_option_as_alt => {
@@ -3024,6 +3070,27 @@ test "sidebar.agents is a boolean that defaults on and keeps its value on a bad 
     try testing.expectEqual(Key.sidebar_agents, Key.fromName("sidebar.agents").?);
     try testing.expectEqual(@as(?[]const u8, null), checkValue(.sidebar_agents, "true"));
     try testing.expect(checkValue(.sidebar_agents, "yes") != null);
+}
+
+test "sidebar.status_icons is dots or symbols, defaults to dots and keeps its value on a bad line" {
+    var silent = try parse(testing.allocator, "", null);
+    defer silent.deinit();
+    try testing.expectEqual(StatusIcons.dots, silent.settings.sidebar_status_icons);
+
+    var symbols = try parse(testing.allocator, "sidebar.status_icons = symbols\n", null);
+    defer symbols.deinit();
+    try testing.expect(!symbols.hasDiagnostics());
+    try testing.expectEqual(StatusIcons.symbols, symbols.settings.sidebar_status_icons);
+
+    var bad = try parse(testing.allocator, "sidebar.status_icons = Dots\n", &symbols);
+    defer bad.deinit();
+    try expectDiagnostic(&bad, 1, "sidebar.status_icons: expected `dots` or `symbols`");
+    try testing.expectEqual(StatusIcons.symbols, bad.settings.sidebar_status_icons);
+
+    try testing.expectEqual(Key.sidebar_status_icons, Key.fromName("sidebar.status_icons").?);
+    try testing.expectEqual(@as(?[]const u8, null), checkValue(.sidebar_status_icons, "dots"));
+    try testing.expectEqualStrings("expected `dots` or `symbols`", checkValue(.sidebar_status_icons, "circles").?);
+    try testing.expectEqualStrings("symbols", StatusIcons.symbols.text());
 }
 
 test "restore.enabled and accessibility.enabled are booleans that default on" {

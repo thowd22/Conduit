@@ -43,6 +43,7 @@ const agent = @import("agent");
 const workspace = @import("workspace");
 const session = @import("session");
 const config = @import("config");
+const theme = @import("theme");
 const platform = @import("platform");
 const pty = @import("pty");
 const inputmod = @import("input");
@@ -74,6 +75,39 @@ pub fn stateGlyph(state: State) []const u8 {
         .waiting_permission => "!",
         .done => "✓",
         .errored => "×",
+    };
+}
+
+/// The sidebar status icon for an agent state in the configured style
+/// (TASK-85), herdr's two tables. Conduit's two waits are both herdr's
+/// "blocked", and `errored` is Conduit's own `×` in both styles. Every icon
+/// is one cell from the bundled face or a built-in sprite, never emoji.
+pub fn statusIcon(style: config.StatusIcons, state: State) []const u8 {
+    return switch (style) {
+        .dots => switch (state) {
+            .working, .waiting_input, .waiting_permission, .done => "●",
+            .idle => "○",
+            .errored => "×",
+        },
+        .symbols => switch (state) {
+            .working => "◐",
+            .waiting_input, .waiting_permission, .errored => "×",
+            .done => "✓",
+            .idle => "○",
+        },
+    };
+}
+
+/// The theme role a status icon is painted in (TASK-85), herdr's colours
+/// through the active scheme: busy yellow, blocked red, done cyan, idle
+/// green, and an error in the danger role. Only the icon takes it.
+pub fn statusRole(state: State) theme.Role {
+    return switch (state) {
+        .working => .yellow,
+        .waiting_input, .waiting_permission => .red,
+        .done => .cyan,
+        .idle => .green,
+        .errored => .danger,
     };
 }
 
@@ -128,11 +162,14 @@ pub fn rowHarnessName(harness: Harness) []const u8 {
 pub const agent_row_name_bytes = 16;
 pub const agent_row_bytes = 3 + 1 + agent_row_name_bytes + 1 + "permission".len;
 
-/// `<glyph> <name> <state>` into `buffer`; a name longer than
-/// `agent_row_name_bytes` is cut so the row always fits `agent_row_bytes`.
-pub fn formatAgentRow(buffer: *[agent_row_bytes]u8, name: []const u8, state: State) []const u8 {
+/// `<icon> <name> <state>` into `buffer`, the icon in `style`; a name
+/// longer than `agent_row_name_bytes` is cut so the row always fits
+/// `agent_row_bytes`. The icon is the row's first `statusIcon(...).len`
+/// bytes, which the sidebar paints in `statusRole`.
+pub fn formatAgentRow(buffer: *[agent_row_bytes]u8, style: config.StatusIcons, name: []const u8, state: State) []const u8 {
     const kept = agent.truncateUtf8(name, agent_row_name_bytes);
-    return std.fmt.bufPrint(buffer, "{s} {s} {s}", .{ stateGlyph(state), kept, rowStateWord(state) }) catch stateGlyph(state);
+    const icon = statusIcon(style, state);
+    return std.fmt.bufPrint(buffer, "{s} {s} {s}", .{ icon, kept, rowStateWord(state) }) catch icon;
 }
 
 // The agent manager (TASK-58) ------------------------------------------------------
@@ -2571,14 +2608,36 @@ test "every state has one glyph, and urgency orders the waits first" {
     try testing.expectEqual(@as(?State, null), mostUrgent(&.{}));
 }
 
-test "sidebar agent rows read glyph, harness and state words" {
+test "status icons follow herdr's dots and symbols tables, errored is × in both" {
+    // Order: idle, working, waiting_input, waiting_permission, done, errored.
+    const dots = [_][]const u8{ "○", "●", "●", "●", "●", "×" };
+    const symbols = [_][]const u8{ "○", "◐", "×", "×", "✓", "×" };
+    try testing.expectEqualSlices(State, &.{ .idle, .working, .waiting_input, .waiting_permission, .done, .errored }, std.enums.values(State));
+    for (std.enums.values(State), dots, symbols) |state, dot, symbol| {
+        try testing.expectEqualStrings(dot, statusIcon(.dots, state));
+        try testing.expectEqualStrings(symbol, statusIcon(.symbols, state));
+        for ([_][]const u8{ dot, symbol }) |icon| {
+            try testing.expect(std.unicode.utf8CountCodepoints(icon) catch 0 == 1);
+            try testing.expect(icon.len <= 3);
+        }
+    }
+}
+
+test "status icon colours come from the theme roles herdr uses" {
+    const roles = [_]theme.Role{ .green, .yellow, .red, .red, .cyan, .danger };
+    for (std.enums.values(State), roles) |state, role| try testing.expectEqual(role, statusRole(state));
+}
+
+test "sidebar agent rows read icon, harness and state words" {
     var buffer: [agent_row_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings("▸ claude working", formatAgentRow(&buffer, rowHarnessName(.claude_code), .working));
-    try std.testing.expectEqualStrings("! codex permission", formatAgentRow(&buffer, rowHarnessName(.codex), .waiting_permission));
-    try std.testing.expectEqualStrings("✓ pi done", formatAgentRow(&buffer, rowHarnessName(.pi), .done));
-    try std.testing.expectEqualStrings("? opencode input", formatAgentRow(&buffer, rowHarnessName(.opencode), .waiting_input));
-    try std.testing.expectEqualStrings("× fake errored", formatAgentRow(&buffer, "fake", .errored));
-    try std.testing.expectEqualStrings("· aaaaaaaaaaaaaaaa idle", formatAgentRow(&buffer, "a" ** 40, .idle));
+    try std.testing.expectEqualStrings("● claude working", formatAgentRow(&buffer, .dots, rowHarnessName(.claude_code), .working));
+    try std.testing.expectEqualStrings("◐ claude working", formatAgentRow(&buffer, .symbols, rowHarnessName(.claude_code), .working));
+    try std.testing.expectEqualStrings("● codex permission", formatAgentRow(&buffer, .dots, rowHarnessName(.codex), .waiting_permission));
+    try std.testing.expectEqualStrings("× codex permission", formatAgentRow(&buffer, .symbols, rowHarnessName(.codex), .waiting_permission));
+    try std.testing.expectEqualStrings("✓ pi done", formatAgentRow(&buffer, .symbols, rowHarnessName(.pi), .done));
+    try std.testing.expectEqualStrings("● opencode input", formatAgentRow(&buffer, .dots, rowHarnessName(.opencode), .waiting_input));
+    try std.testing.expectEqualStrings("× fake errored", formatAgentRow(&buffer, .dots, "fake", .errored));
+    try std.testing.expectEqualStrings("○ aaaaaaaaaaaaaaaa idle", formatAgentRow(&buffer, .symbols, "a" ** 40, .idle));
 }
 
 test "the notification list is bounded, newest first, and forgets a workspace" {

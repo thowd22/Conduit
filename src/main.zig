@@ -3063,6 +3063,7 @@ const settings_shell_fields = [_]SettingsField{settingsField(.shell, .text)};
 const settings_editor_fields = [_]SettingsField{settingsField(.editor_command, .text)};
 const settings_agents_fields = [_]SettingsField{
     settingsField(.sidebar_agents, .toggle),
+    settingsField(.sidebar_status_icons, .cycle),
     settingsField(.notifications_enabled, .toggle),
     settingsField(.notifications_os, .toggle),
     settingsField(.notifications_permission, .toggle),
@@ -16716,6 +16717,8 @@ const App = struct {
                 var workspace_storage_index: usize = 0;
                 var tab_storage_index: usize = 0;
                 var agent_state_slot: usize = 0;
+                // The agent status icon style (TASK-85), read once per frame.
+                const icon_style = self.config_current.settings.sidebar_status_icons;
                 self.agent_state_id_generation = (self.agent_state_id_generation + 1) % self.agent_state_ids.len;
                 var agent_row_slot: usize = 0;
                 self.agent_row_id_generation = (self.agent_row_id_generation + 1) % self.agent_row_ids.len;
@@ -16767,9 +16770,15 @@ const App = struct {
                         }
                     }
                     // The most urgent agent state in the workspace leads its
-                    // row (TASK-56); the glyph element's id carries the state.
+                    // row (TASK-56) as a status icon in its state's colour
+                    // (TASK-85); the glyph element's id carries the state.
+                    var workspace_icon: ?agent.State = null;
                     if (self.agents.workspaceState(key)) |state| {
-                        workspace_label = std.fmt.bufPrint(&self.agent_workspace_labels[workspace_slot], "{s} {s}", .{ app_agents.stateGlyph(state), workspace_label }) catch workspace_label;
+                        const icon = app_agents.statusIcon(icon_style, state);
+                        if (std.fmt.bufPrint(&self.agent_workspace_labels[workspace_slot], "{s} {s}", .{ icon, workspace_label })) |label| {
+                            workspace_label = label;
+                            workspace_icon = state;
+                        } else |_| {}
                         if (agent_state_slot < sidebar_element_capacity) {
                             const state_id = try std.fmt.bufPrint(&self.agent_state_ids[self.agent_state_id_generation][agent_state_slot], "{s}.agent.{s}", .{ semantic, @tagName(state) });
                             agent_state_slot += 1;
@@ -16804,6 +16813,8 @@ const App = struct {
                             .{ .foreground = .accent },
                         .hovered = .{ .foreground = .strong, .underline = .accent },
                         .focused = .{ .foreground = .strong, .background = .selection },
+                        .lead_foreground = if (workspace_icon) |state| app_agents.statusRole(state) else null,
+                        .lead_bytes = if (workspace_icon) |state| app_agents.statusIcon(icon_style, state).len else 0,
                     });
                     row += 1;
                     if (!selected) continue;
@@ -16849,10 +16860,14 @@ const App = struct {
                             // An agent's tab leads with its state glyph in
                             // place of TASK-29's `* `/`! ` marks (TASK-56).
                             var tab_label = tab.displayLabel();
+                            var tab_icon: ?agent.State = null;
                             const agent_session = model.focusedPaneSessionId(tab.id()) orelse tab.sessionId();
                             const tab_agent = self.agents.agentForSession(key, agent_session) orelse self.agents.agentForSession(key, tab.sessionId());
                             if (tab_agent) |record| {
-                                tab_label = std.fmt.bufPrint(&self.agent_tab_labels[storage_index], "{s} {s}", .{ app_agents.stateGlyph(record.state), tab.name() }) catch tab.displayLabel();
+                                if (std.fmt.bufPrint(&self.agent_tab_labels[storage_index], "{s} {s}", .{ app_agents.statusIcon(icon_style, record.state), tab.name() })) |label| {
+                                    tab_label = label;
+                                    tab_icon = record.state;
+                                } else |_| {}
                                 if (agent_state_slot < sidebar_element_capacity) {
                                     const state_id = try std.fmt.bufPrint(&self.agent_state_ids[self.agent_state_id_generation][agent_state_slot], "{s}.agent.{s}", .{ tab_semantic, @tagName(record.state) });
                                     agent_state_slot += 1;
@@ -16888,6 +16903,8 @@ const App = struct {
                                     .{ .foreground = .foreground },
                                 .hovered = .{ .foreground = .strong, .underline = .accent },
                                 .focused = .{ .foreground = .strong, .background = .selection },
+                                .lead_foreground = if (tab_icon) |state| app_agents.statusRole(state) else null,
+                                .lead_bytes = if (tab_icon) |state| app_agents.statusIcon(icon_style, state).len else 0,
                             });
                         }
 
@@ -16935,7 +16952,7 @@ const App = struct {
                             const slot = agent_row_slot;
                             agent_row_slot += 1;
                             const row_semantic = try agentRowSemanticId(&self.agent_row_ids[self.agent_row_id_generation][slot], key, tab.id(), record.id);
-                            const row_label = app_agents.formatAgentRow(&self.agent_row_labels[slot], self.agents.rowName(record), record.state);
+                            const row_label = app_agents.formatAgentRow(&self.agent_row_labels[slot], icon_style, self.agents.rowName(record), record.state);
                             const row_id: ui.Id = .{ .value = row_semantic };
                             try self.ui_tree.addInteractiveText(.{
                                 .id = row_id,
@@ -16949,9 +16966,11 @@ const App = struct {
                                 .id = row_id,
                                 .label = row_label,
                                 .action = agent_row_action,
-                                .normal = .{ .foreground = agentRowRole(record.state) },
+                                .normal = .{ .foreground = .foreground },
                                 .hovered = .{ .foreground = .strong, .underline = .accent },
                                 .focused = .{ .foreground = .strong, .background = .selection },
+                                .lead_foreground = app_agents.statusRole(record.state),
+                                .lead_bytes = app_agents.statusIcon(icon_style, record.state).len,
                             });
                         }
                     }
@@ -20486,6 +20505,7 @@ const App = struct {
             .shell => if (self.config_current.settings.shell.len == 0) "(default)" else self.config_current.settings.shell,
             .remote_profile, .remote_recent, .control_enabled, .restore_enabled, .accessibility_enabled, .profile, .keybind => "",
             .sidebar_agents => if (self.config_current.settings.sidebar_agents) "true" else "false",
+            .sidebar_status_icons => self.config_current.settings.sidebar_status_icons.text(),
             .editor_command => if (self.config_current.settings.editor_command.len == 0) "(codium)" else self.config_current.settings.editor_command,
         };
     }
@@ -20956,6 +20976,10 @@ const App = struct {
             .font_ligatures => if (self.font_settings.values.ligatures) "false" else "true",
             .font_nerd_symbols => if (self.font_settings.values.builtin_symbols) "false" else "true",
             .sidebar_agents => if (self.config_current.settings.sidebar_agents) "false" else "true",
+            .sidebar_status_icons => switch (self.config_current.settings.sidebar_status_icons) {
+                .dots => config.StatusIcons.symbols.text(),
+                .symbols => config.StatusIcons.dots.text(),
+            },
             .mouse_right_click => switch (self.config_current.settings.right_click orelse config.RightClick.built_in) {
                 .menu => config.RightClick.paste.text(),
                 .paste => config.RightClick.menu.text(),
@@ -26607,17 +26631,6 @@ fn agentForRowSemantic(semantic_id: []const u8) ?agent.AgentId {
     return @enumFromInt(value);
 }
 
-/// The colour an agent row is painted in: a wait stands out, an error is
-/// danger, a finished agent recedes.
-fn agentRowRole(state: agent.State) theme.Role {
-    return switch (state) {
-        .waiting_input, .waiting_permission => .attention,
-        .errored => .danger,
-        .done => .muted,
-        .idle, .working => .foreground,
-    };
-}
-
 test "agent row ids round-trip and other sidebar ids are not agent rows" {
     var buffer: [workspace_semantic_capacity]u8 = undefined;
     const id = try agentRowSemanticId(&buffer, @enumFromInt(3), @enumFromInt(7), @enumFromInt(42));
@@ -30016,31 +30029,31 @@ fn waitForAgent(self: *App, io: Io, out: *Writer, trace: *const AgentOsTrace, co
 /// and a spinner burst that never shows idle while it runs and leaves for
 /// idle only after the quiet window and the debounce.
 fn agentScreenChecks(self: *App, io: Io, out: *Writer, trace: *const AgentOsTrace, failures: *usize, row: []const u8) !void {
-    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "? fake input" } }), "its prompt on screen shows the row `{s}`", .{agentRowLabel(self, row)});
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "× fake input" } }), "its prompt on screen shows the row `{s}`", .{agentRowLabel(self, row)});
     _ = try agentTypeLine(self, io, out, "ask");
-    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "! fake permission" } }) and
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "× fake permission" } }) and
         self.ui_tree.byId(.{ .value = "workspace.1.tab.1.agent.waiting_permission" }) != null, "its approval prompt shows `{s}` and the permission glyph", .{agentRowLabel(self, row)});
     // Screen text never answers: the prompt is still waiting for the human.
     agentCheck(out, failures, !self.activeLive().terminal().visibleTextContains("FAKE-ANSWER-"), "nothing answered the approval but the human", .{});
     _ = try agentTypeLine(self, io, out, "y");
     agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .terminal_text = "FAKE-ANSWER-y" }) and
-        try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "? fake input" } }), "answered by the human's keystroke, it is back at its prompt", .{});
+        try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "× fake input" } }), "answered by the human's keystroke, it is back at its prompt", .{});
     _ = try agentTypeLine(self, io, out, "fail");
     agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "\u{00d7} fake errored" } }), "an error line under its prompt shows `{s}`", .{agentRowLabel(self, row)});
 
     _ = try agentTypeLine(self, io, out, "spin");
-    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "\u{25b8} fake working" } }), "its spinner shows `{s}`", .{agentRowLabel(self, row)});
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "\u{25d0} fake working" } }), "its spinner shows `{s}`", .{agentRowLabel(self, row)});
     const burst = try watchRowUntil(self, io, out, row, "FAKE-SPIN-DONE");
     agentCheck(out, failures, burst.reached and !burst.left_working, "the row stayed working through the spinner burst ({d} frames sampled)", .{burst.samples});
     const quiet_from = Io.Clock.awake.now(io).nanoseconds;
-    agentCheck(out, failures, agentRowLabelIs(self, row, "\u{25b8} fake working"), "right after the burst the row still reads working", .{});
-    const settled = try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "\u{00b7} fake idle" } });
+    agentCheck(out, failures, agentRowLabelIs(self, row, "\u{25d0} fake working"), "right after the burst the row still reads working", .{});
+    const settled = try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "\u{25cb} fake idle" } });
     const settled_ms = @divTrunc(Io.Clock.awake.now(io).nanoseconds - quiet_from, std.time.ns_per_ms);
     // The quiet window and three confirmations 100 ms apart: never sooner
     // than 1.3 s after the last output, less the time it took to see it.
     agentCheck(out, failures, settled and settled_ms >= 1200, "plain lines after it settle to idle only after the debounce ({d} ms)", .{settled_ms});
     _ = try agentTypeLine(self, io, out, "next");
-    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "? fake input" } }), "its prompt again shows input", .{});
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "× fake input" } }), "its prompt again shows input", .{});
 }
 
 const RowWatch = struct { reached: bool, left_working: bool, samples: usize };
@@ -30119,6 +30132,27 @@ fn agentRowLabel(self: *const App, id: []const u8) []const u8 {
     return element.label;
 }
 
+/// Whether sidebar row `id` paints its first cell, the status icon, in
+/// `icon` (TASK-85), and, when `text` is given, the cell after the icon and
+/// its space in `text`: the colour is the icon's alone. Reads the overlay
+/// the last frame drew.
+fn sidebarIconPainted(self: *App, id: []const u8, icon: theme.Role, text: ?theme.Role) bool {
+    const element = self.ui_tree.byId(.{ .value = id }) orelse return false;
+    const cell = self.fonts.metrics().cell;
+    const col: u32 = @intCast(@divTrunc(element.bounds.x, @as(i32, @intCast(cell.width_px))));
+    const row: u32 = @intCast(@divTrunc(element.bounds.y, @as(i32, @intCast(cell.height_px))));
+    var icon_ok = false;
+    var text_ok = text == null;
+    for (self.overlayView().cells) |overlay_cell| {
+        if (overlay_cell.position.row != row) continue;
+        if (overlay_cell.position.col == col) icon_ok = sameColor(overlay_cell.foreground, ui.resolveRole(&self.palette, icon));
+        if (text) |role| if (overlay_cell.position.col == col + 2) {
+            text_ok = sameColor(overlay_cell.foreground, ui.resolveRole(&self.palette, role));
+        };
+    }
+    return icon_ok and text_ok;
+}
+
 fn agentRowLabelIs(self: *const App, id: []const u8, label: []const u8) bool {
     return std.mem.eql(u8, agentRowLabel(self, id), label);
 }
@@ -30181,7 +30215,7 @@ fn agentRowChecks(self: *App, io: Io, out: *Writer, os_trace: *const AgentOsTrac
     _ = try clickTabsElement(self, io, out, try paneSemanticId(&pane_buffer, f.key, model.focusedPaneId(f.agent_tab) orelse return null));
     _ = try agentTypeLine(self, io, out, "six");
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element = "workspace.1.tab.2.agent.waiting_input" }) and
-        agentRowLabelIs(self, f.agent_row, "? fake input"), "waiting for input: the agent row reads `? fake input` with no other gesture", .{});
+        agentRowLabelIs(self, f.agent_row, "× fake input"), "waiting for input: the agent row reads `× fake input` with no other gesture", .{});
 
     // A click on the row from another tab shows the agent and its view.
     _ = try clickTabsElement(self, io, out, first_tab);
@@ -30265,7 +30299,8 @@ fn agentRowChecks(self: *App, io: Io, out: *Writer, os_trace: *const AgentOsTrac
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .reloads = reloads + 1 }) and
         try waitForAgent(self, io, out, os_trace, .{ .element_absent = f.agent_row }) and
         self.ui_tree.byId(.{ .value = f.second_row }) == null and self.ui_tree.byId(.{ .value = f.observed_row }) == null and
-        self.ui_tree.byId(.{ .value = "workspace.1.tab.2.agent.waiting_input" }) != null, "sidebar.agents = false hid every agent row and kept the tab glyphs", .{});
+        self.ui_tree.byId(.{ .value = "workspace.1.tab.2.agent.waiting_input" }) != null and
+        std.mem.startsWith(u8, agentRowLabel(self, agent_tab), "● "), "sidebar.agents = false hid every agent row and kept the tab glyphs, back in the default dots", .{});
     _ = try settingsChord(self, io, out);
     const settings_reloads = self.config_reload_count;
     const settings_open = try waitForAgent(self, io, out, os_trace, .{ .element = "settings.dialog" });
@@ -30274,10 +30309,18 @@ fn agentRowChecks(self: *App, io: Io, out: *Writer, os_trace: *const AgentOsTrac
     agentCheck(out, failures, settings_open and row_selected and
         try waitForAgent(self, io, out, os_trace, .{ .reloads = settings_reloads + 1 }) and
         std.mem.indexOf(u8, settingsLabel(self, "settings.row.sidebar.agents"), "true") != null, "the settings view's sidebar.agents row turned the rows back on", .{});
+    // TASK-85: the style row beneath it switches the icons by keyboard.
+    const style_reloads = self.config_reload_count;
+    const style_selected = try selectSettingsRow(self, io, out, "settings.row.sidebar.status_icons");
+    const style_before = std.mem.indexOf(u8, settingsLabel(self, "settings.row.sidebar.status_icons"), "dots") != null;
+    _ = try postNamedKey(self, io, out, .enter, .{});
+    agentCheck(out, failures, style_selected and style_before and
+        try waitForAgent(self, io, out, os_trace, .{ .reloads = style_reloads + 1 }) and
+        std.mem.indexOf(u8, settingsLabel(self, "settings.row.sidebar.status_icons"), "symbols") != null, "the settings view's sidebar.status_icons row switched dots to symbols", .{});
     _ = try postNamedKey(self, io, out, .escape, .{});
     agentCheck(out, failures, try waitForAgent(self, io, out, os_trace, .{ .element_absent = "settings.dialog" }) and
         try waitForAgent(self, io, out, os_trace, .{ .element = f.agent_row }) and
-        agentRowLabelIs(self, f.agent_row, "? fake input"), "with the settings view closed the rows are back", .{});
+        agentRowLabelIs(self, f.agent_row, "× fake input") and std.mem.startsWith(u8, agentRowLabel(self, agent_tab), "× "), "with the settings view closed the rows are back, in symbols", .{});
     return pixels;
 }
 
@@ -30324,26 +30367,29 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     const agent_row = try agentRowSemanticId(&agent_row_buffer, first_key, agent_tab, launched_id);
     var agent_tab_buffer: [workspace_semantic_capacity]u8 = undefined;
     const agent_tab_semantic = try tabSemanticId(&agent_tab_buffer, first_key, agent_tab);
-    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = agent_row, .text = "· fake idle" } }) and
-        agentRowBeneath(self, agent_tab_semantic, agent_row), "a launched agent added a tab-height row `· fake idle` indented directly under its tab", .{});
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = agent_row, .text = "○ fake idle" } }) and
+        agentRowBeneath(self, agent_tab_semantic, agent_row), "a launched agent added a tab-height row `○ fake idle` indented directly under its tab", .{});
 
     // Each typed line releases one step of the scripted adapter.
     _ = try agentTypeLine(self, io, out, "one");
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.working" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.agent.working" }), "working: the tab and workspace glyphs changed live", .{});
-    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "▸ fake working"), "working: the agent row reads `▸ fake working` in the same frame as the glyph", .{});
+    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "● fake working") and sidebarIconPainted(self, agent_row, .yellow, .foreground) and
+        sidebarIconPainted(self, "workspace.1.tab.2", .yellow, null) and sidebarIconPainted(self, "workspace.1", .yellow, null), "working: the agent row reads `● fake working` in the same frame as the glyph, every icon yellow", .{});
     _ = try agentTypeLine(self, io, out, "two");
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.waiting_permission" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.agent.waiting_permission" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .entry_body = "Run: make test" }), "waiting for permission: glyphs changed and a permission notification was listed", .{});
-    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "! fake permission"), "waiting for permission: the agent row reads `! fake needs permission`", .{});
+    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "● fake permission") and sidebarIconPainted(self, agent_row, .red, .foreground) and
+        sidebarIconPainted(self, "workspace.1.tab.2", .red, null) and sidebarIconPainted(self, "workspace.1", .red, null), "waiting for permission: the agent row reads `● fake permission`, every icon red", .{});
     agentCheck(out, &failures, os_trace.calls == 0, "a focused window raised no OS notification", .{});
 
     self.focus_override = false;
     _ = try agentTypeLine(self, io, out, "three");
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.done" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .os_calls = 1 }), "done: the glyph changed and an unfocused window raised one OS notification", .{});
-    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "✓ fake done"), "done: the agent row reads `✓ fake done`", .{});
+    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "● fake done") and sidebarIconPainted(self, agent_row, .cyan, .foreground) and
+        sidebarIconPainted(self, "workspace.1.tab.2", .cyan, null) and sidebarIconPainted(self, "workspace.1", .cyan, null), "done: the agent row reads `● fake done`, every icon cyan", .{});
 
     // The background tab's OSC 777 and bell become terminal notifications.
     var trigger_buffer: [path_capacity]u8 = undefined;
@@ -30356,7 +30402,8 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     _ = try agentTypeLine(self, io, out, "four");
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.2.agent.errored" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.agent.errored" }), "errored: the glyphs changed", .{});
-    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "× fake errored"), "errored: the agent row reads `× fake errored`", .{});
+    agentCheck(out, &failures, agentRowLabelIs(self, agent_row, "× fake errored") and sidebarIconPainted(self, agent_row, .danger, .foreground) and
+        sidebarIconPainted(self, "workspace.1.tab.2", .danger, null) and sidebarIconPainted(self, "workspace.1", .danger, null), "errored: the agent row reads `× fake errored`, every icon in the danger colour", .{});
 
     // A second agent (idle) does not lower the workspace's most urgent glyph.
     agentCheck(out, &failures, try launchFakeAgentByMouse(self, io, out) and
@@ -30368,9 +30415,32 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     const second_row = try agentRowSemanticId(&second_row_buffer, first_key, third_tab, second_agent);
     var third_tab_buffer: [workspace_semantic_capacity]u8 = undefined;
     const third_tab_semantic = try tabSemanticId(&third_tab_buffer, first_key, third_tab);
-    agentCheck(out, &failures, agentRowLabelIs(self, second_row, "· fake idle") and agentRowBeneath(self, third_tab_semantic, second_row) and
+    agentCheck(out, &failures, agentRowLabelIs(self, second_row, "○ fake idle") and agentRowBeneath(self, third_tab_semantic, second_row) and
         agentRowLabelIs(self, agent_row, "× fake errored") and
         rowY(self, third_tab_semantic) == (rowY(self, agent_row) orelse -1) + @as(i32, @intCast(self.fonts.metrics().cell.height_px)), "each agent has its own row under its own tab, and the next tab moved down one row", .{});
+    try self.drawFrame();
+    agentCheck(out, &failures, sidebarIconPainted(self, second_row, .green, .foreground) and sidebarIconPainted(self, third_tab_semantic, .green, null) and
+        sidebarIconPainted(self, "workspace.1", .danger, null), "idle: the second agent's row and tab icons are green and the workspace keeps the errored icon", .{});
+
+    // TASK-85: `sidebar.status_icons = symbols` from the settings file
+    // redraws every icon in herdr's symbols style, same ids, same colours.
+    const style_path = self.config_path orelse return 1;
+    const style_reloads = self.config_reload_count;
+    try writeConfigTestFile(io, style_path, "sidebar.status_icons = symbols\n");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .reloads = style_reloads + 1 }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .label = .{ .id = second_row, .text = "○ fake idle" } }) and
+        agentRowLabelIs(self, agent_row, "× fake errored") and
+        std.mem.startsWith(u8, agentRowLabel(self, agent_tab_semantic), "× ") and std.mem.startsWith(u8, agentRowLabel(self, "workspace.1"), "× ") and
+        self.ui_tree.byId(.{ .value = "workspace.1.agent.errored" }) != null and self.ui_tree.byId(.{ .value = "workspace.1.tab.3.agent.idle" }) != null, "sidebar.status_icons = symbols applied by hot reload, with the same semantic ids", .{});
+    try self.drawFrame();
+    agentCheck(out, &failures, sidebarIconPainted(self, agent_row, .danger, .foreground) and sidebarIconPainted(self, second_row, .green, .foreground) and
+        sidebarIconPainted(self, agent_tab_semantic, .danger, null), "the symbols keep the state colours on the icon alone", .{});
+    const bad_reloads = self.config_reload_count;
+    try writeConfigTestFile(io, style_path, "sidebar.status_icons = circles\n");
+    agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .reloads = bad_reloads + 1 }) and
+        try waitForAgent(self, io, out, &os_trace, .{ .element = "config.error" }) and
+        std.mem.indexOf(u8, agentRowLabel(self, "config.error"), "expected `dots` or `symbols`") != null and
+        self.config_current.settings.sidebar_status_icons == .symbols and agentRowLabelIs(self, agent_row, "× fake errored"), "a bad value is a config.error line and keeps symbols", .{});
 
     // Agent choices list live agents and never the scratchpad.
     self.rebuildAgentChoices();
@@ -30385,7 +30455,7 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     // A hot-reloaded switch suppresses that kind of entry.
     const path = self.config_path orelse return 1;
     const reloads = self.config_reload_count;
-    try writeConfigTestFile(io, path, "notifications.permission = false\n");
+    try writeConfigTestFile(io, path, "sidebar.status_icons = symbols\nnotifications.permission = false\n");
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .reloads = reloads + 1 }) and
         !self.agents.settings.permission, "the settings file's notifications.permission = false applied by hot reload", .{});
     const entries_before = self.agents.notifications.count();
