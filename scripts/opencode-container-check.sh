@@ -19,6 +19,14 @@
 #      `Agent: launch` starts OpenCode whose structured events drive the tab
 #      glyph and the agent view, where the permission is answered by click
 #      (AC1, AC2).
+#   3. TASK-88: the hand-started agent's sidebar row label follows the screen
+#      (input, working, permission answered in the TUI, input again) and
+#      carries OpenCode's terminal title; from another tab a click on the row
+#      shows the TUI, a second opens the agent view and a third closes it;
+#      the launched agent's view shows the mock's reasoning and the bash
+#      result (`agent.view.<a>.reasoning.<n>`, `agent.view.<a>.result.<n>`).
+#      Each label is appended to rows.txt. The errored state (the mock
+#      stopped, about a minute of OpenCode retries) was verified by hand.
 # The transcript, screenshots, semantic trees and logs land in the output
 # directory (default: .zig-cache/opencode-live). Requires docker and zig.
 #
@@ -56,7 +64,7 @@ if [ "$exec_inside" = 1 ]; then
       "npm": "@ai-sdk/openai-compatible",
       "name": "Conduit mock",
       "options": { "baseURL": "http://127.0.0.1:8765/v1", "apiKey": "mock" },
-      "models": { "conduit-mock": { "name": "Conduit mock", "tool_call": true } }
+      "models": { "conduit-mock": { "name": "Conduit mock", "tool_call": true, "reasoning": true } }
     }
   },
   "model": "conduit/conduit-mock",
@@ -67,7 +75,7 @@ JSON
   # OPENCODE_CONFIG survives conduit-test's isolated HOME: Local children
   # inherit Conduit's environment (TASK-73).
   export OPENCODE_CONFIG=/tmp/oc/opencode.json
-  python3 /scripts/opencode-mock-provider.py --port 8765 --log "$out/provider.log" &
+  python3 /scripts/opencode-mock-provider.py --port 8765 --delay 2 --log "$out/provider.log" &
 
   step "opencode version"
   opencode --version
@@ -104,6 +112,45 @@ JSON
   # Wait for any element whose id starts with $1 (the glyph's state is
   # whatever the PTY baseline says at that moment). Bounded polling of the
   # semantic tree: `wait-for` takes exact ids only.
+  # Wait until the label of an element whose id starts with $1 matches the
+  # extended regex $2, and record it. Bounded polling: there is no label wait.
+  labels() {
+    c --json inspect | python3 -c '
+import json, sys
+prefix = sys.argv[1]
+def walk(n):
+    if isinstance(n, dict):
+        if str(n.get("id", "")).startswith(prefix):
+            print(n["id"] + "\t" + str(n.get("label", "")) + "\t" + ("selected" if n.get("selected") else ""))
+        for v in n.values():
+            walk(v)
+    elif isinstance(n, list):
+        for v in n:
+            walk(v)
+try:
+    walk(json.load(sys.stdin))
+except ValueError:
+    pass
+' "$1"
+  }
+  wait_selected() {
+    local deadline=$((SECONDS + ${2:-10}))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      if labels "$1" | grep -qP "^\Q$1\E\t[^\t]*\tselected$"; then return 0; fi
+      sleep 0.2
+    done
+    return 1
+  }
+  wait_label() {
+    local deadline=$((SECONDS + ${3:-30})) found
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      found=$(labels "$1" | cut -f2 | grep -E "$2" | head -1 || true)
+      if [ -n "$found" ]; then echo "$1: $found" | tee -a "$out/rows.txt"; return 0; fi
+      sleep 0.2
+    done
+    echo "$1: no label matching $2 in time: $(labels "$1" | cut -f2 | tr '\n' '|')" | tee -a "$out/rows.txt"
+    return 1
+  }
   wait_prefix() {
     local deadline=$((SECONDS + ${2:-30}))
     while [ "$SECONDS" -lt "$deadline" ]; do
@@ -127,6 +174,36 @@ JSON
   c --json inspect > "$out/observed-tree.json"
   grep -o '"workspace.1.tab.1.agent.[a-z_]*"' "$out/observed-tree.json" | sort -u || true
   shot observed-opencode
+
+  step "TASK-88: the observed row through a turn, and row clicks"
+  row=workspace.1.tab.1.agent-row.
+  check wait_label "$row" '^● opencode input: OpenCode' 30
+  c type 'run the marker'
+  c key ENTER
+  check wait_label "$row" '^● opencode working: OC \| ' 20
+  shot observed-working
+  check wait_label "$row" '^● opencode permission: OC \| ' 30
+  shot observed-permission
+  # Allow once is the TUI's highlighted choice.
+  c key ENTER
+  check c wait-for terminal-text 'All done.' 30000
+  check wait_label "$row" '^● opencode input: OC \| ' 30
+  row_id=$(labels "$row" | head -1 | cut -f1)
+  c key CTRL+SHIFT+t
+  check wait_selected workspace.1.tab.2 10
+  c click "$row_id"
+  check wait_selected workspace.1.tab.1 10
+  check c wait-for element workspace.1.pane.1 exists true 5000
+  if labels agent.view. | grep -q .; then echo "FAIL the first row click opened the view"; failures=$((failures + 1)); fi
+  shot observed-row-click-terminal
+  c click "$row_id"
+  check wait_prefix 'agent.view.' 10
+  labels agent.view. > "$out/observed-view.txt"
+  shot observed-row-click-view
+  c click "$row_id"
+  check c wait-for element workspace.1.pane.1 exists true 5000
+  for _ in $(seq 1 25); do labels agent.view. | grep -q . || break; sleep 0.2; done
+  if labels agent.view. | grep -q .; then echo "FAIL the third row click left the view open"; failures=$((failures + 1)); fi
   # OpenCode's exit chord; a second one when the first only cleared input.
   c key CTRL+c
   if ! c wait-for element workspace.1.tab.1.agent.done exists true 5000; then c key CTRL+c; fi
@@ -147,8 +224,8 @@ JSON
   check c wait-for element palette.argument exists true 5000
   c type 'run the marker'
   c key ENTER
-  check c wait-for element workspace.1.tab.2.agent.working exists true 60000
-  check c wait-for element workspace.1.tab.2.agent.waiting_permission exists true 60000
+  check c wait-for element workspace.1.tab.3.agent.working exists true 60000
+  check c wait-for element workspace.1.tab.3.agent.waiting_permission exists true 60000
   shot launched-waiting-permission
   c key CTRL+SHIFT+a
   check wait_prefix 'agent.view.' 10
@@ -160,9 +237,14 @@ JSON
   if [ -n "$once" ]; then c click "$once"; fi
   outcome="${once%.once}.outcome"
   check c wait-for element "$outcome" exists true 20000
-  check c wait-for element workspace.1.tab.2.agent.done exists true 60000
+  check c wait-for element workspace.1.tab.3.agent.done exists true 60000
   c --json inspect > "$out/final-tree.json"
   shot agent-view-done
+  labels agent.view. | cut -f1,2 > "$out/launched-view.txt"
+  check grep -qE $'^agent\\.view\\.[0-9]+\\.reasoning\\.[0-9]+\t∴ The user wants the marker; run it with bash first\\.$' "$out/launched-view.txt"
+  check grep -qE $'^agent\\.view\\.[0-9]+\\.result\\.[0-9]+\t +↳ bash: conduit-live$' "$out/launched-view.txt"
+  grep -E '\.(reasoning|result)\.' "$out/launched-view.txt" || true
+  check wait_label workspace.1.tab.3.agent-row. '^● opencode done: OC \| ' 10
   c logs 1048576 > "$out/conduit.log" || true
   c quit || true
   echo "conduit-test failures: $failures"

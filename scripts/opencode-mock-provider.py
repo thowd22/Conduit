@@ -11,6 +11,12 @@ answers are fixed, which is what makes the live check deterministic:
 - any other request calls the `bash` tool once with `echo conduit-live`,
   which OpenCode's `permission.bash = "ask"` turns into a permission request.
 
+Both tool-carrying answers stream a `reasoning_content` delta first, so
+OpenCode records reasoning parts (TASK-87/TASK-88), and wait `--delay`
+seconds before streaming, so a turn is visibly working for a while. A prompt
+containing `provider-error` is answered with HTTP 400, OpenCode's provider
+error block.
+
 Only loopback is served. Every request is appended to the log named by
 `--log`, so the transcript shows what OpenCode actually sent.
 """
@@ -22,6 +28,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOOL_COMMAND = "echo conduit-live"
+REASONING_TOOL = "The user wants the marker; run it with bash first."
+REASONING_DONE = "The marker printed; the task is finished."
 
 
 def chunk(delta, finish=None):
@@ -34,6 +42,15 @@ def chunk(delta, finish=None):
     }
 
 
+def text_of(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return ""
+
+
 def answer_for(request):
     messages = request.get("messages") or []
     tools = request.get("tools") or []
@@ -41,12 +58,15 @@ def answer_for(request):
         return "text", "Conduit live check"
     last = messages[-1] if messages else {}
     if last.get("role") == "tool":
-        return "text", "All done."
+        return "done", "All done."
+    if last.get("role") == "user" and "provider-error" in text_of(last):
+        return "error", "mock refused this request"
     return "tool", TOOL_COMMAND
 
 
 class Handler(BaseHTTPRequestHandler):
     log_path = None
+    delay = 0.0
 
     def log_message(self, fmt, *args):  # quiet the default stderr log
         pass
@@ -77,8 +97,18 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.rstrip("/").endswith("/chat/completions"):
             self.send_error(404)
             return
+        if kind == "error":
+            body = json.dumps({"error": {"message": payload, "type": "invalid_request_error"}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if kind in ("tool", "done") and self.delay > 0:
+            time.sleep(self.delay)
         if not request.get("stream"):
-            message = {"role": "assistant", "content": payload if kind == "text" else None}
+            message = {"role": "assistant", "content": None if kind == "tool" else payload}
             finish = "stop"
             if kind == "tool":
                 message["tool_calls"] = [self.tool_call()]
@@ -100,7 +130,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         events = [chunk({"role": "assistant", "content": ""})]
-        if kind == "text":
+        if kind == "tool":
+            events.append(chunk({"reasoning_content": REASONING_TOOL}))
+        elif kind == "done":
+            events.append(chunk({"reasoning_content": REASONING_DONE}))
+        if kind != "tool":
             events.append(chunk({"content": payload}))
             events.append(chunk({}, "stop"))
         else:
@@ -134,8 +168,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--log")
+    parser.add_argument("--delay", type=float, default=0.0)
     args = parser.parse_args()
     Handler.log_path = args.log
+    Handler.delay = args.delay
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"mock provider on 127.0.0.1:{args.port}", flush=True)
     try:

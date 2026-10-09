@@ -2854,6 +2854,8 @@ test "live: a real opencode serve, when installed" {
     var out: [16]event.StoredEvent = undefined;
     var saw_working = false;
     var saw_tool = false;
+    var saw_reasoning = false;
+    var saw_result = false;
     var saw_answer = false;
     var answered = false;
     var resolved: ?event.PermissionOutcome = null;
@@ -2880,6 +2882,14 @@ test "live: a real opencode serve, when installed" {
                     answered = true;
                 },
                 .permission_resolved => |r| resolved = r.outcome,
+                // TASK-88: the mock streams `reasoning_content` before the
+                // tool call, and the allowed bash prints its marker.
+                .reasoning => |r| if (std.mem.eql(u8, r.text, "The user wants the marker; run it with bash first.")) {
+                    saw_reasoning = true;
+                },
+                .tool_result => |r| if (std.mem.eql(u8, r.name, "bash") and std.mem.eql(u8, r.summary, "conduit-live") and !r.failed) {
+                    saw_result = true;
+                },
                 .message => |m| if (m.role == .assistant and std.mem.eql(u8, m.text, "All done.")) {
                     saw_answer = true;
                 },
@@ -2888,6 +2898,7 @@ test "live: a real opencode serve, when installed" {
         }
     }
     try testing.expect(saw_working and saw_tool and answered and saw_answer and done);
+    try testing.expect(saw_reasoning and saw_result);
     // Conduit answered, so the outcome is `allowed`, not "elsewhere".
     try testing.expectEqual(@as(?event.PermissionOutcome, .allowed), resolved);
 }
