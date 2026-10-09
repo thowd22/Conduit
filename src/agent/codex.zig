@@ -67,7 +67,10 @@
 //! Hand-started detection (best effort): with no harness session id,
 //! `attach` in `.daemon` mode asks the daemon for its loaded threads
 //! (`thread/loaded/list`) and the most recently updated thread whose cwd is
-//! `Options.cwd` (`thread/list`), and resumes that one. When the correlation
+//! `Options.cwd` (`thread/list`), and resumes that one. A TUI this adapter
+//! launched instead takes the earliest loaded thread in its cwd created since
+//! the launch (`createdAt`), so it never follows an older TUI's thread in the
+//! same directory (TASK-88). When the correlation
 //! token reaches Conduit through Codex hooks (TASK-60), the owner passes the
 //! hook's session id as `AttachRequest.harness_session_id` and the guess is
 //! skipped.
@@ -1098,6 +1101,14 @@ pub const CodexAdapter = struct {
     loaded: [max_loaded_threads]IdText = undefined,
     loaded_count: usize = 0,
     chosen: IdText = .{},
+    /// The `createdAt` of `chosen`, while a launched TUI's attach picks the
+    /// earliest thread created since its launch.
+    chosen_created: i64 = 0,
+    /// Unix seconds when `launch` described a TUI on this adapter, or null
+    /// for an observed (hand-started) agent. A launched TUI's own thread is
+    /// created after this, so `attach` never resumes an older thread in the
+    /// same cwd, such as another TUI's thread left waiting on an approval.
+    launched_at: ?i64 = null,
 
     backlog: []event.StoredEvent,
     backlog_head: usize = 0,
@@ -1284,6 +1295,7 @@ pub const CodexAdapter = struct {
             try argv.appendSlice(allocator, &.{ "codex", "app-server", "--listen", "stdio://" });
         } else {
             try argv.appendSlice(allocator, &.{ "codex", "--cd", try allocator.dupe(u8, request.cwd) });
+            self.launched_at = std.Io.Clock.real.now(self.io).toSeconds();
             if (request.initial_prompt) |prompt| {
                 // `--` keeps a prompt that starts with '-' from parsing as a flag.
                 try argv.appendSlice(allocator, &.{ "--", try allocator.dupe(u8, prompt) });
@@ -1324,6 +1336,7 @@ pub const CodexAdapter = struct {
             .daemon => {
                 try self.call(.thread_loaded_list, "thread/loaded/list", .{ .limit = max_loaded_threads });
                 self.chosen = .{};
+                self.chosen_created = 0;
                 try self.call(.thread_list, "thread/list", .{
                     .cwd = self.cwd,
                     .limit = 50,
@@ -1552,14 +1565,24 @@ pub const CodexAdapter = struct {
                 }
             },
             .thread_list => {
-                // Sorted most recently updated first: the first loaded thread
-                // in this cwd is the best guess.
+                // Sorted most recently updated first: for a hand-started TUI
+                // the first loaded thread in this cwd is the best guess. A
+                // launched TUI takes the earliest thread created since its
+                // launch (`createdAt` is whole seconds, hence one second of
+                // slack), and none while its own does not exist yet.
                 for (array(field(r, "data"))) |thread| {
                     const id_text = string(field(thread, "id")) orelse continue;
                     const cwd = string(field(thread, "cwd")) orelse continue;
                     if (!std.mem.eql(u8, cwd, self.cwd)) continue;
                     if (!self.isLoaded(id_text)) continue;
-                    if (self.chosen.set(id_text)) break;
+                    const launched_at = self.launched_at orelse {
+                        if (self.chosen.set(id_text)) break;
+                        continue;
+                    };
+                    const created = integer(field(thread, "createdAt")) orelse continue;
+                    if (created < launched_at - 1) continue;
+                    if (!self.chosen.isEmpty() and created >= self.chosen_created) continue;
+                    if (self.chosen.set(id_text)) self.chosen_created = created;
                 }
             },
             .turn_start, .turn_steer => {
@@ -2083,6 +2106,13 @@ fn field(value: Value, name: []const u8) ?Value {
 fn string(value: ?Value) ?[]const u8 {
     return switch (value orelse return null) {
         .string => |s| s,
+        else => null,
+    };
+}
+
+fn integer(value: ?Value) ?i64 {
+    return switch (value orelse return null) {
+        .integer => |i| i,
         else => null,
     };
 }
@@ -3405,6 +3435,53 @@ test "daemon attach finds a hand-started TUI's thread by cwd" {
     const refused = try Rig.create(.daemon, &.{results[0]});
     defer refused.destroy();
     try testing.expectError(error.UnknownTarget, refused.attach("gone"));
+}
+
+test "a launched TUI's attach skips threads created before its launch" {
+    // TASK-88: a launched Codex resumed the most recently updated thread in
+    // its cwd, which was an older TUI's thread still waiting on an approval;
+    // the agent view answered that thread while the launched TUI kept asking.
+    const now = std.Io.Clock.real.now(testing.io).toSeconds();
+    var list_buffer: [512]u8 = undefined;
+    const list = try std.fmt.bufPrint(&list_buffer, "{{\"data\":[" ++
+        "{{\"id\":\"old\",\"cwd\":\"/work/proj\",\"createdAt\":{d},\"updatedAt\":{d}}}," ++
+        "{{\"id\":\"later\",\"cwd\":\"/work/proj\",\"createdAt\":{d},\"updatedAt\":{d}}}," ++
+        "{{\"id\":\"mine\",\"cwd\":\"/work/proj\",\"createdAt\":{d},\"updatedAt\":{d}}}]}}", .{
+        now - 600, now + 5,
+        now + 3,   now + 4,
+        now,       now + 1,
+    });
+    const results = [_]FakeServer.Result{
+        .{ .method = "initialize", .json = default_init_result },
+        .{ .method = "thread/loaded/list", .json = "{\"data\":[\"old\",\"later\",\"mine\"],\"nextCursor\":null}" },
+        .{ .method = "thread/list", .json = list },
+        .{ .method = "thread/resume", .json = "{\"thread\":{\"id\":\"mine\",\"cwd\":\"/work/proj\",\"status\":{\"type\":\"idle\"}}}" },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const token: adapter_mod.CorrelationToken = .fromBytes(@splat(9));
+
+    // Launched: the first thread created since the launch is its own.
+    const rig = try Rig.create(.daemon, &results);
+    defer rig.destroy();
+    _ = try rig.codex.adapter().launch(arena_state.allocator(), .{ .context_kind = .local, .cwd = "/work/proj", .token = token });
+    try rig.attach(null);
+    try testing.expectEqualStrings("{\"id\":4,\"method\":\"thread/resume\",\"params\":{\"threadId\":\"mine\",\"excludeTurns\":true}}", rig.server.lines.items[4]);
+
+    // Only an older thread: nothing yet (the TUI starts its thread on the
+    // first message), so the owner retries.
+    var old_buffer: [256]u8 = undefined;
+    const old_only = try std.fmt.bufPrint(&old_buffer, "{{\"data\":[{{\"id\":\"old\",\"cwd\":\"/work/proj\",\"createdAt\":{d},\"updatedAt\":{d}}}]}}", .{ now - 600, now + 5 });
+    const early = try Rig.create(.daemon, &.{ results[0], results[1], .{ .method = "thread/list", .json = old_only } });
+    defer early.destroy();
+    _ = try early.codex.adapter().launch(arena_state.allocator(), .{ .context_kind = .local, .cwd = "/work/proj", .token = token });
+    try testing.expectError(error.UnknownTarget, early.attach(null));
+
+    // Observed (no launch): still the most recently updated loaded thread.
+    const observed = try Rig.create(.daemon, &.{ results[0], results[1], results[2], .{ .method = "thread/resume", .json = "{\"thread\":{\"id\":\"old\",\"cwd\":\"/work/proj\",\"status\":{\"type\":\"idle\"}}}" } });
+    defer observed.destroy();
+    try observed.attach(null);
+    try testing.expectEqualStrings("{\"id\":4,\"method\":\"thread/resume\",\"params\":{\"threadId\":\"old\",\"excludeTurns\":true}}", observed.server.lines.items[4]);
 }
 
 test "a full owner queue keeps events with the adapter" {
