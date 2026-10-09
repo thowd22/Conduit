@@ -32,11 +32,13 @@
 //!   skipped.
 //! * **Session registry** (`findRunningSession`). Claude Code 2.1.x keeps an
 //!   undocumented `<config>/sessions/<pid>.json` per running interactive
-//!   session with `sessionId`, `cwd` and `status` (`busy`, `waiting`,
-//!   `idle`), removed on exit. It is the best-effort way to recognise a
+//!   session with `sessionId`, `cwd`, `status` (`busy`, `waiting`, `idle`)
+//!   and, while waiting, `waitingFor` (`permission prompt` at a tool
+//!   approval), removed on exit. It is the best-effort way to recognise a
 //!   `claude` the human started by hand in a Conduit terminal, and the live
-//!   status of such an attached session; it is never the only source of a
-//!   permission state.
+//!   status of such an attached session, including that it waits on a
+//!   permission prompt; only a hook ever reports the request itself, so an
+//!   observed session's prompt is answered in its terminal.
 //!
 //! Hook → event mapping (verified against Claude Code 2.1.292 hook inputs):
 //!   SessionStart (startup, resume, clear)  → status idle (`compact` → none)
@@ -847,9 +849,10 @@ pub const TranscriptReader = struct {
 pub const RegisteredSession = struct {
     pid: u32,
     session_id: SessionId,
-    /// `busy` → working, `waiting` → waiting_input (Claude does not say for
-    /// what; a permission request is only ever claimed by a hook), `idle` →
-    /// idle; anything else is unknown.
+    /// `busy` → working, `waiting` → waiting_permission when `waitingFor`
+    /// names a permission prompt (2.1.292 writes `"permission prompt"` at a
+    /// tool approval) and waiting_input otherwise, `idle` → idle; anything
+    /// else is unknown.
     status: ?State,
     started_at: i64,
 };
@@ -865,7 +868,7 @@ pub fn parseRegisteredSession(arena: Allocator, bytes: []const u8, cwd_out: ?*[]
         if (std.mem.eql(u8, s, "busy"))
             .working
         else if (std.mem.eql(u8, s, "waiting"))
-            .waiting_input
+            if (waitingForPermission(string(record, "waitingFor"))) .waiting_permission else .waiting_input
         else if (std.mem.eql(u8, s, "idle"))
             .idle
         else
@@ -879,6 +882,13 @@ pub fn parseRegisteredSession(arena: Allocator, bytes: []const u8, cwd_out: ?*[]
         .status = status,
         .started_at = integer(record, "startedAt") orelse 0,
     };
+}
+
+/// Whether a registry record's `waitingFor` names a permission prompt. Only
+/// the word is trusted, never the rest of the text.
+fn waitingForPermission(waiting_for: ?[]const u8) bool {
+    const text = waiting_for orelse return false;
+    return std.ascii.indexOfIgnoreCase(text, "permission") != null;
 }
 
 /// How to recognise a hand-started session: by the process id of the
@@ -1730,6 +1740,7 @@ const registry_mod = @import("registry.zig");
 const fixture_hooks = @embedFile("claude_code/fixtures/hooks.jsonl");
 const fixture_transcript = @embedFile("claude_code/fixtures/transcript.jsonl");
 const fixture_registry = @embedFile("claude_code/fixtures/session-registry.json");
+const fixture_registry_permission = @embedFile("claude_code/fixtures/session-registry-permission.json");
 const fixture_permission = @embedFile("claude_code/fixtures/permission-request.json");
 const fixture_token = "0123456789abcdef0123456789abcdef";
 
@@ -2385,6 +2396,45 @@ test "a hand-started session is detected, attached and followed until it exits" 
     try dir.deleteFile(testing.io, "config/sessions/4242.json");
     try testing.expectEqual(@as(usize, 0), try iface.poll(&queue));
     try testing.expectError(error.Disconnected, iface.poll(&queue));
+}
+
+test "a hand-started session waiting on a permission prompt reads as waiting for permission" {
+    // Recorded from 2.1.292 at a Bash approval (TASK-88): `status` is
+    // `waiting` and `waitingFor` names what for.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const permission = parseRegisteredSession(arena.allocator(), fixture_registry_permission, null).?;
+    try testing.expectEqual(@as(?State, .waiting_permission), permission.status);
+    const waiting = try std.mem.replaceOwned(u8, arena.allocator(), fixture_registry_permission, ",\"waitingFor\":\"permission prompt\"", "");
+    try testing.expectEqual(@as(?State, .waiting_input), parseRegisteredSession(arena.allocator(), waiting, null).?.status);
+
+    // Through an observed agent's poll: busy, the approval, busy again.
+    var scratch: Scratch = undefined;
+    try scratch.init();
+    defer scratch.deinit();
+    const dir = scratch.tmp.dir;
+    try dir.createDirPath(testing.io, "config/sessions");
+    try dir.writeFile(testing.io, .{ .sub_path = "config/sessions/4242.json", .data = fixture_registry });
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    var a = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .config_dir = scratch.join(&buffer, "config"), .observe = .{ .pid = 4242, .cwd = "/work/conduit" } });
+    const iface = a.adapter();
+    defer iface.destroy();
+    try iface.attach(.{ .session = .first, .token = fixtureToken() });
+    var queue = try event.EventQueue.init(testing.allocator, testing.io, 8);
+    defer queue.deinit(testing.allocator);
+    var out: [8]event.StoredEvent = undefined;
+    const steps = [_]struct { record: []const u8, state: State }{
+        .{ .record = fixture_registry, .state = .working },
+        .{ .record = fixture_registry_permission, .state = .waiting_permission },
+        .{ .record = fixture_registry, .state = .working },
+    };
+    for (steps) |step| {
+        try dir.writeFile(testing.io, .{ .sub_path = "config/sessions/4242.json", .data = step.record });
+        try testing.expectEqual(@as(usize, 1), try iface.poll(&queue));
+        try testing.expectEqual(@as(usize, 1), queue.drain(&out));
+        try testing.expectEqual(step.state, out[0].event.status_change.state);
+        try testing.expectEqual(state_model.Source.structured, out[0].event.status_change.source);
+    }
 }
 
 test "an observed claude attaches by its foreground pid, else by its cwd, and waits until registered" {
