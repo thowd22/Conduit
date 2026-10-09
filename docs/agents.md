@@ -98,6 +98,36 @@ The semantic ids are unchanged (`<row>.agent.<state>` on tab and workspace rows,
 `workspace.<k>.tab.<n>.agent-row.<id>` for agent rows), so the test driver and accessibility read
 the state from the id and the label, not from the colour.
 
+### Reasoning and tool output in the agent view (TASK-87)
+
+Open an agent's view (click its sidebar row, or **Agent: toggle view**) to see what it is doing,
+not just what it says. Besides messages (`you ›`, `claude ›`), tool uses (`⚙ <tool> <summary>`),
+file references and permission prompts, the view shows:
+
+- **Reasoning** as dim rows under a `∴` prefix, wrapped at the pane width like a message. A very
+  long block is cut (at 8 KiB per event) and ends with `…`.
+- **Tool results** as one row under the tool use, `↳ <first line of output>`, cut with `…` when
+  there was more. A failed result (a non-zero exit, an error result, a refused patch) is drawn in
+  the danger colour and, where the harness reports an exit status, reads `exit N: …`. When the
+  row above is not that tool's, the result names it (`↳ Bash: …`).
+
+What each harness contributes:
+
+| Harness | Reasoning | Tool results |
+|---|---|---|
+| Claude Code 2.1.292 | `thinking` blocks from the session transcript | `PostToolUse` (`tool_response`: Bash stdout/stderr, a Read's line count, a file path) and `PostToolUseFailure` (`error`) hooks; from the transcript's `tool_result` blocks when no hooks run (an agent started by hand) |
+| Codex 0.160.1 | the summary of each completed `reasoning` item (its raw text when there is no summary); rollout `reasoning` records | completed `commandExecution` items (output, `exitCode`, `failed`/`declined` status) and `fileChange` items (`add path`, failed unless `completed`); rollout tool outputs |
+| Pi 0.73.1 | `thinking` blocks: from Conduit's extension (`message_end`), the RPC stream and the session file | `tool_execution_end` from the extension (its first 500 characters of output) and the RPC stream; the session file's `toolResult` and `bashExecution` entries |
+| OpenCode 1.18.35 | `reasoning` message parts, once they end | tool parts that reach `completed` (bash's `metadata.exit` marks a non-zero exit) or `error` |
+
+Reasoning appears only when the model returns it to the harness: a model or provider that hides
+its reasoning (or an encrypted Codex reasoning item without a summary) shows none. All of it is
+untrusted text from the harness: Conduit cleans it of control characters, shows it and lets you
+select, copy and search it, but never acts on it and never logs it. Each fixture behind this was
+recorded from the pinned harness version against a local model stand-in (no account):
+`src/agent/claude_code/fixtures/*-tools.jsonl`, `test/fixtures/agent/codex/*-reasoning-0.160.1.jsonl`,
+`src/agent/pi/testdata/*_reasoning_*`, `test/fixtures/agent/opencode/recorded-reasoning-*`.
+
 ### Agents on Windows (TASK-82)
 
 The control endpoint is a per-user named pipe on Windows (`\\.\pipe\conduit-<your SID>-r-…`,

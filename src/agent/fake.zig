@@ -376,9 +376,11 @@ test "a full lifecycle from the fake: idle, working, permission, working, done, 
     };
     const script = [_]event.Event{
         .{ .status_change = .{ .state = .working, .source = .structured } },
+        .{ .reasoning = .{ .text = "The build file names every step." } },
         .{ .message = .{ .role = .assistant, .text = "Reading the build." } },
         .{ .tool_use = .{ .name = "Read", .summary = "build.zig" } },
         .{ .file_reference = .{ .path = "build.zig", .line = 42 } },
+        .{ .tool_result = .{ .name = "Read", .summary = "120 lines" } },
         .{ .subagent = .{ .id = "sub-1", .name = "explore", .phase = .start } },
         .{ .subagent = .{ .id = "sub-1", .name = "explore", .phase = .stop } },
         .{ .permission_request = .{ .id = "req-1", .title = "Run zig build?", .decisions = &decisions } },
@@ -423,8 +425,8 @@ test "a full lifecycle from the fake: idle, working, permission, working, done, 
     }
     const S = @import("state.zig").State;
     try testing.expectEqualSlices(S, &.{
-        .working,            .working, .working, .working, .working, .working,
-        .waiting_permission, .working, .done,    .idle,    .done,
+        .working, .working,            .working, .working, .working, .working, .working,
+        .working, .waiting_permission, .working, .done,    .idle,    .done,
     }, &seen);
     try testing.expectEqualStrings("allow", fake.permissionAnswer().decision);
     const agent = reg.get(id).?;
