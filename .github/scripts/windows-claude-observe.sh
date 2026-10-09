@@ -13,8 +13,8 @@
 #   2. type `claude` and Enter;
 #   3. wait for the tab's observed-agent glyph and check the agent's own row,
 #      `workspace.1.tab.1.agent-row.<id>`, reads `· claude idle`;
-#   4. Ctrl+C until Claude Code exits (or, reported with a warning when Ctrl+C
-#      does not reach it, end it with taskkill), then wait for `done` and
+#   4. Ctrl+C until Claude Code exits (or, reported with a warning when it
+#      does not leave, end it with taskkill), then wait for `done` and
 #      check the row reads `✓ claude done`.
 #
 # Screenshots of both states, the semantic tree, the terminal text and the
@@ -80,79 +80,6 @@ if ct wait-for terminal-text "PS " 60000 > /dev/null; then
 else
   fail "no PowerShell prompt"
 fi
-# --- TASK-83 diagnostics (temporary) ------------------------------------------
-# claude_state <label>: what Windows says about claude.exe and its children.
-claude_state() {
-  powershell.exe -NoProfile -Command "\$p = @(Get-Process claude -ErrorAction SilentlyContinue); if (\$p.Count -eq 0) { 'no claude process' } else { foreach (\$q in \$p) { 'pid ' + \$q.Id + ' responding ' + \$q.Responding + ' cpu ' + \$q.CPU + ' threads ' + \$q.Threads.Count + ' handles ' + \$q.HandleCount; \$q.Threads | Group-Object ThreadState,WaitReason | ForEach-Object { '  ' + \$_.Count + ' x ' + \$_.Name } }; Get-CimInstance Win32_Process | Where-Object { \$p.Id -contains \$_.ParentProcessId } | ForEach-Object { '  child ' + \$_.ProcessId + ' ' + \$_.CommandLine } }" \
-    2>&1 | tr -d '\r' | sed "s/^/INFO $1: /"
-}
-
-# The same Claude Code in a classic console window (conhost, no
-# pseudoconsole): two Ctrl+C key events written straight into its console
-# input buffer, for comparison.
-classic_ps1="$(cygpath -u "$root")/classic.ps1"
-cat > "$classic_ps1" <<'PS1'
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class ConsoleKeys {
-  [StructLayout(LayoutKind.Explicit, CharSet = CharSet.Unicode)]
-  public struct KeyEventRecord {
-    [FieldOffset(0)] public int KeyDown;
-    [FieldOffset(4)] public ushort RepeatCount;
-    [FieldOffset(6)] public ushort VirtualKeyCode;
-    [FieldOffset(8)] public ushort VirtualScanCode;
-    [FieldOffset(10)] public char UnicodeChar;
-    [FieldOffset(12)] public uint ControlKeyState;
-  }
-  [StructLayout(LayoutKind.Explicit)]
-  public struct InputRecord {
-    [FieldOffset(0)] public ushort EventType;
-    [FieldOffset(4)] public KeyEventRecord KeyEvent;
-  }
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
-  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-  static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
-  [DllImport("kernel32.dll", SetLastError = true)]
-  static extern bool WriteConsoleInputW(IntPtr h, InputRecord[] records, uint count, out uint written);
-  public static string CtrlC(uint pid) {
-    FreeConsole();
-    if (!AttachConsole(pid)) return "attach failed " + Marshal.GetLastWin32Error();
-    IntPtr h = CreateFileW("CONIN$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
-    var r = new InputRecord[2];
-    r[0].EventType = 1;
-    r[0].KeyEvent.KeyDown = 1;
-    r[0].KeyEvent.RepeatCount = 1;
-    r[0].KeyEvent.VirtualKeyCode = 0x43;
-    r[0].KeyEvent.VirtualScanCode = 0x2e;
-    r[0].KeyEvent.UnicodeChar = (char)3;
-    r[0].KeyEvent.ControlKeyState = 8;
-    r[1] = r[0];
-    r[1].KeyEvent.KeyDown = 0;
-    uint written;
-    bool ok = WriteConsoleInputW(h, r, 2, out written);
-    CloseHandle(h);
-    FreeConsole();
-    return "wrote " + ok + " " + written;
-  }
-}
-'@
-$exe = 'C:\npm\prefix\node_modules\@anthropic-ai\claude-code\bin\claude.exe'
-$p = Start-Process -FilePath $exe -PassThru -WorkingDirectory 'D:\a\Conduit\Conduit'
-Start-Sleep -Seconds 12
-'classic: first ' + [ConsoleKeys]::CtrlC($p.Id)
-Start-Sleep -Milliseconds 300
-'classic: second ' + [ConsoleKeys]::CtrlC($p.Id)
-if ($p.WaitForExit(15000)) { 'classic: exited with ' + $p.ExitCode } else {
-  'classic: still running 15 s after two Ctrl+C'
-  Stop-Process -Id $p.Id -Force
-}
-PS1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$classic_ps1")" 2>&1 | tr -d '\r' | sed 's/^/INFO /'
-# --- end of TASK-83 diagnostics -----------------------------------------------
-
 ct type "claude" > /dev/null
 ct key ENTER > /dev/null
 
@@ -176,53 +103,29 @@ esac
 keep_screenshot claude-idle
 ct terminal-text > "$out/claude-terminal.txt" 2>&1 || true
 
-# TASK-83 diagnostics (temporary): one press alone first, to see whether
-# Claude Code clears its "Press Ctrl-C again" hint (alive, timers running).
-claude_state "idle"
-ct key CTRL+c > /dev/null
-if ct wait-for terminal-text "Press Ctrl-C again" 5000 > /dev/null; then
-  echo "INFO single press: hint shown"
-  cleared=no
-  for _ in $(seq 1 20); do
-    if ! ct terminal-text 2> /dev/null | grep -q "Press Ctrl-C again"; then cleared=yes; break; fi
-    sleep 0.5
-  done
-  echo "INFO single press: hint cleared within 10 s: $cleared"
-else
-  echo "INFO single press: no hint"
-fi
-
 # Ctrl+C until Claude Code has left: the first asks "Press Ctrl-C again to
 # exit", and a second within a moment of that ends it.
 left=""
-ct key CTRL+c > /dev/null
-ct wait-for terminal-text "Press Ctrl-C again" 3000 > /dev/null || true
-ct key CTRL+c > /dev/null
-if ct wait-for element workspace.1.tab.1.agent.done exists true 5000 > /dev/null; then
-  left=ctrl-c
-else
-  echo "INFO Ctrl+C twice: claude is still in front"
-  claude_state "after double press"
-  ct terminal-text > "$out/claude-after-double.txt" 2>&1 || true
-  # TASK-83 diagnostics (temporary): does Enter, or a third Ctrl+C, end it?
-  ct key ENTER > /dev/null
-  if ct wait-for element workspace.1.tab.1.agent.done exists true 8000 > /dev/null; then
-    left=enter-after
-  else
-    ct key CTRL+c > /dev/null
-    if ct wait-for element workspace.1.tab.1.agent.done exists true 8000 > /dev/null; then
-      left=third-ctrl-c
-    fi
+for attempt in 1 2 3; do
+  ct key CTRL+c > /dev/null
+  ct wait-for terminal-text "Press Ctrl-C again" 3000 > /dev/null || true
+  ct key CTRL+c > /dev/null
+  if ct wait-for element workspace.1.tab.1.agent.done exists true 5000 > /dev/null; then
+    left=ctrl-c
+    break
   fi
-  echo "INFO after Enter and a third Ctrl+C: ${left:-still running}"
-  [ -n "$left" ] && left="extra:$left"
-fi
+  echo "INFO Ctrl+C $attempt: claude is still in front"
+done
 ct terminal-text > "$out/claude-after-ctrl-c.txt" 2>&1 || true
 if [ -z "$left" ]; then
-  # Reported, not gating: Ctrl+C through the pseudoconsole has not reached
-  # this Claude Code on the runner. What is gated is that its leaving the
-  # foreground ends the observed agent, so it is ended from outside.
-  echo "::warning::Ctrl+C did not end claude under ConPTY; ending it with taskkill"
+  # Reported, not gating. Both presses do reach Claude Code (TASK-83): the
+  # first shows its hint and the second starts its exit, which writes its
+  # terminal-mode resets and then never finishes on the runner, with no
+  # terminal in the way too: under a bare pseudoconsole and in a classic
+  # console window alike (runs 37867442891, 37869071981). What is gated is
+  # that its leaving the foreground ends the observed agent, so it is ended
+  # from outside.
+  echo "::warning::claude did not finish exiting after two Ctrl+C; ending it with taskkill"
   taskkill /F /IM claude.exe || true
   left=taskkill
 fi
