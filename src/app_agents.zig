@@ -214,22 +214,45 @@ pub fn sanitizeTitle(buffer: []u8, raw: []const u8) []const u8 {
 /// (U+2800..U+28FF) count too.
 const title_activity_glyphs = [_]u21{ 0x00b7, 0x2722, 0x2733, 0x2736, 0x273b, 0x273d, 0x25d0, 0x25d3, 0x25d1, 0x25d2 };
 
-/// `title` trimmed, without one leading activity glyph when that glyph is
+/// `title` trimmed, without one leading activity indicator when it is
 /// followed by whitespace or is all there is, or null when nothing is left.
-/// Only one glyph goes: `⠋ ⠙ task` reads `⠙ task`, and a glyph glued to a
-/// word is part of the title.
+/// An indicator is one activity glyph, or a one-character bracket badge
+/// such as Codex's `[ ! ]` / `[ . ]` approval blink (TASK-88). Only one
+/// goes: `⠋ ⠙ task` reads `⠙ task`, and a glyph glued to a word is part of
+/// the title. A `|` separator the indicator was joined with (`⠧ | proj`)
+/// goes with it.
 pub fn strippedTitle(title: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, title, " \t");
     if (trimmed.len == 0) return null;
-    const length = std.unicode.utf8ByteSequenceLength(trimmed[0]) catch return trimmed;
-    if (length > trimmed.len) return trimmed;
-    const first = std.unicode.utf8Decode(trimmed[0..length]) catch return trimmed;
+    const indicator = leadingIndicator(trimmed) orelse return trimmed;
+    const rest = trimmed[indicator..];
+    if (rest.len != 0 and rest[0] != ' ' and rest[0] != '\t') return trimmed;
+    var left = std.mem.trim(u8, rest, " \t");
+    if (left.len >= 2 and left[0] == '|' and (left[1] == ' ' or left[1] == '\t')) left = std.mem.trim(u8, left[1..], " \t");
+    return if (left.len == 0) null else left;
+}
+
+/// The byte length of the activity indicator `trimmed` starts with: one
+/// recognised glyph, or `[` + one printable character between optional
+/// spaces + `]`.
+fn leadingIndicator(trimmed: []const u8) ?usize {
+    if (trimmed[0] == '[') {
+        var i: usize = 1;
+        while (i < trimmed.len and trimmed[i] == ' ') i += 1;
+        if (i >= trimmed.len) return null;
+        const length = std.unicode.utf8ByteSequenceLength(trimmed[i]) catch return null;
+        if (i + length > trimmed.len or trimmed[i] == ' ' or trimmed[i] == ']') return null;
+        i += length;
+        while (i < trimmed.len and trimmed[i] == ' ') i += 1;
+        if (i < trimmed.len and trimmed[i] == ']') return i + 1;
+        return null;
+    }
+    const length = std.unicode.utf8ByteSequenceLength(trimmed[0]) catch return null;
+    if (length > trimmed.len) return null;
+    const first = std.unicode.utf8Decode(trimmed[0..length]) catch return null;
     const recognised = (first >= 0x2800 and first <= 0x28ff) or
         std.mem.indexOfScalar(u21, &title_activity_glyphs, first) != null;
-    const rest = trimmed[length..];
-    if (!recognised or (rest.len != 0 and rest[0] != ' ' and rest[0] != '\t')) return trimmed;
-    const left = std.mem.trim(u8, rest, " \t");
-    return if (left.len == 0) null else left;
+    return if (recognised) length else null;
 }
 
 /// One sidebar agent row (TASK-86). `label` is the semantic label the
@@ -2820,6 +2843,18 @@ test "titles lose one leading activity glyph the way herdr strips them" {
         try testing.expectEqualStrings("task", strippedTitle(title).?);
     }
     try testing.expectEqualStrings("⠙ task", strippedTitle("⠋ ⠙ task").?);
+    // Codex 0.160.1 blinks a bracket badge during an approval and joins a
+    // spinner frame to the title with `|`.
+    try testing.expectEqualStrings("Action Required | proj", strippedTitle("[ ! ] Action Required | proj").?);
+    try testing.expectEqualStrings("Action Required | proj", strippedTitle("[ . ] Action Required | proj").?);
+    try testing.expectEqualStrings("proj", strippedTitle("⠧ | proj").?);
+    try testing.expectEqualStrings("proj", strippedTitle("[!] proj").?);
+    try testing.expectEqual(@as(?[]const u8, null), strippedTitle("[ ! ]"));
+    // Not badges: an empty bracket, a word in brackets, a glued bracket.
+    try testing.expectEqualStrings("[ ] proj", strippedTitle("[ ] proj").?);
+    try testing.expectEqualStrings("[main] proj", strippedTitle("[main] proj").?);
+    try testing.expectEqualStrings("[!]proj", strippedTitle("[!]proj").?);
+    try testing.expectEqualStrings("| proj", strippedTitle("| proj").?);
     // Unknown symbols, a glyph glued to a word, and one mid-title stay.
     for ([_][]const u8{ "★task", "★ production", "✨ task", "@ task", "task ⠋ detail", "[prod] task", "⠋task", "✳Claude Code" }) |title| {
         try testing.expectEqualStrings(title, strippedTitle(title).?);

@@ -572,7 +572,8 @@ JSON-RPC over a pluggable `Transport`: a minimal RFC 6455 WebSocket client over
 (`Mode.daemon`, joining a TUI's thread), or newline-delimited JSON over the pipes of an
 owner-spawned `codex app-server --listen stdio://` (`Mode.stdio`, a headless agent). `detect` runs
 `codex --version` through `ExecutionContext.run` and feeds the version gate (0.160.0 ≤ v <
-0.162.0, also checked against the `initialize` userAgent); outside the range capabilities drop to
+0.163.0 since TASK-88, because Codex's managed daemon updates itself to the latest release
+whatever the CLI version; also checked against the `initialize` userAgent); outside the range capabilities drop to
 heuristics only and `attach` fails with `error.Protocol`. `attach` runs `initialize`/`initialized`
 and then resumes a known harness session id, starts a thread (stdio), or finds a hand-started TUI:
 the most recently updated loaded thread (`thread/loaded/list` ∩ `thread/list`) whose cwd is the
@@ -1296,6 +1297,38 @@ OpenCode 1.18.35 in its container) against local model stand-ins; the fake's scr
 kinds, and `--agent-view-test` and the agent-view scenario check them. Reasoning only appears when
 the model returns it; real accounts were not used, the Pi extension change was exercised through
 RPC mode only, and omp, macOS and Windows were not tried.
+
+TASK-88 is complete on Linux. Each real harness was started by hand and launched inside a
+driven Conduit against a local model stand-in with no account (Claude Code 2.1.292, Codex
+0.160.1, Pi 0.73.1 on the box; OpenCode 1.18.35 in its check container), and its sidebar row,
+row clicks and agent view were read through `conduit-test` with inspected screenshots; the
+evidence is in the task notes. Every harness showed the coloured icons (working yellow, the waits
+red, done cyan, idle a green ring, errored a red `×`), the TUI on a first row click, the view on
+a second and the TUI on a third, and `agent.view.<a>.reasoning.<n>`/`result.<n>` rows where a
+structured channel exists: Claude Code's transcript and hooks (observed agents too, through the
+registry attach), Codex's daemon thread (observed and launched), Pi's extension (launched only;
+an observed Pi has no extension) and OpenCode's HTTP client (launched only). Titles: Claude Code
+`✳ <summary>` is stripped to the summary and cleared on exit; Codex titles the cwd basename and
+blinks `[ ! ]`/`[ . ] Action Required | <cwd>` at an approval; Pi `π - <cwd>`; OpenCode
+`OpenCode` then `OC | <session title>`. Fixes that came out of it: the Claude Code registry's
+`waitingFor: "permission prompt"` maps to `waiting_permission` and, with hooks live, the
+transcript also reports failed tool results (a classifier-blocked call gets no PostToolUse);
+a launched Codex attaches to the earliest daemon thread created since its launch instead of the
+newest in its cwd (which could be another TUI's), and the Codex gate admits 0.162.x; an observed
+agent's OSC 133 marks are ignored (Pi draws each message between prompt and command marks) and
+its title no longer shows once it has ended (the shell's again: PowerShell names its window, cmd
+the last command, the Windows runner's console `/bin/sh`); `strippedTitle` also drops a
+one-character bracket badge and a joining `|`. The Windows `--agent-test` matches a row's state
+words with or without a title detail, and `windows-claude-observe.sh` expects the icons.
+Known and left: a launched OpenCode flickers working → idle → working before its first turn
+(PTY heuristics before the first `session.status`); a provider HTTP error in OpenCode still reads
+as input; a launched Codex exiting inside a `--command` run ended the app; a Kitty Ctrl+C
+release report can reach the shell when Codex exits mid-release; `conduit-test key CTRL+C` is
+Ctrl+Shift+C, lowercase `CTRL+c` is SIGINT. Incident: a driven keystroke hit Codex's "Update
+now" dialog and upgraded the global npm `@openai/codex` to 0.162.0; it was restored to 0.160.1
+from the npm cache at once. omp, real accounts, macOS and Windows harness screens stay
+unverified; the three-OS matrix and a windows.yml `--agent-test` run are recorded on the final
+commit below.
 
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
