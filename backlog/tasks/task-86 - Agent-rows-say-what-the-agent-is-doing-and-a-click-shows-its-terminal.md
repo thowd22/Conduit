@@ -4,6 +4,7 @@ title: 'Agent rows say what the agent is doing, and a click shows its terminal'
 status: To Do
 assignee: []
 created_date: '2026-10-09 04:52'
+updated_date: '2026-10-09 05:10'
 labels:
   - agents
   - ui
@@ -29,4 +30,5 @@ The user's words: 'It just saying claude working doesnt really show me anything.
 - [ ] #4 The deterministic --agent-test and the agent-notifications scenario prove the row text (the fake sets a title through OSC 2 with a leading spinner frame, and the row shows it stripped), the terminal-first activation and the second-activation toggle, by mouse and by keyboard; the row frame was inspected
 - [ ] #5 A real hand-started Claude Code (against the local Messages API stand-in, no account) shows its own title in its row and a click on the row shows its TUI; the evidence is in the task notes
 - [ ] #6 docs/user-guide.md, docs/agents.md and AGENTS.md describe the row and the click
+- [ ] #7 The agent manager rows, the Agent: stop and Agent: focus choice lists, the agent prompts heading and the backlog card badges use the configured status icon too, so one state looks the same everywhere
 <!-- AC:END -->

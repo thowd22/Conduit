@@ -1243,6 +1243,23 @@ Node 22 and Bun 1.4.2 programs typed into Conduit exit on the second press. The 
 keeps its taskkill fallback and warning until a Claude Code release exits cleanly there. Pasted
 text cannot trigger the rewrite, because `preparePaste` rejects every control byte before the PTY.
 
+TASK-85 is complete on Linux. Sidebar agent rows, the tab rows that lead with an agent and the
+workspace rows now carry herdr's status icons, chosen by `sidebar.status_icons = dots|symbols`
+(default `dots`, hot-reloaded, a cycling row in the settings view's Agents group; a bad value is a
+`config.error` line that keeps the previous style). `app_agents.statusIcon` draws `●` for working,
+both waits and done and `○` for idle in dots, `◐` working, `×` waits, `✓` done and `○` idle in
+symbols, and `×` for errored in both; `statusRole` colours only the icon from the theme (working
+`yellow`, waits `red`, done `cyan`, idle `green`, errored `danger`) through the new
+`ui.InteractiveText.lead_foreground`/`lead_bytes`, while the row text keeps its role (agent rows
+are `foreground` again). `◐` is a `font_sprite` glyph because the bundled JetBrains Mono lacks it.
+The `<row>.agent.<state>` and `agent-row` ids are unchanged. `--agent-test` checks every state's
+icon colour on the overlay in dots, switches to symbols through the settings file and the settings
+view, and runs the screen-state checks in symbols; the agent-notifications scenario clicks the
+settings row to symbols. 640x360 frames with errored, done, permission, working and idle agents
+were inspected in both styles. herdr's done-until-seen rule was deliberately not adopted: done
+stays until the record is forgotten (TASK-80). macOS and Windows rendering, other themes and the
+`◐` sprite above scale 1 are unverified.
+
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
 attributes in any order, and `shell = <name>` for the default (32 profiles, 32 arguments and 32
