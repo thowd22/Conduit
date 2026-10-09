@@ -528,16 +528,36 @@ const agent_notifications_steps = [_]Step{
     .{ .wait_element = .{ .id = "notifications", .state = "exists", .equals = false } },
     .{ .wait_terminal_text = .{ .contains = "FAKE-STEP 3" } },
     .screenshot,
-    // TASK-80: the agent's own sidebar row under its tab. A click on it from
-    // the first tab shows the agent and its view; the sidebar keys reach it
-    // too, and Enter on the row of the view already showing closes it.
+    // TASK-80 and TASK-86: the agent's own sidebar row under its tab. A
+    // click on it from the first tab shows the agent's tab with its
+    // terminal (only that tab's screen has `FAKE-STEP 3`), and a second
+    // click, with the terminal presented, opens the view over it. Back on
+    // the first tab, a click shows the terminal again rather than the view
+    // that had covered it. The sidebar keys reach the row too: Enter opens
+    // the view over the presented terminal and, once more, closes it.
     .{ .click = "workspace.1.tab.1" },
     .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
     .{ .click = agent_row_id },
-    // The view is registered only over a pane that is showing, so its
-    // presence proves the agent's tab came forward.
+    .{ .wait_terminal_text = .{ .contains = "FAKE-STEP 3" } },
+    .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = false } },
+    .screenshot,
+    .{ .click = agent_row_id },
     .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = true } },
     .screenshot,
+    .{ .click = "workspace.1.tab.1" },
+    .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
+    .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = false } },
+    .{ .click = agent_row_id },
+    .{ .wait_terminal_text = .{ .contains = "FAKE-STEP 3" } },
+    .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = false } },
+    .{ .key = "CTRL+SHIFT+DOWN" },
+    .{ .wait_element = .{ .id = "workspace.1", .state = "focused", .equals = true } },
+    .{ .key = "TAB" },
+    .{ .key = "DOWN" },
+    .{ .key = "DOWN" },
+    .{ .wait_element = .{ .id = agent_row_id, .state = "focused", .equals = true } },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = true } },
     .{ .key = "CTRL+SHIFT+DOWN" },
     .{ .wait_element = .{ .id = "workspace.1", .state = "focused", .equals = true } },
     .{ .key = "TAB" },
@@ -547,8 +567,9 @@ const agent_notifications_steps = [_]Step{
     .{ .key = "ENTER" },
     .{ .wait_element = .{ .id = agent_view_id, .state = "exists", .equals = false } },
     // A fake harness started by hand in the first tab is observed: its row
-    // appears under that human tab, a click shows its view, the keys close
-    // it again, and the row stays, done, once the program leaves.
+    // appears under that human tab, a click while that terminal is
+    // presented shows its view, the keys close it again, and the row stays,
+    // done, once the program leaves.
     .{ .click = "workspace.1.tab.1" },
     .{ .click = "workspace.1.pane.1" },
     .{ .wait_terminal_text = .{ .contains = "CONDUIT_E2E> " } },
@@ -592,6 +613,14 @@ const agent_notifications_steps = [_]Step{
     .{ .type_text = "next" },
     .{ .key = "ENTER" },
     .{ .wait_element = .{ .id = observed_glyph ++ "waiting_input", .state = "exists", .equals = true } },
+    // TASK-86: the fake titles its window behind a braille spinner frame;
+    // its row paints the title without the frame (the screenshot), and the
+    // retained semantic tree's label reads `... done: Fixing the tests`.
+    .{ .type_text = "title" },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = "OBS-TITLED" } },
+    .{ .wait_element = .{ .id = observed_glyph ++ "waiting_input", .state = "exists", .equals = true } },
+    .screenshot,
     .{ .type_text = "bye" },
     .{ .key = "ENTER" },
     .{ .wait_element = .{ .id = "workspace.1.tab.1.agent.done", .state = "exists", .equals = true, .timeout_ms = 10_000 } },
@@ -632,13 +661,15 @@ const observed_view_id = "agent.view.2";
 /// draws what the fake's screen manifest knows (TASK-84), a typed line at a
 /// time: its `fake› ` prompt, `ask` an approval the next line answers,
 /// `fail` an error line, `spin` six spinner frames 0.4 s apart and then
-/// plain lines held until the next line, and `bye` leaves.
+/// plain lines held until the next line, `title` an OSC 2 title behind a
+/// braille spinner frame (TASK-86), and `bye` leaves.
 const observed_fake_command =
     "set -m; f=\"${TMPDIR:-/tmp}/conduit-fake-agent\"; " ++
     "printf '%s\\n' 'printf \"OBS-%s\\n\" READY' 'p() { printf \"fake\\342\\200\\272 \"; }' 'p' " ++
     "'while read l; do case $l in " ++
     "ask) printf \"fake asks: run make test? [y/n]\\n\"; read a; printf \"OBS-ANSWER-%s\\n\" \"$a\"; p;; " ++
     "fail) printf \"fake error: the build failed\\n\"; p;; " ++
+    "title) printf \"\\033]2;\\342\\240\\213 Fixing the tests\\007OBS-%s\\n\" TITLED; p;; " ++
     "spin) for i in 1 2 3 4 5 6; do printf \"\\342\\240\\213 fake working %s\\n\" $i; sleep 0.4; done; " ++
     "printf \"OBS-SPIN-%s\\nsettled\\nquiet\\nnow\\n\" DONE; read a; p;; " ++
     "bye) break;; *) p;; esac; done' > \"$f\"; sh \"$f\"";
@@ -1259,8 +1290,13 @@ test "the agent scenario opens launched and observed agents from their sidebar r
         },
         else => {},
     };
-    try std.testing.expect(row_clicks == 2 and row_focus == 2 and observed_row);
+    // Three clicks and two focused Enters on the launched agent's row
+    // (terminal, view, terminal again; view, closed), one of each on the
+    // observed agent's.
+    try std.testing.expect(row_clicks == 4 and row_focus == 3 and observed_row);
     try std.testing.expect(std.mem.indexOf(u8, observed_fake_command, "OBS-READY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, observed_fake_command, "OBS-TITLED") == null);
+    try std.testing.expect(std.mem.indexOf(u8, observed_fake_command, "\\033]2;\\342\\240\\213 Fixing the tests") != null);
 }
 
 test "sidebar branch scenario waits on the branch row appearing, leaving and returning" {
