@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-08 22:04'
-updated_date: '2026-10-09 01:33'
+updated_date: '2026-10-09 01:45'
 labels:
   - windows
   - input
@@ -46,6 +46,8 @@ Run 37865506186 (diagnostics): ReadKey reader under ConPTY gets 2 Ctrl+C events 
 Run 37867442891: the new ConPTY test 'two Ctrl+C presses reach a Windows console program as two key events, legacy and Kitty' passes on windows-latest (the VT reader now gets bytes 3,3 for the Kitty pair). Node 22 and Bun 1.4.2 raw-mode probes typed through Conduit both get two byte-3 presses and exit; opening /dev/tty fails ENOENT in both, so Claude's drainStdin does not block there. Claude Code 2.1.295 still does not exit on the double press inside Conduit, and also not under a bare pseudoconsole with no terminal behind it (the pty probe: hint after one press, still running 30 s after the second and after 80 more keys). The SendKeys classic-console comparison failed to focus the window.
 
 Run 37869071981 (third and last diagnostic iteration): Claude Code 2.1.295 under a bare pseudoconsole (no terminal) writes its terminal-mode resets (CSI > 4m, ?2031l, ?2004l, mouse off, cursor show) after the second Ctrl+C and then never exits; Enter and a third Ctrl+C change nothing. In a classic console window (Start-Process, no ConPTY) two Ctrl+C key events written with WriteConsoleInputW also leave it running 15 s later. Inside Conduit: hint shown and cleared after one press, double press leaves it with flat CPU and an Executive-wait thread; Enter and a third press do nothing. Conclusion: both presses reach Claude Code; its own shutdown hangs on this Windows runner independent of Conduit and of ConPTY. Per the stop rule the taskkill fallback and warning stay in windows-claude-observe.sh (comment and warning text now say why). AC2 is met: the ConPTY test 'two Ctrl+C presses reach a Windows console program as two key events, legacy and Kitty' passed on windows-latest in runs 37867442891 and 37869071981; Linux: 'every Ctrl+C the encoder can produce reaches a pseudoconsole as Ctrl+C' (term) and 'a Kitty Ctrl+C report is found for the pseudoconsole, and nothing else is' (pty) pass. AC1 is not met and cannot be met from Conduit; it needs a Claude Code fix or a decision to drop or reword it.
+
+Cleaned branch, run 37870374778 (success): both new pty tests OK on windows-latest; the observe step still gates idle/done and ends Claude Code with taskkill plus the reworded warning.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
