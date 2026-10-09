@@ -80,6 +80,74 @@ if ct wait-for terminal-text "PS " 60000 > /dev/null; then
 else
   fail "no PowerShell prompt"
 fi
+# --- TASK-83 diagnostics (temporary) ------------------------------------------
+# A raw-mode probe under Node and under Bun (Claude Code's runtime): two Ctrl+C
+# presses through the driver, the second of which calls process.exit.
+probe_js="$(cygpath -u "$root")/ctrl-c-probe.js"
+cat > "$probe_js" <<'JS'
+const label = process.argv[2] || "x";
+let presses = 0;
+process.stdin.setRawMode(true);
+process.stdin.resume();
+console.log("probe-" + "ready-" + label + " " + (process.versions.bun ? "bun " + process.versions.bun : "node " + process.version));
+process.stdin.on("data", (d) => {
+  console.log("DATA-" + label + " " + [...d].join(","));
+  if (d.includes(3) && ++presses === 2) {
+    console.log("EXITING-" + label);
+    process.exit(0);
+  }
+});
+JS
+probe_win="$(cygpath -w "$probe_js")"
+
+# claude_state <label>: what Windows says about claude.exe and its children.
+claude_state() {
+  powershell.exe -NoProfile -Command "\$p = @(Get-Process claude -ErrorAction SilentlyContinue); if (\$p.Count -eq 0) { 'no claude process' } else { foreach (\$q in \$p) { 'pid ' + \$q.Id + ' responding ' + \$q.Responding + ' cpu ' + \$q.CPU + ' threads ' + \$q.Threads.Count + ' handles ' + \$q.HandleCount; \$q.Threads | Group-Object ThreadState,WaitReason | ForEach-Object { '  ' + \$_.Count + ' x ' + \$_.Name } }; Get-CimInstance Win32_Process | Where-Object { \$p.Id -contains \$_.ParentProcessId } | ForEach-Object { '  child ' + \$_.ProcessId + ' ' + \$_.CommandLine } }" \
+    2>&1 | tr -d '\r' | sed "s/^/INFO $1: /"
+}
+
+# probe_runtime <label> <program>: run the probe, press Ctrl+C twice, report.
+probe_runtime() {
+  local label="$1" program="$2"
+  if ! command -v "$program" > /dev/null; then
+    echo "INFO probe $label: $program is not installed"
+    return
+  fi
+  ct type "& '$(cygpath -w "$(command -v "$program")")' '$probe_win' $label; 'probe' + '-ended-$label'" > /dev/null
+  ct key ENTER > /dev/null
+  if ! ct wait-for terminal-text "probe-ready-$label" 60000 > /dev/null; then
+    echo "INFO probe $label: never ready"
+    ct terminal-text > "$out/probe-$label.txt" 2>&1 || true
+    return
+  fi
+  ct key CTRL+c > /dev/null
+  if ct wait-for terminal-text "DATA-$label 3" 5000 > /dev/null; then
+    echo "INFO probe $label: first Ctrl+C arrived as byte 3"
+  else
+    echo "INFO probe $label: first Ctrl+C did not arrive as byte 3"
+  fi
+  ct key CTRL+c > /dev/null
+  if ct wait-for terminal-text "EXITING-$label" 5000 > /dev/null; then
+    echo "INFO probe $label: second Ctrl+C arrived; process.exit called"
+  else
+    echo "INFO probe $label: second Ctrl+C did not arrive"
+  fi
+  if ct wait-for terminal-text "probe-ended-$label" 10000 > /dev/null; then
+    echo "INFO probe $label: the process ended and PowerShell went on"
+  else
+    echo "INFO probe $label: the process did not end within 10 s"
+    taskkill /F /IM "$program.exe" > /dev/null 2>&1 || true
+    ct wait-for terminal-text "probe-ended-$label" 10000 > /dev/null || true
+  fi
+  ct terminal-text > "$out/probe-$label.txt" 2>&1 || true
+  grep -E "probe-ready|DATA-|EXITING-" "$out/probe-$label.txt" | sed "s/^/INFO probe $label screen: /"
+}
+probe_runtime node node
+probe_runtime bun bun
+ct type "Clear-Host" > /dev/null
+ct key ENTER > /dev/null
+# --- end of TASK-83 diagnostics -----------------------------------------------
+
 ct type "claude" > /dev/null
 ct key ENTER > /dev/null
 
@@ -103,6 +171,24 @@ esac
 keep_screenshot claude-idle
 ct terminal-text > "$out/claude-terminal.txt" 2>&1 || true
 
+# TASK-83 diagnostics (temporary): one press alone first, to see whether
+# Claude Code clears its "Press Ctrl-C again" hint (alive, timers running).
+claude_state "idle"
+ct key CTRL+c > /dev/null
+if ct wait-for terminal-text "Press Ctrl-C again" 5000 > /dev/null; then
+  echo "INFO single press: hint shown"
+  cleared=no
+  for _ in $(seq 1 20); do
+    if ! ct terminal-text 2> /dev/null | grep -q "Press Ctrl-C again"; then cleared=yes; break; fi
+    sleep 0.5
+  done
+  echo "INFO single press: hint cleared within 10 s: $cleared"
+else
+  echo "INFO single press: no hint"
+fi
+claude_state "after one press"
+keep_screenshot claude-one-press
+
 # Ctrl+C until Claude Code has left: the first asks "Press Ctrl-C again to
 # exit", and a second within a moment of that ends it.
 left=""
@@ -115,6 +201,9 @@ for attempt in 1 2 3; do
     break
   fi
   echo "INFO Ctrl+C $attempt: claude is still in front"
+  claude_state "after double press $attempt"
+  ct terminal-text > "$out/claude-after-double-$attempt.txt" 2>&1 || true
+  [ "$attempt" = 1 ] && keep_screenshot claude-after-double-1
 done
 ct terminal-text > "$out/claude-after-ctrl-c.txt" 2>&1 || true
 if [ -z "$left" ]; then
@@ -138,6 +227,34 @@ case "$row" in
   *) fail "the agent row is '${row:-<none>}', expected '✓ claude done'" ;;
 esac
 keep_screenshot claude-done
+
+# TASK-83 diagnostics (temporary): the same double press under `claude --debug`,
+# then its debug log.
+ct type "Clear-Host" > /dev/null
+ct key ENTER > /dev/null
+ct type "claude --debug" > /dev/null
+ct key ENTER > /dev/null
+if ct wait-for terminal-text "text style" 60000 > /dev/null; then
+  ct key CTRL+c > /dev/null
+  ct wait-for terminal-text "Press Ctrl-C again" 3000 > /dev/null || echo "INFO debug run: no hint"
+  ct key CTRL+c > /dev/null
+  if ct wait-for terminal-text "PS D:" 10000 > /dev/null; then
+    echo "INFO debug run: claude --debug ended on the double press"
+  else
+    echo "INFO debug run: claude --debug is still running 10 s after the double press"
+    claude_state "debug run"
+    keep_screenshot claude-debug-hung
+    taskkill /F /IM claude.exe > /dev/null 2>&1 || true
+  fi
+else
+  echo "INFO debug run: claude --debug never drew its first screen"
+fi
+ct terminal-text > "$out/claude-debug-terminal.txt" 2>&1 || true
+find "$(cygpath -u "$root")" -path '*/.claude/debug/*' -type f 2> /dev/null | while read -r f; do
+  cp "$f" "$out/" 2> /dev/null || true
+  echo "INFO debug log $f"
+  tail -n 60 "$f" | sed 's/^/INFO debug: /'
+done
 
 ct logs 1048576 > "$out/app.log" 2>&1 || true
 ct inspect > "$out/tree.txt" 2>&1 || true

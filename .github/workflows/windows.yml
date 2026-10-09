@@ -30,7 +30,7 @@ name: Windows
 
 on:
   push:
-    branches: ["task-49-windows", "task-49-windows-release", "task-49-conpty", "task-47-wsl*", "task-82-*", "task-81-*"]
+    branches: ["task-49-windows", "task-49-windows-release", "task-49-conpty", "task-47-wsl*", "task-82-*", "task-81-*", "task-83-*"]
   workflow_dispatch:
     inputs:
       version:
@@ -241,7 +241,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
         run: |
-          npm install --global --no-audit --no-fund @anthropic-ai/claude-code
+          npm install --global --no-audit --no-fund @anthropic-ai/claude-code bun
           claude --version || true
           bash .github/scripts/windows-claude-observe.sh "$PWD/zig-out/bin/conduit.exe" "$PWD/zig-out/bin/conduit-test.exe" \
             "$ARTIFACT_ROOT/claude-observe"
@@ -278,7 +278,7 @@ jobs:
           # CPU (the build uses -mcpu native); one that dies with an illegal
           # instruction is not a result, so the next newest is tried.
           status=0
-          for name in font workspace; do
+          for name in font workspace pty; do
             ran=""
             for bin in $(ls -t $(find .zig-cache -type f -name "$name-test.exe")); do
               rc=0
@@ -293,7 +293,7 @@ jobs:
             done
             echo "== $name-test (${ran:-no runnable binary})"
             [ -n "$ran" ] || status=1
-            grep -iE "wsl|directwrite|windows|passed|failed|skipped" "$ARTIFACT_ROOT/$name-test.txt" | head -n 60 || true
+            grep -iE "wsl|directwrite|windows|passed|failed|skipped|pty_probe|TASK-83" "$ARTIFACT_ROOT/$name-test.txt" | head -n 120 || true
           done
           exit $status
 

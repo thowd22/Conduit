@@ -4810,6 +4810,148 @@ test "a Git for Windows sh read loop that ignores WINCH survives a ConPTY resize
 // The selection and the command-line split are plain functions over plain data, so they run on
 // every platform; the snapshot and the reads behind them are proved by the ConPTY test after them.
 
+// --- Ctrl+C through a pseudoconsole (TASK-83) ---------------------------------------------------
+
+const probe_log = std.log.scoped(.pty_probe);
+
+/// Start a Windows PowerShell script under a pseudoconsole. The script travels base64-encoded as
+/// UTF-16LE (`-EncodedCommand`), so no command-line quoting rule can change a byte of it.
+fn spawnPowerShellScript(gpa: Allocator, script: []const u8) !Pty {
+    const utf16 = try std.unicode.utf8ToUtf16LeAlloc(gpa, script);
+    defer gpa.free(utf16);
+    const bytes = std.mem.sliceAsBytes(utf16);
+    const encoded = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    defer gpa.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    return spawnConPty(gpa, windowsRequest(&.{
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded,
+    }));
+}
+
+/// Write `bytes`, then a sentinel key the script names, and return what the terminal said up to
+/// the script's answer to that sentinel. Everything sent before the sentinel has been read by
+/// then, so counting in the result needs no timing.
+fn sendThenSentinel(gpa: Allocator, pty: Pty, bytes: []const u8, sentinel: []const u8, answer: []const u8) ![]u8 {
+    try writeAll(pty, bytes);
+    try writeAll(pty, sentinel);
+    return readUntil(gpa, pty, answer);
+}
+
+/// A console program that reads key events the way a .NET console program does, with Ctrl+C as
+/// input rather than a signal, and prints one line per key.
+const read_key_script =
+    \\[Console]::TreatControlCAsInput = $true
+    \\'probe-' + 'ready'
+    \\while ($true) {
+    \\  $k = [Console]::ReadKey($true)
+    \\  'key:' + [int]$k.KeyChar + ':' + $k.Key + ':' + $k.Modifiers
+    \\  if ($k.KeyChar -eq 'q') { break }
+    \\}
+;
+
+test "TASK-83 probe: Ctrl+C key events through ConPTY, legacy and kitty" {
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try spawnPowerShellScript(gpa, read_key_script);
+    defer pty.destroy();
+    const ready = try readUntil(gpa, pty, "probe-ready");
+    defer gpa.free(ready);
+    probe_log.warn("readkey ready: {f}", .{std.ascii.hexEscape(ready, .lower)});
+
+    const legacy = try sendThenSentinel(gpa, pty, "\x03\x03", "z", "key:122:");
+    defer gpa.free(legacy);
+    probe_log.warn("readkey legacy: {d} ctrl-c lines: {f}", .{
+        std.mem.count(u8, legacy, "key:3:"), std.ascii.hexEscape(legacy, .lower),
+    });
+
+    const kitty = try sendThenSentinel(gpa, pty, "\x1b[99;5u\x1b[99;5u", "y", "key:121:");
+    defer gpa.free(kitty);
+    probe_log.warn("readkey kitty: {d} ctrl-c lines: {f}", .{
+        std.mem.count(u8, kitty, "key:3:"), std.ascii.hexEscape(kitty, .lower),
+    });
+
+    const kitty_events = try sendThenSentinel(gpa, pty, "\x1b[99;5u\x1b[99;5:3u\x1b[99;5u\x1b[99;5:3u", "x", "key:120:");
+    defer gpa.free(kitty_events);
+    probe_log.warn("readkey kitty with releases: {d} ctrl-c lines: {f}", .{
+        std.mem.count(u8, kitty_events, "key:3:"), std.ascii.hexEscape(kitty_events, .lower),
+    });
+
+    const win32 = try sendThenSentinel(gpa, pty, "\x1b[67;46;3;1;8;1_\x1b[67;46;3;0;8;1_\x1b[67;46;3;1;8;1_\x1b[67;46;3;0;8;1_", "w", "key:119:");
+    defer gpa.free(win32);
+    probe_log.warn("readkey win32-input-mode: {d} ctrl-c lines: {f}", .{
+        std.mem.count(u8, win32, "key:3:"), std.ascii.hexEscape(win32, .lower),
+    });
+    try writeAll(pty, "q");
+}
+
+/// A console program that reads bytes with virtual-terminal input on and processed input off,
+/// which is how a raw-mode Node or Bun program reads its terminal.
+const read_vt_script =
+    \\$k = Add-Type -PassThru -Name K -Namespace P -MemberDefinition '[DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int n); [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr h, out uint m); [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(System.IntPtr h, uint m);'
+    \\$h = $k::GetStdHandle(-10)
+    \\$m = 0
+    \\[void]$k::GetConsoleMode($h, [ref]$m)
+    \\'mode:' + $m
+    \\'set:' + $k::SetConsoleMode($h, 0x200)
+    \\$s = [Console]::OpenStandardInput()
+    \\$b = New-Object byte[] 256
+    \\'probe-' + 'ready'
+    \\while (($n = $s.Read($b, 0, 256)) -gt 0) {
+    \\  $got = $b[0..($n - 1)]
+    \\  'bytes:' + ($got -join ',')
+    \\  if ($got -contains 122) { 'seen-' + 'z' }
+    \\  if ($got -contains 121) { 'seen-' + 'y' }
+    \\  if ($got -contains 120) { 'seen-' + 'x' }
+    \\  if ($got -contains 113) { break }
+    \\}
+;
+
+test "TASK-83 probe: Ctrl+C bytes through ConPTY to a VT-input reader" {
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try spawnPowerShellScript(gpa, read_vt_script);
+    defer pty.destroy();
+    const ready = try readUntil(gpa, pty, "probe-ready");
+    defer gpa.free(ready);
+    probe_log.warn("vt ready: {f}", .{std.ascii.hexEscape(ready, .lower)});
+
+    const legacy = try sendThenSentinel(gpa, pty, "\x03", "", "bytes:3");
+    defer gpa.free(legacy);
+    probe_log.warn("vt first ctrl-c: {f}", .{std.ascii.hexEscape(legacy, .lower)});
+    const again = try sendThenSentinel(gpa, pty, "\x03", "z", "seen-z");
+    defer gpa.free(again);
+    probe_log.warn("vt second ctrl-c: {f}", .{std.ascii.hexEscape(again, .lower)});
+    const kitty = try sendThenSentinel(gpa, pty, "\x1b[99;5u\x1b[99;5u", "y", "seen-y");
+    defer gpa.free(kitty);
+    probe_log.warn("vt kitty: {f}", .{std.ascii.hexEscape(kitty, .lower)});
+    const win32 = try sendThenSentinel(gpa, pty, "\x1b[67;46;3;1;8;1_\x1b[67;46;3;0;8;1_", "x", "seen-x");
+    defer gpa.free(win32);
+    probe_log.warn("vt win32-input-mode: {f}", .{std.ascii.hexEscape(win32, .lower)});
+    try writeAll(pty, "q");
+}
+
+test "TASK-83 probe: what a program's keyboard-mode requests look like after ConPTY" {
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try spawnPowerShellScript(gpa,
+        \\[Console]::Out.Write([string][char]27 + '[>1u')
+        \\'after-' + 'push'
+        \\[Console]::Out.Write([string][char]27 + '[?u')
+        \\'after-' + 'query'
+        \\[Console]::Out.Write([string][char]27 + '[>4;2m')
+        \\'probe-' + 'done'
+    );
+    defer pty.destroy();
+    const seen = try readUntil(gpa, pty, "probe-done");
+    defer gpa.free(seen);
+    probe_log.warn("output passthrough: push {}, query {}, modifyOtherKeys {}: {f}", .{
+        std.mem.indexOf(u8, seen, "\x1b[>1u") != null,
+        std.mem.indexOf(u8, seen, "\x1b[?u") != null,
+        std.mem.indexOf(u8, seen, "\x1b[>4;2m") != null,
+        std.ascii.hexEscape(seen, .lower),
+    });
+}
+
 test "a Windows command line splits into its first word and NUL-separated later words" {
     var out: [128]u8 = undefined;
     var words = splitWindowsCommandLine("\"C:\\Program Files\\nodejs\\node.exe\" \"C:\\Users\\a b\\node_modules\\@anthropic-ai\\claude-code\\cli.js\" --resume", &out).?;
