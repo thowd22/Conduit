@@ -4031,6 +4031,71 @@ pub const Terminal = struct {
         return false;
     }
 
+    /// The widest row `activeScreenText` keeps, in bytes; a longer row is cut
+    /// at a whole scalar.
+    pub const active_row_capacity = 1024;
+
+    /// The bottom `max_rows` rows of the active screen, the one the program
+    /// is drawing on now, written to the end of `out` and returned as a slice
+    /// of it. Rows are separated by `\n`, trailing blank cells are dropped,
+    /// blanks before text become spaces, wide spacer tails emit nothing and a
+    /// grapheme's tail follows its base. Rows are taken from the bottom up and
+    /// reading stops at the first row that no longer fits, so the newest rows
+    /// always survive a small buffer.
+    ///
+    /// Read from the engine directly, not from the last `refresh`: it is the
+    /// same for a session nobody is looking at, and it never includes
+    /// scrollback, whatever the viewport is scrolled to. Allocates nothing.
+    /// Owner thread, like every other read.
+    pub fn activeScreenText(self: *const Terminal, out: []u8, max_rows: u16) []const u8 {
+        const pages = &self.vt.screens.active.pages;
+        var start = out.len;
+        var y: usize = self.size.rows;
+        var taken: u16 = 0;
+        var row: [active_row_capacity]u8 = undefined;
+        while (y > 0 and taken < max_rows) {
+            y -= 1;
+            taken += 1;
+            const pin = pages.pin(.{ .active = .{ .x = 0, .y = @intCast(y) } }) orelse continue;
+            const cells = pin.cells(.all);
+            var len: usize = 0;
+            var text_end: usize = 0;
+            for (cells) |*slot| {
+                if (slot.wide == .spacer_tail or slot.wide == .spacer_head) continue;
+                const codepoint = slot.codepoint();
+                var encoded: [4]u8 = undefined;
+                if (codepoint == 0) {
+                    if (len + 1 > row.len) break;
+                    row[len] = ' ';
+                    len += 1;
+                    continue;
+                }
+                const n = encodeVisibleScalar(&encoded, codepoint);
+                if (len + n > row.len) break;
+                @memcpy(row[len..][0..n], encoded[0..n]);
+                len += n;
+                if (slot.hasGrapheme()) {
+                    if (pin.grapheme(slot)) |tail| for (tail) |extra| {
+                        const m = encodeVisibleScalar(&encoded, extra);
+                        if (len + m > row.len) break;
+                        @memcpy(row[len..][0..m], encoded[0..m]);
+                        len += m;
+                    };
+                }
+                if (codepoint != ' ') text_end = len;
+            }
+            const separator: usize = if (start == out.len) 0 else 1;
+            if (text_end + separator > start) break;
+            if (separator == 1) {
+                start -= 1;
+                out[start] = '\n';
+            }
+            start -= text_end;
+            @memcpy(out[start..][0..text_end], row[0..text_end]);
+        }
+        return out[start..];
+    }
+
     /// Where the cursor is and what shape it has, as of the last `refresh`.
     pub fn cursor(self: *const Terminal) Cursor {
         const view = self.view.cursor;
@@ -5920,6 +5985,30 @@ test "visible text emits wide and combining graphemes once" {
     var writer = std.Io.Writer.fixed(&buf);
     try terminal.writeVisibleText(&writer);
     try testing.expectEqualStrings("a\u{6f22}b\ne\u{0301}x", writer.buffered());
+}
+
+test "the active screen's bottom rows are read without refresh, scrollback or overflow" {
+    const testing = std.testing;
+
+    var terminal: Terminal = undefined;
+    try terminal.init(testIo(), testing.allocator, .{ .cols = 12, .rows = 4 });
+    defer terminal.deinit(testing.allocator);
+
+    // Six lines into four rows: two go to scrollback. No refresh is needed.
+    terminal.feed("old 1\r\nold 2\r\nA B\r\n\r\na\u{6f22}e\u{0301}\r\n\u{276f} ");
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("A B\n\na\u{6f22}e\u{0301}\n\u{276f}", terminal.activeScreenText(&buf, 8));
+    // Only the newest rows are asked for, or fit.
+    try testing.expectEqualStrings("a\u{6f22}e\u{0301}\n\u{276f}", terminal.activeScreenText(&buf, 2));
+    // A blank row costs only its separator; the row above it does not fit.
+    var small: [12]u8 = undefined;
+    try testing.expectEqualStrings("\na\u{6f22}e\u{0301}\n\u{276f}", terminal.activeScreenText(&small, 8));
+    var tiny: [2]u8 = undefined;
+    try testing.expectEqualStrings("", terminal.activeScreenText(&tiny, 8));
+
+    // A viewport scrolled into history still reads the active screen.
+    terminal.scrollToTop();
+    try testing.expectEqualStrings("a\u{6f22}e\u{0301}\n\u{276f}", terminal.activeScreenText(&buf, 2));
 }
 
 test "visible text contains same-row text and rejects absent text" {

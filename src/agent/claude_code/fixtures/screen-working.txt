@@ -1,0 +1,30 @@
+
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /home/user/work
+
+
+❯ /clear
+
+❯ make the probe file
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* Whirlpooling…
+  ⎿  Tip: Use /statusline to set up a custom status line that will display beneath the input box
+                                                                                ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt · ← for agents

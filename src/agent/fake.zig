@@ -474,16 +474,18 @@ test "a heuristic-only agent follows the PTY baseline through the registry" {
         .ownership = .observed,
         .token = adapter.CorrelationToken.fromBytes(@splat(2)),
     });
-    var h: heuristics_mod.Heuristics = .{ .quiet_after_ns = 10 };
+    var h: heuristics_mod.Heuristics = .{ .quiet_after_ns = 10, .idle_cap_ns = 10 };
     const observations = [_]heuristics_mod.Observation{
         .{ .output = .{ .now_ns = 1 } },
         .bell,
         .user_input,
         .{ .tick = .{ .now_ns = 50 } },
+        .{ .tick = .{ .now_ns = 60 } },
         .{ .child_exited = .{ .code = 0 } },
     };
     const S = @import("state.zig").State;
-    const expected = [_]S{ .working, .waiting_input, .working, .idle, .done };
+    // Quiet is idle once the debounce has run out.
+    const expected = [_]S{ .working, .waiting_input, .working, .working, .idle, .done };
     for (observations, expected) |observation, state| {
         const batch = h.observe(observation);
         for (batch.events()) |ev| _ = try reg.apply(id, ev);
@@ -543,4 +545,34 @@ test "resolve_on_answer reports each answer's outcome on the next poll" {
     try testing.expectEqualStrings("r1", out[1].event.permission_resolved.id);
     try testing.expectEqual(event.PermissionOutcome.rejected, out[1].event.permission_resolved.outcome);
     try testing.expectEqual(@as(usize, 0), try handle.poll(&queue));
+}
+
+// Screen manifest (TASK-84) ----------------------------------------------------
+
+/// What the hand-started `conduit-fake-agent` of Conduit's checks prints, so
+/// `--agent-test` and the agent-notifications scenario drive the screen layer
+/// through a real PTY: `fake› ` is its prompt, `fake asks: … [y/n]` its
+/// approval, `⠋ fake working` frames its spinner and `fake error: …` a failed
+/// turn. Written for the fake, not captured from a harness.
+pub const screen_manifest: agent_screen.ScreenManifest = blk: {
+    const m: agent_screen.ScreenManifest = .{
+        .captured_from = "conduit-fake-agent",
+        .permission = &.{.{ .all = &.{"[y/n]"}, .row_prefix = "fake asks:", .rows = 4 }},
+        .working = &.{.{ .all = &.{"fake working"}, .rows = 4 }},
+        .errored = &.{.{ .row_prefix = "fake error:", .rows = 4 }},
+        .input = &.{.{ .row_prefix = "fake\u{203a}", .rows = 2 }},
+    };
+    m.validate();
+    break :blk m;
+};
+
+const agent_screen = @import("screen.zig");
+
+test "the fake's screen manifest names its prompt, approval, spinner and error" {
+    const m = &screen_manifest;
+    try testing.expectEqual(agent_screen.Class.input, m.classify("OBSERVED-FAKE-READY\nfake\u{203a} "));
+    try testing.expectEqual(agent_screen.Class.permission, m.classify("fake\u{203a} ask\nfake asks: run make test? [y/n]"));
+    try testing.expectEqual(agent_screen.Class.working, m.classify("fake\u{203a} spin\n\u{280b} fake working 3"));
+    try testing.expectEqual(agent_screen.Class.errored, m.classify("fake error: the build failed\nfake\u{203a} "));
+    try testing.expectEqual(agent_screen.Class.none, m.classify("fake\u{203a} \nFAKE-SPIN-DONE\nOBSERVED-FAKE-BYE\nFAKE-BACK\n$ "));
 }

@@ -1,0 +1,30 @@
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /home/user/work
+
+
+❯ make the probe file
+
+  Ran 1 shell command
+
+● Done.
+
+✻ Cooked for 0s · done 12:36 AM
+
+❯ please fail now
+
+  Ran 1 shell command
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Brewed for 0s · done 12:37 AM
+
+❯ please fail again
+
+● API Error: 400 mock refused this request
+
+✻ Sautéed for 0s · done 12:37 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents

@@ -19,8 +19,9 @@
 //! `agent/event.zig` (events and the bounded hand-over queue),
 //! `agent/adapter.zig` (the interface), `agent/registry.zig` (agents per
 //! workspace), `agent/heuristics.zig` (the PTY baseline),
-//! `agent/harness.zig` (the closed harness set), `agent/fake.zig` (the
-//! scripted adapter tests use) and `agent/sink_io.zig` (the harness-neutral
+//! `agent/screen.zig` (the per-harness screen manifests the heuristics
+//! match, TASK-84), `agent/harness.zig` (the closed harness set),
+//! `agent/fake.zig` (the scripted adapter tests use) and `agent/sink_io.zig` (the harness-neutral
 //! IO under the sink channels, Local or through a remote context, TASK-61)
 //! and `agent/poll.zig` (readiness waits on the transports' descriptors).
 //!
@@ -90,6 +91,11 @@ pub const Registry = registry.Registry;
 pub const Heuristics = heuristics.Heuristics;
 pub const Observation = heuristics.Observation;
 
+/// Per-harness screen patterns for the PTY baseline (TASK-84).
+pub const screen = @import("agent/screen.zig");
+pub const ScreenManifest = screen.ScreenManifest;
+pub const ScreenClass = screen.Class;
+
 pub const FakeAdapter = @import("agent/fake.zig").FakeAdapter;
 /// The scripted fake's own program name, which only checks recognize.
 pub const fake_command_name = @import("agent/fake.zig").command_name;
@@ -119,6 +125,22 @@ pub fn instructionProfile(harness: Harness) InstructionProfile {
         .opencode => opencode.instruction_profile,
     };
 }
+/// What `harness`'s TUI shows when it works, waits or fails, as its adapter
+/// captured it (TASK-84), for the PTY baseline of agents whose structured
+/// channel is missing or silent. Like `instructionProfile`, the one place
+/// outside an adapter that maps a harness to its screen knowledge.
+pub fn screenManifest(harness: Harness) *const ScreenManifest {
+    return switch (harness) {
+        .claude_code => &claude_code.screen_manifest,
+        .codex => &codex.screen_manifest,
+        .pi => &pi.screen_manifest,
+        .opencode => &opencode.screen_manifest,
+    };
+}
+
+/// The scripted fake's screen patterns, for the checks' hand-started fake.
+pub const fake_screen_manifest = &@import("agent/fake.zig").screen_manifest;
+
 /// Interpreters whose script, not their own name, says which program runs:
 /// npm installs harness launchers as `#!/usr/bin/env node` scripts (on
 /// Windows, `.cmd`/`.ps1` shims that run `node.exe <package>\cli.js`), so a
@@ -425,6 +447,7 @@ test {
     _ = adapter;
     _ = registry;
     _ = heuristics;
+    _ = screen;
     _ = @import("agent/fake.zig");
     _ = claude_code;
     _ = codex;

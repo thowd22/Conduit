@@ -1,0 +1,30 @@
+
+  >_ OpenAI Codex (v0.160.1)
+     /home/user/cwork
+
+  How’s life between the brackets?
+
+
+› RUNTOOL please
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Working (1s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  mock-model default · /home/user/cwork
+  ← for agents · ? for shortcuts                                           ⚠ 1 warning · f2 to view

@@ -2771,3 +2771,39 @@ test "live: a real opencode serve, when installed" {
     // Conduit answered, so the outcome is `allowed`, not "elsewhere".
     try testing.expectEqual(@as(?event.PermissionOutcome, .allowed), resolved);
 }
+
+// Screen manifest (TASK-84) ----------------------------------------------------
+
+/// What OpenCode's TUI shows, for a hand-started `opencode` whose server
+/// Conduit cannot reach and for remote OpenCode agents. Not captured:
+/// OpenCode is not installed on the machine this was written on, so these
+/// are the TUI strings herdr's OpenCode manifest (2026.06.10) relies on, for
+/// OpenCode 1.x: the `△ Permission required` dialog with its `enter
+/// confirm`/`esc dismiss` hints, and the `esc interrupt` hint while a turn
+/// runs. Its idle prompt and error rendering are not documented anywhere
+/// this could check, so those classes stay empty and OpenCode falls back to
+/// the PTY baseline (quiet is idle) for them.
+pub const screen_manifest: agent_screen.ScreenManifest = blk: {
+    const m: agent_screen.ScreenManifest = .{
+        .captured_from = "OpenCode 1.x strings via herdr (unverified)",
+        .permission = &.{
+            .{ .all = &.{"\u{25b3} permission required"}, .rows = 20 },
+            .{ .all = &.{ "esc dismiss", "enter confirm" }, .rows = 12 },
+        },
+        .working = &.{
+            .{ .all = &.{"esc interrupt"}, .rows = 8 },
+            .{ .all = &.{"esc to interrupt"}, .rows = 8 },
+        },
+    };
+    m.validate();
+    break :blk m;
+};
+
+const agent_screen = @import("screen.zig");
+
+test "the screen manifest classifies OpenCode's documented strings" {
+    const m = &screen_manifest;
+    try testing.expectEqual(agent_screen.Class.permission, m.classify("  \u{25b3} Permission required\n  bash: make clean\n  Allow once   Allow always   Reject\n  enter confirm  esc dismiss"));
+    try testing.expectEqual(agent_screen.Class.working, m.classify("\u{2503} fix the tests\n\n  \u{25a0}\u{25a0}\u{25a0}\u{2b1d}  esc interrupt"));
+    try testing.expectEqual(agent_screen.Class.none, m.classify("\u{2503} fix the tests\n  tab agents  ctrl+p commands"));
+}

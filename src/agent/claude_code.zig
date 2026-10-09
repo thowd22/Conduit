@@ -2773,3 +2773,48 @@ test "in an SSH workspace the sink lives on the remote host: launch writes it, t
     var answer_buffer: [Dir.max_path_bytes]u8 = undefined;
     try testing.expectError(error.NotFound, ref.statPath(io, try std.fmt.bufPrint(&answer_buffer, "{s}/decisions/{s}", .{ sink, id })));
 }
+
+// Screen manifest (TASK-84) ----------------------------------------------------
+
+/// What Claude Code's TUI shows, for agents whose hooks are not (or not yet)
+/// speaking: a hand-started `claude`, or a launch whose sink stays silent.
+/// Captured from Claude Code 2.1.292 on Linux at 100x30, unauthenticated
+/// against a local stand-in for the Messages API, in default permission mode
+/// (`src/agent/claude_code/fixtures/screen-*.txt`). The approval dialog ends
+/// in `Esc to cancel · Tab to amend` under `Do you want to proceed?` (Bash)
+/// or `Do you want to make this edit to …?` (Edit) and numbered options; a
+/// running turn keeps `esc to interrupt` in the footer under the prompt box;
+/// a failed request prints `● API Error: …` above the prompt; and the idle
+/// prompt box is a `❯` row between two rules.
+pub const screen_manifest: agent_screen.ScreenManifest = blk: {
+    const m: agent_screen.ScreenManifest = .{
+        .captured_from = "Claude Code 2.1.292",
+        .permission = &.{
+            .{ .all = &.{ "do you want to proceed?", "esc to cancel" }, .rows = 20 },
+            .{ .all = &.{ "do you want to", "1. yes", "esc to cancel" }, .rows = 20 },
+            .{ .all = &.{"esc to cancel"}, .row_prefix = "\u{276f} 1. yes", .rows = 20 },
+            .{ .all = &.{"do you want to allow this connection?"}, .rows = 20 },
+        },
+        .working = &.{
+            .{ .all = &.{"esc to interrupt"}, .rows = 3 },
+        },
+        .errored = &.{
+            .{ .row_prefix = "\u{25cf} api error:", .rows = 8 },
+        },
+        .input = &.{
+            .{ .row_prefix = "\u{276f}", .rows = 6 },
+        },
+    };
+    m.validate();
+    break :blk m;
+};
+
+const agent_screen = @import("screen.zig");
+
+test "the screen manifest classifies screens recorded from Claude Code 2.1.292" {
+    const m = &screen_manifest;
+    try testing.expectEqual(agent_screen.Class.input, m.classify(@embedFile("claude_code/fixtures/screen-input.txt")));
+    try testing.expectEqual(agent_screen.Class.working, m.classify(@embedFile("claude_code/fixtures/screen-working.txt")));
+    try testing.expectEqual(agent_screen.Class.permission, m.classify(@embedFile("claude_code/fixtures/screen-permission.txt")));
+    try testing.expectEqual(agent_screen.Class.errored, m.classify(@embedFile("claude_code/fixtures/screen-errored.txt")));
+}

@@ -3966,3 +3966,46 @@ test "codex --version output parses strictly" {
     try testing.expect(parseVersionOutput("codex-cli 0.160.1;x\n") == null);
     try testing.expect(parseVersionOutput("codex-cli " ++ "9" ** 300 ++ "\n") == null);
 }
+
+// Screen manifest (TASK-84) ----------------------------------------------------
+
+/// What Codex's TUI shows, for a hand-started `codex` the daemon cannot see
+/// and for remote Codex agents, which run on the PTY baseline. Captured from
+/// Codex 0.160.1 on Linux at 100x30 against a local stand-in for the
+/// Responses API (`src/agent/codex/fixtures/screen-*.txt`). An approval reads
+/// `Would you like to run the following command?` (or `…make the following
+/// edits?`) over numbered choices and `Press enter to confirm or esc to
+/// cancel`; a running turn shows `• Working (1s • esc to interrupt)`; a
+/// failed turn prints a `■` line; and the idle composer is a `›` row.
+pub const screen_manifest: agent_screen.ScreenManifest = blk: {
+    const m: agent_screen.ScreenManifest = .{
+        .captured_from = "Codex 0.160.1",
+        .permission = &.{
+            .{ .all = &.{"press enter to confirm or esc to cancel"}, .rows = 12 },
+            .{ .all = &.{"would you like to run the following command?"}, .rows = 20 },
+            .{ .all = &.{"would you like to make the following edits?"}, .rows = 20 },
+            .{ .all = &.{"yes, proceed (y)"}, .rows = 12 },
+        },
+        .working = &.{
+            .{ .all = &.{"esc to interrupt"}, .rows = 8 },
+        },
+        .errored = &.{
+            .{ .row_prefix = "\u{25a0}", .rows = 6 },
+        },
+        .input = &.{
+            .{ .row_prefix = "\u{203a}", .rows = 4 },
+        },
+    };
+    m.validate();
+    break :blk m;
+};
+
+const agent_screen = @import("screen.zig");
+
+test "the screen manifest classifies screens recorded from Codex 0.160.1" {
+    const m = &screen_manifest;
+    try testing.expectEqual(agent_screen.Class.input, m.classify(@embedFile("codex/fixtures/screen-input.txt")));
+    try testing.expectEqual(agent_screen.Class.working, m.classify(@embedFile("codex/fixtures/screen-working.txt")));
+    try testing.expectEqual(agent_screen.Class.permission, m.classify(@embedFile("codex/fixtures/screen-permission.txt")));
+    try testing.expectEqual(agent_screen.Class.errored, m.classify(@embedFile("codex/fixtures/screen-errored.txt")));
+}

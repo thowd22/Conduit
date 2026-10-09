@@ -2319,3 +2319,48 @@ test "in an SSH workspace the sink transport follows the remote events file and 
     try testing.expectEqualStrings(decision_yes, try ref.readFile(io, try std.fmt.bufPrint(&decision_buffer, "{s}/" ++ decisions_dir_name ++ "/c2398549-1", .{sink_dir}), &answer));
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, sink_dir, .{}));
 }
+
+// Screen manifest (TASK-84) ----------------------------------------------------
+
+/// What Pi's TUI shows, for a hand-started `pi` (which loads no Conduit
+/// extension) and for remote or silent launches. Captured from Pi 0.73.1 on
+/// Linux at 100x30 against a local stand-in for the Chat Completions API,
+/// with Conduit's extension gating bash (`src/agent/pi/testdata/screen-*.txt`).
+/// Pi has no approval of its own: an extension's confirm (Conduit's reads
+/// `Allow bash?`) is Pi's select dialog, `→ Yes` / `No` over `↑↓ navigate
+/// enter select escape/ctrl+c cancel`, drawn while the `⠼ Working...` line
+/// above it keeps spinning. A failed request prints `Error: …` rows, a retry
+/// `Retrying (n/3)`, and the idle editor sits between two rules over the
+/// `<n>%/<window>` context footer. omp is assumed to draw the same and has
+/// not been captured.
+pub const screen_manifest: agent_screen.ScreenManifest = blk: {
+    const m: agent_screen.ScreenManifest = .{
+        .captured_from = "Pi 0.73.1",
+        .permission = &.{
+            .{ .all = &.{"enter select"}, .row_prefix = "\u{2192} yes", .rows = 10 },
+            .{ .all = &.{"enter select"}, .row_prefix = "\u{2192} no", .rows = 10 },
+        },
+        .working = &.{
+            .{ .all = &.{"working..."}, .rows = 12 },
+            .{ .all = &.{"retrying ("}, .rows = 12 },
+        },
+        .errored = &.{
+            .{ .row_prefix = "error:", .rows = 8 },
+        },
+        .input = &.{
+            .{ .all = &.{"%/"}, .row_prefix = "\u{2500}\u{2500}\u{2500}\u{2500}", .rows = 6 },
+        },
+    };
+    m.validate();
+    break :blk m;
+};
+
+const agent_screen = @import("screen.zig");
+
+test "the screen manifest classifies screens recorded from Pi 0.73.1" {
+    const m = &screen_manifest;
+    try testing.expectEqual(agent_screen.Class.input, m.classify(@embedFile("pi/testdata/screen-input.txt")));
+    try testing.expectEqual(agent_screen.Class.working, m.classify(@embedFile("pi/testdata/screen-working.txt")));
+    try testing.expectEqual(agent_screen.Class.permission, m.classify(@embedFile("pi/testdata/screen-permission.txt")));
+    try testing.expectEqual(agent_screen.Class.errored, m.classify(@embedFile("pi/testdata/screen-errored.txt")));
+}
