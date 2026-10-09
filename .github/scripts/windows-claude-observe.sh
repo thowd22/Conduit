@@ -81,103 +81,74 @@ else
   fail "no PowerShell prompt"
 fi
 # --- TASK-83 diagnostics (temporary) ------------------------------------------
-# A raw-mode probe under Node and under Bun (Claude Code's runtime): two Ctrl+C
-# presses through the driver; the second opens /dev/tty and reads it once, as
-# Claude Code's drainStdin does on exit, then calls process.exit.
-probe_js="$(cygpath -u "$root")/ctrl-c-probe.js"
-cat > "$probe_js" <<'JS'
-const fs = require("fs");
-const label = process.argv[2] || "x";
-let presses = 0;
-process.stdin.setRawMode(true);
-process.stdin.resume();
-console.log("probe-" + "ready-" + label + " " + (process.versions.bun ? "bun " + process.versions.bun : "node " + process.version));
-process.stdin.on("data", (d) => {
-  console.log("DATA-" + label + " " + [...d].join(","));
-  if (d.includes(3) && ++presses === 2) {
-    console.log("EXITING-" + label);
-    let fd = -1;
-    try {
-      fd = fs.openSync("/dev/tty", fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
-      console.log("TTY-OPEN-" + label + " " + fd);
-    } catch (e) {
-      console.log("TTY-OPEN-FAILED-" + label + " " + e.code);
-    }
-    if (fd >= 0) {
-      try {
-        const n = fs.readSync(fd, Buffer.alloc(64), 0, 64, null);
-        console.log("TTY-READ-" + label + " " + n);
-      } catch (e) {
-        console.log("TTY-READ-FAILED-" + label + " " + e.code);
-      }
-    }
-    process.exit(0);
-  }
-});
-JS
-probe_win="$(cygpath -w "$probe_js")"
-
 # claude_state <label>: what Windows says about claude.exe and its children.
 claude_state() {
   powershell.exe -NoProfile -Command "\$p = @(Get-Process claude -ErrorAction SilentlyContinue); if (\$p.Count -eq 0) { 'no claude process' } else { foreach (\$q in \$p) { 'pid ' + \$q.Id + ' responding ' + \$q.Responding + ' cpu ' + \$q.CPU + ' threads ' + \$q.Threads.Count + ' handles ' + \$q.HandleCount; \$q.Threads | Group-Object ThreadState,WaitReason | ForEach-Object { '  ' + \$_.Count + ' x ' + \$_.Name } }; Get-CimInstance Win32_Process | Where-Object { \$p.Id -contains \$_.ParentProcessId } | ForEach-Object { '  child ' + \$_.ProcessId + ' ' + \$_.CommandLine } }" \
     2>&1 | tr -d '\r' | sed "s/^/INFO $1: /"
 }
 
-# probe_runtime <label>: run the probe under <label> (node or bun), press
-# Ctrl+C twice, report.
-probe_runtime() {
-  local label="$1"
-  if ! command -v "$label" > /dev/null; then
-    echo "INFO probe $label: not installed"
-    return
-  fi
-  ct type "$label '$probe_win' $label; 'probe' + '-ended-$label'" > /dev/null
-  ct key ENTER > /dev/null
-  if ! ct wait-for terminal-text "probe-ready-$label" 60000 > /dev/null; then
-    echo "INFO probe $label: never ready"
-    ct terminal-text > "$out/probe-$label.txt" 2>&1 || true
-    return
-  fi
-  ct key CTRL+c > /dev/null
-  ct wait-for terminal-text "DATA-$label 3" 5000 > /dev/null || echo "INFO probe $label: first Ctrl+C did not arrive as byte 3"
-  ct key CTRL+c > /dev/null
-  ct wait-for terminal-text "EXITING-$label" 5000 > /dev/null || echo "INFO probe $label: second Ctrl+C did not arrive"
-  if ct wait-for terminal-text "probe-ended-$label" 10000 > /dev/null; then
-    echo "INFO probe $label: the process ended and PowerShell went on"
-  else
-    echo "INFO probe $label: the process did not end within 10 s; one more key"
-    ct key x > /dev/null
-    if ct wait-for terminal-text "probe-ended-$label" 10000 > /dev/null; then
-      echo "INFO probe $label: one more key ended it"
-    else
-      echo "INFO probe $label: still running after one more key"
-      taskkill /F /IM "$label.exe" > /dev/null 2>&1 || true
-      ct wait-for terminal-text "probe-ended-$label" 10000 > /dev/null || true
-    fi
-  fi
-  ct terminal-text > "$out/probe-$label.txt" 2>&1 || true
-  grep -E "probe-ready|DATA-|EXITING-|TTY-" "$out/probe-$label.txt" | sed "s/^/INFO probe $label screen: /"
-}
-probe_runtime node
-probe_runtime bun
-ct type "Clear-Host" > /dev/null
-ct key ENTER > /dev/null
-
-# The same Claude Code in a classic console window (no pseudoconsole), with
-# Ctrl+C sent by SendKeys, for comparison.
+# The same Claude Code in a classic console window (conhost, no
+# pseudoconsole): two Ctrl+C key events written straight into its console
+# input buffer, for comparison.
 classic_ps1="$(cygpath -u "$root")/classic.ps1"
 cat > "$classic_ps1" <<'PS1'
-$exe = (Get-Command claude.exe -ErrorAction SilentlyContinue).Source
-if (-not $exe) { $exe = 'C:\npm\prefix\node_modules\@anthropic-ai\claude-code\bin\claude.exe' }
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ConsoleKeys {
+  [StructLayout(LayoutKind.Explicit, CharSet = CharSet.Unicode)]
+  public struct KeyEventRecord {
+    [FieldOffset(0)] public int KeyDown;
+    [FieldOffset(4)] public ushort RepeatCount;
+    [FieldOffset(6)] public ushort VirtualKeyCode;
+    [FieldOffset(8)] public ushort VirtualScanCode;
+    [FieldOffset(10)] public char UnicodeChar;
+    [FieldOffset(12)] public uint ControlKeyState;
+  }
+  [StructLayout(LayoutKind.Explicit)]
+  public struct InputRecord {
+    [FieldOffset(0)] public ushort EventType;
+    [FieldOffset(4)] public KeyEventRecord KeyEvent;
+  }
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool WriteConsoleInputW(IntPtr h, InputRecord[] records, uint count, out uint written);
+  public static string CtrlC(uint pid) {
+    FreeConsole();
+    if (!AttachConsole(pid)) return "attach failed " + Marshal.GetLastWin32Error();
+    IntPtr h = CreateFileW("CONIN$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+    var r = new InputRecord[2];
+    r[0].EventType = 1;
+    r[0].KeyEvent.KeyDown = 1;
+    r[0].KeyEvent.RepeatCount = 1;
+    r[0].KeyEvent.VirtualKeyCode = 0x43;
+    r[0].KeyEvent.VirtualScanCode = 0x2e;
+    r[0].KeyEvent.UnicodeChar = (char)3;
+    r[0].KeyEvent.ControlKeyState = 8;
+    r[1] = r[0];
+    r[1].KeyEvent.KeyDown = 0;
+    uint written;
+    bool ok = WriteConsoleInputW(h, r, 2, out written);
+    CloseHandle(h);
+    FreeConsole();
+    return "wrote " + ok + " " + written;
+  }
+}
+'@
+$exe = 'C:\npm\prefix\node_modules\@anthropic-ai\claude-code\bin\claude.exe'
 $p = Start-Process -FilePath $exe -PassThru -WorkingDirectory 'D:\a\Conduit\Conduit'
-Start-Sleep -Seconds 10
-$w = New-Object -ComObject WScript.Shell
-'classic: activate ' + $w.AppActivate($p.Id)
-Start-Sleep -Seconds 1
-$w.SendKeys('^c')
+Start-Sleep -Seconds 12
+'classic: first ' + [ConsoleKeys]::CtrlC($p.Id)
 Start-Sleep -Milliseconds 300
-$w.SendKeys('^c')
-if ($p.WaitForExit(15000)) { 'classic: exited with ' + $p.ExitCode } else { 'classic: still running 15 s after two Ctrl+C'; Stop-Process -Id $p.Id -Force }
+'classic: second ' + [ConsoleKeys]::CtrlC($p.Id)
+if ($p.WaitForExit(15000)) { 'classic: exited with ' + $p.ExitCode } else {
+  'classic: still running 15 s after two Ctrl+C'
+  Stop-Process -Id $p.Id -Force
+}
 PS1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$classic_ps1")" 2>&1 | tr -d '\r' | sed 's/^/INFO /'
 # --- end of TASK-83 diagnostics -----------------------------------------------
@@ -233,21 +204,18 @@ else
   echo "INFO Ctrl+C twice: claude is still in front"
   claude_state "after double press"
   ct terminal-text > "$out/claude-after-double.txt" 2>&1 || true
-  # Is it waiting for input? One key, then up to seventy more.
-  ct key x > /dev/null
-  if ct wait-for element workspace.1.tab.1.agent.done exists true 5000 > /dev/null; then
-    left=one-more-key
+  # TASK-83 diagnostics (temporary): does Enter, or a third Ctrl+C, end it?
+  ct key ENTER > /dev/null
+  if ct wait-for element workspace.1.tab.1.agent.done exists true 8000 > /dev/null; then
+    left=enter-after
   else
-    for n in $(seq 1 70); do
-      ct key x > /dev/null
-      if ct wait-for element workspace.1.tab.1.agent.done exists true 150 > /dev/null 2>&1; then
-        left="$n-more-keys"
-        break
-      fi
-    done
+    ct key CTRL+c > /dev/null
+    if ct wait-for element workspace.1.tab.1.agent.done exists true 8000 > /dev/null; then
+      left=third-ctrl-c
+    fi
   fi
-  echo "INFO extra keys: ${left:-none ended it}"
-  [ -n "$left" ] && left="keys:$left"
+  echo "INFO after Enter and a third Ctrl+C: ${left:-still running}"
+  [ -n "$left" ] && left="extra:$left"
 fi
 ct terminal-text > "$out/claude-after-ctrl-c.txt" 2>&1 || true
 if [ -z "$left" ]; then

@@ -5058,19 +5058,33 @@ test "TASK-83 probe: Claude Code under a bare pseudoconsole, two Ctrl+C presses"
     const hint = try sendThenSentinel(gpa, pty, "\x03", "", "again to exit");
     defer gpa.free(hint);
     probe_log.warn("bare claude: hint after one press: {}", .{std.mem.indexOf(u8, hint, "again to exit") != null});
-    try writeAll(pty, "\x03");
-    const ended = waitForExit(pty);
-    probe_log.warn("bare claude: after the second press: {s}", .{if (ended) |_| "exited" else |err| @errorName(err)});
-    if (ended) |_| return else |_| {}
-    var sent: usize = 0;
-    while (sent < 80 and pty.state() == .running) : (sent += 1) {
-        writeAll(pty, "x") catch break;
+    const steps = [_]struct { name: []const u8, bytes: []const u8 }{
+        .{ .name = "second Ctrl+C", .bytes = "\x03" },
+        .{ .name = "Enter", .bytes = "\r" },
+        .{ .name = "third Ctrl+C", .bytes = "\x03" },
+    };
+    for (steps) |step| {
+        writeAll(pty, step.bytes) catch |err| {
+            probe_log.warn("bare claude: {s}: write {s}", .{ step.name, @errorName(err) });
+            return;
+        };
+        var seen: std.ArrayList(u8) = .empty;
+        defer seen.deinit(gpa);
         var scratch: [4096]u8 = undefined;
-        _ = pty.waitReadable(200);
-        while (pty.takeBytes(&scratch) != 0) {}
+        const deadline = monotonicMillis() + 10_000;
+        while (pty.state() == .running and monotonicMillis() < deadline) {
+            _ = pty.waitReadable(100);
+            while (true) {
+                const n = pty.takeBytes(&scratch);
+                if (n == 0) break;
+                try seen.appendSlice(gpa, scratch[0..n]);
+            }
+        }
+        const tail = seen.items[seen.items.len -| 600..];
+        probe_log.warn("bare claude: after {s}: {s}; output tail: {f}", .{ step.name, @tagName(pty.state()), std.ascii.hexEscape(tail, .lower) });
+        if (pty.state() != .running) return;
     }
-    probe_log.warn("bare claude: {s} after {d} more keys", .{ @tagName(pty.state()), sent });
-    if (pty.state() == .running) pty.kill(.kill) catch {};
+    pty.kill(.kill) catch {};
 }
 
 test "a Kitty Ctrl+C report is found for the pseudoconsole, and nothing else is" {
