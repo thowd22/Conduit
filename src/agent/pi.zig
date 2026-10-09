@@ -25,9 +25,10 @@
 //! `{"v":1,"token":"<32 hex>","type":T,...}` with `T` one of `session_start`
 //! (`reason`, `sessionId`, `sessionFile`, `cwd`), `agent_start`, `agent_end`
 //! (`stopReason`, `errorMessage`), `message_end` (`role` user/assistant,
-//! `text` ≤ 4000 UTF-16 units, `stopReason`), `tool_execution_start`
+//! `text` ≤ 4000 UTF-16 units, `thinking` ≤ 4000 and `thinkingCut` for an
+//! assistant's thinking blocks, `stopReason`), `tool_execution_start`
 //! (`toolCallId`, `toolName`, `summary`, `path`), `tool_execution_end`
-//! (`toolCallId`, `toolName`, `isError`), `permission_request` (`id`,
+//! (`toolCallId`, `toolName`, `isError`, `output` ≤ 500 and `outputCut`), `permission_request` (`id`,
 //! `toolName`, `toolCallId`, `title`, `summary`), `permission_resolved`
 //! (`id`, `outcome` allowed/rejected, `by` conduit/harness) and
 //! `session_shutdown` (`reason`). Unknown versions and types are ignored.
@@ -35,8 +36,10 @@
 //! Mapping, both channels: `agent_start` → working; `agent_end` → done, or
 //! errored for `stopReason: error`, or idle for `aborted`; a user or assistant
 //! `message_end` → message (Pi's own coalesced text, so streaming deltas are
-//! not needed); `tool_execution_start` → tool_use plus a file_reference when
-//! the tool names a `path`; a confirm → permission_request with decisions
+//! not needed), preceded by reasoning for an assistant's thinking (TASK-87);
+//! `tool_execution_start` → tool_use plus a file_reference when the tool
+//! names a `path`; `tool_execution_end` → tool_result (the first line of its
+//! output, failed on `isError`); a confirm → permission_request with decisions
 //! `yes`/`no`; its resolution → permission_resolved; RPC `select`/`input`/
 //! `editor` dialogs → waiting_input plus a notification (they are not
 //! answerable here); `auto_retry_end` failure → errored; `extension_error` and
@@ -136,6 +139,8 @@ pub const max_version_bytes = 64;
 const read_chunk_bytes = 16 * 1024;
 const max_read_per_poll = 256 * 1024;
 const max_events_per_line = 16;
+/// The longest tool result summary kept, matching the other adapters.
+const max_result_bytes = 512;
 const max_pending = 16;
 const overflow_head_bytes = 96;
 const max_session_field_bytes = 4096;
@@ -540,15 +545,28 @@ fn eql(a: ?[]const u8, b: []const u8) bool {
 /// Text blocks of a Pi `content` (a string or an array of blocks), joined by
 /// LF and cut to the event store's capacity.
 fn contentText(arena: Allocator, content: ?json.Value) Allocator.Error!Clipped {
+    return blockText(arena, content, "text", "text", true);
+}
+
+/// The `thinking` blocks of an assistant `content`, joined by LF and cut to
+/// the event store's capacity (TASK-87).
+fn thinkingText(arena: Allocator, content: ?json.Value) Allocator.Error!Clipped {
+    return blockText(arena, content, "thinking", "thinking", false);
+}
+
+/// The `key` text of every `block_type` block in `content`, joined by LF and
+/// cut to the event store's capacity; a plain string content counts only
+/// when `string_counts`.
+fn blockText(arena: Allocator, content: ?json.Value, block_type: []const u8, key: []const u8, string_counts: bool) Allocator.Error!Clipped {
     const value = content orelse return .{ .text = "", .truncated = false };
     switch (value) {
-        .string => |s| return clip(s),
+        .string => |s| return if (string_counts) clip(s) else .{ .text = "", .truncated = false },
         .array => |array| {
             var text: std.ArrayList(u8) = .empty;
             var truncated = false;
             for (array.items) |block| {
-                if (!eql(stringField(block, "type"), "text")) continue;
-                const piece = stringField(block, "text") orelse continue;
+                if (!eql(stringField(block, "type"), block_type)) continue;
+                const piece = stringField(block, key) orelse continue;
                 if (text.items.len != 0) try text.append(arena, '\n');
                 const room = event.stored_text_capacity -| text.items.len;
                 const kept = event.truncateUtf8(piece, room);
@@ -583,6 +601,18 @@ fn argsSummary(args: ?json.Value) []const u8 {
 fn addMessage(events: *LineEvents, role: event.Role, text: []const u8, truncated: bool) void {
     if (text.len == 0) return;
     events.add(.{ .message = .{ .role = role, .text = text, .truncated = truncated } });
+}
+
+fn addReasoning(events: *LineEvents, text: []const u8, truncated: bool) void {
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
+    events.add(.{ .reasoning = .{ .text = text, .truncated = truncated } });
+}
+
+/// A tool's result: its first output line, failed when Pi says `isError`.
+/// `cut` says the output was already shortened before it reached Conduit.
+fn addToolResult(events: *LineEvents, name: ?[]const u8, output: []const u8, failed: bool, cut: bool) void {
+    const summary = event.summaryLine(output, max_result_bytes);
+    events.add(.{ .tool_result = .{ .name = name orelse "", .summary = summary.line, .failed = failed, .truncated = summary.truncated or cut } });
 }
 
 fn addToolUse(events: *LineEvents, name: ?[]const u8, summary: []const u8, path: ?[]const u8) void {
@@ -992,10 +1022,16 @@ pub const PiAdapter = struct {
             events.status(outcome);
         } else if (std.mem.eql(u8, kind, "message_end")) {
             const role = roleOf(stringField(root, "role")) orelse return;
+            if (role == .assistant) {
+                const thinking = clip(stringField(root, "thinking") orelse "");
+                addReasoning(events, thinking.text, thinking.truncated or boolField(root, "thinkingCut") == true);
+            }
             const text = clip(stringField(root, "text") orelse "");
             addMessage(events, role, text.text, text.truncated);
         } else if (std.mem.eql(u8, kind, "tool_execution_start")) {
             addToolUse(events, stringField(root, "toolName"), stringField(root, "summary") orelse "", stringField(root, "path"));
+        } else if (std.mem.eql(u8, kind, "tool_execution_end")) {
+            addToolResult(events, stringField(root, "toolName"), stringField(root, "output") orelse "", boolField(root, "isError") == true, boolField(root, "outputCut") == true);
         } else if (std.mem.eql(u8, kind, "permission_request")) {
             const id = stringField(root, "id") orelse return;
             if (!isSafeRequestId(id)) {
@@ -1016,7 +1052,7 @@ pub const PiAdapter = struct {
                 .rejected;
             events.add(.{ .permission_resolved = .{ .id = id, .outcome = outcome } });
         }
-        // tool_execution_end, session_shutdown and anything newer: no event.
+        // session_shutdown and anything newer: no event.
     }
 
     fn mapRpcLine(self: *PiAdapter, arena: Allocator, root: json.Value, events: *LineEvents) Allocator.Error!void {
@@ -1066,11 +1102,21 @@ pub const PiAdapter = struct {
         } else if (std.mem.eql(u8, kind, "message_end")) {
             const message = field(root, "message") orelse return;
             const role = roleOf(stringField(message, "role")) orelse return;
+            if (role == .assistant) {
+                const thinking = try thinkingText(arena, field(message, "content"));
+                addReasoning(events, thinking.text, thinking.truncated);
+            }
             const text = try contentText(arena, field(message, "content"));
             addMessage(events, role, text.text, text.truncated);
         } else if (std.mem.eql(u8, kind, "tool_execution_start")) {
             const args = field(root, "args");
             addToolUse(events, stringField(root, "toolName"), argsSummary(args), if (args) |a| stringField(a, "path") else null);
+        } else if (std.mem.eql(u8, kind, "tool_execution_end")) {
+            // The `toolResult` message_end that follows repeats this result;
+            // only this one is reported, as on the sink channel.
+            const result = field(root, "result");
+            const output = try contentText(arena, if (result) |r| field(r, "content") else null);
+            addToolResult(events, stringField(root, "toolName"), output.text, boolField(root, "isError") == true, output.truncated);
         } else if (std.mem.eql(u8, kind, "extension_ui_request")) {
             const method = stringField(root, "method") orelse return;
             const id = stringField(root, "id") orelse "";
@@ -1216,13 +1262,14 @@ fn joinTitle(arena: Allocator, title: []const u8, message: ?[]const u8) Allocato
 /// `compaction` (`summary`), `branch_summary` (`summary`), `custom`,
 /// `custom_message`, `label` and `session_info`.
 ///
-/// Mapping: user text → message(user); assistant text → message(assistant),
-/// each `toolCall` → tool_use (plus file_reference for a `path` argument), an
-/// error `stopReason` with `errorMessage` → message(system); `bashExecution`
-/// (the human's `!` command) → tool_use("bash"); `compaction` and
+/// Mapping: user text → message(user); assistant `thinking` blocks →
+/// reasoning, its text → message(assistant), each `toolCall` → tool_use
+/// (plus file_reference for a `path` argument), an error `stopReason` with
+/// `errorMessage` → message(system); `toolResult` → tool_result (its first
+/// output line, failed on `isError`); `bashExecution` (the human's `!`
+/// command) → tool_use("bash") and its tool_result; `compaction` and
 /// `branch_summary` → message(system); displayed `custom_message` →
-/// message(system). Tool results, thinking and settings entries are not
-/// transcript. A header with a version above 3 stops the reader
+/// message(system). Settings entries are not transcript. A header with a version above 3 stops the reader
 /// (`error.Protocol`) rather than guessing (decision-7, rule 4). The tree is
 /// read in file order, so abandoned branches appear too.
 pub const SessionReader = struct {
@@ -1321,6 +1368,8 @@ pub const SessionReader = struct {
                 const text = try contentText(arena, field(message, "content"));
                 addMessage(events, .user, text.text, text.truncated);
             } else if (std.mem.eql(u8, role, "assistant")) {
+                const thinking = try thinkingText(arena, field(message, "content"));
+                addReasoning(events, thinking.text, thinking.truncated);
                 const text = try contentText(arena, field(message, "content"));
                 addMessage(events, .assistant, text.text, text.truncated);
                 if (field(message, "content")) |content| {
@@ -1338,8 +1387,15 @@ pub const SessionReader = struct {
                         addMessage(events, .system, clipped.text, clipped.truncated);
                     }
                 }
+            } else if (std.mem.eql(u8, role, "toolResult")) {
+                const output = try contentText(arena, field(message, "content"));
+                addToolResult(events, stringField(message, "toolName"), output.text, boolField(message, "isError") == true, output.truncated);
             } else if (std.mem.eql(u8, role, "bashExecution")) {
                 addToolUse(events, "bash", stringField(message, "command") orelse "", null);
+                const exit_code: ?i64 = if (field(message, "exitCode")) |code| (if (code == .integer) code.integer else null) else null;
+                const failed = boolField(message, "cancelled") == true or (exit_code != null and exit_code.? != 0);
+                const output = clip(stringField(message, "output") orelse "");
+                addToolResult(events, "bash", output.text, failed, output.truncated or boolField(message, "truncated") == true);
             }
         } else if (std.mem.eql(u8, kind, "compaction") or std.mem.eql(u8, kind, "branch_summary")) {
             const text = clip(stringField(root, "summary") orelse "");
@@ -1688,6 +1744,11 @@ test "sink lines map to events, ignoring other agents and unknown versions" {
     i += 1;
     try testing.expectEqual(event.PermissionOutcome.allowed, out[i].event.permission_resolved.outcome);
     i += 1;
+    // This recording's extension sent no output with its result.
+    try testing.expectEqualStrings("bash", out[i].event.tool_result.name);
+    try testing.expectEqualStrings("", out[i].event.tool_result.summary);
+    try testing.expect(!out[i].event.tool_result.failed);
+    i += 1;
     // The foreign-token and version-2 agent_end lines produced nothing.
     try testing.expectEqualStrings("edit", out[i].event.tool_use.name);
     i += 1;
@@ -1780,6 +1841,10 @@ test "RPC lines map to events and answers go back as JSON lines" {
     const request = out[i].event.permission_request;
     try testing.expectEqualStrings("1de97134-8939-444f-a390-d94a95616540", request.id);
     try testing.expectEqualStrings("Allow bash? touch probe_file", request.title);
+    i += 1;
+    // tool_execution_end; the toolResult message_end repeating it adds nothing.
+    try testing.expectEqualStrings("bash", out[i].event.tool_result.name);
+    try testing.expectEqualStrings("(no output)", out[i].event.tool_result.summary);
     i += 1;
     try testing.expectEqual(event.Role.assistant, out[i].event.message.role);
     try testing.expectEqualStrings("MOCK_OK", out[i].event.message.text);
@@ -1875,11 +1940,11 @@ test "a full queue keeps the rest of a line for the next poll" {
         try testing.expectEqual(@as(usize, 1), queue.drain(&out));
         try names.append(testing.allocator, std.meta.activeTag(out[0].event));
     }
-    // The same fifteen events as one big poll, in order, with the
+    // The same sixteen events as one big poll, in order, with the
     // tool_use + file_reference pair split across polls.
-    try testing.expectEqual(@as(usize, 15), names.items.len);
-    try testing.expectEqual(event.Event.Kind.tool_use, names.items[6]);
-    try testing.expectEqual(event.Event.Kind.file_reference, names.items[7]);
+    try testing.expectEqual(@as(usize, 16), names.items.len);
+    try testing.expectEqual(event.Event.Kind.tool_use, names.items[7]);
+    try testing.expectEqual(event.Event.Kind.file_reference, names.items[8]);
 }
 
 test "lines are bounded: an over-long line keeps only its type" {
@@ -1926,16 +1991,25 @@ test "the session reader parses a v3 file fed in pieces" {
 
     var out: [32]event.StoredEvent = undefined;
     const n = queue.drain(&out);
-    const Expect = union(enum) { message: struct { event.Role, []const u8 }, tool: struct { []const u8, []const u8 }, file: []const u8 };
+    const Expect = union(enum) {
+        message: struct { event.Role, []const u8 },
+        tool: struct { []const u8, []const u8 },
+        file: []const u8,
+        reasoning: []const u8,
+        result: struct { []const u8, []const u8 },
+    };
     const expected = [_]Expect{
         .{ .message = .{ .user, "RUNTOOL" } },
         .{ .tool = .{ "bash", "touch probe_file" } },
+        .{ .result = .{ "bash", "(no output)" } },
         .{ .message = .{ .assistant, "MOCK_OK" } },
         .{ .message = .{ .user, "Read src/main.zig" } },
+        .{ .reasoning = "private" },
         .{ .message = .{ .assistant, "Reading it." } },
         .{ .tool = .{ "read", "src/main.zig" } },
         .{ .file = "src/main.zig" },
         .{ .tool = .{ "bash", "git status" } },
+        .{ .result = .{ "bash", "clean" } },
         .{ .message = .{ .system, "User asked for a probe file." } },
         .{ .message = .{ .system, "429 rate limited" } },
     };
@@ -1950,7 +2024,96 @@ test "the session reader parses a v3 file fed in pieces" {
             try testing.expectEqualStrings(t[1], got.event.tool_use.summary);
         },
         .file => |path| try testing.expectEqualStrings(path, got.event.file_reference.path),
+        .reasoning => |text| try testing.expectEqualStrings(text, got.event.reasoning.text),
+        .result => |r| {
+            try testing.expectEqualStrings(r[0], got.event.tool_result.name);
+            try testing.expectEqualStrings(r[1], got.event.tool_result.summary);
+            try testing.expect(!got.event.tool_result.failed);
+        },
     };
+}
+
+test "a recorded 0.73.1 turn yields thinking as reasoning and tool results on every channel" {
+    // Recorded from `pi --mode rpc` 0.73.1 with conduit.js against a local
+    // Chat Completions stand-in that streams `reasoning_content` before
+    // every reply: a bash printing two lines, a failing bash, a read, text.
+    const Kind = event.Event.Kind;
+    const turn = [_]Kind{
+        .reasoning, .tool_use, .tool_result, // printf
+        .reasoning, .tool_use, .tool_result, // ls of a missing directory
+        .reasoning, .tool_use, .file_reference, .tool_result, // read notes.txt
+        .reasoning, .message, // the answer
+    };
+    const Check = struct {
+        fn turnEvents(events: []const event.StoredEvent, kinds: []const Kind) !void {
+            try testing.expectEqual(kinds.len, events.len);
+            for (kinds, events) |kind, *stored| try testing.expectEqual(kind, std.meta.activeTag(stored.event));
+            try testing.expectEqualStrings("Run the probe first to see what it prints.", events[0].event.reasoning.text);
+            const printed = events[2].event.tool_result;
+            try testing.expectEqualStrings("bash", printed.name);
+            try testing.expectEqualStrings("probe line one", printed.summary);
+            try testing.expect(printed.truncated and !printed.failed);
+            const missing = events[5].event.tool_result;
+            try testing.expectEqualStrings("ls: cannot access '/nonexistent-conduit-probe': No such file or directory", missing.summary);
+            try testing.expect(missing.failed and missing.truncated);
+            try testing.expectEqualStrings("notes.txt", events[8].event.file_reference.path);
+            try testing.expectEqualStrings("read", events[9].event.tool_result.name);
+            try testing.expectEqualStrings("hello from the notes", events[9].event.tool_result.summary);
+            try testing.expectEqualStrings("Everything I need is here; summarise.", events[10].event.reasoning.text);
+        }
+    };
+    var out: [64]event.StoredEvent = undefined;
+
+    // The session file.
+    {
+        var reader = SessionReader.init(testing.allocator, default_max_line_bytes);
+        defer reader.deinit();
+        var queue = try event.EventQueue.init(testing.allocator, testing.io, 64);
+        defer queue.deinit(testing.allocator);
+        try reader.feedBytes(@embedFile("pi/testdata/session_reasoning_v3.jsonl"));
+        _ = try reader.drain(&queue);
+        const n = queue.drain(&out);
+        try testing.expectEqual(Kind.message, std.meta.activeTag(out[0].event));
+        try Check.turnEvents(out[1..n], &turn);
+    }
+
+    // The extension's sink and the RPC stream, as the adapter polls them.
+    const channels = [_]struct { mode: Mode, input: []const u8 }{
+        .{ .mode = .tui, .input = @embedFile("pi/testdata/sink_reasoning_events.jsonl") },
+        .{ .mode = .rpc, .input = @embedFile("pi/testdata/rpc_reasoning_events.jsonl") },
+    };
+    for (channels) |channel| {
+        var transport: MemoryTransport = .{ .input = channel.input, .chunk = 101 };
+        defer transport.deinit();
+        var pi = try PiAdapter.init(testing.allocator, testing.io, .{
+            .mode = channel.mode,
+            .sink_dir = if (channel.mode == .tui) "/s" else "",
+            .transport = if (channel.mode == .rpc) transport.rpc() else transport.tui(),
+        });
+        defer pi.deinit();
+        if (channel.mode == .tui) try pi.adapter().attach(.{ .session = @enumFromInt(3), .token = test_token });
+        var queue = try event.EventQueue.init(testing.allocator, testing.io, 64);
+        defer queue.deinit(testing.allocator);
+        var polls: usize = 0;
+        while (polls < 64) : (polls += 1) _ = try pi.adapter().poll(&queue);
+        const n = queue.drain(&out);
+        // Keep the turn's own events: status changes, the prompt and the
+        // channel's session bookkeeping are covered by other tests.
+        var turn_events: [64]event.StoredEvent = undefined;
+        var kept: usize = 0;
+        var prompt_seen = false;
+        for (out[0..n]) |*stored| {
+            if (stored.event == .status_change) continue;
+            if (!prompt_seen and stored.event == .message and stored.event.message.role == .user) {
+                prompt_seen = true;
+                continue;
+            }
+            try turn_events[kept].store(stored.event);
+            kept += 1;
+        }
+        try testing.expect(prompt_seen);
+        try Check.turnEvents(turn_events[0..kept], &turn);
+    }
 }
 
 test "the session reader refuses an unknown format version" {

@@ -55,6 +55,14 @@ function textOf(content) {
 		.join("\n");
 }
 
+function thinkingOf(content) {
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((block) => block && block.type === "thinking" && typeof block.thinking === "string")
+		.map((block) => block.thinking)
+		.join("\n");
+}
+
 function summaryOf(args) {
 	if (!args || typeof args !== "object") return "";
 	if (typeof args.command === "string") return cut(args.command, SUMMARY_LIMIT);
@@ -147,9 +155,12 @@ export default function (pi) {
 	pi.on("message_end", async (event) => {
 		const message = event.message;
 		if (!message || (message.role !== "user" && message.role !== "assistant")) return;
+		const thinking = message.role === "assistant" ? thinkingOf(message.content) : "";
 		emit("message_end", {
 			role: message.role,
 			text: cut(textOf(message.content), TEXT_LIMIT),
+			thinking: thinking ? cut(thinking, TEXT_LIMIT) : undefined,
+			thinkingCut: thinking.length > TEXT_LIMIT ? true : undefined,
 			stopReason: message.stopReason,
 		});
 	});
@@ -161,9 +172,16 @@ export default function (pi) {
 			path: pathOf(event.args),
 		}),
 	);
-	pi.on("tool_execution_end", async (event) =>
-		emit("tool_execution_end", { toolCallId: event.toolCallId, toolName: event.toolName, isError: !!event.isError }),
-	);
+	pi.on("tool_execution_end", async (event) => {
+		const output = textOf(event.result && event.result.content);
+		emit("tool_execution_end", {
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			isError: !!event.isError,
+			output: cut(output, SUMMARY_LIMIT),
+			outputCut: output.length > SUMMARY_LIMIT ? true : undefined,
+		});
+	});
 	if (GATE === "1" || GATE === "all") {
 		pi.on("tool_call", async (event, ctx) => {
 			if (GATE !== "all" && !GATED.has(event.toolName)) return undefined;

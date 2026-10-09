@@ -1,0 +1,15 @@
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"session_start","reason":"startup","sessionId":"01a11f0e-9175-705f-93f0-8eb2f6968c5f","sessionFile":"/home/user/.pi/agent/sessions/--home-user-proj--/2026-10-09T05-06-50-870Z_01a11f0e-9175-705f-93f0-8eb2f6968c5f.jsonl","cwd":"/home/user/proj"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"agent_start"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"message_end","role":"user","text":"run the probe"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"message_end","role":"assistant","text":"","thinking":"Run the probe first to see what it prints.","stopReason":"toolUse"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_start","toolCallId":"call_0","toolName":"bash","summary":"printf 'probe line one\\nprobe line two\\n'"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_end","toolCallId":"call_0","toolName":"bash","isError":false,"output":"probe line one\nprobe line two\n"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"message_end","role":"assistant","text":"","thinking":"Both lines printed. Check that the missing directory really is missing.","stopReason":"toolUse"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_start","toolCallId":"call_1","toolName":"bash","summary":"ls /nonexistent-conduit-probe"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_end","toolCallId":"call_1","toolName":"bash","isError":true,"output":"ls: cannot access '/nonexistent-conduit-probe': No such file or directory\n\n\nCommand exited with code 2"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"message_end","role":"assistant","text":"","thinking":"The listing failed as expected. Read the notes next.","stopReason":"toolUse"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_start","toolCallId":"call_2","toolName":"read","summary":"notes.txt","path":"notes.txt"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"tool_execution_end","toolCallId":"call_2","toolName":"read","isError":false,"output":"hello from the notes\nsecond note line\n"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"message_end","role":"assistant","text":"The probe printed two lines, the directory is missing, and the notes say hello.","thinking":"Everything I need is here; summarise.","stopReason":"stop"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"agent_end","stopReason":"stop"}
+{"v":1,"token":"0123456789abcdef0123456789abcdef","type":"session_shutdown","reason":"quit"}
