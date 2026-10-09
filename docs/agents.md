@@ -98,9 +98,30 @@ The semantic ids are unchanged (`<row>.agent.<state>` on tab and workspace rows,
 `workspace.<k>.tab.<n>.agent-row.<id>` for agent rows), so the test driver and accessibility read
 the state from the id and the label, not from the colour.
 
+### What an agent row says, and what a click shows (TASK-86)
+
+An agent's sidebar row reads `<icon> <harness>  <detail>`. The detail is the title the harness set
+on its terminal (OSC 0 or 2), with one leading activity glyph removed the way herdr does it (a
+braille spinner frame, or one of Claude Code's `· ✢ ✳ ✶ ✻ ✽ ◐ ◓ ◑ ◒`, when a space or nothing
+follows it); Claude Code titles its terminal with a short summary of the conversation, so its row
+reads like `● claude  Fix login bug`. With no title the detail is the backlog task the agent was
+started from (`TASK-12`), and otherwise the state word. The title is untrusted terminal text:
+Conduit drops control characters and malformed UTF-8, keeps at most 192 bytes, cuts it with `…`
+at the row's width, and never logs it or acts on it. The row's semantic label carries the
+harness, the state word and the detail (`● claude working: Fix login bug`) for the test driver and
+accessibility.
+
+Clicking the row, or Enter on it, shows the agent's workspace, tab and pane with its terminal
+visible, closing an agent view that covered it, so you see the harness's own screen: its output,
+its tool calls and whatever reasoning it prints. Activating the row again while that terminal is
+showing opens the structured agent view; Ctrl+Shift+A (Cmd+Shift+A), **Agent: toggle view**, the
+agent manager and the backlog detail open the view as before. The agent manager rows, the
+**Agent: stop** and **Agent: focus** choices, the prompts view's heading and the backlog card
+badges show the same status icon as the sidebar, in the configured style.
+
 ### Reasoning and tool output in the agent view (TASK-87)
 
-Open an agent's view (click its sidebar row, or **Agent: toggle view**) to see what it is doing,
+Open an agent's view (activate its sidebar row a second time while its terminal is showing, or **Agent: toggle view**) to see what it is doing,
 not just what it says. Besides messages (`you ›`, `claude ›`), tool uses (`⚙ <tool> <summary>`),
 file references and permission prompts, the view shows:
 

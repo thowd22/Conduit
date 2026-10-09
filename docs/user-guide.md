@@ -42,16 +42,22 @@ Every agent gets a row of its own, nested one level under the tab it runs in, at
 the tab rows (below the tab's branch row when it has one):
 
 ```
-│ ● workspace        │
-│   ● Terminal 1     │
-│     ● claude done  │
-│   ● Fake agent     │
-│     ● codex permission
+│ ● workspace          │
+│   ● Terminal 1       │
+│     ● claude  Fix lo…│
+│   ● Fake agent       │
+│     ● codex  TASK-12 │
 ```
 
-A row reads `<icon> <harness> <state>` and changes the moment the agent's state does. The icon
-is the only coloured part of the row, so a glance down the sidebar says which tab needs you; its
-colour comes from the active theme, so every theme applies. There are two icon styles, both
+A row reads `<icon> <harness>  <detail>` and changes the moment the agent's state or title does.
+The detail says what the agent is doing: the title the harness gave its terminal (Claude Code
+titles it with a summary of the conversation), without the spinner frame the harness puts in
+front of it; else the backlog task the agent was started from (`TASK-12`); else the state word
+(`working`, `input`, `permission`, `done`, `errored`, `idle`). The detail is dimmer than the
+harness name and is cut with `…` at the sidebar's edge; the full text, with the state word, is
+the row's accessible label (`● claude working: Fix login bug`). A title is only ever shown: Conduit
+never acts on it. The icon is the only coloured part of the row, so a glance down the sidebar
+says which tab needs you; its colour comes from the active theme, so every theme applies. There are two icon styles, both
 herdr's, chosen with `sidebar.status_icons` (or the settings view's Agents group):
 
 | State | `dots` (default) | `symbols` | Colour |
@@ -62,15 +68,17 @@ herdr's, chosen with `sidebar.status_icons` (or the settings view's Agents group
 | idle | `○` | `○` | green |
 | errored | `×` | `×` | danger (red) |
 
-The state word (`input`, `permission`) tells the two waits apart. The row
+The icon's colour and the label's state word tell the two waits apart. The row
 appears as soon as the agent registers, whether you started it with **Agent: launch** or by
 typing `claude`, `codex`, `pi`/`omp` or `opencode` in a tab yourself (a hand-started agent shows
 its harness name before it reports anything). A finished agent keeps its row, showing done or
 errored, until the tab closes or the agent is restarted.
 
 Click a row, or focus it with the sidebar keys and press Enter, to bring the agent's workspace,
-tab and pane forward and open its [agent view](#agent-view); activating the row again while that
-view is showing closes it. A tab dragged onto an agent row moves to that row's tab. The tab row
+tab and pane forward with its terminal showing: the harness's own live screen, with its output
+and whatever reasoning it prints. An [agent view](#agent-view) that covered the terminal closes.
+Activating the row again while that terminal is showing opens the agent view over it, and once
+more closes it. A tab dragged onto an agent row moves to that row's tab. The tab row
 leads with the icon of the agent in its focused pane, and the workspace row with the icon of its
 most urgent agent (permission, then input, errored, done, working, idle), in the same style and
 colours. Set `sidebar.agents = false` (or turn it off in the settings view's Agents group) to keep
@@ -344,8 +352,8 @@ An agent launched with **Agent: launch** runs in its own tab as a real terminal.
 (Cmd+Shift+A), or **Agent: toggle view** in the palette, replaces that pane's terminal with the
 agent view: the same session shown as structured, terminal-styled rows built from the events the
 agent's harness reports. The terminal keeps running underneath, and the same chord or command
-switches back to it. A click on the agent's row in the sidebar ([Agent rows](#agent-rows)) opens
-the view from anywhere.
+switches back to it. A click on the agent's row in the sidebar ([Agent rows](#agent-rows)) shows
+the agent's terminal first; a second click opens the view.
 
 - **Messages** start with who wrote them (`you ›`, the harness's name such as `claude ›`, or
   `system ›`) and wrap at the pane width; this is the one place Conduit wraps text. **Tool uses**
@@ -419,8 +427,8 @@ and nothing in a file or prompt runs: an editor opens only from your click or ke
 
 Ctrl+Shift+G (Cmd+Shift+G), or **Agents** in the palette, opens one list of every agent in every
 workspace: Conduit's own launches and harnesses it noticed you start in a terminal. The
-scratchpad never appears. Each row reads `<glyph> <harness>  <workspace> › <tab>  <task>  <state>
-<last activity>`, ordered like the sidebar (workspace, then tab); states and ages update live while
+scratchpad never appears. Each row reads `<icon> <harness>  <workspace> › <tab>  <task>  <state>
+<last activity>`, with the sidebar's status icon ([Agent rows](#agent-rows)), ordered like the sidebar (workspace, then tab); states and ages update live while
 the list is open. The task column names the backlog task an agent was started on from the
 [backlog view](#backlog-view), or shows `–`.
 
@@ -470,7 +478,7 @@ every chord keep working, and the terminals beneath keep running. A directory wi
 says `no backlog/ here`. Only Local workspaces are read for now.
 
 The **board** has a column per status in `config.yml`, each card `<id> <title>` over a dim row with
-the agent working on it (glyph, harness, state), labels and assignees. The **list** has every task
+the agent working on it (status icon, harness, state), labels and assignees. The **list** has every task
 in ordinal order with its status. Completed and draft tasks are not shown. Changes to the files —
 from the `backlog` CLI, an agent, an editor or `git` — appear on their own.
 
@@ -501,7 +509,7 @@ detail's message line; without the CLI the view is read-only (`backlog CLI not f
 **Start agent** offers the harnesses `agent.launch` would (Enter or a click starts one, Escape or
 `back` returns). The agent opens in a new tab of the workspace, in the project directory, with the
 task as its initial prompt: `TASK-7: <title>`, the description and the acceptance criteria (at most
-16 KiB; longer tasks are cut and marked). Its card, list row and detail then show its glyph, harness
+16 KiB; longer tasks are cut and marked). Its card, list row and detail then show its status icon, harness
 and state live, and the [agent manager](#agent-manager) names the task in its task column.
 
 ## Settings view
