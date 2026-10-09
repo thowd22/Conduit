@@ -129,14 +129,16 @@ pub fn matches(pattern: *const Pattern, text: []const u8) bool {
 }
 
 /// The tail of `text` holding its last `count` non-blank rows (all of it
-/// for 0). Blank rows between them stay; a region never splits a row.
+/// for 0). Blank rows between them stay; a region never splits a row. A row
+/// that is only spaces and a carriage return is blank too, so a fixture
+/// checked out with CRLF endings classifies as the LF original does.
 fn bottomRows(text: []const u8, count: u8) []const u8 {
     if (count == 0) return text;
     var seen: u8 = 0;
     var end = text.len;
     while (true) {
         const start = if (std.mem.lastIndexOfScalar(u8, text[0..end], '\n')) |nl| nl + 1 else 0;
-        if (std.mem.trim(u8, text[start..end], " ").len != 0) {
+        if (std.mem.trim(u8, text[start..end], " \r").len != 0) {
             seen += 1;
             if (seen == count) return text[start..];
         }
@@ -183,6 +185,18 @@ test "patterns match literals in a bottom region, case-folded, with a row anchor
     // A region larger than the text is the whole text.
     try testing.expect(matches(&.{ .all = &.{"old line"}, .rows = 30 }, text));
     try testing.expect(!matches(&.{ .all = &.{"absent"} }, ""));
+}
+
+test "a CRLF screen counts its rows like the LF screen" {
+    // A Windows checkout rewrites fixture line endings; a `\r` row is blank.
+    const lf = "old line\n\n  x error: boom\n\n> \n";
+    const crlf = "old line\r\n\r\n  x error: boom\r\n\r\n> \r\n";
+    const pattern: Pattern = .{ .row_prefix = "x error:", .rows = 2 };
+    try testing.expect(matches(&pattern, lf));
+    try testing.expect(matches(&pattern, crlf));
+    const narrow: Pattern = .{ .all = &.{"old line"}, .rows = 2 };
+    try testing.expect(!matches(&narrow, lf));
+    try testing.expect(!matches(&narrow, crlf));
 }
 
 test "a blocker outranks work, work outranks an error, an error outranks the prompt" {

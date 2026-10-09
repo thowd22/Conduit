@@ -13,3 +13,5 @@ build.zig.zon text eol=lf
 # a Windows checkout must not rewrite their line endings. The parsers accept
 # CRLF on their own; that is covered by unit tests, not by the fixtures.
 test/fixtures/** text eol=lf
+src/agent/*/fixtures/** text eol=lf
+src/agent/*/testdata/** text eol=lf
