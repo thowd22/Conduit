@@ -6409,6 +6409,47 @@ test "the Kitty keyboard protocol changes the bytes, and only when it is enabled
     try testing.expectEqualStrings("\x1b[15;1:3~", encoded.slice());
 }
 
+test "every Ctrl+C the encoder can produce reaches a pseudoconsole as Ctrl+C" {
+    // TASK-83: a pseudoconsole drops Kitty reports, so the ConPTY backend writes a Kitty Ctrl+C
+    // as 0x03 and its release as nothing. Every flag combination a program can push, every key
+    // action and both lock keys must give a report that rewrite recognises whole.
+    const testing = std.testing;
+
+    var terminal: Terminal = undefined;
+    try terminal.init(testIo(), testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer terminal.deinit(testing.allocator);
+
+    var encoded: EncodedKey = .{};
+    var push: [8]u8 = undefined;
+    var flags: u8 = 0;
+    while (flags < 32) : (flags += 1) {
+        terminal.feed("\x1b[<u");
+        terminal.feed(try std.fmt.bufPrint(&push, "\x1b[>{d}u", .{flags}));
+        inline for (std.enums.values(KeyAction)) |action| {
+            inline for (.{ false, true }) |caps_lock| {
+                inline for (.{ false, true }) |num_lock| {
+                    terminal.encodeKey(.{
+                        .action = action,
+                        .mods = .{ .ctrl = true, .caps_lock = caps_lock, .num_lock = num_lock },
+                        .text = "c",
+                        .unshifted_codepoint = 'c',
+                    }, &encoded);
+                    const bytes = encoded.slice();
+                    if (bytes.len == 0 or std.mem.eql(u8, bytes, "\x03")) {
+                        // Legacy: nothing for a release, the C0 control otherwise.
+                        try testing.expect(bytes.len == 0 or action != .release);
+                    } else {
+                        const found = pty.conPtyInput(bytes);
+                        try testing.expectEqual(@as(usize, 0), found.start);
+                        try testing.expectEqual(bytes.len, found.len);
+                        try testing.expectEqual(action != .release, found.interrupt);
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "a composing press encodes to nothing, in either protocol" {
     const testing = std.testing;
 

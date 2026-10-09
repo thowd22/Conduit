@@ -1941,6 +1941,75 @@ fn releaseHandles(self: *ConPty) void {
     self.stop = invalid_handle;
 }
 
+/// The first Kitty keyboard protocol report of Ctrl+C in some bytes on their way to a
+/// pseudoconsole: where it starts, how long it is (0 when there is none), and whether it is a
+/// press (or repeat) rather than a release.
+pub const ConPtyInput = struct {
+    start: usize = 0,
+    len: usize = 0,
+    interrupt: bool = false,
+};
+
+/// Find the first Kitty keyboard report of Ctrl+C in `bytes`.
+///
+/// A pseudoconsole turns the terminal's input back into console key events, and its parser knows
+/// the legacy encodings and win32-input-mode but not the Kitty protocol's `CSI 99;5u`: it drops
+/// that report, so a console program never sees the key (a `[Console]::ReadKey` reader got
+/// nothing for it on the windows-latest runner, TASK-83) and a console with processed input on
+/// never raises its Ctrl+C event. A pseudoconsole also passes a program's `CSI > 1 u` straight
+/// through to the terminal, so the terminal does switch to that encoding. Ctrl+C with nothing
+/// selected is always the interrupt, so under a pseudoconsole its report is written as `0x03`,
+/// whatever the protocol flags; every other key is written exactly as encoded.
+///
+/// Matched: `ESC [ 99 [:alternates] ; <modifiers>[:<event>] [;<text>] u` whose modifiers are Ctrl
+/// alone, give or take Caps Lock and Num Lock. Event 3 is a release, which a legacy Ctrl+C does
+/// not have; 1, 2 or none is a press or a repeat, each one Ctrl+C.
+pub fn conPtyInput(bytes: []const u8) ConPtyInput {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, from, "\x1b[99")) |start| : (from = start + 1) {
+        if (kittyCtrlC(bytes[start..])) |found| {
+            return .{ .start = start, .len = found.len, .interrupt = found.interrupt };
+        }
+    }
+    return .{};
+}
+
+/// Whether `bytes` starts with a Kitty report of Ctrl+C; `conPtyInput` says what is matched.
+fn kittyCtrlC(bytes: []const u8) ?struct { len: usize, interrupt: bool } {
+    var at: usize = "\x1b[99".len;
+    // Alternate key codes (shifted, base layout) follow the key code after colons.
+    if (at < bytes.len and bytes[at] == ':') {
+        while (at < bytes.len and (bytes[at] == ':' or std.ascii.isDigit(bytes[at]))) at += 1;
+    }
+    if (at >= bytes.len or bytes[at] != ';') return null;
+    at += 1;
+    const modifiers_start = at;
+    while (at < bytes.len and std.ascii.isDigit(bytes[at])) at += 1;
+    const modifiers = std.fmt.parseUnsigned(u16, bytes[modifiers_start..at], 10) catch return null;
+    if (modifiers == 0) return null;
+    const ctrl: u16 = 4;
+    const locks: u16 = 64 | 128;
+    if (((modifiers - 1) & ~locks) != ctrl) return null;
+    var event: u16 = 1;
+    if (at < bytes.len and bytes[at] == ':') {
+        at += 1;
+        const event_start = at;
+        while (at < bytes.len and std.ascii.isDigit(bytes[at])) at += 1;
+        event = std.fmt.parseUnsigned(u16, bytes[event_start..at], 10) catch return null;
+    }
+    // Associated text: Ctrl+C has none, but a report may still carry the empty field.
+    if (at < bytes.len and bytes[at] == ';') {
+        at += 1;
+        while (at < bytes.len and (bytes[at] == ':' or std.ascii.isDigit(bytes[at]))) at += 1;
+    }
+    if (at >= bytes.len or bytes[at] != 'u') return null;
+    return switch (event) {
+        1, 2 => .{ .len = at + 1, .interrupt = true },
+        3 => .{ .len = at + 1, .interrupt = false },
+        else => null,
+    };
+}
+
 /// One live terminal on Windows: a pseudoconsole, a child, four events, a byte ring, a read thread
 /// and an exit watcher.
 const ConPty = struct {
@@ -2254,9 +2323,17 @@ const ConPty = struct {
     /// the owner thread — and it blocks for exactly as long as the terminal's own input buffer
     /// takes to accept the bytes, which is the same bound a write to a POSIX pty master has. The
     /// caller sees it as a short write and retries the rest.
+    ///
+    /// A Kitty keyboard protocol report of Ctrl+C goes in as the one byte a pseudoconsole
+    /// recognises as Ctrl+C (see `conPtyInput`), and its release as nothing. Each such report is
+    /// its own write, so the count returned always ends on a whole report.
     fn writeBytes(self: *ConPty, bytes: []const u8) Error!usize {
         if (bytes.len == 0) return 0;
-        return win.writeFile(self.input, bytes);
+        const next = conPtyInput(bytes);
+        if (next.len == 0) return win.writeFile(self.input, bytes);
+        if (next.start != 0) return win.writeFile(self.input, bytes[0..next.start]);
+        if (next.interrupt) try self.writeAll(&[_]u8{0x03});
+        return next.len;
     }
 
     /// Write every byte, looping over the short writes the interface allows. Only an interrupt uses
@@ -4849,38 +4926,37 @@ const read_key_script =
     \\}
 ;
 
-test "TASK-83 probe: Ctrl+C key events through ConPTY, legacy and kitty" {
+test "two Ctrl+C presses reach a Windows console program as two key events, legacy and Kitty" {
+    // TASK-83's second acceptance criterion. Before the ConPTY backend rewrote Kitty reports, the
+    // legacy pair arrived as two `key:3:C:Control` events and both Kitty pairs as none at all
+    // (windows-latest, run 37865506186).
     if (!has_conpty_backend) return error.SkipZigTest;
     const gpa = testing.allocator;
     const pty = try spawnPowerShellScript(gpa, read_key_script);
     defer pty.destroy();
     const ready = try readUntil(gpa, pty, "probe-ready");
     defer gpa.free(ready);
-    probe_log.warn("readkey ready: {f}", .{std.ascii.hexEscape(ready, .lower)});
+    try testing.expect(std.mem.indexOf(u8, ready, "probe-ready") != null);
 
-    const legacy = try sendThenSentinel(gpa, pty, "\x03\x03", "z", "key:122:");
-    defer gpa.free(legacy);
-    probe_log.warn("readkey legacy: {d} ctrl-c lines: {f}", .{
-        std.mem.count(u8, legacy, "key:3:"), std.ascii.hexEscape(legacy, .lower),
-    });
-
-    const kitty = try sendThenSentinel(gpa, pty, "\x1b[99;5u\x1b[99;5u", "y", "key:121:");
-    defer gpa.free(kitty);
-    probe_log.warn("readkey kitty: {d} ctrl-c lines: {f}", .{
-        std.mem.count(u8, kitty, "key:3:"), std.ascii.hexEscape(kitty, .lower),
-    });
-
-    const kitty_events = try sendThenSentinel(gpa, pty, "\x1b[99;5u\x1b[99;5:3u\x1b[99;5u\x1b[99;5:3u", "x", "key:120:");
-    defer gpa.free(kitty_events);
-    probe_log.warn("readkey kitty with releases: {d} ctrl-c lines: {f}", .{
-        std.mem.count(u8, kitty_events, "key:3:"), std.ascii.hexEscape(kitty_events, .lower),
-    });
-
-    const win32 = try sendThenSentinel(gpa, pty, "\x1b[67;46;3;1;8;1_\x1b[67;46;3;0;8;1_\x1b[67;46;3;1;8;1_\x1b[67;46;3;0;8;1_", "w", "key:119:");
-    defer gpa.free(win32);
-    probe_log.warn("readkey win32-input-mode: {d} ctrl-c lines: {f}", .{
-        std.mem.count(u8, win32, "key:3:"), std.ascii.hexEscape(win32, .lower),
-    });
+    // Each pair goes in as separate writes, one per key, the way the owner writes keys, and a
+    // sentinel key after it proves every key before it has been read.
+    const pairs = [_]struct { keys: []const []const u8, sentinel: []const u8, answer: []const u8 }{
+        // Legacy: the C0 control.
+        .{ .keys = &.{ "\x03", "\x03" }, .sentinel = "z", .answer = "key:122:" },
+        // Kitty, disambiguate: the press only.
+        .{ .keys = &.{ "\x1b[99;5u", "\x1b[99;5u" }, .sentinel = "y", .answer = "key:121:" },
+        // Kitty, report events: a press and a release each time.
+        .{ .keys = &.{ "\x1b[99;5u", "\x1b[99;5:3u", "\x1b[99;5u", "\x1b[99;5:3u" }, .sentinel = "x", .answer = "key:120:" },
+    };
+    for (pairs) |pair| {
+        for (pair.keys) |key| try writeAll(pty, key);
+        try writeAll(pty, pair.sentinel);
+        const seen = try readUntil(gpa, pty, pair.answer);
+        defer gpa.free(seen);
+        errdefer probe_log.warn("seen: {f}", .{std.ascii.hexEscape(seen, .lower)});
+        try testing.expect(std.mem.indexOf(u8, seen, pair.answer) != null);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, seen, "key:3:C:Control"));
+    }
     try writeAll(pty, "q");
 }
 
@@ -4950,6 +5026,79 @@ test "TASK-83 probe: what a program's keyboard-mode requests look like after Con
         std.mem.indexOf(u8, seen, "\x1b[>4;2m") != null,
         std.ascii.hexEscape(seen, .lower),
     });
+}
+
+test "TASK-83 probe: Claude Code under a bare pseudoconsole, two Ctrl+C presses" {
+    if (!has_conpty_backend) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const claude_exe = "C:\\npm\\prefix\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
+    const pty = spawnConPty(gpa, .{
+        .argv = &.{claude_exe},
+        .env = &.{
+            "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\Git\\bin",
+            "SYSTEMROOT=C:\\Windows",
+            "TEMP=C:\\Windows\\Temp",
+            "TMP=C:\\Windows\\Temp",
+            "USERPROFILE=C:\\Windows\\Temp",
+            "HOME=C:\\Windows\\Temp",
+            "APPDATA=C:\\Windows\\Temp",
+            "LOCALAPPDATA=C:\\Windows\\Temp",
+            "CLAUDE_CODE_GIT_BASH_PATH=C:\\Program Files\\Git\\bin\\bash.exe",
+        },
+        .cwd = windows_test_cwd,
+        .size = WindowSize.init(30, 100),
+    }) catch |err| {
+        probe_log.warn("bare claude: cannot start: {s}", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer pty.destroy();
+    const first = try readUntil(gpa, pty, "text style");
+    defer gpa.free(first);
+    probe_log.warn("bare claude: first screen seen: {}", .{std.mem.indexOf(u8, first, "text style") != null});
+    const hint = try sendThenSentinel(gpa, pty, "\x03", "", "again to exit");
+    defer gpa.free(hint);
+    probe_log.warn("bare claude: hint after one press: {}", .{std.mem.indexOf(u8, hint, "again to exit") != null});
+    try writeAll(pty, "\x03");
+    const ended = waitForExit(pty);
+    probe_log.warn("bare claude: after the second press: {s}", .{if (ended) |_| "exited" else |err| @errorName(err)});
+    if (ended) |_| return else |_| {}
+    var sent: usize = 0;
+    while (sent < 80 and pty.state() == .running) : (sent += 1) {
+        writeAll(pty, "x") catch break;
+        var scratch: [4096]u8 = undefined;
+        _ = pty.waitReadable(200);
+        while (pty.takeBytes(&scratch) != 0) {}
+    }
+    probe_log.warn("bare claude: {s} after {d} more keys", .{ @tagName(pty.state()), sent });
+    if (pty.state() == .running) pty.kill(.kill) catch {};
+}
+
+test "a Kitty Ctrl+C report is found for the pseudoconsole, and nothing else is" {
+    // Presses, repeats and releases, with lock keys, alternates and an empty text field.
+    try testing.expectEqual(ConPtyInput{ .start = 0, .len = 7, .interrupt = true }, conPtyInput("\x1b[99;5u"));
+    try testing.expectEqual(ConPtyInput{ .start = 0, .len = 9, .interrupt = true }, conPtyInput("\x1b[99;5:1u"));
+    try testing.expectEqual(ConPtyInput{ .start = 0, .len = 9, .interrupt = true }, conPtyInput("\x1b[99;5:2u"));
+    try testing.expectEqual(ConPtyInput{ .start = 0, .len = 9, .interrupt = false }, conPtyInput("\x1b[99;5:3u"));
+    try testing.expectEqual(ConPtyInput{ .start = 0, .len = 8, .interrupt = true }, conPtyInput("\x1b[99;69u"));
+    try testing.expectEqual(ConPtyInput{ .start = 0, .len = 9, .interrupt = true }, conPtyInput("\x1b[99;197u"));
+    try testing.expectEqual(ConPtyInput{ .start = 0, .len = 11, .interrupt = true }, conPtyInput("\x1b[99::99;5u"));
+    try testing.expectEqual(ConPtyInput{ .start = 0, .len = 8, .interrupt = true }, conPtyInput("\x1b[99;5;u"));
+    // Found after other bytes, so the write before it ends where it starts.
+    try testing.expectEqual(ConPtyInput{ .start = 3, .len = 7, .interrupt = true }, conPtyInput("abc\x1b[99;5u\x1b[99;5u"));
+
+    // Not Ctrl+C alone: shift, alt or super with it, another key, no modifiers, or not a report.
+    const none = ConPtyInput{};
+    try testing.expectEqual(none, conPtyInput("\x03"));
+    try testing.expectEqual(none, conPtyInput("\x1b[99;6u"));
+    try testing.expectEqual(none, conPtyInput("\x1b[99;7u"));
+    try testing.expectEqual(none, conPtyInput("\x1b[99;13u"));
+    try testing.expectEqual(none, conPtyInput("\x1b[99u"));
+    try testing.expectEqual(none, conPtyInput("\x1b[999;5u"));
+    try testing.expectEqual(none, conPtyInput("\x1b[100;5u"));
+    try testing.expectEqual(none, conPtyInput("\x1b[99;5~"));
+    try testing.expectEqual(none, conPtyInput("\x1b[99;5:4u"));
+    try testing.expectEqual(none, conPtyInput("\x1b[99;5"));
+    try testing.expectEqual(none, conPtyInput("\x1b[99;0u"));
 }
 
 test "a Windows command line splits into its first word and NUL-separated later words" {

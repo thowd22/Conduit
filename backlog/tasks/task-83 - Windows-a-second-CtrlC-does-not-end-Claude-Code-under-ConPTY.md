@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-08 22:04'
-updated_date: '2026-10-09 00:34'
+updated_date: '2026-10-09 00:58'
 labels:
   - windows
   - input
@@ -37,3 +37,9 @@ On the hosted Windows runner (TASK-81's windows-claude-observe.sh), Claude Code 
 3. Turn the probe into the AC2 unit test (two Ctrl+C presses reach a console program as two key events in the legacy and kitty encodings), remove the temporary diagnostics, make the observe script gate on Ctrl+C ending Claude Code (no taskkill fallback).
 4. Update AGENTS.md (TASK-81 paragraph) and docs, finalise with run ids.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Run 37865506186 (diagnostics): ReadKey reader under ConPTY gets 2 Ctrl+C events for legacy 0x03 x2 and for win32-input-mode, but 0 for Kitty CSI 99;5u (with or without releases); a VT-input reader gets the Kitty bytes raw. ConPTY forwards a program's CSI > 1 u and CSI ? u to the terminal, so Conduit would switch to Kitty encoding. Claude Code 2.1.295 reports kittyKeyboard=no (its CSI ? u query gets no reply through ConPTY), so it receives 0x03. A raw-mode Node probe receives both presses as byte 3 and exits. Claude Code: one press shows the hint and clears it after ~1 s (alive); the double press starts its exit and then it stays with CPU flat and a new thread in an Executive wait, never redrawing, for 15 s (main JS thread blocked in a synchronous call; its shutdown failsafe timer never fires). Its exit path calls drainStdin, which opens /dev/tty and reads it synchronously. Fix 1: the ConPTY backend writes a Kitty Ctrl+C report as 0x03 (release as nothing).
+<!-- SECTION:NOTES:END -->
