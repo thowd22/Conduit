@@ -241,7 +241,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
         run: |
-          npm install --global --no-audit --no-fund @anthropic-ai/claude-code bun
+          npm install --global --no-audit --no-fund @anthropic-ai/claude-code
           claude --version || true
           bash .github/scripts/windows-claude-observe.sh "$PWD/zig-out/bin/conduit.exe" "$PWD/zig-out/bin/conduit-test.exe" \
             "$ARTIFACT_ROOT/claude-observe"
