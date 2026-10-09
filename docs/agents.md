@@ -83,6 +83,21 @@ in `backlog/docs/doc-3`. In short:
   may be edited, opens editable files in `vi`, and for Claude Code restarts the agent to apply an
   edit (TASK-59).
 
+### Status icons (TASK-85)
+
+The sidebar marks every agent row, the tab it runs in and its workspace with a coloured status
+icon, in [herdr](https://github.com/herdrdev/herdr)'s style. `sidebar.status_icons = dots` (the
+default) draws `●` for working, waiting and done and `○` for idle; `symbols` draws `◐` working,
+`×` waiting, `✓` done and `○` idle. An errored agent is `×` in both. Only the icon is coloured,
+from the theme's roles: working yellow, waiting (for input or permission) red, done cyan, idle
+green, errored the danger colour; the row's text keeps its normal colour. The tab and workspace
+rows carry the most urgent agent's icon. Unlike herdr, a done agent stays done until its record
+is forgotten rather than until it is seen. The icons are the same for every harness and come from
+the bundled font (`◐` is drawn by Conduit itself), so nothing needs an emoji or a patched font.
+The semantic ids are unchanged (`<row>.agent.<state>` on tab and workspace rows, and
+`workspace.<k>.tab.<n>.agent-row.<id>` for agent rows), so the test driver and accessibility read
+the state from the id and the label, not from the colour.
+
 ### Agents on Windows (TASK-82)
 
 The control endpoint is a per-user named pipe on Windows (`\\.\pipe\conduit-<your SID>-r-…`,

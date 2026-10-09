@@ -37,7 +37,8 @@ row, **Open config file**, closes the dialog and opens the file itself, as `conf
 - **Editing.** Enter or a click edits a row the way its value needs:
   - `true`/`false` settings (`font.ligatures`, `font.nerd_symbols`, and `sidebar.agents` and
     every `notifications.*` switch in the Agents group) flip;
-  - `mouse.right_click` switches between `menu` and `paste`;
+  - `mouse.right_click` switches between `menu` and `paste`, and `sidebar.status_icons` between
+    `dots` and `symbols`;
   - `theme` and `font.family` close the dialog and open the palette's theme or family chooser,
     with its live preview;
   - numbers (`font.size`, `scratchpad.size`, `scratchpad.large_size`) and text (`font.bold`,
@@ -121,6 +122,7 @@ keybind = ctrl+alt+p=palette.open
 | `notifications.pi` | `true` or `false` | `true` | Every notification from Pi agents |
 | `notifications.opencode` | `true` or `false` | `true` | Every notification from OpenCode agents |
 | `sidebar.agents` | `true` or `false` | `true` | Whether each agent has its own sidebar row, `<glyph> <harness> <state>`, nested under its tab; a click or Enter on it opens that agent's view ([user-guide.md](user-guide.md#agent-rows)). `false` keeps only the glyph in front of the tab name. Settings-view row in the Agents group |
+| `sidebar.status_icons` | `dots` or `symbols` | `dots` | The agent status icons on agent, tab and workspace rows, in herdr's two styles. `dots`: `●` working, waiting and done, `○` idle. `symbols`: `◐` working, `×` waiting (for input or permission), `✓` done, `○` idle. An errored agent is `×` in both. The icon alone is coloured from the theme: working yellow, waiting red, done cyan, idle green, errored the danger colour ([user-guide.md](user-guide.md#agent-rows)). Hot-reloaded; a value other than `dots` or `symbols` is a `config.error` line and keeps the previous style. Settings-view row in the Agents group |
 | `remote.profile` | `<name> = <[user@]host[:port]>`, repeats | none | A saved SSH connection listed by **Remote: connect**; see [Remote connections](#remote-connections) |
 | `remote.recent` | comma-separated `[user@]host[:port]`, at most 10 | `""` | The destinations connected to most recently, newest first; written by Conduit |
 | `control.enabled` | `true` or `false` | `true` in development (Debug) builds, `false` in release builds | Read at startup: whether this run starts the local control endpoint harnesses use and the single-instance endpoint `conduit` commands reuse ([control-api.md](control-api.md)). No settings-view row |

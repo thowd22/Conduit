@@ -42,26 +42,39 @@ Every agent gets a row of its own, nested one level under the tab it runs in, at
 the tab rows (below the tab's branch row when it has one):
 
 ```
-│ ! workspace        │
-│   Terminal 1       │
-│     ✓ claude done  │
-│   ! Fake agent     │
-│     ! codex permission
+│ ● workspace        │
+│   ● Terminal 1     │
+│     ● claude done  │
+│   ● Fake agent     │
+│     ● codex permission
 ```
 
-A row reads `<glyph> <harness> <state>` and changes the moment the agent's state does: `·` idle,
-`▸ … working`, `? … input` (waiting for input), `! … permission` (waiting for permission), `✓ … done`,
-`× … errored`. The row
+A row reads `<icon> <harness> <state>` and changes the moment the agent's state does. The icon
+is the only coloured part of the row, so a glance down the sidebar says which tab needs you; its
+colour comes from the active theme, so every theme applies. There are two icon styles, both
+herdr's, chosen with `sidebar.status_icons` (or the settings view's Agents group):
+
+| State | `dots` (default) | `symbols` | Colour |
+|---|---|---|---|
+| working | `●` | `◐` | yellow |
+| waiting for input, waiting for permission | `●` | `×` | red |
+| done | `●` | `✓` | cyan |
+| idle | `○` | `○` | green |
+| errored | `×` | `×` | danger (red) |
+
+The state word (`input`, `permission`) tells the two waits apart. The row
 appears as soon as the agent registers, whether you started it with **Agent: launch** or by
 typing `claude`, `codex`, `pi`/`omp` or `opencode` in a tab yourself (a hand-started agent shows
-its harness name before it reports anything). A finished agent keeps its row, showing `✓` or `×`,
-until the tab closes or the agent is restarted.
+its harness name before it reports anything). A finished agent keeps its row, showing done or
+errored, until the tab closes or the agent is restarted.
 
 Click a row, or focus it with the sidebar keys and press Enter, to bring the agent's workspace,
 tab and pane forward and open its [agent view](#agent-view); activating the row again while that
-view is showing closes it. A tab dragged onto an agent row moves to that row's tab. The glyph in
-front of the tab name stays. Set `sidebar.agents = false` (or turn it off in the settings view's
-Agents group) to keep only the glyphs.
+view is showing closes it. A tab dragged onto an agent row moves to that row's tab. The tab row
+leads with the icon of the agent in its focused pane, and the workspace row with the icon of its
+most urgent agent (permission, then input, errored, done, working, idle), in the same style and
+colours. Set `sidebar.agents = false` (or turn it off in the settings view's Agents group) to keep
+only those icons.
 
 Configuration problems appear in red at the bottom of the sidebar as `config:<line>: <message>`
 (see [config.md, Errors](config.md#errors)).
