@@ -1,11 +1,11 @@
 ---
 id: TASK-86
 title: 'Agent rows say what the agent is doing, and a click shows its terminal'
-status: In Progress
+status: Done
 assignee:
   - '@opus-5.5'
 created_date: '2026-10-09 04:52'
-updated_date: '2026-10-09 05:29'
+updated_date: '2026-10-09 05:40'
 labels:
   - agents
   - ui
@@ -25,13 +25,13 @@ The user's words: 'It just saying claude working doesnt really show me anything.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The agent row reads <icon> <harness>  <detail>; detail is the stripped terminal title when set, else the backlog task id of a task-launched agent, else the state word; the title is sanitised and cut with an ellipsis to the row width; unit tests cover the stripping (braille frames, each Claude glyph, whitespace, a title that is only a glyph) and the fallback order
-- [ ] #2 The row's semantic label carries the harness, the state word and the detail, the agent-row and <row>.agent.<state> ids are unchanged, and sidebar.agents = false still hides the rows
-- [ ] #3 Click or Enter on a row shows the agent's workspace, tab and pane with its terminal visible even when an agent view covered it; activating the row again while that terminal is presented toggles the agent view; keyboard parity through the sidebar rows is unchanged
-- [ ] #4 The deterministic --agent-test and the agent-notifications scenario prove the row text (the fake sets a title through OSC 2 with a leading spinner frame, and the row shows it stripped), the terminal-first activation and the second-activation toggle, by mouse and by keyboard; the row frame was inspected
-- [ ] #5 A real hand-started Claude Code (against the local Messages API stand-in, no account) shows its own title in its row and a click on the row shows its TUI; the evidence is in the task notes
-- [ ] #6 docs/user-guide.md, docs/agents.md and AGENTS.md describe the row and the click
-- [ ] #7 The agent manager rows, the Agent: stop and Agent: focus choice lists, the agent prompts heading and the backlog card badges use the configured status icon too, so one state looks the same everywhere
+- [x] #1 The agent row reads <icon> <harness>  <detail>; detail is the stripped terminal title when set, else the backlog task id of a task-launched agent, else the state word; the title is sanitised and cut with an ellipsis to the row width; unit tests cover the stripping (braille frames, each Claude glyph, whitespace, a title that is only a glyph) and the fallback order
+- [x] #2 The row's semantic label carries the harness, the state word and the detail, the agent-row and <row>.agent.<state> ids are unchanged, and sidebar.agents = false still hides the rows
+- [x] #3 Click or Enter on a row shows the agent's workspace, tab and pane with its terminal visible even when an agent view covered it; activating the row again while that terminal is presented toggles the agent view; keyboard parity through the sidebar rows is unchanged
+- [x] #4 The deterministic --agent-test and the agent-notifications scenario prove the row text (the fake sets a title through OSC 2 with a leading spinner frame, and the row shows it stripped), the terminal-first activation and the second-activation toggle, by mouse and by keyboard; the row frame was inspected
+- [x] #5 A real hand-started Claude Code (against the local Messages API stand-in, no account) shows its own title in its row and a click on the row shows its TUI; the evidence is in the task notes
+- [x] #6 docs/user-guide.md, docs/agents.md and AGENTS.md describe the row and the click
+- [x] #7 The agent manager rows, the Agent: stop and Agent: focus choice lists, the agent prompts heading and the backlog card badges use the configured status icon too, so one state looks the same everywhere
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -72,4 +72,12 @@ Real Claude Code 2.1.292 (hand-started, isolated HOME seeded past onboarding, lo
 
 Proposed AGENTS.md paragraph:
 TASK-86 is complete on Linux. A sidebar agent row reads `<icon> <harness>  <detail>`: the agent terminal's OSC 0/2 title with one leading activity glyph stripped as herdr does (a braille frame U+2800..U+28FF or one of `· ✢ ✳ ✶ ✻ ✽ ◐ ◓ ◑ ◒` followed by whitespace or alone; `app_agents.strippedTitle`), else the backlog task id of a task-launched agent, else the state word. The title is sanitised (`sanitizeTitle`: controls become spaces, malformed UTF-8 is dropped, at most 192 bytes), cut with `…` at the row, painted muted after the harness name and never logged or acted on. The semantic label is `<icon> <harness> <state>` plus `: <detail>` when there is one, so labels without a title are unchanged; `ui.InteractiveText` gained paint-only `painted` text and a `tail_foreground`/`tail_from` dim tail for this. Activating a row shows the agent's workspace, tab and pane with its terminal, closing a view that covered it; only an activation while that terminal is already presented toggles the agent view (Ctrl+Shift+A, the palette, the manager and the backlog detail are unchanged). The agent manager rows, the Agent: stop/focus choices, the prompts heading and the backlog badges use `statusIcon` in the configured style, and `stateGlyph` is gone. `--agent-test` and the agent-notifications scenario cover the title (the hand-started fake sets `⠋ Fixing the tests` through OSC 2), terminal-first activation and the second-activation toggle by mouse and keys; a real hand-started Claude Code 2.1.292 against a local Messages API stand-in showed `● claude input: Fix login bug` and a click on its row showed its TUI. The e2e driver has no label wait, so the scenario's title evidence is its screenshot and retained semantic tree. macOS and Windows are unverified.
+
+Coordinator: merged at 9782505 after a rebase onto TASK-87 (docs/agents.md sections kept in row-then-view order); the full local gate passed on main except one font-picker e2e flake that passed 22/22 on two reruns and 5/5 by hand (tracked as TASK-89).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Agent rows read <icon> <harness>  <detail> with the stripped terminal title, the backlog task id or the state word; activating a row shows the terminal first and only a second activation toggles the agent view; the manager, choice lists, prompts heading and backlog badges use the configured icon. Verified by unit tests (stripping, sanitising, fallback order), --agent-test, --agent-manager-test, --agent-prompts-test, --backlog-test, the agent-notifications scenario, inspected frames, a real hand-started Claude Code 2.1.292 showing '● claude input: Fix login bug' and its TUI on click, and the full local gate.
+<!-- SECTION:FINAL_SUMMARY:END -->

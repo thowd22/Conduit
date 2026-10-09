@@ -1,11 +1,11 @@
 ---
 id: TASK-87
 title: Agent view shows reasoning and tool output from every harness
-status: In Progress
+status: Done
 assignee:
   - '@opus-5.5'
 created_date: '2026-10-09 04:52'
-updated_date: '2026-10-09 05:24'
+updated_date: '2026-10-09 05:40'
 labels:
   - agents
   - ui
@@ -25,13 +25,13 @@ The user wants to see an agent's output and reasoning when they open it. The str
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 agent.Event has reasoning and tool_result variants with bounded copies through EventQueue and the view's EventLog; the all-kinds unit tests cover them
-- [ ] #2 The Claude Code adapter emits reasoning from transcript thinking blocks and tool_result from PostToolUse and the transcript's tool results, proven by fixtures recorded from Claude Code 2.1.292
-- [ ] #3 The Codex adapter emits reasoning from item/reasoning notifications and tool_result from completed command and file-change items, proven by fixtures recorded from Codex 0.160.1
-- [ ] #4 The Pi adapter emits reasoning from session thinking content and tool_result from tool results, proven by fixtures recorded from Pi 0.73.1
-- [ ] #5 The OpenCode adapter emits reasoning from reasoning parts and tool_result from completed tool parts, proven by fixtures recorded from OpenCode 1.18.35
-- [ ] #6 The agent view renders reasoning as dim wrapped rows and a tool result under its tool use, within the existing entry and byte budgets, and the fake adapter's script plus --agent-view-test and the agent-view scenario show both
-- [ ] #7 docs/agents.md describes what each harness contributes to the view; AGENTS.md records the change
+- [x] #1 agent.Event has reasoning and tool_result variants with bounded copies through EventQueue and the view's EventLog; the all-kinds unit tests cover them
+- [x] #2 The Claude Code adapter emits reasoning from transcript thinking blocks and tool_result from PostToolUse and the transcript's tool results, proven by fixtures recorded from Claude Code 2.1.292
+- [x] #3 The Codex adapter emits reasoning from item/reasoning notifications and tool_result from completed command and file-change items, proven by fixtures recorded from Codex 0.160.1
+- [x] #4 The Pi adapter emits reasoning from session thinking content and tool_result from tool results, proven by fixtures recorded from Pi 0.73.1
+- [x] #5 The OpenCode adapter emits reasoning from reasoning parts and tool_result from completed tool parts, proven by fixtures recorded from OpenCode 1.18.35
+- [x] #6 The agent view renders reasoning as dim wrapped rows and a tool result under its tool use, within the existing entry and byte budgets, and the fake adapter's script plus --agent-view-test and the agent-view scenario show both
+- [x] #7 docs/agents.md describes what each harness contributes to the view; AGENTS.md records the change
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -62,4 +62,12 @@ Verification: zig fmt; zig build; zig build test = 1044/1068 passed, 22 skipped,
 Coordinator diff (not committed here; other agents own those files): scratchpad t87/coordinator.diff, reproduced in the hand-off report.
 
 AGENTS.md paragraph (proposed): TASK-87 is complete on Linux. agent.Event gained `reasoning` (text, truncated) and `tool_result` (name, one-line summary, failed, truncated), copied through EventQueue and the view's EventLog under the existing bounds. The agent view draws reasoning as dim rows wrapped under a `∴` prefix and a tool result as one `↳ <first line>` row under its tool, in the danger colour when it failed; the first row of each reasoning block and each result row register as `agent.view.<a>.reasoning.<n>` and `agent.view.<a>.result.<n>`. Claude Code reports transcript thinking blocks and PostToolUse/PostToolUseFailure results (transcript tool_result blocks when no hooks run); Codex completed reasoning summaries and commandExecution/fileChange results, and its rollout reader both; Pi's extension forwards thinking and tool output, and its sink, RPC and session readers map them; OpenCode ended reasoning parts and completed or errored tool parts, where a bash that exits non-zero stays `completed` with `metadata.exit`. Each is proven by fixtures recorded from the pinned version (Claude Code 2.1.292, Codex 0.160.1, Pi 0.73.1, OpenCode 1.18.35 in its container) against local model stand-ins; the fake's scripts carry both kinds, and --agent-view-test and the agent-view scenario check them. Reasoning only appears when the model returns it; real accounts were not used.
+
+Coordinator: merged at d329749; the coordinator diff (fake scripts, view ids agent.view.<a>.reasoning.<n>/.result.<n>, agent-view scenario waits) landed in ce0e881; --agent-view-test, --agent-test, --agent-manager-test and the full gate passed on main.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+agent.Event gained reasoning and tool_result; all four adapters emit them from their structured channels, proven by fixtures recorded from Claude Code 2.1.292, Codex 0.160.1, Pi 0.73.1 and OpenCode 1.18.35 against local stand-ins; the agent view draws reasoning as dim ∴ rows and results as ↳ rows (danger when failed). Verified by the adapter and view unit tests, --agent-view-test, the agent-view scenario and the full local gate.
+<!-- SECTION:FINAL_SUMMARY:END -->

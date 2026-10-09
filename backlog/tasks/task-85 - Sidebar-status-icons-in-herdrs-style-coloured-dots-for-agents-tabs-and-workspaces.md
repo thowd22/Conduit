@@ -3,11 +3,11 @@ id: TASK-85
 title: >-
   Sidebar status icons in herdr's style: coloured dots for agents, tabs and
   workspaces
-status: In Progress
+status: Done
 assignee:
   - '@opus-5.5'
 created_date: '2026-10-09 04:52'
-updated_date: '2026-10-09 05:09'
+updated_date: '2026-10-09 05:40'
 labels:
   - agents
   - ui
@@ -27,12 +27,12 @@ The user compared Conduit with herdr (picture: herdr.png in the repo root, untra
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A sidebar.status_icons setting with values dots (default) and symbols exists in config, docs/config.md and the settings view's Agents group, hot-reloads, and a bad value is a config.error line that keeps the previous value
-- [ ] #2 In dots style working, waiting_input, waiting_permission and done draw ●, idle draws ○; in symbols style working draws ◐, waiting_input and waiting_permission draw ×, done draws ✓, idle draws ○; errored draws × in both styles; a unit test pins both tables
-- [ ] #3 The icon colour is yellow for working, red for waiting_input and waiting_permission, cyan for done, green for idle and danger for errored, taken from the theme roles, on agent rows, tab rows and workspace rows alike, while the row text keeps its normal role; a unit test pins the colour table
-- [ ] #4 Tab and workspace rows show the icon of their most urgent agent as before and the <row>.agent.<state> semantic ids and the agent-row ids are unchanged, so the driver and accessibility see the same elements
-- [ ] #5 The deterministic --agent-test and the agent-notifications scenario pass with the new icons in both styles (the style switched through the settings file during the check), and a 640x360 screenshot showing working, blocked, done, errored and idle icons in colour was inspected
-- [ ] #6 docs/user-guide.md and docs/agents.md describe the icons, the colours and the setting; AGENTS.md records the change
+- [x] #1 A sidebar.status_icons setting with values dots (default) and symbols exists in config, docs/config.md and the settings view's Agents group, hot-reloads, and a bad value is a config.error line that keeps the previous value
+- [x] #2 In dots style working, waiting_input, waiting_permission and done draw ●, idle draws ○; in symbols style working draws ◐, waiting_input and waiting_permission draw ×, done draws ✓, idle draws ○; errored draws × in both styles; a unit test pins both tables
+- [x] #3 The icon colour is yellow for working, red for waiting_input and waiting_permission, cyan for done, green for idle and danger for errored, taken from the theme roles, on agent rows, tab rows and workspace rows alike, while the row text keeps its normal role; a unit test pins the colour table
+- [x] #4 Tab and workspace rows show the icon of their most urgent agent as before and the <row>.agent.<state> semantic ids and the agent-row ids are unchanged, so the driver and accessibility see the same elements
+- [x] #5 The deterministic --agent-test and the agent-notifications scenario pass with the new icons in both styles (the style switched through the settings file during the check), and a 640x360 screenshot showing working, blocked, done, errored and idle icons in colour was inspected
+- [x] #6 docs/user-guide.md and docs/agents.md describe the icons, the colours and the setting; AGENTS.md records the change
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -58,4 +58,12 @@ Implemented on branch worktree-agent-a7855d3c9c23f3826 (commits 18465ce, eca4209
 - main.zig: workspace/tab/agent rows lead with the icon in its role; agentRowRole removed (agent row text is .foreground); settings Agents group gets a cycling sidebar.status_icons row; ids unchanged.
 - Unchanged on purpose (out of scope): stateGlyph still feeds the agent manager rows, Agent: stop/focus choices, the prompts heading and the backlog card badge, so those still show · ▸ ? ! ✓ ×.
 Evidence: zig fmt --check clean; zig build ok; zig build test 1043/1067 passed, 22 skipped, 2 failed: platform driver-transport tests fail with EndpointTooLong because testing.tmpDir under this worktree's .zig-cache makes a 111-byte Unix socket path (environmental, platform.zig untouched). xvfb --agent-test exit 0 (67 ok, 0 FAIL) incl. per-state overlay colour checks in dots, symbols by settings file, bad value as config.error, the screen-state checks in symbols, and the settings-view row by keyboard. --settings-test (40 ok) and --config-test (25 ok) exit 0. zig build e2e (artifact dir /tmp/claude-1000/c85e2e, short path for the socket limit): 22 passed, 0 failed; agent-notifications now clicks the settings row to symbols and its last frame shows cyan ✓ icons. 640x360 conduit-test screenshots with five fake agents (errored, done, permission, working, idle) inspected in both styles: dots red/cyan/red/yellow ●, green ○, red ×; symbols ×, ✓, ×, ◐, ○ in the same colours, row text uncoloured.
+
+Coordinator: merged at c7bc8f0; the full local gate (fmt, build, 1051 unit tests, every built-in check, 22/22 e2e) passed on main; the dots and symbols crops were inspected by the coordinator (coloured dots, ◐ sprite, uncoloured row text). CI 37887539231/37887539194 green on 0d98b3f.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Added sidebar.status_icons = dots|symbols (default dots, hot-reloaded, settings-view row, bad value keeps the previous style) and herdr's icon tables with theme-role colours on agent, tab and workspace rows through ui.InteractiveText.lead_foreground/lead_bytes; ◐ is a font sprite. Verified by unit tests for both tables and the colours, --agent-test (every state's icon colour on the overlay, the switch to symbols through the file and the settings view), the agent-notifications scenario, inspected 640x360 frames in both styles, the full local gate and the hosted CI.
+<!-- SECTION:FINAL_SUMMARY:END -->
