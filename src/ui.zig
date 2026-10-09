@@ -829,6 +829,13 @@ pub const InteractiveText = struct {
     hovered: TextStyle = .{ .underline = .accent },
     /// Style when focused.
     focused: TextStyle = .{ .background = .selection },
+    /// The label's first `lead_bytes` bytes paint in `lead_foreground` over
+    /// whichever style `state` selects, so a status icon keeps its own
+    /// colour while the rest of the row keeps its role (TASK-85). Null, or
+    /// a length that is not a whole leading part of the label, paints the
+    /// label in one style.
+    lead_foreground: ?theme.Role = null,
+    lead_bytes: usize = 0,
 
     /// Paint the label in the style selected by `state`.
     pub fn draw(
@@ -844,6 +851,20 @@ pub const InteractiveText = struct {
         };
         switch (self.paint) {
             .label => {
+                if (self.lead_foreground) |lead| {
+                    if (self.lead_bytes != 0 and self.lead_bytes <= self.label.len and
+                        std.unicode.utf8ValidateSlice(self.label[0..self.lead_bytes]))
+                    {
+                        var lead_style = style;
+                        lead_style.foreground = lead;
+                        const runs = [_]Run{
+                            .{ .text = self.label[0..self.lead_bytes], .style = lead_style },
+                            .{ .text = self.label[self.lead_bytes..], .style = style },
+                        };
+                        try (Text{ .runs = &runs }).draw(canvas, bounds);
+                        return;
+                    }
+                }
                 const runs = [_]Run{.{ .text = self.label, .style = style }};
                 try (Text{ .runs = &runs }).draw(canvas, bounds);
             },
@@ -3295,6 +3316,43 @@ test "interactive text selects visuals without invoking its action" {
     view = canvas.view(&palette);
     try testing.expectEqual(resolveRole(&palette, .white), view.cells[0].foreground);
     try testing.expect(view.cells[0].background == null);
+}
+
+test "interactive text paints a coloured lead over every state's style" {
+    const testing = std.testing;
+    var canvas = try Canvas.init(testing.allocator, 8, 1);
+    defer canvas.deinit();
+    const palette = testPalette();
+    const item = InteractiveText{
+        .id = try Id.parse("item.agent"),
+        .label = "● fake",
+        .action = "agent.row",
+        .normal = .{ .foreground = .foreground },
+        .hovered = .{ .foreground = .strong, .underline = .accent },
+        .focused = .{ .foreground = .strong, .background = .selection },
+        .lead_foreground = .yellow,
+        .lead_bytes = "●".len,
+    };
+
+    try item.draw(&canvas, canvas.bounds(), .normal);
+    var view = canvas.view(&palette);
+    try testing.expectEqual(resolveRole(&palette, .yellow), view.cells[0].foreground);
+    try testing.expectEqual(resolveRole(&palette, .foreground), view.cells[2].foreground);
+
+    canvas.clear();
+    try item.draw(&canvas, canvas.bounds(), .focused);
+    view = canvas.view(&palette);
+    try testing.expectEqual(resolveRole(&palette, .yellow), view.cells[0].foreground);
+    try testing.expectEqual(resolveRole(&palette, .selection), view.cells[0].background.?);
+    try testing.expectEqual(resolveRole(&palette, .strong), view.cells[2].foreground);
+
+    // A lead that would split a character paints the label in one style.
+    var unsplit = item;
+    unsplit.lead_bytes = 1;
+    canvas.clear();
+    try unsplit.draw(&canvas, canvas.bounds(), .normal);
+    view = canvas.view(&palette);
+    try testing.expectEqual(resolveRole(&palette, .foreground), view.cells[0].foreground);
 }
 
 test "decoration-only interactive text preserves underlying glyph ownership" {

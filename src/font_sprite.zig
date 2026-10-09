@@ -1,5 +1,5 @@
-//! Built-in sprite glyphs: box drawing, block elements, braille and the Powerline separators,
-//! drawn procedurally at the current cell size.
+//! Built-in sprite glyphs: box drawing, block elements, braille, the Powerline separators and
+//! the half-filled circle U+25D0, drawn procedurally at the current cell size.
 //!
 //! **Owns** turning one of those codepoints and a cell size into a coverage mask exactly one cell
 //! wide and one cell tall. **Never** opens a font, touches the atlas or knows what a terminal is:
@@ -19,6 +19,10 @@
 //! arcs and Powerline shapes are sampled 4x4 per pixel, which anti-aliases their slopes while
 //! still filling to the exact cell edge.
 //!
+//! U+25D0 `◐` is here for a different reason: it is the sidebar's "working" status icon (TASK-85)
+//! and the bundled JetBrains Mono, which has `○` and `●`, lacks it, so without a sprite it would
+//! depend on whatever the system has installed.
+//!
 //! Not drawn here, and resolved through the font fallback chain instead: the Powerline flame,
 //! pixelated, ice and Lego shapes (U+E0C0..U+E0D1, U+E0D6..U+E0D7) and every other Nerd Font
 //! private-use icon, which Conduit's bundled Symbols Nerd Font Mono face covers.
@@ -31,6 +35,7 @@ pub fn covers(codepoint: u21) bool {
         0x2500...0x259F => true,
         0x2800...0x28FF => true,
         0xE0B0...0xE0BF, 0xE0D2, 0xE0D4 => true,
+        0x25D0 => true,
         else => false,
     };
 }
@@ -54,6 +59,7 @@ pub fn render(codepoint: u21, width_px: u32, height_px: u32, out: []u8) bool {
         0x2580...0x259F => block(&canvas, codepoint),
         0x2800...0x28FF => braille(&canvas, codepoint),
         0xE0B0...0xE0BF, 0xE0D2, 0xE0D4 => powerline(&canvas, codepoint),
+        0x25D0 => halfCircle(&canvas),
         else => return false,
     }
     return true;
@@ -488,6 +494,30 @@ fn arc(canvas: *Canvas, codepoint: u21) void {
     if (right) canvas.rect(lx0 + r, ly0, w, ly0 + t, 255) else canvas.rect(0, ly0, lx0 + t - r, ly0 + t, 255);
 }
 
+const HalfCircle = struct {
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    stroke: f32,
+};
+
+fn insideHalfCircle(c: HalfCircle, x: f32, y: f32) bool {
+    const dx = x - c.cx;
+    const dy = y - c.cy;
+    const distance = @sqrt(dx * dx + dy * dy);
+    if (distance > c.radius) return false;
+    return dx <= 0 or distance >= c.radius - c.stroke;
+}
+
+/// U+25D0 `◐`: a circle as wide as the cell, centred on it, its left half filled and its right
+/// half an outline, sized like JetBrains Mono's own `○` and `●` (about one advance across, with a
+/// ring about a twelfth of it) so the three read as one set.
+fn halfCircle(canvas: *Canvas) void {
+    const radius = @min(canvas.w(), canvas.h()) / 2;
+    const stroke = @max(@as(f32, @floatFromInt(lineThickness(canvas.height))), canvas.w() / 12);
+    canvas.sample(HalfCircle{ .cx = canvas.w() / 2, .cy = canvas.h() / 2, .radius = radius, .stroke = stroke }, insideHalfCircle);
+}
+
 const Slope = enum { rising, falling };
 
 fn diagonal(canvas: *Canvas, slope: Slope) void {
@@ -649,9 +679,25 @@ test "sprite coverage is exactly the ranges drawn here" {
     try testing.expect(!covers(0xE0C0)); // flames come from the bundled symbols face
     try testing.expect(!covers('A'));
     try testing.expect(!covers(0x25A0));
+    try testing.expect(covers(0x25D0));
+    try testing.expect(!covers(0x25CF)); // `●` and `○` come from the bundled face
     var tiny: [3]u8 = undefined;
     try testing.expect(!render(0x2500, 2, 2, &tiny));
     try testing.expect(!render('A', 1, 1, &tiny));
+}
+
+test "U+25D0 fills its left half and outlines its right half" {
+    const w = 10;
+    const h = 22;
+    const mask = try renderAlloc(0x25D0, w, h);
+    defer testing.allocator.free(mask);
+    // Inside the left half is solid, the right half's middle is empty and its rim is drawn.
+    try testing.expectEqual(@as(u8, 255), at(mask, w, 2, h / 2));
+    try testing.expectEqual(@as(u8, 0), at(mask, w, 6, h / 2));
+    try testing.expect(at(mask, w, w - 1, h / 2) > 0);
+    // Nothing above or below the circle.
+    try testing.expectEqual(@as(u8, 0), at(mask, w, w / 2, 0));
+    try testing.expectEqual(@as(u8, 0), at(mask, w, w / 2, h - 1));
 }
 
 test "U+2500 and U+2502 meet the cell edges and cross at the same pixels" {
