@@ -1189,6 +1189,35 @@ done` once it leaves. Two Ctrl+C presses have not yet ended Claude Code under Co
 "Press Ctrl-C again to exit"), so that step ends it with taskkill and warns; TASK-83 tracks it.
 macOS still reports no foreground process.
 
+TASK-84 is complete on Linux. The PTY baseline reads the screen, following herdr's design
+(manifests per harness, output as the working authority, a debounced idle).
+`agent/screen.zig` defines `ScreenManifest`: per class (permission, working, errored, input) at most 16 patterns, each up to
+4 case-folded literals that must appear, up to 4 that must not, an optional row-start prefix, and
+a region of the last N (≤ 32) non-blank rows; manifests are compile-time data checked by
+`validate`, matching allocates nothing, and `classify` ranks permission > working > errored >
+input. Each adapter publishes `screen_manifest` (`agent.screenManifest(harness)`; the fake has
+`agent.fake_screen_manifest`): Claude Code 2.1.292, Codex 0.160.1 and Pi 0.73.1 were captured at
+100x30 against local API stand-ins and are pinned by scrubbed fixtures
+(`src/agent/{claude_code/fixtures,codex/fixtures,pi/testdata}/screen-*.txt`); OpenCode's strings
+come from herdr's manifest, are unverified, and it has no error or input patterns. `Heuristics`
+ticks carry an optional screen (`wantsScreen`, only with a manifest and while working or after a
+redraw): after 1 s of quiet the screen names input or errored, a permission prompt wins at once
+even during output (Pi's spinner keeps running behind its confirm), a state the screen named
+survives redraws until the screen changes, a visible busy line holds working for 3 s, and plain
+idle needs three quiet confirmations 100 ms apart or 700 ms, reset by any output. Structured
+events still win in the registry; screen text only moves the heuristic state and is never stored
+or logged. `term.Terminal.activeScreenText` reads the bottom rows of the active screen from the
+engine (no refresh, no scrollback, no allocation); the runtime reads it through
+`SessionProbe.screen_fn` into one 8 KiB buffer, ticking a working agent every 100 ms. The
+hand-started fake in `--agent-test` and the `agent-notifications` scenario now draws a prompt, an
+approval, an error and a spinner burst, and the checks follow its row through `? fake input`,
+`! fake permission`, `× fake errored`, `▸ fake working` (never leaving it during the burst) and a
+`· fake idle` that arrives no sooner than the debounce allows. A real Claude Code 2.1.292 started
+by hand in a driven Conduit, against a local Messages API stand-in with no account, showed
+`? claude input`, `! claude permission` at its Bash approval, `? claude input` after it and
+`✓ claude done` after `/exit`, all from the screen. omp, OpenCode and macOS/Windows screens are
+uncaptured.
+
 TASK-46 is complete. `config` reads repeatable `profile = <name> = <command> [arguments...]`
 lines (shell-style quoting, literal backslashes outside `\"`/`\\`), `profile.<name>.env|cwd|login`
 attributes in any order, and `shell = <name>` for the default (32 profiles, 32 arguments and 32

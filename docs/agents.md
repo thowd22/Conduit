@@ -173,6 +173,53 @@ Claude Code started as `claude` in a PowerShell tab, observed as `· claude idle
 the first Ctrl+C with "Press Ctrl-C again to exit" but has not yet exited on the second one under
 ConPTY, so the check ends it with `taskkill` and reports that with a warning.
 
+### Screen states (TASK-84)
+
+An agent whose structured channel is missing or silent (every observed Pi, OpenCode and Claude
+Code whose session registry is not found, a Codex the daemon cannot see, remote Codex and
+OpenCode agents) is followed by the PTY baseline, and that baseline now reads the screen. Each
+adapter ships a screen manifest: a few literal patterns per state, each a set of case-insensitive
+strings that must all appear in the last N non-blank rows of the terminal's active screen,
+optionally with a row that starts with a given prefix. Conduit classifies the bottom 32 rows
+(read from the terminal engine, never scrollback, at most 8 KiB) with priority permission, then
+working, then error, then input:
+
+| Harness | Captured from | Permission | Working | Error | Input |
+|---|---|---|---|---|---|
+| Claude Code | 2.1.292 | `Do you want to proceed?` or `Do you want to … 1. Yes` with `Esc to cancel` | `esc to interrupt` footer | `● API Error:` row | `❯` prompt row |
+| Codex | 0.160.1 | `Press enter to confirm or esc to cancel`, `Would you like to run the following command?` | `esc to interrupt` | `■` row | `›` composer row |
+| Pi | 0.73.1 | an extension's confirm (`→ Yes`/`→ No` over `enter select`) | `Working...`, `Retrying (` | `Error:` row | the editor rule over the `%/` context footer |
+| OpenCode | not captured | `△ Permission required`, `enter confirm` + `esc dismiss` | `esc interrupt` | none | none |
+
+The Claude Code, Codex and Pi screens were captured on Linux at 100x30 against local stand-ins
+for their model APIs (no account) and are checked in as scrubbed fixtures beside each adapter.
+OpenCode is not installed where this was written: its strings are the ones herdr's manifest
+relies on and are unverified, and it has no error or input patterns, so those fall back to the
+baseline.
+
+The rules, borrowed from herdr's design: output is the authority for working, and the screen
+names the quiet states once the terminal has been silent for 1 s (`? input`, `× errored`). A
+permission prompt on screen wins at once, even while output continues, because Pi keeps
+animating its spinner behind the confirm. A wait the screen named survives redraws (typing at the
+prompt, moving a dialog's selection) until the screen says something else. A busy line still on
+screen keeps a silent agent working for up to 3 s. With nothing on screen, leaving working for
+idle is debounced: three quiet confirmations 100 ms apart, or 700 ms, and any output starts over,
+so a pausing spinner does not flap the glyph. Structured events still win: once a harness's hooks,
+daemon or event stream have spoken, the registry ignores every heuristic claim. Screen text is
+untrusted. It is classified and dropped, never stored or logged, and it can only move the state;
+it never answers a prompt or triggers anything.
+
+A real Claude Code 2.1.292 started by hand in a driven Conduit on Linux (against a local Messages
+API stand-in, in default permission mode) read `? claude input` about 3 s after it was started,
+`▸ claude working` when a prompt was sent, `! claude permission` 3 s later at its Bash approval
+dialog, `? claude input` again after the approval, and `✓ claude done` after `/exit`; Conduit had
+no session registry to attach to, so every state came from the screen.
+
+Limits: patterns are literals, so a harness release that rewords its TUI needs a manifest update;
+a harness's own output that happens to contain a pattern (an error line quoted in a reply) can
+misclassify a quiet screen until the next redraw; and omp, OpenCode and Windows/macOS terminals
+have not been captured.
+
 The work is tracked as TASK-52 (adapter interface), TASK-53 to TASK-55 (Claude Code, Codex and Pi
 adapters), TASK-56 (notifications), TASK-57 (agent view), TASK-58 (agent manager), TASK-59 (prompt viewer and editor), TASK-60
 (control API), TASK-61 (agents over SSH), TASK-62 to TASK-64 (Backlog.md) and TASK-78 (OpenCode).
