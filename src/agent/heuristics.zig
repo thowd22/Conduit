@@ -133,10 +133,12 @@ pub const Heuristics = struct {
     }
 
     /// Whether ticks should come every `idle_recheck_ns` rather than at the
-    /// caller's usual pace: a working session is the one whose quiet may
-    /// need confirming.
+    /// caller's usual pace: while working (its quiet may need confirming)
+    /// and when a wait the screen named was redrawn (the human may have
+    /// started a turn).
     pub fn wantsFastTicks(self: *const Heuristics) bool {
-        return !self.exited and self.state == .working;
+        if (self.exited) return false;
+        return self.state == .working or (self.from_screen and self.dirty);
     }
 
     /// Fold one observation and return the events it implies.

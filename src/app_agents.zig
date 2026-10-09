@@ -454,6 +454,15 @@ pub const Choice = union(enum) {
         };
     }
 
+    /// The screen patterns its PTY baseline matches (TASK-84): the
+    /// harness's own, or the fake's.
+    pub fn screenManifest(self: Choice) *const agent.ScreenManifest {
+        return switch (self) {
+            .harness => |h| agent.screenManifest(h),
+            .fake => agent.fake_screen_manifest,
+        };
+    }
+
     /// Whether this choice only gets the PTY baseline in a remote workspace:
     /// Codex's daemon socket and OpenCode's loopback port are on the remote
     /// host, and forwarding them is not implemented (TASK-61).
@@ -1376,6 +1385,10 @@ pub const SessionProbe = struct {
     /// Owner thread; bounded (`pty.Pty.foregroundProcess` reads `/proc`).
     /// Null when the session is gone.
     probe_fn: ?*const fn (context: ?*anyopaque, key: WorkspaceKey, id: SessionId, buffer: []u8) ?SessionFacts = null,
+    /// The bottom `rows` rows of the session's active screen, written into
+    /// `buffer` (TASK-84). Owner thread; bounded, never scrollback. Null when
+    /// the session is gone. The text is untrusted and only classified.
+    screen_fn: ?*const fn (context: ?*anyopaque, key: WorkspaceKey, id: SessionId, rows: u16, buffer: []u8) ?[]const u8 = null,
 };
 
 /// At most one foreground look per session per this interval, and only after
@@ -1459,6 +1472,9 @@ pub const Runtime = struct {
     claude_program: ?[]const u8 = null,
     /// How the runtime asks the app what runs in a session (observed agents).
     probe: SessionProbe = .{},
+    /// The one screen snapshot a tick hands an agent's heuristics (TASK-84),
+    /// overwritten by the next read and never kept or logged.
+    screen_buffer: [agent.Heuristics.screen_capacity]u8 = undefined,
     watches: std.ArrayList(Watch) = .empty,
     /// Foreground looks taken, for checks and diagnostics.
     foreground_checks: usize = 0,
@@ -1866,7 +1882,11 @@ pub const Runtime = struct {
             .token = runner.token,
             .capabilities = runner.adapter().capabilities(),
         });
-        self.tracks.append(self.allocator, .{ .id = id, .last_activity_ns = Io.Clock.awake.now(self.io).nanoseconds }) catch |err| {
+        self.tracks.append(self.allocator, .{
+            .id = id,
+            .heuristics = .{ .manifest = runner.choice.screenManifest() },
+            .last_activity_ns = Io.Clock.awake.now(self.io).nanoseconds,
+        }) catch |err| {
             // The id was issued just above, so it is known to the registry.
             self.registry.remove(id) catch |remove_err| log.debug("an agent was not unregistered: {s}", .{@errorName(remove_err)});
             return err;
@@ -2084,10 +2104,10 @@ pub const Runtime = struct {
         const agent_id = self.registry.findBySession(key, id) orelse return;
         const track_record = self.trackFor(agent_id) orelse return;
         switch (observation) {
-            .output, .title, .command_started => {
-                track_record.last_tick_ns = now_ns;
-                track_record.last_activity_ns = now_ns;
-            },
+            // Ticks keep their pace through output (TASK-84): the screen is
+            // looked at while a turn runs, for a permission prompt drawn
+            // over a spinner that never stops.
+            .output, .title, .command_started => track_record.last_activity_ns = now_ns,
             else => {},
         }
         const batch = track_record.heuristics.observe(observation);
@@ -2231,6 +2251,14 @@ pub const Runtime = struct {
             log.warn("the observed agent's side channel worker did not start: {s}", .{@errorName(err)});
         };
         log.debug("observing a {s} the human started", .{choice.value()});
+    }
+
+    /// The bottom of a session's active screen for its agent's heuristics,
+    /// in the runtime's one buffer (valid until the next read), or null
+    /// without a screen seam or a session.
+    fn readScreen(self: *Runtime, key: WorkspaceKey, id: SessionId) ?[]const u8 {
+        const screen_fn = self.probe.screen_fn orelse return null;
+        return screen_fn(self.probe.context, key, id, agent.Heuristics.screen_rows, &self.screen_buffer);
     }
 
     fn trackFor(self: *Runtime, id: AgentId) ?*Track {
@@ -2458,11 +2486,13 @@ pub const Runtime = struct {
         }
         self.checkForegrounds(now_ns);
         for (self.tracks.items) |*candidate| {
-            if (now_ns - candidate.last_tick_ns < tick_interval_ns) continue;
+            const interval = if (candidate.heuristics.wantsFastTicks()) fast_tick_interval_ns else tick_interval_ns;
+            if (now_ns - candidate.last_tick_ns < interval) continue;
             candidate.last_tick_ns = now_ns;
             const record = self.registry.get(candidate.id) orelse continue;
             if (record.hasExited()) continue;
-            const batch = candidate.heuristics.observe(.{ .tick = .{ .now_ns = clampNs(now_ns) } });
+            const text = if (candidate.heuristics.wantsScreen()) self.readScreen(record.workspace, record.session) else null;
+            const batch = candidate.heuristics.observe(.{ .tick = .{ .now_ns = clampNs(now_ns), .screen = text } });
             for (batch.events()) |ev| self.applyAndAnnounce(candidate.id, ev, null);
         }
         var index: usize = 0;
@@ -2518,6 +2548,8 @@ pub const Runtime = struct {
 };
 
 const tick_interval_ns: i96 = 500 * std.time.ns_per_ms;
+/// The tick pace while a turn may be ending: the idle debounce's recheck.
+const fast_tick_interval_ns: i96 = agent.Heuristics.default_idle_recheck_ns;
 
 fn clampNs(value: i96) u64 {
     if (value <= 0) return 0;
@@ -2635,6 +2667,8 @@ const ScriptedProbe = struct {
     pid: u32 = 100,
     gone: bool = false,
     looks: usize = 0,
+    screen: []const u8 = "",
+    screen_reads: usize = 0,
 
     fn probe(context: ?*anyopaque, key: WorkspaceKey, id: SessionId, buffer: []u8) ?SessionFacts {
         const self: *ScriptedProbe = @ptrCast(@alignCast(context.?));
@@ -2654,7 +2688,89 @@ const ScriptedProbe = struct {
             },
         };
     }
+
+    /// The session's screen as the test last drew it.
+    fn screenOf(context: ?*anyopaque, _: WorkspaceKey, _: SessionId, _: u16, buffer: []u8) ?[]const u8 {
+        const self: *ScriptedProbe = @ptrCast(@alignCast(context.?));
+        self.screen_reads += 1;
+        if (self.gone) return null;
+        @memcpy(buffer[0..self.screen.len], self.screen);
+        return buffer[0..self.screen.len];
+    }
 };
+
+test "an observed agent's screen names its waits and its spinner does not flap to idle" {
+    var runtime = try Runtime.init(testing.allocator, testing.io, .{ .fake_enabled = true });
+    defer runtime.deinit();
+    var notifier: TestNotifier = .{};
+    runtime.notifier = .{ .context = &notifier, .notify_fn = TestNotifier.record };
+    const key = WorkspaceKey.fromOrdinal(0);
+    const human = SessionId.fromOrdinal(1);
+    const ms: i96 = std.time.ns_per_ms;
+    var scripted: ScriptedProbe = .{ .argv0 = "/bin/sh", .argv1 = "/tmp/bin/conduit-fake-agent", .pid = 77 };
+    runtime.probe = .{ .context = &scripted, .probe_fn = ScriptedProbe.probe, .screen_fn = ScriptedProbe.screenOf };
+
+    runtime.observe(key, human, .{ .output = .{ .now_ns = 0 } }, 0);
+    _ = runtime.poll(0);
+    const id = (runtime.agentForSession(key, human) orelse return error.TestUnexpectedResult).id;
+    // Its prompt, once quiet.
+    scripted.screen = "OBSERVED-FAKE-READY\nfake\u{203a} ";
+    runtime.observe(key, human, .{ .output = .{ .now_ns = @intCast(100 * ms) } }, 100 * ms);
+    try testing.expectEqual(State.working, runtime.registry.get(id).?.state);
+    _ = runtime.poll(600 * ms);
+    try testing.expectEqual(State.working, runtime.registry.get(id).?.state);
+    _ = runtime.poll(1200 * ms);
+    try testing.expectEqual(State.waiting_input, runtime.registry.get(id).?.state);
+    try testing.expectEqualStrings("fake", runtime.rowName(runtime.registry.get(id).?));
+
+    // A spinner burst whose frames are 1.2 s apart: each gap outlasts the
+    // quiet window but not the idle debounce, so working holds throughout.
+    scripted.screen = "fake\u{203a} spin\nFAKE-SPIN\nframe";
+    var t: i96 = 1300 * ms;
+    runtime.observe(key, human, .{ .output = .{ .now_ns = @intCast(t) } }, t);
+    _ = runtime.poll(t + 100 * ms);
+    try testing.expectEqual(State.working, runtime.registry.get(id).?.state);
+    var frame: usize = 0;
+    while (frame < 4) : (frame += 1) {
+        var step: usize = 0;
+        while (step < 12) : (step += 1) {
+            t += 100 * ms;
+            _ = runtime.poll(t);
+            try testing.expectEqual(State.working, runtime.registry.get(id).?.state);
+        }
+        runtime.observe(key, human, .{ .output = .{ .now_ns = @intCast(t) } }, t);
+    }
+    // Then quiet with nothing on screen: idle once the debounce has its
+    // three confirmations.
+    var steps: usize = 0;
+    while (steps < 30 and runtime.registry.get(id).?.state != .idle) : (steps += 1) {
+        t += 100 * ms;
+        _ = runtime.poll(t);
+    }
+    try testing.expectEqual(State.idle, runtime.registry.get(id).?.state);
+    try testing.expectEqual(@as(usize, 13), steps);
+
+    // A permission prompt drawn while output keeps coming.
+    scripted.screen = "fake\u{203a} ask\nfake asks: run make test? [y/n]";
+    t += 100 * ms;
+    runtime.observe(key, human, .{ .output = .{ .now_ns = @intCast(t) } }, t);
+    t += 100 * ms;
+    runtime.observe(key, human, .{ .output = .{ .now_ns = @intCast(t) } }, t);
+    _ = runtime.poll(t);
+    try testing.expectEqual(State.waiting_permission, runtime.registry.get(id).?.state);
+    // Announced like any wait, once.
+    try testing.expectEqual(Kind.permission, runtime.notifications.newest(0).?.kind);
+    const raised = runtime.notifications.count();
+    t += 100 * ms;
+    runtime.observe(key, human, .{ .output = .{ .now_ns = @intCast(t) } }, t);
+    _ = runtime.poll(t + 100 * ms);
+    try testing.expectEqual(raised, runtime.notifications.count());
+    // The screen is read only while it can say something new.
+    const reads = scripted.screen_reads;
+    _ = runtime.poll(t + 600 * ms);
+    _ = runtime.poll(t + 1200 * ms);
+    try testing.expectEqual(reads, scripted.screen_reads);
+}
 
 test "a harness started by hand in a human terminal is observed, rate-limited, and ends when it leaves" {
     var runtime = try Runtime.init(testing.allocator, testing.io, .{ .fake_enabled = true });

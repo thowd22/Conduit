@@ -7459,7 +7459,7 @@ const App = struct {
             .driver_artifact_dir = options.run.test_artifact_dir,
         };
         app.agents.wake = .{ .context = app, .wake_fn = agentWake };
-        app.agents.probe = .{ .context = app, .probe_fn = agentSessionFacts };
+        app.agents.probe = .{ .context = app, .probe_fn = agentSessionFacts, .screen_fn = agentSessionScreen };
         // A hidden window is headless automation: its agents notify the list,
         // never the desktop, unless a check installs its own seam.
         if (options.run.hidden) app.agents.notifier = .{ .notify_fn = discardOsNotification };
@@ -11794,6 +11794,16 @@ const App = struct {
             .claude_config_dir = self.claude_config_dir,
             .codex_home = self.codex_home,
         };
+    }
+
+    /// The bottom rows of a session's active screen, for its agent's screen
+    /// manifest (TASK-84): read from the terminal engine, never scrollback,
+    /// into the runtime's buffer. Null once the session is gone.
+    fn agentSessionScreen(context: ?*anyopaque, key: workspace.WorkspaceKey, id: session.SessionId, rows: u16, buffer: []u8) ?[]const u8 {
+        const self: *App = @ptrCast(@alignCast(context.?));
+        const model = self.workspace_registry.byKey(key) orelse return null;
+        const live = model.sessionById(id) orelse return null;
+        return live.terminal().activeScreenText(buffer, rows);
     }
 
     /// `--agent-test`'s private directory: the parent of the sink root.
@@ -28576,11 +28586,28 @@ const agent_test_script =
     "else printf 'ECHO:%s\\r\\n' \"$line\"; fi; done";
 
 /// The fake harness a person starts by hand in `--agent-test`'s first tab:
-/// it says it is ready, waits for one line and leaves.
+/// it says it is ready and then draws what its screen manifest
+/// (`agent.fake_screen_manifest`, TASK-84) knows, one typed line at a time:
+/// its `fake› ` prompt, `ask` an approval answered by the next line, `fail`
+/// an error line, `spin` six spinner frames 0.4 s apart and then plain
+/// lines (held until the next line), and `bye` leaves.
 const observed_fake_script =
-    "printf 'OBSERVED-FAKE-READY\\r\\n'\n" ++
-    "IFS= read -r line\n" ++
-    "printf 'OBSERVED-FAKE-BYE\\r\\n'\n";
+    \\printf 'OBSERVED-FAKE-READY\r\n'
+    \\p() { printf 'fake\342\200\272 '; }
+    \\p
+    \\while IFS= read -r line; do
+    \\  case "$line" in
+    \\    ask) printf 'fake asks: run make test? [y/n]\r\n'; IFS= read -r a; printf 'FAKE-ANSWER-%s\r\n' "$a"; p ;;
+    \\    fail) printf 'fake error: the build failed\r\n'; p ;;
+    \\    spin) for i in 1 2 3 4 5 6; do printf '\342\240\213 fake working %s\r\n' "$i"; sleep 0.4; done
+    \\      printf 'FAKE-SPIN-%s\r\nsettled\r\nquiet\r\nnow\r\n' DONE; IFS= read -r a; p ;;
+    \\    bye) break ;;
+    \\    *) p ;;
+    \\  esac
+    \\done
+    \\printf 'OBSERVED-FAKE-BYE\r\n'
+    \\
+;
 
 const agent_test_initial_config = "# --agent-test\n";
 const agent_test_budget_ms: i64 = 8000;
@@ -29983,6 +30010,64 @@ fn waitForAgent(self: *App, io: Io, out: *Writer, trace: *const AgentOsTrace, co
     }
 }
 
+/// TASK-84: the hand-started fake draws what its screen manifest knows, and
+/// its sidebar row follows from the screen alone (it has no structured
+/// channel): its prompt, an approval it holds until answered, an error line,
+/// and a spinner burst that never shows idle while it runs and leaves for
+/// idle only after the quiet window and the debounce.
+fn agentScreenChecks(self: *App, io: Io, out: *Writer, trace: *const AgentOsTrace, failures: *usize, row: []const u8) !void {
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "? fake input" } }), "its prompt on screen shows the row `{s}`", .{agentRowLabel(self, row)});
+    _ = try agentTypeLine(self, io, out, "ask");
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "! fake permission" } }) and
+        self.ui_tree.byId(.{ .value = "workspace.1.tab.1.agent.waiting_permission" }) != null, "its approval prompt shows `{s}` and the permission glyph", .{agentRowLabel(self, row)});
+    // Screen text never answers: the prompt is still waiting for the human.
+    agentCheck(out, failures, !self.activeLive().terminal().visibleTextContains("FAKE-ANSWER-"), "nothing answered the approval but the human", .{});
+    _ = try agentTypeLine(self, io, out, "y");
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .terminal_text = "FAKE-ANSWER-y" }) and
+        try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "? fake input" } }), "answered by the human's keystroke, it is back at its prompt", .{});
+    _ = try agentTypeLine(self, io, out, "fail");
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "\u{00d7} fake errored" } }), "an error line under its prompt shows `{s}`", .{agentRowLabel(self, row)});
+
+    _ = try agentTypeLine(self, io, out, "spin");
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "\u{25b8} fake working" } }), "its spinner shows `{s}`", .{agentRowLabel(self, row)});
+    const burst = try watchRowUntil(self, io, out, row, "FAKE-SPIN-DONE");
+    agentCheck(out, failures, burst.reached and !burst.left_working, "the row stayed working through the spinner burst ({d} frames sampled)", .{burst.samples});
+    const quiet_from = Io.Clock.awake.now(io).nanoseconds;
+    agentCheck(out, failures, agentRowLabelIs(self, row, "\u{25b8} fake working"), "right after the burst the row still reads working", .{});
+    const settled = try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "\u{00b7} fake idle" } });
+    const settled_ms = @divTrunc(Io.Clock.awake.now(io).nanoseconds - quiet_from, std.time.ns_per_ms);
+    // The quiet window and three confirmations 100 ms apart: never sooner
+    // than 1.3 s after the last output, less the time it took to see it.
+    agentCheck(out, failures, settled and settled_ms >= 1200, "plain lines after it settle to idle only after the debounce ({d} ms)", .{settled_ms});
+    _ = try agentTypeLine(self, io, out, "next");
+    agentCheck(out, failures, try waitForAgent(self, io, out, trace, .{ .label = .{ .id = row, .text = "? fake input" } }), "its prompt again shows input", .{});
+}
+
+const RowWatch = struct { reached: bool, left_working: bool, samples: usize };
+
+/// Pump until the active terminal shows `text`, sampling `row`'s label on
+/// every iteration: whether it ever stopped reading working.
+fn watchRowUntil(self: *App, io: Io, out: *Writer, row: []const u8, text: []const u8) !RowWatch {
+    var result: RowWatch = .{ .reached = false, .left_working = false, .samples = 0 };
+    const deadline = Io.Clock.real.now(io).nanoseconds + agent_test_budget_ms * std.time.ns_per_ms;
+    while (true) {
+        if (self.scheduler.shouldDraw()) try self.drawFrame();
+        result.samples += 1;
+        if (std.mem.indexOf(u8, agentRowLabel(self, row), "working") == null) result.left_working = true;
+        if (self.activeLive().terminal().visibleTextContains(text)) {
+            result.reached = true;
+            return result;
+        }
+        const event = self.window.pump(@min(self.waitBudget(io, deadline), 50));
+        if (event) |one| {
+            describeEvent(out, one) catch {};
+            if (!try self.handle(one)) return result;
+        }
+        if (self.poll()) self.scheduler.invalidate();
+        if (Io.Clock.real.now(io).nanoseconds >= deadline) return result;
+    }
+}
+
 fn agentCheck(out: *Writer, failures: *usize, ok: bool, comptime format: []const u8, args: anytype) void {
     out.print("agent-test: {s} " ++ format ++ "\n", .{if (ok) "ok  " else "FAIL"} ++ args) catch {};
     if (!ok) failures.* += 1;
@@ -30390,6 +30475,7 @@ fn agentTest(self: *App, io: Io, out: *Writer) !u8 {
     const first_tab_semantic = try tabSemanticId(&first_tab_buffer, first_key, first_tab);
     agentCheck(out, &failures, std.mem.indexOf(u8, agentRowLabel(self, observed_row), " fake ") != null and
         agentRowBeneath(self, first_tab_semantic, observed_row), "the hand-started agent got its own row `{s}` under the human tab before any structured event", .{agentRowLabel(self, observed_row)});
+    try agentScreenChecks(self, io, out, &os_trace, &failures, observed_row);
     _ = try agentTypeLine(self, io, out, "bye");
     agentCheck(out, &failures, try waitForAgent(self, io, out, &os_trace, .{ .terminal_text = "FAKE-BACK" }) and
         try waitForAgent(self, io, out, &os_trace, .{ .element = "workspace.1.tab.1.agent.done" }) and

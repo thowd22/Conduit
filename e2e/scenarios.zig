@@ -567,6 +567,31 @@ const agent_notifications_steps = [_]Step{
     .{ .key = "ENTER" },
     .{ .wait_element = .{ .id = observed_view_id, .state = "exists", .equals = false } },
     .{ .click = "workspace.1.pane.1" },
+    // TASK-84: with no structured channel, the row follows the fake's
+    // screen: its prompt, an approval (answered only by the typed `y`), an
+    // error line, and a spinner burst that still reads working the moment
+    // it ends and settles to idle only once the debounce has run.
+    .{ .wait_element = .{ .id = observed_glyph ++ "waiting_input", .state = "exists", .equals = true } },
+    .{ .type_text = "ask" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = observed_glyph ++ "waiting_permission", .state = "exists", .equals = true } },
+    .screenshot,
+    .{ .type_text = "y" },
+    .{ .key = "ENTER" },
+    .{ .wait_terminal_text = .{ .contains = "OBS-ANSWER-y" } },
+    .{ .wait_element = .{ .id = observed_glyph ++ "waiting_input", .state = "exists", .equals = true } },
+    .{ .type_text = "fail" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = observed_glyph ++ "errored", .state = "exists", .equals = true } },
+    .{ .type_text = "spin" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = observed_glyph ++ "working", .state = "exists", .equals = true } },
+    .{ .wait_terminal_text = .{ .contains = "OBS-SPIN-DONE", .timeout_ms = 10_000 } },
+    .{ .wait_element = .{ .id = observed_glyph ++ "working", .state = "exists", .equals = true, .timeout_ms = 200 } },
+    .{ .wait_element = .{ .id = observed_glyph ++ "idle", .state = "exists", .equals = true } },
+    .{ .type_text = "next" },
+    .{ .key = "ENTER" },
+    .{ .wait_element = .{ .id = observed_glyph ++ "waiting_input", .state = "exists", .equals = true } },
     .{ .type_text = "bye" },
     .{ .key = "ENTER" },
     .{ .wait_element = .{ .id = "workspace.1.tab.1.agent.done", .state = "exists", .equals = true, .timeout_ms = 10_000 } },
@@ -581,11 +606,23 @@ const observed_row_id = "workspace.1.tab.1.agent-row.2";
 const observed_view_id = "agent.view.2";
 
 /// Starts the fake harness by hand as its own foreground job, named
-/// `conduit-fake-agent` so it is recognised. Its marker is assembled by
-/// printf, so the typed command's echo never contains `OBS-READY`.
+/// `conduit-fake-agent` so it is recognised. Its markers are assembled by
+/// printf, so the typed command's echo never contains `OBS-READY`. It then
+/// draws what the fake's screen manifest knows (TASK-84), a typed line at a
+/// time: its `fake› ` prompt, `ask` an approval the next line answers,
+/// `fail` an error line, `spin` six spinner frames 0.4 s apart and then
+/// plain lines held until the next line, and `bye` leaves.
 const observed_fake_command =
     "set -m; f=\"${TMPDIR:-/tmp}/conduit-fake-agent\"; " ++
-    "printf '%s\\n' 'printf \"OBS-%s\\n\" READY' 'read l' > \"$f\"; sh \"$f\"";
+    "printf '%s\\n' 'printf \"OBS-%s\\n\" READY' 'p() { printf \"fake\\342\\200\\272 \"; }' 'p' " ++
+    "'while read l; do case $l in " ++
+    "ask) printf \"fake asks: run make test? [y/n]\\n\"; read a; printf \"OBS-ANSWER-%s\\n\" \"$a\"; p;; " ++
+    "fail) printf \"fake error: the build failed\\n\"; p;; " ++
+    "spin) for i in 1 2 3 4 5 6; do printf \"\\342\\240\\213 fake working %s\\n\" $i; sleep 0.4; done; " ++
+    "printf \"OBS-SPIN-%s\\nsettled\\nquiet\\nnow\\n\" DONE; read a; p;; " ++
+    "bye) break;; *) p;; esac; done' > \"$f\"; sh \"$f\"";
+
+const observed_glyph = "workspace.1.tab.1.agent.";
 
 // TASK-57: the same fake agent, stepped to its first permission request,
 // then shown as the structured agent view by its chord. The request's

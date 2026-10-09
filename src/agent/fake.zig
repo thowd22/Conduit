@@ -557,7 +557,7 @@ test "resolve_on_answer reports each answer's outcome on the next poll" {
 pub const screen_manifest: agent_screen.ScreenManifest = blk: {
     const m: agent_screen.ScreenManifest = .{
         .captured_from = "conduit-fake-agent",
-        .permission = &.{.{ .all = &.{"[y/n]"}, .row_prefix = "fake asks:", .rows = 4 }},
+        .permission = &.{.{ .all = &.{"[y/n]"}, .row_prefix = "fake asks:", .rows = 2 }},
         .working = &.{.{ .all = &.{"fake working"}, .rows = 4 }},
         .errored = &.{.{ .row_prefix = "fake error:", .rows = 4 }},
         .input = &.{.{ .row_prefix = "fake\u{203a}", .rows = 2 }},
