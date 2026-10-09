@@ -25,8 +25,9 @@
 //!   prompt resolves anything still pending as resolved elsewhere.
 //! * **Transcript** (`TranscriptReader`). The session JSONL named by the
 //!   hooks' `transcript_path` (or found under `<config>/projects/` for an
-//!   attached session) yields user and assistant messages and, when no hook
-//!   channel reports them, tool uses and file references. The format is
+//!   attached session) yields user and assistant messages, the model's
+//!   thinking blocks as reasoning (TASK-87) and, when no hook channel reports
+//!   them, tool uses, the files they name and their `tool_result` blocks. The format is
 //!   internal to Claude Code and parsed tolerantly; unknown records are
 //!   skipped.
 //! * **Session registry** (`findRunningSession`). Claude Code 2.1.x keeps an
@@ -43,7 +44,9 @@
 //!   PreToolUse                             → status working, tool_use, file refs
 //!   PermissionRequest                      → permission_request (allow / deny)
 //!   PermissionEnd (synthetic)              → permission_resolved
-//!   PostToolUse, PostToolUseFailure        → status working
+//!   PostToolUse, PostToolUseFailure        → status working, tool_result
+//!                                            (from `tool_response`, or
+//!                                            `error` for a failure)
 //!   Notification                           → notification (+ waiting_input for
 //!                                            agent_needs_input / elicitation)
 //!   Stop                                   → status done (a finished turn)
@@ -569,6 +572,38 @@ fn toolSummary(input: ?Value) []const u8 {
     return "";
 }
 
+/// The text of a transcript `tool_result` block's content: a string, or the
+/// first `text` block of an array.
+fn toolResultText(content: ?Value) []const u8 {
+    const value = content orelse return "";
+    return switch (value) {
+        .string => |s| s,
+        .array => |blocks| for (blocks.items) |block| {
+            if (std.mem.eql(u8, string(block, "type") orelse "", "text")) break string(block, "text") orelse "";
+        } else "",
+        else => "",
+    };
+}
+
+/// What a `PostToolUse` hook's `tool_response` says, as text to summarise:
+/// the response itself when it is a string, else the first non-empty output
+/// field Claude Code's built-in tools use (Bash's `stdout` then `stderr`),
+/// else a file's line count (Read) or path (Write, Edit). Empty when none.
+fn hookResponseText(arena: Allocator, response: ?Value) Allocator.Error![]const u8 {
+    const value = response orelse return "";
+    switch (value) {
+        .string => |s| return s,
+        .object => {},
+        else => return "",
+    }
+    for ([_][]const u8{ "stdout", "stderr", "output", "content", "result", "message" }) |key| {
+        if (string(value, key)) |s| if (std.mem.trim(u8, s, " \t\r\n").len != 0) return s;
+    }
+    const file = field(value, "file");
+    if (integer(file, "numLines")) |lines| return std.fmt.allocPrint(arena, "{d} lines", .{lines});
+    return string(value, "filePath") orelse string(file, "filePath") orelse "";
+}
+
 /// A file a tool input names, with the starting line `Read` takes.
 fn fileReference(input: ?Value) ?event.FileReference {
     const path = string(input, "file_path") orelse string(input, "notebook_path") orelse return null;
@@ -611,6 +646,19 @@ pub const EventBuf = struct {
         }
     }
 
+    /// A tool's result, summarised to its first line.
+    fn toolResult(self: *EventBuf, name: []const u8, output: []const u8, failed: bool) void {
+        if (name.len > event.max_identifier_bytes) return;
+        const summary = event.summaryLine(output, max_summary_bytes);
+        self.add(.{ .tool_result = .{ .name = name, .summary = summary.line, .failed = failed, .truncated = summary.truncated } });
+    }
+
+    fn reasoning(self: *EventBuf, text: []const u8) void {
+        if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
+        const kept = event.truncateUtf8(text, max_message_bytes);
+        self.add(.{ .reasoning = .{ .text = kept, .truncated = kept.len != text.len } });
+    }
+
     fn message(self: *EventBuf, role: event.Role, text: []const u8) void {
         if (text.len == 0) return;
         const kept = event.truncateUtf8(text, max_message_bytes);
@@ -620,11 +668,12 @@ pub const EventBuf = struct {
 
 // Transcript -------------------------------------------------------------------
 
-/// Map one transcript record to events. Messages always; tool uses and the
-/// files they name only with `include_tools`, which is off when hooks
-/// already report them live. Meta records (local command caveats),
-/// sidechain records (a subagent's own conversation), thinking blocks, tool
-/// results and every record type this version does not know are skipped.
+/// Map one transcript record to events. Messages and thinking blocks
+/// (as reasoning) always; tool uses, the files they name and tool results
+/// only with `include_tools`, which is off when hooks already report them
+/// live. Meta records (local command caveats), sidechain records (a
+/// subagent's own conversation), redacted thinking and every record type
+/// this version does not know are skipped.
 pub fn mapTranscriptRecord(arena: Allocator, line: []const u8, include_tools: bool, out: *EventBuf) void {
     const record = parseLine(arena, line) orelse return;
     const kind = string(record, "type") orelse return;
@@ -642,8 +691,14 @@ pub fn mapTranscriptRecord(arena: Allocator, line: []const u8, include_tools: bo
             const block_type = string(block, "type") orelse continue;
             if (std.mem.eql(u8, block_type, "text")) {
                 out.message(role, string(block, "text") orelse continue);
+            } else if (role == .assistant and std.mem.eql(u8, block_type, "thinking")) {
+                out.reasoning(string(block, "thinking") orelse continue);
             } else if (include_tools and role == .assistant and std.mem.eql(u8, block_type, "tool_use")) {
                 out.toolUse(string(block, "name") orelse continue, field(block, "input"), true);
+            } else if (include_tools and role == .user and std.mem.eql(u8, block_type, "tool_result")) {
+                // The record names only the tool use id; the view shows the
+                // result under the tool use it follows.
+                out.toolResult("", toolResultText(field(block, "content")), boolean(block, "is_error"));
             }
         },
         else => {},
@@ -1470,6 +1525,14 @@ pub const ClaudeCodeAdapter = struct {
                     }
                 }
                 out.status(.working);
+                const tool = string(payload, "tool_name") orelse "";
+                if (hook == .post_tool_use_failure) {
+                    out.toolResult(tool, string(payload, "error") orelse "", true);
+                } else {
+                    const interrupted = boolean(field(payload, "tool_response"), "interrupted");
+                    const text = try hookResponseText(arena, field(payload, "tool_response"));
+                    out.toolResult(tool, if (interrupted and text.len == 0) "interrupted" else text, interrupted);
+                }
             },
             .notification => {
                 const kind = string(payload, "notification_type") orelse "";
@@ -1925,7 +1988,7 @@ test "every hook event maps to the documented events, through the registry" {
         // the malformed line and the other agent's line yield nothing
         .permission_request, // PermissionRequest
         .permission_resolved, // PermissionEnd allow
-        .status_change, // PostToolUse → working
+        .status_change, .tool_result, // PostToolUse → working, its result
         .subagent, .subagent, // SubagentStart, SubagentStop
         .status_change, .notification, // Notification agent_needs_input
         .status_change, // Stop → done
@@ -1949,13 +2012,17 @@ test "every hook event maps to the documented events, through the registry" {
     try testing.expectEqualStrings("allow", request.decisions[0].id);
     try testing.expectEqual(event.DecisionKind.reject, request.decisions[1].kind);
     try testing.expectEqual(event.PermissionOutcome.allowed, e[7].event.permission_resolved.outcome);
-    try testing.expectEqualStrings("Explore", e[9].event.subagent.name);
-    try testing.expectEqual(event.Subagent.Phase.stop, e[10].event.subagent.phase);
-    try testing.expectEqual(State.waiting_input, e[11].event.status_change.state);
-    try testing.expectEqualStrings("Claude needs your input", e[12].event.notification.body);
-    try testing.expectEqual(State.done, e[13].event.status_change.state);
-    try testing.expectEqual(State.errored, e[15].event.status_change.state);
-    try testing.expectEqualStrings("turn failed: authentication_failed", e[16].event.notification.body);
+    // `touch` printed nothing: the result has no summary and did not fail.
+    try testing.expectEqualStrings("Bash", e[9].event.tool_result.name);
+    try testing.expectEqualStrings("", e[9].event.tool_result.summary);
+    try testing.expect(!e[9].event.tool_result.failed);
+    try testing.expectEqualStrings("Explore", e[10].event.subagent.name);
+    try testing.expectEqual(event.Subagent.Phase.stop, e[11].event.subagent.phase);
+    try testing.expectEqual(State.waiting_input, e[12].event.status_change.state);
+    try testing.expectEqualStrings("Claude needs your input", e[13].event.notification.body);
+    try testing.expectEqual(State.done, e[14].event.status_change.state);
+    try testing.expectEqual(State.errored, e[16].event.status_change.state);
+    try testing.expectEqualStrings("turn failed: authentication_failed", e[17].event.notification.body);
 
     // The session and its transcript were learned from the payloads.
     try testing.expectEqualStrings("11111111-2222-4333-8444-555555555555", a.sessionId().?);
@@ -1976,9 +2043,9 @@ test "every hook event maps to the documented events, through the registry" {
     defer states.deinit(testing.allocator);
     for (events.items) |*stored| try states.append(testing.allocator, (try reg.apply(id, stored.event)).current);
     try testing.expectEqualSlices(State, &.{
-        .idle,    .idle,    .working, .working,       .working,       .working, .waiting_permission, .working,
-        .working, .working, .working, .waiting_input, .waiting_input, .done,    .working,            .errored,
-        .errored,
+        .idle,    .idle,    .working, .working, .working,       .working,       .waiting_permission, .working,
+        .working, .working, .working, .working, .waiting_input, .waiting_input, .done,               .working,
+        .errored, .errored,
     }, states.items);
     try testing.expect(!reg.get(id).?.hasExited());
 }
@@ -2054,7 +2121,7 @@ test "a reported transcript path is followed only inside Claude's projects direc
     }) |bad| try testing.expect(!a.acceptableTranscriptPath(bad));
 }
 
-test "transcript records become messages, tool uses and file references" {
+test "transcript records become messages, reasoning, tool uses and file references" {
     var events = try StoredList.init();
     defer events.deinit();
     var lines = std.mem.splitScalar(u8, fixture_transcript, '\n');
@@ -2067,19 +2134,21 @@ test "transcript records become messages, tool uses and file references" {
     }
     const e = events.items;
     const K = Event.Kind;
-    const kinds = [_]K{ .message, .message, .tool_use, .file_reference, .tool_use, .file_reference, .tool_use, .message };
+    const kinds = [_]K{ .message, .reasoning, .message, .tool_use, .file_reference, .tool_result, .tool_use, .file_reference, .tool_use, .message };
     try testing.expectEqual(kinds.len, e.len);
     for (kinds, e) |kind, *stored| try testing.expectEqual(kind, std.meta.activeTag(stored.event));
     try testing.expectEqual(event.Role.user, e[0].event.message.role);
     try testing.expectEqualStrings("read the build", e[0].event.message.text);
-    try testing.expectEqualStrings("I'll read the build first.", e[1].event.message.text);
-    try testing.expectEqualStrings("Read", e[2].event.tool_use.name);
-    try testing.expectEqual(@as(?u32, 42), e[3].event.file_reference.line);
-    try testing.expectEqualStrings("src/main.zig", e[5].event.file_reference.path);
-    try testing.expectEqualStrings("zig build test", e[6].event.tool_use.summary);
-    try testing.expectEqualStrings("thanks, now explain", e[7].event.message.text);
+    try testing.expectEqualStrings("check the build file before touching anything", e[1].event.reasoning.text);
+    try testing.expectEqualStrings("I'll read the build first.", e[2].event.message.text);
+    try testing.expectEqualStrings("Read", e[3].event.tool_use.name);
+    try testing.expectEqual(@as(?u32, 42), e[4].event.file_reference.line);
+    try testing.expectEqualStrings("42\tconst std = @import(\"std\");", e[5].event.tool_result.summary);
+    try testing.expectEqualStrings("src/main.zig", e[7].event.file_reference.path);
+    try testing.expectEqualStrings("zig build test", e[8].event.tool_use.summary);
+    try testing.expectEqualStrings("thanks, now explain", e[9].event.message.text);
 
-    // Without tools only the messages remain.
+    // Without tools the messages and the reasoning remain.
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var out: EventBuf = .{};
@@ -2089,11 +2158,11 @@ test "transcript records become messages, tool uses and file references" {
         out = .{};
         mapTranscriptRecord(arena.allocator(), line, false, &out);
         for (out.slice()) |ev| {
-            try testing.expectEqual(K.message, std.meta.activeTag(ev));
+            try testing.expect(ev == .message or ev == .reasoning);
             messages += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 3), messages);
+    try testing.expectEqual(@as(usize, 4), messages);
 
     // Long text is cut at a UTF-8 boundary and flagged.
     const long = try std.fmt.allocPrint(arena.allocator(), "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{"é" ** (max_message_bytes / 2 + 1)});
@@ -2102,6 +2171,79 @@ test "transcript records become messages, tool uses and file references" {
     try testing.expect(out.slice()[0].message.truncated);
     try testing.expect(out.slice()[0].message.text.len <= max_message_bytes);
     try testing.expect(std.unicode.utf8ValidateSlice(out.slice()[0].message.text));
+}
+
+const fixture_transcript_tools = @embedFile("claude_code/fixtures/transcript-tools.jsonl");
+const fixture_hooks_tools = @embedFile("claude_code/fixtures/hooks-tools.jsonl");
+
+test "a recorded 2.1.292 turn yields its thinking as reasoning and its tool results" {
+    // Recorded from `claude -p` 2.1.292 against a local Messages API
+    // stand-in that answers every request with a thinking block and walks
+    // three tools: a Bash printing two lines, a failing Bash, a Read.
+    var events = try StoredList.init();
+    defer events.deinit();
+    var lines = std.mem.splitScalar(u8, fixture_transcript_tools, '\n');
+    while (lines.next()) |line| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var out: EventBuf = .{};
+        mapTranscriptRecord(arena.allocator(), line, true, &out);
+        for (out.slice()) |ev| try events.append(ev);
+    }
+    const e = events.items;
+    const K = Event.Kind;
+    const kinds = [_]K{
+        .message, // the prompt
+        .reasoning, .tool_use, .tool_result, // printf
+        .reasoning, .tool_use, .tool_result, // ls of a missing directory
+        .reasoning, .tool_use, .file_reference, .tool_result, // Read
+        .reasoning, .message, // the answer
+    };
+    try testing.expectEqual(kinds.len, e.len);
+    for (kinds, e) |kind, *stored| try testing.expectEqual(kind, std.meta.activeTag(stored.event));
+    try testing.expectEqualStrings("I should run the probe first to see what it prints.", e[1].event.reasoning.text);
+    try testing.expect(!e[1].event.reasoning.truncated);
+    const printed = e[3].event.tool_result;
+    try testing.expectEqualStrings("", printed.name);
+    try testing.expectEqualStrings("probe line one", printed.summary);
+    try testing.expect(printed.truncated and !printed.failed);
+    const failed = e[6].event.tool_result;
+    try testing.expectEqualStrings("Exit code 2", failed.summary);
+    try testing.expect(failed.failed and failed.truncated);
+    try testing.expectEqualStrings("/home/user/work/notes.txt", e[9].event.file_reference.path);
+    try testing.expectEqualStrings("1\thello from the notes", e[10].event.tool_result.summary);
+    try testing.expect(!e[10].event.tool_result.failed);
+    try testing.expectEqualStrings("Everything I need is here; summarise.", e[11].event.reasoning.text);
+
+    // With hooks live the transcript adds only messages and reasoning; the
+    // results come from PostToolUse and PostToolUseFailure, named.
+    var a = try ClaudeCodeAdapter.init(testing.allocator, testing.io, .{ .sink_dir = "/run/conduit/agent-1", .config_dir = "/home/user/.claude" });
+    defer a.deinit();
+    a.mode = .owned;
+    a.token = fixtureToken();
+    var hooked = try StoredList.init();
+    defer hooked.deinit();
+    var hook_lines = std.mem.splitScalar(u8, fixture_hooks_tools, '\n');
+    while (hook_lines.next()) |line| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var out: EventBuf = .{};
+        try a.mapHookLine(arena.allocator(), line, &out);
+        for (out.slice()) |ev| try hooked.append(ev);
+    }
+    const h = hooked.items;
+    try testing.expectEqual(@as(usize, 6), h.len);
+    for (h, 0..) |*stored, i| try testing.expectEqual(if (i % 2 == 0) K.status_change else K.tool_result, std.meta.activeTag(stored.event));
+    try testing.expectEqualStrings("Bash", h[1].event.tool_result.name);
+    try testing.expectEqualStrings("probe line one", h[1].event.tool_result.summary);
+    try testing.expect(h[1].event.tool_result.truncated and !h[1].event.tool_result.failed);
+    try testing.expectEqualStrings("Bash", h[3].event.tool_result.name);
+    try testing.expectEqualStrings("Exit code 2", h[3].event.tool_result.summary);
+    try testing.expect(h[3].event.tool_result.failed);
+    try testing.expectEqualStrings("Read", h[5].event.tool_result.name);
+    try testing.expectEqualStrings("3 lines", h[5].event.tool_result.summary);
+    try testing.expect(!h[5].event.tool_result.failed);
+    try testing.expect(!a.transcript.?.include_tools);
 }
 
 test "the transcript reader is incremental, bounded and resumes after a full queue" {
@@ -2128,11 +2270,12 @@ test "the transcript reader is incremental, bounded and resumes after a full que
     const first = fixture_transcript[0 .. std.mem.indexOf(u8, fixture_transcript, "I'll read").? + 40];
     try scratch.tmp.dir.writeFile(testing.io, .{ .sub_path = "t.jsonl", .data = first });
     var drained = try reader.poll(&sink, testing.io, &arena, &queue);
-    try testing.expectEqual(@as(usize, 1), drained.pushed);
-    try testing.expectEqual(@as(usize, 1), queue.drain(out));
+    try testing.expectEqual(@as(usize, 2), drained.pushed);
+    try testing.expectEqual(@as(usize, 2), queue.drain(out));
     try testing.expectEqualStrings("read the build", out[0].event.message.text);
+    try testing.expectEqual(Event.Kind.reasoning, std.meta.activeTag(out[1].event));
 
-    // The whole fixture: 8 events through a queue of 3 arrive across polls,
+    // The rest of the fixture: 8 events through a queue of 3 arrive across polls,
     // in order, none twice.
     try scratch.tmp.dir.writeFile(testing.io, .{ .sub_path = "t.jsonl", .data = fixture_transcript });
     var kinds: std.ArrayList(Event.Kind) = .empty;
@@ -2144,7 +2287,7 @@ test "the transcript reader is incremental, bounded and resumes after a full que
         for (out[0..n]) |*stored| try kinds.append(testing.allocator, std.meta.activeTag(stored.event));
         if (!drained.full and n == 0) break;
     }
-    try testing.expectEqualSlices(Event.Kind, &.{ .message, .tool_use, .file_reference, .tool_use, .file_reference, .tool_use, .message }, kinds.items);
+    try testing.expectEqualSlices(Event.Kind, &.{ .message, .tool_use, .file_reference, .tool_result, .tool_use, .file_reference, .tool_use, .message }, kinds.items);
 
     // A record longer than the line buffer is skipped whole; the next one
     // still arrives.
@@ -2225,7 +2368,7 @@ test "a hand-started session is detected, attached and followed until it exits" 
     const out = try testing.allocator.alloc(event.StoredEvent, 32);
     defer testing.allocator.free(out);
     const pushed = try iface.poll(&queue);
-    try testing.expectEqual(@as(usize, 9), pushed);
+    try testing.expectEqual(@as(usize, 11), pushed);
     const n = queue.drain(out);
     try testing.expectEqual(Event.Kind.message, std.meta.activeTag(out[0].event));
     try testing.expectEqual(State.working, out[n - 1].event.status_change.state);
